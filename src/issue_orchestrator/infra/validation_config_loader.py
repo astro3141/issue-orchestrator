@@ -7,12 +7,18 @@ from pathlib import Path
 import yaml
 
 from .config_paths import DEFAULT_CONFIG_NAME, find_config_file
-from .config_models import ValidationConfig
+from .config_models import (
+    PublishValidationConfig,
+    ValidationCommandConfig,
+    ValidationConfig,
+)
 from .env import get_env
 from .validation_junit_paths import configured_validation_junit_xml_paths_from_mapping
 from .validation_profiles import (
     DEFAULT_VALIDATION_PROFILE,
-    UnknownValidationProfileError,
+    ValidationProfile,
+    ValidationProfileRegistry,
+    profiles_from_mapping,
 )
 
 
@@ -26,25 +32,32 @@ def default_validation_config() -> dict:
     return defaults
 
 
-def _profile_gates(validation: dict, profile: str | None) -> tuple[dict, dict]:
-    """Return the ``(quick, publish)`` mappings for the selected profile.
+def _selected_profile(validation: dict, profile: str | None) -> ValidationProfile:
+    """Resolve the selected profile straight from parsed YAML.
 
-    ``None`` or ``default`` means the top-level pair, which is why an
-    existing config that never mentions profiles is byte-for-byte unchanged.
-    A named profile must exist: the agent side fails closed rather than
-    silently validating with somebody else's contract (#7059).
+    Routed through :class:`ValidationProfileRegistry` — the same owner the
+    orchestrator side uses — so "which gates does this name mean" is answered
+    once, not once per side of the session boundary. A named profile must
+    exist: the agent side fails closed rather than silently validating with
+    somebody else's contract (#7059).
     """
-    if not profile or profile == DEFAULT_VALIDATION_PROFILE:
-        return validation.get("quick", {}) or {}, validation.get("publish", {}) or {}
-
-    profiles = validation.get("profiles", {}) or {}
-    selected = profiles.get(profile)
-    if not isinstance(selected, dict):
-        raise UnknownValidationProfileError(
-            profile,
-            [DEFAULT_VALIDATION_PROFILE, *profiles],
+    quick = validation.get("quick", {}) or {}
+    publish = validation.get("publish", {}) or {}
+    registry = ValidationProfileRegistry(
+        ValidationConfig(
+            quick=ValidationCommandConfig(
+                cmd=quick.get("cmd"),
+                timeout_seconds=quick.get("timeout_seconds", 300),
+            ),
+            publish=PublishValidationConfig(
+                cmd=publish.get("cmd"),
+                timeout_seconds=publish.get("timeout_seconds", 1800),
+                dirty_check=publish.get("dirty_check", "tracked"),
+            ),
+            profiles=profiles_from_mapping(validation.get("profiles")),
         )
-    return selected.get("quick", {}) or {}, selected.get("publish", {}) or {}
+    )
+    return registry.resolve(profile)
 
 
 def extract_validation_config(config: dict, profile: str | None = None) -> dict:
@@ -58,27 +71,18 @@ def extract_validation_config(config: dict, profile: str | None = None) -> dict:
     defaults = default_validation_config()
     guardrail_defaults = defaults["coverage_guardrail"]
     validation = config.get("validation", {}) or {}
-    quick, publish = _profile_gates(validation, profile)
+    selected = _selected_profile(validation, profile)
     guardrail = validation.get("coverage_guardrail", {}) or {}
     return {
-        "profile": profile or DEFAULT_VALIDATION_PROFILE,
+        "profile": selected.name,
         "quick": {
-            "cmd": quick.get("cmd"),
-            "timeout_seconds": quick.get(
-                "timeout_seconds",
-                defaults["quick"]["timeout_seconds"],
-            ),
+            "cmd": selected.quick.cmd,
+            "timeout_seconds": selected.quick.timeout_seconds,
         },
         "publish": {
-            "cmd": publish.get("cmd"),
-            "timeout_seconds": publish.get(
-                "timeout_seconds",
-                defaults["publish"]["timeout_seconds"],
-            ),
-            "dirty_check": publish.get(
-                "dirty_check",
-                defaults["publish"]["dirty_check"],
-            ),
+            "cmd": selected.publish.cmd,
+            "timeout_seconds": selected.publish.timeout_seconds,
+            "dirty_check": selected.publish.dirty_check,
         },
         "junit_xml_paths": configured_validation_junit_xml_paths_from_mapping(config),
         "coverage_guardrail": {
