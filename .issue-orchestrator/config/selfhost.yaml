@@ -1,0 +1,116 @@
+# Self-hosting configuration — astro3141/issue-orchestrator fork
+#
+# Deliberately a NAMED config, not default.yaml and not a merge into main.yaml.
+# The upstream repository already owns main.yaml, and scripts/verify-pr.sh (a
+# tracked upstream file) selects it by name. Creating default.yaml made
+# setup-guardrails rewrite that tracked file, which the repository's own
+# test_checked_in_verify_pr_matches_portable_generated_output correctly caught.
+# Select this file explicitly instead:
+#
+#   ISSUE_ORCHESTRATOR_CONFIG_NAME=selfhost.yaml
+#
+# SELF-HOSTING BOUNDARY
+#
+# The trusted pinned runtime at ~/io-tools/issue-orchestrator orchestrates this
+# repository as a candidate. The candidate's own (possibly modified) IO source
+# never runs itself. Promoting this fork to runtime is a separate decision,
+# taken only after a PR passes independent review and the publish gate, and
+# followed by its own smoke/self-host test.
+
+repo:
+  name: astro3141/issue-orchestrator
+  github:
+    api_url: https://api.github.com
+    http_timeout_seconds: 20
+
+default_agent:
+  provider: claude-code
+  model: opus
+
+agents:
+  agent:backend:
+    prompt: .prompts/backend.md
+    provider: claude-code
+    ai_system: claude-code
+    model: opus
+    timeout_minutes: 300
+    reviewer: agent:reviewer
+    provider_args:
+      permission_mode: bypassPermissions
+  agent:reviewer:
+    prompt: .prompts/code-review.md
+    provider: claude-code
+    ai_system: claude-code
+    model: opus
+    timeout_minutes: 60
+    provider_args:
+      permission_mode: bypassPermissions
+
+worktrees:
+  base: /Users/astro3141/io-fork-worktrees
+  base_branch_override: main
+  seed_ref: origin/main
+  reuse_push_preflight: true
+  worktree_branch_on_recreate: delete
+  remediation:
+    pr_collision: new_branch
+    push_rebase_retry: true
+
+execution:
+  concurrency:
+    max_concurrent_sessions: 1
+    session_timeout_minutes: 300
+  session_interactions:
+    enabled: true
+  isolation:
+    mode: standard
+
+review:
+  enabled: true
+  default: agent:reviewer
+  max_rework_cycles: 1
+
+validation:
+  # LC_ALL=C is pinned because git emits localized stderr on this machine and
+  # at least one test asserts on English text. Measured: the assertion fails
+  # under the ambient Korean locale and passes under LC_ALL=C, on an unmodified
+  # checkout. That is an environment difference, not a defect.
+  quick:
+    # Focused on the #7059 change area rather than the whole suite, so rework
+    # rounds stay short. Whole-repository regression duty belongs to publish.
+    cmd: "LC_ALL=C LANG=C .venv/bin/python -m pytest tests/unit tests/integration -q --tb=short -p no:cacheprovider -k 'validation or profile or config or prepush' && LC_ALL=C make typecheck"
+    timeout_seconds: 1800
+  publish:
+    # The upstream project's own gate, reproduced rather than invented:
+    # main.yaml sets publish to `make validate-pr-raw`, which already runs
+    # typecheck, lint-arch, lint-complexity, test-unit, test-simulated-core,
+    # test-integration-core-local, test-simulated-agent, test-integration-agent
+    # and test-vscode. Adding typecheck or lint-arch here would duplicate them.
+    #
+    # tests/e2e is intentionally absent: it is a separate live contract needing
+    # gh auth and E2E_TEST_REPO, and with that variable unset the fixtures fall
+    # back to the current git repo (tests/e2e/fixtures/github_utils.py:140) and
+    # write issues into this fork. Upstream CI does not run it either. Run live
+    # E2E separately against a throwaway E2E_TEST_REPO.
+    cmd: "LC_ALL=C LANG=C make validate-pr-raw"
+    timeout_seconds: 5400
+
+retry:
+  max_validation_retries: 2
+  validation_error_file: validation-errors.txt
+
+labels:
+  in_progress: in-progress
+  blocked: blocked
+  needs_human: needs-human
+  needs_rework: needs-rework
+  validation_failed: validation-failed
+
+tech_lead:
+  # Requirements for #3 are already fixed by the human operator; no task
+  # discovery or contract authoring is delegated.
+  enabled: false
+
+filtering:
+  fetch_limit: 100
+  max_to_start: 0
