@@ -52,6 +52,13 @@ from ..domain.session_run import SessionRunAssets
 from ..ports.provider_resilience import ProviderErrorType
 from ..infra.provider_resilience import ProviderStatus, read_provider_status
 from ..infra.logging_config import issue_log
+from ..infra.config_models import PublishValidationConfig, ValidationCommandConfig
+from ..infra.validation_profiles import (
+    DEFAULT_VALIDATION_PROFILE,
+    UnknownValidationProfileError as UnknownValidationProfileError,
+    ValidationProfile,
+    ValidationProfileRegistry,
+)
 from ..infra.validation_state import (
     DEFAULT_RETRY_TEMPLATE,
     _truncate_with_tail,
@@ -107,6 +114,10 @@ class ValidationFailureContext:
     repo_root: Path | None
     failure_kind: ValidationFailureKind
     dirty_files: tuple[str, ...]
+    # The validation contract this run executed (#7059). Carried on the
+    # failure so retry state, diagnostics, and events all name the same
+    # profile the gate actually ran.
+    profile: ValidationProfile
 
 
 @dataclass(frozen=True)
@@ -160,6 +171,7 @@ class SessionController:
         validation_attempt_key_factory: "ValidationAttemptKeyFactory | None" = None,
         max_validation_retries: int = 0,
         review_exchange_canceller: ReviewExchangeCanceller | None = None,
+        validation_profiles: "ValidationProfileRegistry | None" = None,
     ):
         """Initialize the controller.
 
@@ -176,6 +188,10 @@ class SessionController:
             attempt_store: Owner for cross-run attempt-scoped validation facts
             validation_attempt_key_factory: Builds the issue-at-HEAD cache key
             max_validation_retries: Maximum number of validation retries (0 = no retries)
+            validation_profiles: Owner of named validation profiles (#7059).
+                When omitted, ``validation_cmd``/``validation_timeout_seconds``
+                *are* the default profile — the pre-profile behavior, expressed
+                through the same owner instead of beside it.
         """
         self.completion_processor = completion_processor
         self.events = events
@@ -183,8 +199,16 @@ class SessionController:
         self._working_copy = working_copy
         self._command_runner = command_runner
         self._max_validation_retries = max_validation_retries
-        self._validation_cmd = validation_cmd
-        self._validation_timeout = validation_timeout_seconds
+        self._validation_profiles = validation_profiles or ValidationProfileRegistry.single(
+            ValidationProfile(
+                name=DEFAULT_VALIDATION_PROFILE,
+                quick=ValidationCommandConfig(
+                    cmd=validation_cmd,
+                    timeout_seconds=validation_timeout_seconds,
+                ),
+                publish=PublishValidationConfig(),
+            )
+        )
         self._validation_junit_xml_paths = tuple(validation_junit_xml_paths)
         self._validation_evidence_recorder = (
             validation_evidence_recorder
@@ -194,6 +218,32 @@ class SessionController:
         self._attempt_store = attempt_store
         self._validation_attempt_key_factory = validation_attempt_key_factory
         self._review_exchange_canceller = review_exchange_canceller
+
+    def _profile_for_run(self, run_dir: Path) -> ValidationProfile:
+        """The validation contract frozen for this run (#7059).
+
+        Read from the run directory's manifest — durable state written when
+        the run was created — so a restarted orchestrator, a rework round, and
+        a retry all validate against the same contract the run was launched
+        under. Nothing here consults the issue's current labels or branch.
+
+        A run created before profiles existed, or by a launch path that did
+        not record one, reads back as the default profile: the pre-#7059
+        behavior, unchanged.
+
+        A run that names a profile the current config no longer defines
+        raises. Substituting another contract would let the run claim it
+        satisfied a gate it never executed, which is precisely the confusion
+        recording the profile exists to prevent.
+
+        Raises:
+            UnknownValidationProfileError: when the recorded profile is gone.
+        """
+        manifest = self.session_output.read_manifest(run_dir) or {}
+        recorded = manifest.get("validation_profile")
+        return self._validation_profiles.resolve(
+            recorded if isinstance(recorded, str) and recorded else None
+        )
 
     def decide_outcome(
         self,
@@ -454,7 +504,10 @@ class SessionController:
         self,
         context: SessionFinalizationContext,
     ) -> SessionDecision | None:
-        has_validation = bool(self._validation_cmd and self._command_runner)
+        has_validation = bool(
+            self._profile_for_run(context.run_assets.run_dir).quick.cmd
+            and self._command_runner
+        )
         finalization_plan = self.completion_processor.completion_finalization_plan(
             issue_number=context.issue_number,
             session_name=context.session_name,
@@ -581,6 +634,7 @@ class SessionController:
                 repo_root=repo_root,
                 failure_kind=ValidationFailureKind.DIRTY_BEFORE_VALIDATION,
                 dirty_files=dirty_policy.blocking_paths,
+                profile=self._profile_for_run(failure_run_dir),
             )
         )
 
@@ -739,11 +793,10 @@ class SessionController:
         issue_key: "IssueKey | None",
         task_kind: "TaskKind | None" = None,
     ) -> ValidationGateDecision | None:
-        if not (
-            status == SessionStatus.COMPLETED
-            and self._validation_cmd
-            and self._command_runner
-        ):
+        if status != SessionStatus.COMPLETED or not self._command_runner:
+            return None
+        profile = self._profile_for_run(run_dir)
+        if not profile.quick.cmd:
             return None
         # Review-only sessions (PR review / retrospective review) make no commits
         # and publish nothing, so the code validation-retry gate does not apply.
@@ -764,6 +817,7 @@ class SessionController:
             retry_prompt_template,
             repo_root,
             issue_key,
+            profile,
         )
 
     def _emit_pre_publish_validation_failure(
@@ -1057,12 +1111,17 @@ class SessionController:
         retry_prompt_template: str | None,
         repo_root: Path | None,
         issue_key: "IssueKey | None",
+        profile: ValidationProfile,
     ) -> ValidationGateDecision:
         """Run validation gate and return updated status."""
         logger.info(
-            issue_log(issue_number, "Running validation gate: cmd=%s timeout=%ds"),
-            self._validation_cmd,
-            self._validation_timeout,
+            issue_log(
+                issue_number,
+                "Running validation gate: profile=%s cmd=%s timeout=%ds",
+            ),
+            profile.name,
+            profile.quick.cmd,
+            profile.quick.timeout_seconds,
         )
         validation_passed, validation_error, validation_error_file = (
             self._run_validation(
@@ -1072,6 +1131,7 @@ class SessionController:
                 issue_title,
                 run_dir,
                 issue_key,
+                profile,
             )
         )
 
@@ -1087,6 +1147,7 @@ class SessionController:
                 original_prompt=original_prompt,
                 retry_prompt_template=retry_prompt_template,
                 repo_root=repo_root,
+                profile=profile,
             )
             if dirty_after_validation is not None:
                 return dirty_after_validation
@@ -1108,7 +1169,8 @@ class SessionController:
                 {
                     "issue_number": issue_number,
                     "session_name": session_name,
-                    "validation_cmd": self._validation_cmd,
+                    "validation_cmd": profile.quick.cmd,
+                    "validation_profile": profile.name,
                     "run_dir": str(run_dir),
                     "artifacts": self._validation_record_artifacts(
                         run_dir,
@@ -1145,6 +1207,7 @@ class SessionController:
                     repo_root=repo_root,
                     failure_kind=ValidationFailureKind.VALIDATION_COMMAND,
                     dirty_files=(),
+                    profile=profile,
                 )
             ),
             passed=False,
@@ -1165,6 +1228,7 @@ class SessionController:
         original_prompt: str | None,
         retry_prompt_template: str | None,
         repo_root: Path | None,
+        profile: ValidationProfile,
     ) -> ValidationGateDecision | None:
         dirty_policy = self.completion_processor.check_dirty_policy(worktree_path)
         if dirty_policy.ok:
@@ -1211,6 +1275,7 @@ class SessionController:
                 repo_root=repo_root,
                 failure_kind=ValidationFailureKind.DIRTY_AFTER_VALIDATION,
                 dirty_files=dirty_policy.blocking_paths,
+                profile=profile,
             )
         )
         return ValidationGateDecision(
@@ -1257,11 +1322,13 @@ class SessionController:
         logger.warning(
             issue_log(
                 failure.issue_number,
-                "Validation gate FAILED (retry %d/%d): cmd=%s error=%s summary=%s error_file=%s run_dir=%s",
+                "Validation gate FAILED (retry %d/%d): profile=%s cmd=%s error=%s "
+                "summary=%s error_file=%s run_dir=%s",
             ),
             failure.retry_count + 1,
             self._max_validation_retries,
-            self._validation_cmd,
+            failure.profile.name,
+            failure.profile.quick.cmd,
             failure.error[:200] if failure.error else "none",
             validation_summary or "none",
             failure.error_file,
@@ -1270,7 +1337,9 @@ class SessionController:
         state = ValidationState(
             retry_count=failure.retry_count + 1,
             max_retries=self._max_validation_retries,
-            validation_cmd=self._validation_cmd,
+            validation_cmd=failure.profile.quick.cmd,
+            # The retry runs the same contract the failing run did (#7059).
+            validation_profile=failure.profile.name,
             last_error=failure.error[:2000] if failure.error else None,
             last_error_file=str(failure.error_file)
             if failure.error_file
@@ -1289,6 +1358,7 @@ class SessionController:
             repo_root=failure.repo_root,
             failure_kind=failure.failure_kind,
             dirty_files=failure.dirty_files,
+            validation_cmd=failure.profile.quick.cmd or "",
         )
         self.session_output.write_retry_prompt(failure.run_dir, retry_prompt_content)
 
@@ -1297,7 +1367,8 @@ class SessionController:
             {
                 "issue_number": failure.issue_number,
                 "session_name": failure.session_name,
-                "validation_cmd": self._validation_cmd,
+                "validation_cmd": failure.profile.quick.cmd,
+                "validation_profile": failure.profile.name,
                 "error_file": str(failure.error_file)
                 if failure.error_file
                 else None,
@@ -1333,7 +1404,8 @@ class SessionController:
             {
                 "issue_number": failure.issue_number,
                 "session_name": failure.session_name,
-                "validation_cmd": self._validation_cmd,
+                "validation_cmd": failure.profile.quick.cmd,
+                "validation_profile": failure.profile.name,
                 "error_file": str(failure.error_file)
                 if failure.error_file
                 else None,
@@ -1449,13 +1521,15 @@ class SessionController:
         issue_title: str,
         run_dir: Path,
         issue_key: "IssueKey | None" = None,
+        profile: ValidationProfile | None = None,
     ) -> tuple[bool, Optional[str], Optional[Path]]:
         """Run validation command (with attempt-scoped caching) and return result.
 
         Uses PublishGate for caching. When an attempt identity is available,
         cached validation is scoped by issue identity and HEAD SHA. Older
         SHA-only caching remains available for callers that have no issue
-        identity.
+        identity. The selected profile is part of the cache key either way, so
+        a result produced under one contract cannot satisfy another (#7059).
 
         Args:
             worktree_path: Path to the worktree
@@ -1463,11 +1537,14 @@ class SessionController:
             issue_number: Issue number for logging
             issue_title: Issue title for logging and retry context
             issue_key: Stable issue identity used for attempt-scoped caching
+            profile: The run's frozen validation contract; read from the run
+                directory when the caller did not already resolve it
 
         Returns:
             Tuple of (passed, error_message, error_file_path)
         """
-        if not self._command_runner or not self._validation_cmd:
+        selected = profile if profile is not None else self._profile_for_run(run_dir)
+        if not self._command_runner or not selected.quick.cmd:
             return True, None, None
 
         target_run_dir = run_dir
@@ -1485,15 +1562,20 @@ class SessionController:
             worktree=worktree_path,
             command_runner=self._command_runner,
             working_copy=self._working_copy,
-            command=self._validation_cmd,
-            timeout_seconds=self._validation_timeout,
+            command=selected.quick.cmd,
+            timeout_seconds=selected.quick.timeout_seconds,
             attempt_store=self._attempt_store,
             attempt_key=attempt_key,
+            profile=selected.name,
         )
 
         logger.info(
-            issue_log(issue_number, "Running validation: cmd=%s worktree=%s sha=%s"),
-            self._validation_cmd,
+            issue_log(
+                issue_number,
+                "Running validation: profile=%s cmd=%s worktree=%s sha=%s",
+            ),
+            selected.name,
+            selected.quick.cmd,
             worktree_path,
             sha_display,
         )
@@ -1618,6 +1700,7 @@ class SessionController:
         retry_count: int,
         max_retries: int,
         failure_kind: ValidationFailureKind,
+        validation_cmd: str,
         template_path: Optional[str] = None,
         repo_root: Optional[Path] = None,
         dirty_files: tuple[str, ...] = (),
@@ -1630,6 +1713,8 @@ class SessionController:
             validation_error_file: Path to the full error file
             retry_count: Current retry attempt (0-based, displayed as 1-based)
             max_retries: Maximum allowed retries
+            failure_kind: What kind of validation failure triggered the retry
+            validation_cmd: The command the run's validation profile executed
             template_path: Optional path to custom template (relative to repo_root)
             repo_root: Repo root for resolving template_path
 
@@ -1674,7 +1759,7 @@ class SessionController:
         display_max = max_retries + 1
         return template.format(
             original_task=task_prompt,
-            validation_cmd=self._validation_cmd or "",
+            validation_cmd=validation_cmd,
             error_file=str(validation_error_file)
             if validation_error_file
             else "unknown",

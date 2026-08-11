@@ -510,6 +510,10 @@ class SessionLauncher:
 
         Delegates to :mod:`.session_env`, which owns the agent session
         environment contract for every launch path.
+
+        The role's validation profile is resolved here, once per launch, from
+        the config owner — so every launch path exports the same frozen
+        choice the run directory records (#7059).
         """
         return build_session_env_exports(
             config=self.config,
@@ -520,6 +524,9 @@ class SessionLauncher:
             run_dir=run_assets.run_dir,
             worktree_path=worktree_path,
             callback_endpoint=self._agent_callback_endpoint,
+            validation_profile=self.config.validation_profiles().name_for_agent(
+                agent_label
+            ),
         )
 
     # ─────────────────────────────────────────────────────────────────────────

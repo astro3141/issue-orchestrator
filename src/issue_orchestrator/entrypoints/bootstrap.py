@@ -1147,9 +1147,12 @@ def build_orchestrator_for_testing(
         events=events,
         session_output=session_output,
         working_copy=working_copy,
-        command_runner=command_runner if config.validation.quick.cmd else None,
-        validation_cmd=config.validation.quick.cmd,
-        validation_timeout_seconds=config.validation.quick.timeout_seconds,
+        command_runner=(
+            command_runner
+            if config.validation_profiles().any_quick_command_configured
+            else None
+        ),
+        validation_profiles=config.validation_profiles(),
         attempt_store=attempt_store,
         validation_attempt_key_factory=_validation_attempt_key_factory(config),
         review_exchange_canceller=_cancel_review_exchange_for_testing,

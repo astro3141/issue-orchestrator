@@ -50,6 +50,54 @@ non-recursive target that runs the same required suite without re-entering
 `scripts/verify-pr.sh`, so the wrapper can seed and reuse the cache without
 re-entering itself.
 
+### Named validation profiles
+
+Different workflow classes can require different validation contracts —
+ordinary implementation, documentation-only work, or an authority-changing
+workflow that must run extra invariants. `validation.profiles` names those
+contracts, and a role selects one explicitly:
+
+```yaml
+validation:
+  quick: { cmd: "make validate-quick" }        # the `default` profile
+  publish: { cmd: "make validate-pr-raw" }     # ...
+
+  profiles:
+    foundation:
+      quick:
+        cmd: "make validate-quick && ./scripts/authority-guard.sh"
+      publish:
+        cmd: "make validate-foundation"
+        dirty_check: all
+
+agents:
+  "agent:backend": { validation_profile: default }      # or simply omit
+  "agent:foundation": { validation_profile: foundation }
+```
+
+Rules that make the choice auditable:
+
+- The top-level `quick`/`publish` pair **is** the profile named `default`. A
+  config that never mentions profiles behaves exactly as before; `default` is
+  reserved and cannot be redefined under `profiles`.
+- Selection is explicit and typed. Nothing is inferred from labels, branch
+  names, or working-tree state, and an agent cannot change its own profile.
+- An unknown `validation_profile` fails at **config validation**, naming the
+  offending role and profile — not at first use.
+- The choice is **frozen for the run**: it is resolved once at launch, written
+  to the run manifest (`validation_profile`), exported to the session as
+  `ISSUE_ORCHESTRATOR_VALIDATION_PROFILE`, and recorded in every validation
+  record. Rework rounds, retries, and recovery after an orchestrator restart
+  all read it back from that durable run state.
+- The profile is part of the **validation cache key**. Two profiles never share
+  a cached result, even when they happen to run the same command today.
+- A run naming a profile the current config no longer defines fails closed
+  rather than silently validating under a different contract.
+
+This is the downstream implementation of upstream issue
+[#7059](https://github.com/issue-orchestrator/issue-orchestrator/issues/7059);
+the owning seam is `infra/validation_profiles.py`.
+
 The old single-command shape (`validation.cmd`,
 `validation.timeout_seconds`, and `validation.pre_push_dirty_check`) is rejected
 at config load time. That keeps upgrades visible instead of silently disabling
@@ -97,3 +145,5 @@ Record fields:
 - `command`
 - `started_at` / `ended_at`
 - `stdout`/`stderr` paths (optional but recommended)
+- `profile` — the named validation profile the run executed (see below);
+  records written before profiles existed read back as `default`

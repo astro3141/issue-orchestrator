@@ -881,6 +881,10 @@ class AgentConfig:
     # Template variables: {original_task}, {validation_cmd}, {error_file}, {error_summary},
     #                     {retry_count}, {max_retries}
     retry_prompt_template: Optional[str] = None
+    # Named validation profile this role runs (upstream #7059). None means the
+    # ``default`` profile, i.e. top-level validation.quick / validation.publish.
+    # Selection is explicit: an unknown name fails config validation.
+    validation_profile: Optional[str] = None
 
     @property
     def effective_permission_mode(self) -> str:

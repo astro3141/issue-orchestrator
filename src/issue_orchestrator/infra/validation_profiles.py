@@ -1,0 +1,312 @@
+"""Named validation profiles and the role → profile binding.
+
+Seam for upstream issue-orchestrator/issue-orchestrator#7059
+("Support per-agent / per-workflow validation profiles"), implemented
+downstream while the upstream request is open. Everything the feature owns
+lives behind :class:`ValidationProfileRegistry` so the seam can be removed in
+one piece when upstream ships its own version.
+
+The model deliberately has one shape:
+
+* ``validation.quick`` / ``validation.publish`` at the top level define the
+  profile named ``default``. A repository that never mentions profiles gets
+  exactly the behavior it had before — the default profile *is* the old global
+  configuration, not a fallback for it.
+* ``validation.profiles.<name>`` defines additional named profiles.
+* ``agents.<label>.validation_profile`` binds a role to one of those names.
+  Selection is explicit and typed; nothing is inferred from labels, branch
+  names, or working-tree state.
+
+An unknown profile name is a configuration error surfaced at config
+validation, never a silent fall back to ``default``.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Iterable, Mapping
+
+from .config_models import (
+    PublishValidationConfig,
+    ValidationCommandConfig,
+    ValidationConfig,
+    ValidationProfileConfig,
+)
+
+DEFAULT_VALIDATION_PROFILE = "default"
+
+__all__ = [
+    "DEFAULT_VALIDATION_PROFILE",
+    "UnknownValidationProfileError",
+    "ValidationProfile",
+    "ValidationProfileRegistry",
+]
+
+
+class UnknownValidationProfileError(ValueError):
+    """Raised when a configured profile name has no definition."""
+
+    def __init__(self, name: str, known: Iterable[str]) -> None:
+        self.name = name
+        self.known = sorted(known)
+        super().__init__(
+            f"Unknown validation profile {name!r}. "
+            f"Known profiles: {', '.join(self.known)}."
+        )
+
+
+@dataclass(frozen=True)
+class ValidationProfile:
+    """One resolved validation contract, frozen for a run/attempt."""
+
+    name: str
+    quick: ValidationCommandConfig
+    publish: PublishValidationConfig
+
+    @property
+    def is_default(self) -> bool:
+        return self.name == DEFAULT_VALIDATION_PROFILE
+
+
+class ValidationProfileRegistry:
+    """Owner of named validation profiles and their role bindings.
+
+    The registry is the only place that answers "which validation commands
+    apply here". Callers ask by profile name (the frozen choice recorded in
+    durable run state) or by agent label (the launch-time choice); they never
+    reach into ``ValidationConfig.profiles`` themselves.
+    """
+
+    def __init__(
+        self,
+        validation: ValidationConfig,
+        bindings: Mapping[str, str | None] | None = None,
+    ) -> None:
+        self._profiles: dict[str, ValidationProfile] = {
+            DEFAULT_VALIDATION_PROFILE: ValidationProfile(
+                name=DEFAULT_VALIDATION_PROFILE,
+                quick=validation.quick,
+                publish=validation.publish,
+            )
+        }
+        for name, profile in validation.profiles.items():
+            self._profiles[name] = ValidationProfile(
+                name=name,
+                quick=profile.quick,
+                publish=profile.publish,
+            )
+        self._bindings: dict[str, str] = {
+            label: profile_name
+            for label, profile_name in (bindings or {}).items()
+            if profile_name
+        }
+
+    @classmethod
+    def single(cls, profile: ValidationProfile) -> "ValidationProfileRegistry":
+        """Build a registry holding ``profile`` as its default.
+
+        Used by callers that already hold one resolved contract (tests, and
+        the completion path when it is handed explicit commands) so they still
+        route every lookup through the one owner.
+        """
+        registry = cls(ValidationConfig(quick=profile.quick, publish=profile.publish))
+        return registry
+
+    @property
+    def names(self) -> tuple[str, ...]:
+        return tuple(self._profiles)
+
+    def has(self, name: str) -> bool:
+        return name in self._profiles
+
+    @property
+    def any_quick_command_configured(self) -> bool:
+        """Whether *any* profile configures a quick gate.
+
+        Composition asks this before handing the completion path a command
+        runner: a repository whose quick gate lives only in a named profile
+        still needs one.
+        """
+        return any(profile.quick.cmd for profile in self._profiles.values())
+
+    @property
+    def any_command_configured(self) -> bool:
+        """Whether *any* profile configures either gate."""
+        return any(
+            profile.quick.cmd or profile.publish.cmd
+            for profile in self._profiles.values()
+        )
+
+    def resolve(self, name: str | None) -> ValidationProfile:
+        """Resolve a profile by name. ``None`` means the default profile.
+
+        Raises:
+            UnknownValidationProfileError: when ``name`` is not defined.
+        """
+        resolved_name = name or DEFAULT_VALIDATION_PROFILE
+        profile = self._profiles.get(resolved_name)
+        if profile is None:
+            raise UnknownValidationProfileError(resolved_name, self._profiles)
+        return profile
+
+    def name_for_agent(self, agent_label: str | None) -> str:
+        """Profile name bound to ``agent_label`` (``default`` when unbound)."""
+        if not agent_label:
+            return DEFAULT_VALIDATION_PROFILE
+        return self._bindings.get(agent_label, DEFAULT_VALIDATION_PROFILE)
+
+    def for_agent(self, agent_label: str | None) -> ValidationProfile:
+        """Resolve the profile bound to ``agent_label``.
+
+        Raises:
+            UnknownValidationProfileError: when the binding names an
+                undefined profile. Config validation fails closed on this
+                first, so reaching it at runtime means the config was
+                bypassed.
+        """
+        return self.resolve(self.name_for_agent(agent_label))
+
+    def binding_errors(self) -> list[str]:
+        """Config-validation errors for role → profile bindings.
+
+        Each message names the offending role and the profile it asked for,
+        so a typo fails closed at startup rather than at first validation.
+        """
+        errors: list[str] = []
+        known = ", ".join(sorted(self._profiles))
+        for label in sorted(self._bindings):
+            profile_name = self._bindings[label]
+            if profile_name not in self._profiles:
+                errors.append(
+                    f"agents.{label}.validation_profile references unknown "
+                    f"validation profile '{profile_name}'. "
+                    f"Defined profiles: {known}."
+                )
+        return errors
+
+
+def profiles_runtime_dict(
+    profiles: Mapping[str, ValidationProfileConfig],
+) -> dict[str, dict[str, object]]:
+    """Fully-populated profile view for the runtime config snapshot."""
+    return {
+        name: {
+            "quick": {
+                "cmd": profile.quick.cmd,
+                "timeout_seconds": profile.quick.timeout_seconds,
+            },
+            "publish": {
+                "cmd": profile.publish.cmd,
+                "timeout_seconds": profile.publish.timeout_seconds,
+                "dirty_check": profile.publish.dirty_check,
+            },
+        }
+        for name, profile in profiles.items()
+    }
+
+
+def profiles_yaml_dict(
+    profiles: Mapping[str, ValidationProfileConfig],
+) -> dict[str, dict[str, object]]:
+    """Round-trip named profiles back to YAML shape.
+
+    Mirrors how the top-level quick/publish pair is written: only non-default
+    values survive, so a re-saved config stays readable.
+    """
+    return {name: _profile_yaml_dict(profile) for name, profile in profiles.items()}
+
+
+def _profile_yaml_dict(profile: ValidationProfileConfig) -> dict[str, object]:
+    profile_dict: dict[str, object] = {}
+    quick_dict: dict[str, object] = {}
+    if profile.quick.cmd:
+        quick_dict["cmd"] = profile.quick.cmd
+        if profile.quick.timeout_seconds != 300:
+            quick_dict["timeout_seconds"] = profile.quick.timeout_seconds
+    if quick_dict:
+        profile_dict["quick"] = quick_dict
+    publish_dict: dict[str, object] = {}
+    if profile.publish.cmd:
+        publish_dict["cmd"] = profile.publish.cmd
+        if profile.publish.timeout_seconds != 1800:
+            publish_dict["timeout_seconds"] = profile.publish.timeout_seconds
+    if profile.publish.dirty_check != "tracked":
+        publish_dict["dirty_check"] = profile.publish.dirty_check
+    if publish_dict:
+        profile_dict["publish"] = publish_dict
+    return profile_dict
+
+
+def dirty_check_errors(profiles: Mapping[str, ValidationProfileConfig]) -> list[str]:
+    """Config-validation errors for per-profile ``publish.dirty_check`` values."""
+    return [
+        f"validation.profiles.{name}.publish.dirty_check must be "
+        "one of: tracked, unstaged, all, off"
+        for name, profile in sorted(profiles.items())
+        if profile.publish.dirty_check not in _DIRTY_CHECK_MODES
+    ]
+
+
+_DIRTY_CHECK_MODES = frozenset({"tracked", "unstaged", "all", "off"})
+
+
+def profiles_from_mapping(
+    profiles_data: object,
+) -> dict[str, ValidationProfileConfig]:
+    """Parse the ``validation.profiles`` YAML section.
+
+    ``default`` is reserved: it always names the top-level
+    ``validation.quick`` / ``validation.publish`` pair, so redefining it here
+    would give one name two meanings.
+    """
+    if not profiles_data:
+        return {}
+    if not isinstance(profiles_data, dict):
+        raise ValueError("validation.profiles must be a mapping of name -> profile")
+
+    profiles: dict[str, ValidationProfileConfig] = {}
+    for name, profile_data in profiles_data.items():
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError("validation.profiles keys must be non-empty strings")
+        if name == DEFAULT_VALIDATION_PROFILE:
+            raise ValueError(
+                f"validation.profiles.{DEFAULT_VALIDATION_PROFILE} is reserved; "
+                "the default profile is validation.quick / validation.publish"
+            )
+        if not isinstance(profile_data, dict):
+            raise ValueError(f"validation.profiles.{name} must be a mapping")
+        unsupported = sorted(set(profile_data) - _SUPPORTED_PROFILE_KEYS)
+        if unsupported:
+            keys = ", ".join(f"validation.profiles.{name}.{key}" for key in unsupported)
+            raise ValueError(
+                f"Unsupported validation profile key(s): {keys}. "
+                "Supported keys: publish, quick."
+            )
+        profiles[name] = profile_config_from_mapping(profile_data)
+    return profiles
+
+
+_SUPPORTED_PROFILE_KEYS = frozenset({"publish", "quick"})
+
+
+def profile_config_from_mapping(data: Mapping[str, object]) -> ValidationProfileConfig:
+    """Build one profile from its raw YAML mapping.
+
+    Shared by the full config loader and the lightweight agent-side loader so
+    a profile means the same thing on both sides of the session boundary.
+    """
+    quick_data = data.get("quick") or {}
+    publish_data = data.get("publish") or {}
+    if not isinstance(quick_data, Mapping) or not isinstance(publish_data, Mapping):
+        raise ValueError("validation profile 'quick'/'publish' must be mappings")
+    return ValidationProfileConfig(
+        quick=ValidationCommandConfig(
+            cmd=quick_data.get("cmd"),
+            timeout_seconds=quick_data.get("timeout_seconds", 300),
+        ),
+        publish=PublishValidationConfig(
+            cmd=publish_data.get("cmd"),
+            timeout_seconds=publish_data.get("timeout_seconds", 1800),
+            dirty_check=publish_data.get("dirty_check", "tracked"),
+        ),
+    )

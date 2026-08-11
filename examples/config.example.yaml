@@ -84,6 +84,10 @@ agents:
     # reviewer: "agent:reviewer"     # Override default reviewer
     # meta_agent: "agent:meta"       # Agent label used to supervise this agent
     # retry_prompt_template: ".prompts/retry.md"
+    # validation_profile: "foundation"
+    #   # Named validation profile this role runs, from validation.profiles.
+    #   # Omit to use `default` (top-level validation.quick / validation.publish).
+    #   # An unknown name fails config validation, naming this role.
 
   "agent:frontend":
     prompt: ".prompts/frontend.md"
@@ -265,6 +269,23 @@ validation:
   # junit_xml_paths:
   #   - "test-results.xml"
   #   - "build/test-results/test/*.xml"
+  #
+  # Optional named validation profiles. The quick/publish pair above is the
+  # profile named `default`; everything here is additional. A role selects one
+  # explicitly with `agents.<label>.validation_profile: <name>` — nothing is
+  # inferred from labels, branch names, or working-tree state, and an unknown
+  # name fails at config validation rather than at first use. The selected
+  # profile is frozen for the run, recorded in the run manifest and validation
+  # record, and included in the validation cache key.
+  # profiles:
+  #   foundation:
+  #     quick:
+  #       cmd: "make validate-quick && ./scripts/authority-guard.sh"
+  #       timeout_seconds: 900
+  #     publish:
+  #       cmd: "make validate-foundation"
+  #       timeout_seconds: 2700
+  #       dirty_check: "all"
 
 retry:
   max_validation_retries: 3

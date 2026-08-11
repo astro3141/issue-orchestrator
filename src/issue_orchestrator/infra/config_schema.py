@@ -26,6 +26,7 @@ from .config_models import (
     TimelineConfig,
     TechLeadConfig,
     ValidationConfig,
+    ValidationProfileConfig,
 )
 from .config_sections import ALLOWED_AGENT_FIELDS, ALLOWED_TOP_LEVEL_FIELDS
 
@@ -149,7 +150,13 @@ def allowed_config_shape() -> dict[str, ConfigShape]:
         "state": _leaf_keys("file"),
         "timeline": dataclass_config_shape(TimelineConfig),
         "tech_lead": dataclass_config_shape(TechLeadConfig),
-        "validation": dataclass_config_shape(ValidationConfig),
+        # ``profiles`` is a name -> profile mapping, which the dataclass walker
+        # would flatten to a LEAF and stop checking. Declare it at its
+        # composition boundary so a typo inside a profile is still caught.
+        "validation": _merge(
+            dataclass_config_shape(ValidationConfig),
+            {"profiles": DynamicMap(dataclass_config_shape(ValidationProfileConfig))},
+        ),
     }
     shape["execution"] = {
         "concurrency": _leaf_keys(

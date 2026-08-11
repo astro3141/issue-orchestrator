@@ -105,16 +105,32 @@ class PublishValidationConfig(ValidationCommandConfig):
 
 
 @dataclass
+class ValidationProfileConfig:
+    """One named validation contract (upstream #7059).
+
+    A profile carries only the two lifecycle gates. Cross-cutting settings
+    (``coverage_guardrail``, ``junit_xml_paths``) stay top-level: they describe
+    how validation output is read, not which contract ran.
+    """
+
+    quick: ValidationCommandConfig = field(default_factory=ValidationCommandConfig)
+    publish: PublishValidationConfig = field(default_factory=PublishValidationConfig)
+
+
+@dataclass
 class ValidationConfig:
     """Validation configuration split by lifecycle cost.
 
     ``quick`` runs while the coding agent still owns the session and during
     coder/reviewer exchanges. ``publish`` is the deeper pre-push/pre-publish
-    gate.
+    gate. Together they define the profile named ``default``; ``profiles``
+    adds further named contracts that a role can select explicitly via
+    ``agents.<label>.validation_profile`` (see ``validation_profiles.py``).
     """
 
     quick: ValidationCommandConfig = field(default_factory=ValidationCommandConfig)
     publish: PublishValidationConfig = field(default_factory=PublishValidationConfig)
+    profiles: dict[str, ValidationProfileConfig] = field(default_factory=dict)
     coverage_guardrail: CoverageGuardrailConfig = field(default_factory=CoverageGuardrailConfig)
     # JUnit XML output paths (relative to worktree, glob-supported) emitted by
     # the validation command. When set, the dashboard renders a structured

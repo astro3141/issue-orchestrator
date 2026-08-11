@@ -187,9 +187,12 @@ def create_completion_components(
         events=events,
         session_output=session_output,
         working_copy=working_copy,
-        command_runner=command_runner if config.validation.quick.cmd else None,
-        validation_cmd=config.validation.quick.cmd,
-        validation_timeout_seconds=config.validation.quick.timeout_seconds,
+        command_runner=(
+            command_runner
+            if config.validation_profiles().any_quick_command_configured
+            else None
+        ),
+        validation_profiles=config.validation_profiles(),
         validation_junit_xml_paths=_validation_junit_xml_paths(config),
         validation_evidence_recorder=RunEvidenceRecorder(session_output),
         attempt_store=attempt_store,

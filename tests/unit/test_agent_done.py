@@ -36,8 +36,10 @@ from issue_orchestrator.entrypoints.cli_tools.agent_done import (
     write_completion_record,
     write_marker_file,
     record_validation_artifacts,
+    QuickValidationSelection,
 )
 from issue_orchestrator.control.validation import AgentGateResult
+from issue_orchestrator.infra.validation_profiles import DEFAULT_VALIDATION_PROFILE
 from issue_orchestrator.entrypoints.cli_tools.coding_done import (
     main as coding_done_main,
     check_dirty_files,
@@ -903,7 +905,14 @@ class TestMain:
                 coding_done_main()
 
     @patch('issue_orchestrator.entrypoints.cli_tools.coding_done.run_preflight_push_check', return_value=(True, None, None))
-    @patch('issue_orchestrator.entrypoints.cli_tools.coding_done.load_validation_cmd', return_value=(None, None))
+    @patch(
+        'issue_orchestrator.entrypoints.cli_tools.coding_done.load_validation_cmd',
+        return_value=QuickValidationSelection(
+            cmd=None,
+            timeout_seconds=0,
+            profile=DEFAULT_VALIDATION_PROFILE,
+        ),
+    )
     @patch('issue_orchestrator.entrypoints.cli_tools.coding_done.check_dirty_files', return_value=[])
     def test_coding_done_writes_completion_record(self, _mock_dirty, _mock_val, _mock_push, tmp_path):
         """Test that coding-done writes completion record to file."""

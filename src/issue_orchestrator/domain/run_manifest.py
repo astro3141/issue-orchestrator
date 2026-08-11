@@ -90,6 +90,10 @@ class RunManifest:
     validation_passed: bool | None = None
     validation_status: str | None = None  # passed, retry, failed
     validation_reason: str | None = None
+    # Named validation profile frozen at launch (#7059). Durable run state:
+    # recovery reads this rather than re-deriving the contract from the
+    # agent's current labels or branch.
+    validation_profile: str | None = None
 
     # ------------------------------------------------------------------
     # Log excerpt (set at completion)

@@ -34,6 +34,7 @@ if TYPE_CHECKING:
 from ..domain.review_exchange_run import ReviewExchangeRunAssets
 from ..domain.review_exchange_summary import ReviewExchangeSummaryV1
 from ..domain.session_run import SessionRunAssets
+from ..infra.validation_profiles import DEFAULT_VALIDATION_PROFILE
 
 
 @dataclass(frozen=True)
@@ -54,6 +55,11 @@ class ValidationRecord:
     timed_out: bool = False
     stdout_path: str | None = None
     stderr_path: str | None = None
+    # Named validation profile this run executed (#7059). Part of the record
+    # so review and recovery can prove which validation contract ran, and so
+    # cache reuse cannot cross profiles. Records written before profiles
+    # existed read back as the default profile.
+    profile: str = DEFAULT_VALIDATION_PROFILE
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary for JSON serialization."""
@@ -69,6 +75,7 @@ class ValidationRecord:
             "timed_out": self.timed_out,
             "stdout_path": self.stdout_path,
             "stderr_path": self.stderr_path,
+            "profile": self.profile,
         }
 
     @classmethod
@@ -86,6 +93,7 @@ class ValidationRecord:
             timed_out=data.get("timed_out", False),
             stdout_path=data.get("stdout_path"),
             stderr_path=data.get("stderr_path"),
+            profile=data.get("profile") or DEFAULT_VALIDATION_PROFILE,
         )
 
 
@@ -99,6 +107,10 @@ class ValidationState:
     retry_count: int = 0  # Queued retry attempt number, not completed retry count.
     max_retries: int = 3
     validation_cmd: str | None = None
+    # Named validation profile the failing run executed (#7059). Durable, so a
+    # retry launched after an orchestrator restart continues under the same
+    # contract instead of re-deriving one.
+    validation_profile: str = DEFAULT_VALIDATION_PROFILE
     last_error: str | None = None
     last_error_file: str | None = None
     original_prompt_file: str | None = None
@@ -173,6 +185,7 @@ class SessionOutput(Protocol):
         retention_tier: str = "hot",
         retention_days: int = 7,
         retention_pinned: bool = False,
+        validation_profile: str | None = None,
     ) -> SessionRunAssets:
         """Create a new run directory and initial manifest.
 
@@ -188,6 +201,10 @@ class SessionOutput(Protocol):
             retention_tier: Retention tier label persisted in manifest
             retention_days: Retention window in days (0 = expires immediately)
             retention_pinned: Whether this run is pinned from retention cleanup
+            validation_profile: Named validation profile frozen for this run
+                (#7059). Recorded durably so recovery after a restart reads
+                the contract the run was launched under instead of
+                re-deriving one.
 
         Returns:
             SessionRunAssets with owned paths to the new run directory

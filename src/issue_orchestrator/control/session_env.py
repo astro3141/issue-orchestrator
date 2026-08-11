@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Protocol
 
 from ..infra.env import ENV_PREFIX
+from ..infra.validation_profiles import DEFAULT_VALIDATION_PROFILE
 from .isolation import build_agent_tool_env_assignments
 
 if TYPE_CHECKING:
@@ -67,6 +68,18 @@ def config_exports(config_path: Path | None) -> str:
     )
 
 
+def validation_profile_export(validation_profile: str) -> str:
+    """Render the frozen validation-profile export (#7059).
+
+    The orchestrator resolves the role's profile once, at launch, and hands
+    the *name* to the session. ``coding-done`` / ``prepush-check`` /
+    ``validate`` then look that name up in the same config file, so every
+    gate in the session runs the contract the run was launched under —
+    nothing re-derives it from labels, branch names, or the working tree.
+    """
+    return f" {ENV_PREFIX}VALIDATION_PROFILE='{validation_profile}'"
+
+
 def build_session_env_exports(
     *,
     config: SessionEnvConfig,
@@ -77,6 +90,7 @@ def build_session_env_exports(
     run_dir: Path,
     worktree_path: Path,
     callback_endpoint: "AgentCallbackEndpoint",
+    validation_profile: str = DEFAULT_VALIDATION_PROFILE,
 ) -> str:
     """Build the common env-export string for all session types.
 
@@ -100,6 +114,7 @@ def build_session_env_exports(
         f" {ENV_PREFIX}ISSUE_NUMBER='{issue_number}'"
         f"{config_exports(config.config_path)}"
         f"{api_port_export(config.control_api_port, callback_endpoint)}"
+        f"{validation_profile_export(validation_profile)}"
         f" {ENV_PREFIX}VALIDATION_OUTPUT_DIR='{run_dir}'"
         f" {ENV_PREFIX}RUN_DIR='{run_dir}'"
         f" {ENV_PREFIX}WORKTREE='{worktree_path}'"
