@@ -6,6 +6,10 @@ from pathlib import Path
 import pytest
 
 from issue_orchestrator.infra.config_models import ValidationConfig
+from issue_orchestrator.infra.validation_profiles import (
+    DEFAULT_VALIDATION_PROFILE,
+    UnknownValidationProfileError,
+)
 from issue_orchestrator.infra.validation_config_loader import (
     default_validation_config,
     extract_validation_config,
@@ -15,7 +19,13 @@ from issue_orchestrator.infra.validation_config_loader import (
 
 
 def test_default_validation_config_uses_config_model_defaults() -> None:
-    assert default_validation_config() == asdict(ValidationConfig())
+    # ``profiles`` is a config-authoring concept; the resolved mapping carries
+    # the selected profile NAME instead (#7059).
+    expected = asdict(ValidationConfig())
+    expected.pop("profiles")
+    expected["profile"] = DEFAULT_VALIDATION_PROFILE
+
+    assert default_validation_config() == expected
 
 
 def test_extract_validation_config_merges_nested_defaults() -> None:
@@ -29,6 +39,7 @@ def test_extract_validation_config_merges_nested_defaults() -> None:
     )
 
     assert result == {
+        "profile": DEFAULT_VALIDATION_PROFILE,
         "quick": {
             "cmd": "make verify",
             "timeout_seconds": 300,

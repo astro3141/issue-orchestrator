@@ -475,6 +475,9 @@ class TestDebugSessionEndpoint:
         # Agent config - get_command returns the base command
         mock_agent_config = MagicMock()
         mock_agent_config.get_command.return_value = "claude --model sonnet 'Work on issue'"
+        # Unbound role: the debug session freezes the default contract onto
+        # its run and exports it, so this must be a real config value.
+        mock_agent_config.validation_profile = None
         mock_orch.config.agents = {"agent:claude": mock_agent_config}
         mock_orch.config.web_port = 8080
         mock_orch.config.control_api_port = 8080
@@ -551,6 +554,7 @@ class TestDebugSessionEndpoint:
         # Agent config
         mock_agent_config = MagicMock()
         mock_agent_config.get_command.return_value = "claude 'Work on issue'"
+        mock_agent_config.validation_profile = None
         mock_orch.config.agents = {"agent:claude": mock_agent_config}
         mock_orch.config.web_port = 8080
         mock_orch.config.control_api_port = 8080
@@ -592,6 +596,7 @@ class TestDebugSessionEndpoint:
         # Agent config
         mock_agent_config = MagicMock()
         mock_agent_config.get_command.return_value = "claude 'Work on issue'"
+        mock_agent_config.validation_profile = None
         mock_orch.config.agents = {"agent:claude": mock_agent_config}
         mock_orch.config.web_port = 8080
         mock_orch.config.control_api_port = 8080

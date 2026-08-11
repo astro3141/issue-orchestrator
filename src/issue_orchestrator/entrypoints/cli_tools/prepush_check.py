@@ -24,6 +24,7 @@ from typing import Optional
 from ...control.validation import PublishGate
 from ...execution import GitWorkingCopy, LocalCommandRunner
 from ...infra.runtime_artifacts import filter_runtime_managed_dirty_paths
+from ...infra.validation_profiles import DEFAULT_VALIDATION_PROFILE
 from ...infra.validation_timings import append_validation_timing, build_timing_envelope
 
 logger = logging.getLogger(__name__)
@@ -55,17 +56,31 @@ class PrepushValidationOutcome:
     record_timed_out: bool | None
 
 
-def load_validation_cmd(worktree: Path) -> tuple[Optional[str], int, str]:
+@dataclass(frozen=True)
+class PublishValidationSelection:
+    """The publish gate this session runs, resolved from one config read."""
+
+    cmd: Optional[str]
+    timeout_seconds: int
+    dirty_check: str
+    profile: str
+
+
+def load_validation_cmd(worktree: Path) -> PublishValidationSelection:
     """Load publish validation configuration from the worktree's config file.
 
     Reads from .issue-orchestrator/config/ in the worktree.
     This ensures tests are deterministic - no env var leakage from parent processes.
 
+    The validation profile the orchestrator froze for this session selects
+    which gate is read (#7059); with no profile selected this is the
+    top-level ``validation.publish``, exactly as before.
+
     Args:
         worktree: Path to the worktree root
 
     Returns:
-        Tuple of (command, timeout_seconds, dirty_check)
+        The resolved publish gate selection
     """
     from ...infra.config import load_runtime_validation_config
 
@@ -75,10 +90,13 @@ def load_validation_cmd(worktree: Path) -> tuple[Optional[str], int, str]:
     cmd = publish_config.get("cmd")
     timeout = publish_config.get("timeout_seconds", 1800)
     dirty_check = publish_config.get("dirty_check", "tracked")
-    if cmd:
-        return cmd, timeout, dirty_check
-
-    return None, 0, dirty_check
+    profile = validation_config.get("profile") or DEFAULT_VALIDATION_PROFILE
+    return PublishValidationSelection(
+        cmd=cmd or None,
+        timeout_seconds=timeout if cmd else 0,
+        dirty_check=dirty_check,
+        profile=profile,
+    )
 
 
 def _print_dirty_files(files: list[str]) -> None:
@@ -141,20 +159,22 @@ def _run_dirty_guard(worktree: Path, mode: str, verbose: bool) -> Optional[int]:
 
 def _run_validation_gate(
     worktree: Path,
-    cmd: str,
-    timeout: int,
+    selection: PublishValidationSelection,
     verbose: bool,
 ) -> PrepushValidationOutcome:
     """Run the publish gate and return the pre-push validation outcome."""
+    cmd = selection.cmd
+    assert cmd is not None  # caller short-circuits when the gate is unconfigured
     if verbose:
-        print(f"Validation configured: {cmd}")
+        print(f"Validation configured [profile={selection.profile}]: {cmd}")
 
     gate = PublishGate(
         worktree,
         command_runner=LocalCommandRunner(),
         working_copy=GitWorkingCopy(),
         command=cmd,
-        timeout_seconds=timeout,
+        timeout_seconds=selection.timeout_seconds,
+        profile=selection.profile,
     )
     start = time.monotonic()
     result = gate.check(session_output_dir=_prepush_output_dir(worktree))
@@ -214,11 +234,13 @@ def _record_prepush_summary(
     final_exit_code: int | None,
     phase: str,
     error_type: str | None,
+    profile: str = DEFAULT_VALIDATION_PROFILE,
 ) -> None:
     """Append an outer pre-push summary timing record."""
     payload: dict[str, object] = {
         "kind": "prepush_gate_summary",
         "head_sha": head_sha,
+        "profile": profile,
         "command": cmd,
         "timeout_seconds": timeout,
         "dirty_check": dirty_check,
@@ -317,6 +339,7 @@ def run_prepush_check(verbose: bool = False, dirty_only: bool = False) -> int:
     cmd: str | None = None
     timeout = 0
     dirty_check = "tracked"
+    profile = DEFAULT_VALIDATION_PROFILE
     dirty_elapsed_seconds: float | None = None
     dirty_exit_code: int | None = None
     validation_outcome: PrepushValidationOutcome | None = None
@@ -326,7 +349,13 @@ def run_prepush_check(verbose: bool = False, dirty_only: bool = False) -> int:
     head_sha: str | None = None
 
     try:
-        cmd, timeout, dirty_check = load_validation_cmd(worktree)
+        selection = load_validation_cmd(worktree)
+        cmd, timeout, dirty_check, profile = (
+            selection.cmd,
+            selection.timeout_seconds,
+            selection.dirty_check,
+            selection.profile,
+        )
         head_sha = GitWorkingCopy().get_head_sha(worktree)
 
         dirty_started_at = time.monotonic()
@@ -352,7 +381,7 @@ def run_prepush_check(verbose: bool = False, dirty_only: bool = False) -> int:
             final_exit_code = 0
             return 0
 
-        validation_outcome = _run_validation_gate(worktree, cmd, timeout, verbose)
+        validation_outcome = _run_validation_gate(worktree, selection, verbose)
         phase = "validation_gate"
         final_exit_code = validation_outcome.exit_code
         return validation_outcome.exit_code
@@ -376,6 +405,7 @@ def run_prepush_check(verbose: bool = False, dirty_only: bool = False) -> int:
             final_exit_code=final_exit_code,
             phase=phase,
             error_type=error_type,
+            profile=profile,
         )
 
 

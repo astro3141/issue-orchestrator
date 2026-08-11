@@ -561,6 +561,7 @@ def run_persistent_session_exchange(  # noqa: PLR0913
             issue_title=issue_title,
             session_name=session_name,
             response_channel=effective_response_channels.for_role(Role.CODER),
+            validation_profile=exchange_run.validation_profile,
         )
         coder = _open_role_session_from_spec(coder_spec)
         # Reviewer-spawn-after-coder-success is the canonical
@@ -592,6 +593,7 @@ def run_persistent_session_exchange(  # noqa: PLR0913
                 issue_title=issue_title,
                 session_name=session_name,
                 response_channel=effective_response_channels.for_role(Role.REVIEWER),
+                validation_profile=exchange_run.validation_profile,
             )
             reviewer = _open_role_session_from_spec(reviewer_spec)
         except BaseException:
@@ -694,6 +696,7 @@ def run_persistent_session_exchange(  # noqa: PLR0913
             issue_title=issue_title,
             session_name=session_name,
             response_channel=effective_response_channels.for_role(Role.CODER),
+            validation_profile=exchange_run.validation_profile,
         ),
         slice_path=coder_session_slice,
     )
@@ -716,6 +719,7 @@ def run_persistent_session_exchange(  # noqa: PLR0913
             issue_title=issue_title,
             session_name=session_name,
             response_channel=effective_response_channels.for_role(Role.REVIEWER),
+            validation_profile=exchange_run.validation_profile,
         ),
         slice_path=reviewer_session_slice,
     )
@@ -938,6 +942,13 @@ class _RoleSessionSpec:
     issue_title: str
     session_name: str
     response_channel: ResponseChannel
+    validation_profile: str
+    """The exchange run's frozen validation contract, exported to the role.
+
+    Read off ``ReviewExchangeRun`` rather than re-resolved from config here:
+    the run manifest already records the choice, and a second resolution at
+    spawn time is exactly the cross-path drift #7059 exists to remove.
+    """
 
 
 @dataclass
@@ -1156,6 +1167,7 @@ def _open_role_session(spec: _RoleSessionSpec) -> PersistentSession:
         web_port=web_port,
         issue_number=issue_number,
         session_name=session_name,
+        validation_profile=spec.validation_profile,
     )
     return open_persistent_session(
         command=command,
@@ -1191,6 +1203,7 @@ def _build_role_env(
     web_port: int | None,
     issue_number: int,
     session_name: str,
+    validation_profile: str,
 ) -> dict[str, str]:
     """Compose the agent environment via the shared filtered-env owner.
 
@@ -1207,6 +1220,13 @@ def _build_role_env(
     exchange run that owns the spawned process. Agent-written response/report
     files must be inside the role worktree; coder validation paths use the
     owner-provided run directory.
+
+    ``VALIDATION_PROFILE`` is exported for the same reason: the in-exchange
+    coder's ``coding-done`` writes this repo's authoritative ``agent_gate``
+    record, and without the export it read the top-level default contract
+    even when its role was bound to a named profile — while a
+    ``SessionLauncher``-launched run of the same role validated correctly
+    (#7059). The value is the run's frozen choice, not a fresh resolution.
     """
     from ..control.isolation import build_agent_tool_env
     from .agent_runner_env import build_filtered_env
@@ -1217,6 +1237,7 @@ def _build_role_env(
         f"{ENV_PREFIX}AGENT_LABEL": agent_label,
         f"{ENV_PREFIX}ISSUE_NUMBER": str(issue_number),
         f"{ENV_PREFIX}REVIEW_RESPONSE_FILE": str(response_file),
+        f"{ENV_PREFIX}VALIDATION_PROFILE": validation_profile,
         "ORCHESTRATOR_ISSUE_NUMBER": str(issue_number),
         "ORCHESTRATOR_SESSION_ID": session_name,
     }

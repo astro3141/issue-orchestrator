@@ -504,7 +504,7 @@ class ValidationSettings(BaseModel):
         description="Fast command run by coding-done and review exchange loops",
         json_schema_extra={
             "doc_examples": ["./scripts/validate-fast.sh", "make test-fast"],
-            "doc_notes": "Keep this fast enough for agent/reviewer back-and-forth. Put repo-specific policy checks such as banned test skips here.",
+            "doc_notes": "Keep this fast enough for agent/reviewer back-and-forth. Put repo-specific policy checks such as banned test skips here. Together with validation.publish this is the profile named 'default'; see 'Named validation profiles' in docs/architecture/validation.md for per-role contracts.",
             "section": "Quick Gate",
             "config_attr": "validation.quick.cmd",
             "yaml_path": "validation.quick.cmd",
@@ -533,7 +533,7 @@ class ValidationSettings(BaseModel):
                 "./scripts/validate-pr.sh",
                 "./scripts/validate-pr-suite.sh",
             ],
-            "doc_notes": "This should match the repo's authoritative local PR/pre-push gate. If make validate-pr wraps the cache-aware verify hook, configure a private non-recursive suite command instead.",
+            "doc_notes": "This should match the repo's authoritative local PR/pre-push gate. If make validate-pr wraps the cache-aware verify hook, configure a private non-recursive suite command instead. Together with validation.quick this is the profile named 'default'; see 'Named validation profiles' in docs/architecture/validation.md for per-role contracts.",
             "section": "Publish Gate",
             "config_attr": "validation.publish.cmd",
             "yaml_path": "validation.publish.cmd",

@@ -58,6 +58,16 @@ class ReviewExchangeRun:
     run_id: str
     parent_session_name: str
     assets: ReviewExchangeRunAssets
+    validation_profile: str
+    """Named validation contract frozen for this exchange (#7059).
+
+    Required, not optional-with-a-default: the in-exchange coder's
+    ``coding-done`` writes this repo's primary validation evidence, so a
+    launch path that forgot to state the contract used to produce a record
+    stamped ``default`` regardless of which gate actually ran. Carrying it on
+    the run means the round env exports the frozen value rather than
+    re-resolving it at spawn time.
+    """
 
     def __post_init__(self) -> None:
         if not self.session_name:
@@ -66,6 +76,8 @@ class ReviewExchangeRun:
             raise ValueError("review exchange run requires run_id")
         if not self.parent_session_name:
             raise ValueError("review exchange run requires parent_session_name")
+        if not self.validation_profile:
+            raise ValueError("review exchange run requires validation_profile")
 
 
 def _require_absolute(path: object, field_name: str) -> None:

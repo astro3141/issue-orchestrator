@@ -154,12 +154,14 @@ class _FakeSessionOutput:
         issue_number: int,
         parent_session_name: str,
         agent_label: str,
+        validation_profile: str,
     ) -> ReviewExchangeRun:
         run = ReviewExchangeRun(
             session_name=f"review-exchange-{issue_number}-{len(self.started_runs) + 1}",
             run_id=f"exchange-run-{len(self.started_runs) + 1}",
             parent_session_name=parent_session_name,
             assets=ReviewExchangeRunAssets.from_run_dir(self._run_dir),
+            validation_profile=validation_profile,
         )
         self.started_runs.append(run)
         return run
@@ -172,6 +174,7 @@ class _FakeSessionOutput:
             run_id="exchange-run-cached",
             parent_session_name=parent_session_name,
             assets=ReviewExchangeRunAssets.from_run_dir(self._run_dir),
+            validation_profile="default",
         )
 
     def store_review_exchange_summary(

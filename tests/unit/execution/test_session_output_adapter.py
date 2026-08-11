@@ -363,6 +363,7 @@ class TestReviewExchangeSummary:
             issue_number=1,
             parent_session_name="issue-1",
             agent_label="agent:coder",
+            validation_profile="default",
         )
         review_run.assets.validation_record_path.write_text(
             json.dumps({"passed": True})

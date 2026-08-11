@@ -29,6 +29,7 @@ from ..infra.terminal_cleaning import (
     is_spinner_fragment,
 )
 from ..infra.terminal_recording import append_output_event
+from ..infra.validation_profiles import DEFAULT_VALIDATION_PROFILE
 from ..domain.review_exchange_manifest import ReviewExchangeManifestHeader
 from ..domain.review_exchange_resume import is_no_completion_reason
 from ..domain.review_exchange_run import ReviewExchangeRun, ReviewExchangeRunAssets
@@ -137,6 +138,7 @@ class FileSystemSessionOutput(RunDirectoryArtifacts):
         retention_tier: str = "hot",
         retention_days: int = 7,
         retention_pinned: bool = False,
+        validation_profile: str | None = None,
     ) -> SessionRunAssets:
         """Create a new run directory and initial manifest."""
         with self._io_lock:
@@ -176,6 +178,10 @@ class FileSystemSessionOutput(RunDirectoryArtifacts):
                 "retention_days": retention_window_days,
                 "retention_expires_at": retention_expires_at,
                 "retention_pinned": retention_pinned,
+                # Frozen for the run: whichever validation contract this run
+                # was launched under stays readable after a restart (#7059).
+                "validation_profile": validation_profile
+                or DEFAULT_VALIDATION_PROFILE,
                 "artifacts": {
                     "terminal_recording": {
                         "kind": "terminal_recording",
@@ -263,7 +269,15 @@ class FileSystemSessionOutput(RunDirectoryArtifacts):
         existing = self.find_run_dir(worktree_path, session_name=session_name)
         if existing:
             return existing
-        run = self.start_run(worktree_path, session_name)
+        run = self.start_run(
+            worktree_path,
+            session_name,
+            # Not a launch path: this backfills a directory for a session
+            # nobody allocated one for, so there is no role binding to freeze.
+            # Stating the default explicitly keeps every start_run call site
+            # honest about the contract it claims (#7059).
+            validation_profile=DEFAULT_VALIDATION_PROFILE,
+        )
         return run.run_dir
 
     def prune_runs(
@@ -549,6 +563,9 @@ class FileSystemSessionOutput(RunDirectoryArtifacts):
             retry_count=data.get("retry_count", 0),
             max_retries=data.get("max_retries", 3),
             validation_cmd=data.get("validation_cmd"),
+            validation_profile=(
+                data.get("validation_profile") or DEFAULT_VALIDATION_PROFILE
+            ),
             last_error=data.get("last_error"),
             last_error_file=data.get("last_error_file"),
             original_prompt_file=data.get("original_prompt_file"),
@@ -655,6 +672,7 @@ Timestamp: {self._now_iso()}
         issue_number: int,
         parent_session_name: str,
         agent_label: str,
+        validation_profile: str,
     ) -> ReviewExchangeRun:
         return _start_review_exchange_run(
             self.start_run,
@@ -662,6 +680,7 @@ Timestamp: {self._now_iso()}
             issue_number=issue_number,
             parent_session_name=parent_session_name,
             agent_label=agent_label,
+            validation_profile=validation_profile,
         )
 
     def store_review_exchange_summary(

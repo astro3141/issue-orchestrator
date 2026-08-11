@@ -67,6 +67,9 @@ def get_output_dir(worktree: Path) -> Path:
 def load_validation_cmd(worktree: Path) -> str | None:
     """Load quick validation command from config.
 
+    Honors the validation profile frozen for this session (#7059), so the
+    command an agent can run by hand is the one its gate will run.
+
     Args:
         worktree: Path to the worktree root
 

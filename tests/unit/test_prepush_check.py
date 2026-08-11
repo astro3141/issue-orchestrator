@@ -35,7 +35,12 @@ class TestLoadValidationCmd:
 
     def test_returns_none_when_no_config(self, temp_worktree):
         """Test returns None when config file doesn't exist."""
-        cmd, timeout, dirty_check = load_validation_cmd(temp_worktree)
+        selection = load_validation_cmd(temp_worktree)
+        cmd, timeout, dirty_check = (
+            selection.cmd,
+            selection.timeout_seconds,
+            selection.dirty_check,
+        )
         assert cmd is None
         assert timeout == 0
         assert dirty_check == "tracked"
@@ -47,7 +52,12 @@ class TestLoadValidationCmd:
         config_path = config_dir / "default.yaml"
         config_path.write_text("some_key: value\n")
 
-        cmd, timeout, dirty_check = load_validation_cmd(temp_worktree)
+        selection = load_validation_cmd(temp_worktree)
+        cmd, timeout, dirty_check = (
+            selection.cmd,
+            selection.timeout_seconds,
+            selection.dirty_check,
+        )
         assert cmd is None
         assert dirty_check == "tracked"
 
@@ -63,7 +73,12 @@ validation:
     timeout_seconds: 300
 """)
 
-        cmd, timeout, dirty_check = load_validation_cmd(temp_worktree)
+        selection = load_validation_cmd(temp_worktree)
+        cmd, timeout, dirty_check = (
+            selection.cmd,
+            selection.timeout_seconds,
+            selection.dirty_check,
+        )
         assert cmd == "pytest"
         assert timeout == 300
         assert dirty_check == "tracked"
@@ -80,7 +95,12 @@ validation:
 """)
         monkeypatch.setenv("ISSUE_ORCHESTRATOR_CONFIG_NAME", "main.yaml")
 
-        cmd, timeout, dirty_check = load_validation_cmd(temp_worktree)
+        selection = load_validation_cmd(temp_worktree)
+        cmd, timeout, dirty_check = (
+            selection.cmd,
+            selection.timeout_seconds,
+            selection.dirty_check,
+        )
 
         assert cmd == "pytest -k selected"
         assert timeout == 45
@@ -113,7 +133,12 @@ validation:
     cmd: "make test"
 """)
 
-        cmd, timeout, dirty_check = load_validation_cmd(temp_worktree)
+        selection = load_validation_cmd(temp_worktree)
+        cmd, timeout, dirty_check = (
+            selection.cmd,
+            selection.timeout_seconds,
+            selection.dirty_check,
+        )
         assert cmd == "make test"
         assert timeout == 1800  # Publish default
         assert dirty_check == "tracked"
@@ -130,7 +155,12 @@ validation:
     dirty_check: "unstaged"
 """)
 
-        cmd, timeout, dirty_check = load_validation_cmd(temp_worktree)
+        selection = load_validation_cmd(temp_worktree)
+        cmd, timeout, dirty_check = (
+            selection.cmd,
+            selection.timeout_seconds,
+            selection.dirty_check,
+        )
         assert cmd == "make test"
         assert timeout == 1800
         assert dirty_check == "unstaged"

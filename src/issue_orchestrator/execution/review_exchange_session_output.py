@@ -21,6 +21,7 @@ def start_review_exchange_run(
     issue_number: int,
     parent_session_name: str,
     agent_label: str,
+    validation_profile: str,
 ) -> ReviewExchangeRun:
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     session_name = f"review-exchange-{issue_number}-{timestamp}"
@@ -31,6 +32,9 @@ def start_review_exchange_run(
         agent_label=agent_label,
         backend="persistent-pty",
         orchestrator_log=str(get_repo_log_path(worktree_path)),
+        # Freeze the coder role's contract into the exchange run manifest, so
+        # the round env and any post-restart read agree on which gate ran.
+        validation_profile=validation_profile,
     )
     assets = ReviewExchangeRunAssets.from_run_dir(run.run_dir)
     assets.exchange_dir.mkdir(parents=True, exist_ok=True)
@@ -39,6 +43,7 @@ def start_review_exchange_run(
         run_id=run.run_id,
         parent_session_name=parent_session_name,
         assets=assets,
+        validation_profile=validation_profile,
     )
 
 

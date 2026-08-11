@@ -107,6 +107,7 @@ def _make_exchange_run(tmp_path: Path) -> ReviewExchangeRun:
         run_id="r1",
         parent_session_name="coding-42",
         assets=ReviewExchangeRunAssets.from_run_dir(run_dir),
+        validation_profile="default",
     )
 
 

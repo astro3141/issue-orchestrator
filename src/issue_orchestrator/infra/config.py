@@ -39,6 +39,16 @@ from .config_models import (
     TechLeadActivationOwner,
     TechLeadConfig,
     ValidationConfig,
+    ValidationProfileConfig as ValidationProfileConfig,
+)
+from .validation_profiles import (
+    DEFAULT_VALIDATION_PROFILE as DEFAULT_VALIDATION_PROFILE,
+    UnknownValidationProfileError as UnknownValidationProfileError,
+    ValidationProfile as ValidationProfile,
+    ValidationProfileRegistry,
+    dirty_check_errors,
+    profiles_runtime_dict,
+    profiles_yaml_dict,
 )
 from .config_paths import (
     CONFIG_DIR as CONFIG_DIR,
@@ -428,8 +438,34 @@ class Config(TechLeadActivationOwner):
         return self.prefixed_label(self.label_validation_failed)
 
     def is_validation_enabled(self) -> bool:
-        """Check if any validation command is configured."""
-        return bool(self.validation.quick.cmd or self.validation.publish.cmd)
+        """Check if any validation command is configured (in any profile)."""
+        return self.validation_profiles().any_command_configured
+
+    def validation_profiles(self) -> "ValidationProfileRegistry":
+        """Owner for named validation profiles and role bindings (#7059).
+
+        Built fresh from the current config so a reloaded config never serves
+        a stale contract. Every consumer — session launch, the completion
+        validation gate, config validation — asks this one owner rather than
+        reading ``validation.profiles`` directly.
+        """
+        return ValidationProfileRegistry(
+            self.validation,
+            {
+                label: agent.validation_profile
+                for label, agent in self.agents.items()
+            },
+        )
+
+    def validation_profile_for_run(self, agent_label: Optional[str]) -> str:
+        """Freeze the validation contract for a run launched for ``agent_label``.
+
+        The single expression every run-creation and env-export site uses, so
+        the profile a run *records* and the profile its agent *executes* can
+        never be resolved two different ways (#7059). Callers store the
+        returned name; they never re-derive it from labels or branch state.
+        """
+        return self.validation_profiles().freeze_for_run(agent_label).name
 
     def get_filter_milestones(self) -> list[str]:
         """Return a list of milestone filters."""
@@ -650,6 +686,7 @@ class Config(TechLeadActivationOwner):
                     "exclude": self.validation.coverage_guardrail.exclude,
                 },
                 "junit_xml_paths": list(self.validation.junit_xml_paths),
+                "profiles": profiles_runtime_dict(self.validation.profiles),
             },
             "review": {
                 "enabled": self.review_enabled,
@@ -810,6 +847,8 @@ class Config(TechLeadActivationOwner):
                 agent_dict["ai_system"] = agent.ai_system
             if agent.retry_prompt_template:
                 agent_dict["retry_prompt_template"] = agent.retry_prompt_template
+            if agent.validation_profile:
+                agent_dict["validation_profile"] = agent.validation_profile
             agents_dict[label] = agent_dict
 
         result: dict = {
@@ -1112,6 +1151,8 @@ class Config(TechLeadActivationOwner):
             }
         if self.validation.junit_xml_paths:
             validation_dict["junit_xml_paths"] = list(self.validation.junit_xml_paths)
+        if self.validation.profiles:
+            validation_dict["profiles"] = profiles_yaml_dict(self.validation.profiles)
         if validation_dict:
             result["validation"] = validation_dict
 
@@ -1353,6 +1394,10 @@ class Config(TechLeadActivationOwner):
             errors.append(
                 "validation.publish.dirty_check must be one of: tracked, unstaged, all, off"
             )
+        # Unknown profile bindings and bad per-profile dirty_check values fail
+        # closed here, at config validation, so a typo never reaches first use.
+        errors.extend(dirty_check_errors(self.validation.profiles))
+        errors.extend(self.validation_profiles().binding_errors())
         if (
             self.review_enabled
             and self.review_exchange_require_validation

@@ -37,6 +37,7 @@ from .config_models import (
     ValidationCommandConfig,
     ValidationConfig,
 )
+from .validation_profiles import profiles_from_mapping
 # tech_lead section parsing lives in its own cohesion module; re-exported here so
 # the section dispatch table and existing importers keep working.
 from .config_sections_tech_lead import parse_tech_lead_config
@@ -54,6 +55,7 @@ ALLOWED_AGENT_FIELDS = {
     'prompt', 'provider', 'model', 'timeout_minutes',
     'permission_mode', 'skip_review', 'reviewer', 'command', 'sandbox',
     'meta_agent', 'initial_prompt', 'ai_system', 'provider_args', 'retry_prompt_template',
+    'validation_profile',
 }
 
 _TOP_LEVEL_SECTION_KEYS = (
@@ -73,6 +75,7 @@ _SUPPORTED_VALIDATION_KEYS = frozenset(
     {
         "coverage_guardrail",
         "junit_xml_paths",
+        "profiles",
         "publish",
         "quick",
     }
@@ -709,6 +712,7 @@ def load_validation_section(config: "Config", validation_section: dict) -> None:
                 exclude=coverage_data.get("exclude", []) or [],
             ),
             junit_xml_paths=tuple(str(p) for p in junit_paths_raw if p),
+            profiles=profiles_from_mapping(validation_section.get("profiles")),
         )
         _warn_partial_validation_commands(config.validation)
 
@@ -843,6 +847,7 @@ def load_agents_section(
             "meta_agent": agent_data.get("meta_agent"),
             "ai_system": agent_data.get("ai_system"),
             "retry_prompt_template": agent_data.get("retry_prompt_template"),
+            "validation_profile": agent_data.get("validation_profile"),
             "sandbox": agent_data.get("sandbox", False),  # ADR-0034 opt-in (per-agent)
         }
         if "command" in agent_data:

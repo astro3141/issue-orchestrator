@@ -287,6 +287,9 @@ class WorktreeContext:
             retention_tier=config.session_output_retention_tier,
             retention_days=config.session_output_retention_days,
             retention_pinned=False,
+            # Freeze the role's validation contract into the run directory at
+            # creation, so it survives an orchestrator restart (#7059).
+            validation_profile=config.validation_profile_for_run(agent_label),
         )
 
         return cls(

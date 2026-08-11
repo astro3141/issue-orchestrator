@@ -1,12 +1,13 @@
-"""Validation module - record format, storage, runner, and cache.
+"""Validation gates for the orchestrator.
 
-This module handles validation gates for the orchestrator:
-- ValidationRecord: Dataclass for validation results (imported from ports)
-- ValidationRecordStore: Read/write validation records to disk
-- ValidationRunner: Execute validation commands
-- ValidationCache: Cache lookup for validation results
+- ``ValidationRunner`` executes a validation command and produces a record
+- ``PublishGate`` decides whether publishing is allowed (cache-aware)
+- ``AgentGate`` runs the quick gate at agent completion
 
-Storage location: .issue-orchestrator/validation/<suite>/<HEAD_SHA>.json
+Record storage and cache-reuse rules live in
+:mod:`.validation_record_cache`; ``ValidationRecordStore``,
+``ValidationCache`` and ``VALIDATION_SCHEMA_VERSION`` are re-exported here so
+existing importers keep working.
 """
 
 import json
@@ -21,15 +22,18 @@ from ..domain.attempt import Attempt, AttemptKey
 from ..infra import validation_timings as timings
 from ..infra.atomic_json import atomic_write_json
 from ..infra.emit import emit_event
+from ..infra.validation_profiles import DEFAULT_VALIDATION_PROFILE
 from ..ports import CommandRunner, CommandResult, WorkingCopy
 from ..ports.attempt_store import AttemptStore
 from ..ports.session_output import ValidationRecord
 from .isolation import build_runtime_tool_env
+from .validation_record_cache import (
+    VALIDATION_SCHEMA_VERSION as VALIDATION_SCHEMA_VERSION,
+    ValidationCache as ValidationCache,
+    ValidationRecordStore as ValidationRecordStore,
+)
 
 logger = logging.getLogger(__name__)
-
-# Schema version for validation records
-VALIDATION_SCHEMA_VERSION = 1
 
 
 def _normalize_head_sha(head_sha: str | None) -> str | None:
@@ -37,6 +41,23 @@ def _normalize_head_sha(head_sha: str | None) -> str | None:
         return None
     normalized = head_sha.strip().lower()
     return normalized or None
+
+
+def _failure_reason(record: ValidationRecord) -> str:
+    """Human-facing reason for a failed gate run.
+
+    Names the validation profile whenever it is not the default one, so a
+    failure report says *which contract* rejected the work rather than
+    leaving the reader to guess (#7059).
+    """
+    sha = record.head_sha[:8]
+    suffix = (
+        "" if record.profile == DEFAULT_VALIDATION_PROFILE
+        else f" [profile={record.profile}]"
+    )
+    if record.timed_out:
+        return f"Validation timed out for {sha}{suffix}"
+    return f"Validation failed for {sha} (exit_code={record.exit_code}){suffix}"
 
 
 def _is_session_run_dir(path: Path, worktree: Path) -> bool:
@@ -63,94 +84,6 @@ class ValidationResult:
     command: str
 
 
-class ValidationRecordStore:
-    """Reads and writes validation records to disk.
-
-    Storage layout (simplified - one location per SHA):
-        <worktree>/.issue-orchestrator/validation/<sha>.json
-
-    This allows validation caching across gates - if agent_gate and publish_gate
-    use the same command, the result can be shared.
-    """
-
-    VALIDATION_DIR = ".issue-orchestrator/validation"
-
-    def __init__(self, worktree: Path):
-        """Initialize store for a specific worktree.
-
-        Args:
-            worktree: Path to the git worktree
-        """
-        self.worktree = worktree
-        self.base_dir = worktree / self.VALIDATION_DIR
-
-    def get_record_path(self, sha: str) -> Path:
-        """Get the path for a validation record (one per SHA)."""
-        return self.base_dir / f"{sha}.json"
-
-    def write(self, record: ValidationRecord) -> Path:
-        """Write a validation record to disk atomically.
-
-        Atomicity matters because two gates (agent_gate, publish_gate) may
-        write the same per-SHA file concurrently in different threads, and
-        readers (cache lookups, the review-exchange predicate) parse the
-        file as JSON — a torn write would surface as JSONDecodeError or,
-        worse, a partial-but-syntactically-valid prefix.
-
-        Args:
-            record: The validation record to write
-
-        Returns:
-            Path to the written file
-        """
-        path = self.get_record_path(record.head_sha)
-        atomic_write_json(path, record.to_dict())
-        logger.debug("Wrote validation record to %s", path)
-        return path
-
-    def read(self, sha: str) -> Optional[ValidationRecord]:
-        """Read a validation record from disk.
-
-        Args:
-            sha: The HEAD SHA
-
-        Returns:
-            ValidationRecord if found, None otherwise
-        """
-        path = self.get_record_path(sha)
-
-        if not path.exists():
-            return None
-
-        try:
-            with open(path) as f:
-                data = json.load(f)
-            return ValidationRecord.from_dict(data)
-        except (json.JSONDecodeError, KeyError, TypeError) as e:
-            logger.warning("Failed to read validation record at %s: %s", path, e)
-            return None
-
-    # Legacy methods for backwards compatibility with old suite-based paths
-    def _get_legacy_record_path(self, suite: str, sha: str) -> Path:
-        """Get the legacy path for a validation record (per-suite)."""
-        return self.base_dir / suite / f"{sha}.json"
-
-    def read_legacy(self, suite: str, sha: str) -> Optional[ValidationRecord]:
-        """Read from legacy per-suite location for backwards compatibility."""
-        path = self._get_legacy_record_path(suite, sha)
-
-        if not path.exists():
-            return None
-
-        try:
-            with open(path) as f:
-                data = json.load(f)
-            return ValidationRecord.from_dict(data)
-        except (json.JSONDecodeError, KeyError, TypeError) as e:
-            logger.warning("Failed to read legacy validation record at %s: %s", path, e)
-            return None
-
-
 class ValidationRunner:
     """Runs validation commands and produces records."""
 
@@ -172,6 +105,7 @@ class ValidationRunner:
         timeout_seconds: int = 1800,
         cwd: Optional[Path] = None,
         session_output_dir: Optional[Path] = None,
+        profile: str = DEFAULT_VALIDATION_PROFILE,
     ) -> ValidationRecord:
         """Run a validation command and return a record.
 
@@ -182,6 +116,7 @@ class ValidationRunner:
             timeout_seconds: Timeout in seconds
             cwd: Working directory (defaults to store's worktree)
             session_output_dir: Directory to write stdout/stderr (required)
+            profile: Named validation profile this run executed (#7059)
 
         Returns:
             ValidationRecord with results
@@ -204,6 +139,7 @@ class ValidationRunner:
                 "sha": head_sha,
                 "command": command,
                 "timeout_seconds": timeout_seconds,
+                "profile": profile,
             },
         )
 
@@ -265,6 +201,7 @@ class ValidationRunner:
             timed_out=timed_out,
             stdout_path=stdout_path_str,
             stderr_path=stderr_path_str,
+            profile=profile,
         )
 
         # Write record
@@ -277,8 +214,9 @@ class ValidationRunner:
             )
 
         logger.info(
-            "Validation suite '%s' %s (exit_code=%d)",
+            "Validation suite '%s' [profile=%s] %s (exit_code=%d)",
             suite,
+            profile,
             "passed" if passed else "failed",
             exit_code,
         )
@@ -294,110 +232,12 @@ class ValidationRunner:
                 "exit_code": exit_code,
                 "timed_out": timed_out,
                 "duration_seconds": duration_seconds,
+                "profile": profile,
             },
         )
         timings.record_gate_timings(suite, self.store.worktree, command, stdout, stderr)
 
         return record
-
-
-class ValidationCache:
-    """Cache lookup for validation results.
-
-    The cache is now command-aware: a cached result is valid if it's for
-    the same SHA AND the same command. This allows agent_gate and publish_gate
-    to share validation results when they use the same command.
-    """
-
-    def __init__(self, store: ValidationRecordStore):
-        """Initialize cache with a record store.
-
-        Args:
-            store: Store for reading validation records
-        """
-        self.store = store
-
-    def lookup(
-        self, sha: str, command: Optional[str] = None
-    ) -> Optional[ValidationRecord]:
-        """Look up a cached validation record.
-
-        Args:
-            sha: The HEAD SHA
-            command: If provided, only return record if command matches
-
-        Returns:
-            ValidationRecord if found and valid, None otherwise
-        """
-        record = self.store.read(sha)
-
-        if record is None:
-            logger.debug("Cache miss for %s", sha)
-            emit_event(
-                "validation.cache_miss",
-                {
-                    "sha": sha,
-                },
-            )
-            return None
-
-        # Validate schema version
-        if record.schema_version != VALIDATION_SCHEMA_VERSION:
-            logger.debug(
-                "Cache miss for %s: schema version mismatch (%d != %d)",
-                sha,
-                record.schema_version,
-                VALIDATION_SCHEMA_VERSION,
-            )
-            emit_event(
-                "validation.cache_miss",
-                {
-                    "sha": sha,
-                    "reason": "schema_version_mismatch",
-                },
-            )
-            return None
-
-        # If command specified, check it matches
-        if command and record.command != command:
-            logger.debug(
-                "Cache miss for %s: command mismatch (cached='%s', requested='%s')",
-                sha,
-                record.command,
-                command,
-            )
-            emit_event(
-                "validation.cache_miss",
-                {
-                    "sha": sha,
-                    "reason": "command_mismatch",
-                },
-            )
-            return None
-
-        logger.debug("Cache hit for %s (passed=%s)", sha, record.passed)
-        emit_event(
-            "validation.cache_hit",
-            {
-                "sha": sha,
-                "passed": record.passed,
-                "command": record.command,
-            },
-        )
-        return record
-
-    def is_valid_hit(self, sha: str, command: Optional[str] = None) -> bool:
-        """Check if there's a valid passing cache entry.
-
-        Args:
-            sha: The HEAD SHA
-            command: If provided, only match if command is the same
-
-        Returns:
-            True if there's a passing cache entry for this SHA (and command)
-        """
-        record = self.lookup(sha, command)
-        return record is not None and record.passed
 
 
 @dataclass
@@ -428,6 +268,7 @@ class PublishGate:
         timeout_seconds: int = 1800,
         attempt_store: AttemptStore | None = None,
         attempt_key: AttemptKey | None = None,
+        profile: str = DEFAULT_VALIDATION_PROFILE,
     ):
         """Initialize publish gate for a worktree.
 
@@ -439,6 +280,9 @@ class PublishGate:
                 attempt_key, validation cache hits are scoped by issue identity
                 plus HEAD SHA rather than by SHA alone.
             attempt_key: Stable issue-at-HEAD identity for cache lookup.
+            profile: Named validation profile this gate runs (#7059). Part of
+                the cache key, so a cached result from another profile is
+                never reused.
         """
         if attempt_key is not None and attempt_store is None:
             raise ValueError("attempt_key requires attempt_store")
@@ -447,6 +291,7 @@ class PublishGate:
         self.working_copy = working_copy
         self.command = command
         self.timeout_seconds = timeout_seconds
+        self.profile = profile
         self.attempt_store = attempt_store
         self.attempt_key = attempt_key
         self.store = ValidationRecordStore(worktree)
@@ -474,6 +319,7 @@ class PublishGate:
         payload: dict[str, object] = {
             "kind": "validation_gate_summary",
             "gate": self.SUITE_NAME,
+            "profile": self.profile,
             "command": self.command,
             "timeout_seconds": self.timeout_seconds,
             "head_sha": head_sha,
@@ -547,6 +393,16 @@ class PublishGate:
                 "Publish gate %s cache miss for %s: command mismatch",
                 cache_source,
                 head_sha[:8],
+            )
+            return False
+        if record.profile != self.profile:
+            logger.debug(
+                "Publish gate %s cache miss for %s: profile mismatch "
+                "(cached='%s', requested='%s')",
+                cache_source,
+                head_sha[:8],
+                record.profile,
+                self.profile,
             )
             return False
         return True
@@ -683,7 +539,7 @@ class PublishGate:
             cached = self._attempt_cached_record(head_sha)
             cache_hit_prefix = "attempt_"
         else:
-            cached = self.cache.lookup(head_sha, self.command)
+            cached = self.cache.lookup(head_sha, self.command, self.profile)
             cache_hit_prefix = ""
         if cached is not None and cached.passed:
             cache_lookup = f"{cache_hit_prefix}hit_passed"
@@ -714,13 +570,18 @@ class PublishGate:
             cache_lookup = f"{cache_hit_prefix}miss"
 
         # Run validation
-        logger.info("Publish gate: running validation for %s", head_sha[:8])
+        logger.info(
+            "Publish gate: running validation for %s [profile=%s]",
+            head_sha[:8],
+            self.profile,
+        )
         record = self.runner.run(
             suite=self.SUITE_NAME,
             head_sha=head_sha,
             command=self.command,
             timeout_seconds=self.timeout_seconds,
             session_output_dir=session_output_dir,
+            profile=self.profile,
         )
         # ValidationRunner still populates the legacy SHA cache for callers
         # without attempt identity. When attempt_key is present, the attempt
@@ -737,15 +598,10 @@ class PublishGate:
                 )
             )
         else:
-            reason = (
-                f"Validation failed for {head_sha[:8]} (exit_code={record.exit_code})"
-            )
-            if record.timed_out:
-                reason = f"Validation timed out for {head_sha[:8]}"
             return finish(
                 PublishGateResult(
                     allowed=False,
-                    reason=reason,
+                    reason=_failure_reason(record),
                     record=record,
                     cache_hit=False,
                 )
@@ -778,6 +634,7 @@ class AgentGate:
         working_copy: WorkingCopy,
         command: Optional[str] = None,
         timeout_seconds: int = 1800,
+        profile: str = DEFAULT_VALIDATION_PROFILE,
     ):
         """Initialize agent gate for a worktree.
 
@@ -785,12 +642,14 @@ class AgentGate:
             worktree: Path to the git worktree
             command: Validation command to run (None = gate disabled)
             timeout_seconds: Timeout for validation command
+            profile: Named validation profile this gate runs (#7059)
         """
         self.worktree = worktree
         self.command_runner = command_runner
         self.working_copy = working_copy
         self.command = command
         self.timeout_seconds = timeout_seconds
+        self.profile = profile
         self.store = ValidationRecordStore(worktree)
         self.runner = ValidationRunner(self.store, command_runner)
 
@@ -831,13 +690,18 @@ class AgentGate:
             )
 
         # Run validation
-        logger.info("Agent gate: running validation for %s", head_sha[:8])
+        logger.info(
+            "Agent gate: running validation for %s [profile=%s]",
+            head_sha[:8],
+            self.profile,
+        )
         record = self.runner.run(
             suite=self.SUITE_NAME,
             head_sha=head_sha,
             command=self.command,
             timeout_seconds=self.timeout_seconds,
             session_output_dir=session_output_dir,
+            profile=self.profile,
         )
 
         # Get the path where the record was written
@@ -851,14 +715,9 @@ class AgentGate:
                 record_path=record_path,
             )
         else:
-            reason = (
-                f"Validation failed for {head_sha[:8]} (exit_code={record.exit_code})"
-            )
-            if record.timed_out:
-                reason = f"Validation timed out for {head_sha[:8]}"
             return AgentGateResult(
                 passed=False,
-                reason=reason,
+                reason=_failure_reason(record),
                 record=record,
                 record_path=record_path,
             )

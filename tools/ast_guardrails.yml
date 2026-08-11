@@ -71,6 +71,28 @@ allow_prefixes:
   - src/issue_orchestrator/infra/e2e_slot_policy.py  # E2E due-check reads main HEAD (extracted from e2e_runner)
   - src/issue_orchestrator/infra/e2e_worktree.py  # E2E worktree management (git + uv)
 
+# Calls that must state an owned fact explicitly rather than take a default.
+require_call_kwargs:
+  - name: run_creation_states_validation_profile
+    description: >
+      Every session-run creation must state the validation profile it freezes
+      (#7059). The profile is the contract the run's agent validates under and
+      the one its records claim; a launch path that omits it produces a run
+      stamped 'default' while another path for the same role validates
+      correctly. That cross-path drift is invisible without this check, since
+      the omission is a silent default rather than an error.
+    require_in:
+      - src/issue_orchestrator
+    call_names:
+      - start_run
+      - start_review_exchange_run
+    required_kwargs:
+      - validation_profile
+    allow:
+      # E2EDB.start_run is an unrelated method that happens to share the name:
+      # it starts an E2E *test* run row, which has no validation profile.
+      - src/issue_orchestrator/entrypoints/e2e_worker.py
+
 deny_attr_calls:
   - name: control_no_cached_label_reads
     description: "Control/observation must use fresh label reads"

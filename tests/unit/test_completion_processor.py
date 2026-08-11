@@ -129,6 +129,7 @@ class _FixedReviewExchangeSessionOutput(FileSystemSessionOutput):
         issue_number: int,
         parent_session_name: str,
         agent_label: str,
+        validation_profile: str,
     ) -> ReviewExchangeRun:
         self.review_run_dir.mkdir(parents=True, exist_ok=True)
         assets = ReviewExchangeRunAssets.from_run_dir(self.review_run_dir)
@@ -138,6 +139,7 @@ class _FixedReviewExchangeSessionOutput(FileSystemSessionOutput):
             run_id=self.review_run_dir.name.split("__", 1)[0],
             parent_session_name=parent_session_name,
             assets=assets,
+            validation_profile=validation_profile,
         )
 
 
@@ -2267,6 +2269,7 @@ class TestReviewExchangeExecution:
             assets=ReviewExchangeRunAssets.from_run_dir(
                 tmp_path / ".issue-orchestrator" / "sessions" / "review-run-1"
             ),
+            validation_profile="default",
         )
         processor._run_review_exchange_loop(  # noqa: SLF001
             exchange_run=exchange_run,

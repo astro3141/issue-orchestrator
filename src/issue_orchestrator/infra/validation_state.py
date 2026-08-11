@@ -25,6 +25,7 @@ from ..domain.artifact_contracts import (
 )
 from ..domain.run_manifest import RunManifest
 from ..domain.session_key import TaskKind
+from .validation_profiles import DEFAULT_VALIDATION_PROFILE
 
 logger = logging.getLogger(__name__)
 _NO_CURRENT_RETRY = object()
@@ -101,6 +102,10 @@ class ValidationState:
     retry_count: int = 0  # Queued retry attempt number, not completed retry count.
     max_retries: int = 3
     validation_cmd: Optional[str] = None
+    # Named validation profile the failing run executed (#7059). Durable, so a
+    # retry launched after an orchestrator restart continues under the same
+    # contract instead of re-deriving one.
+    validation_profile: str = DEFAULT_VALIDATION_PROFILE
     last_error: Optional[str] = None
     last_error_file: Optional[str] = None
     original_prompt_file: Optional[str] = None
@@ -113,6 +118,7 @@ class ValidationState:
             retry_count=self.retry_count + 1,
             max_retries=self.max_retries,
             validation_cmd=self.validation_cmd,
+            validation_profile=self.validation_profile,
             last_error=self.last_error,
             last_error_file=self.last_error_file,
             original_prompt_file=self.original_prompt_file,
@@ -205,6 +211,9 @@ def _load_validation_state_file(state_file: Path) -> Optional[ValidationState]:
             retry_count=data.get("retry_count", 0),
             max_retries=data.get("max_retries", 3),
             validation_cmd=data.get("validation_cmd"),
+            validation_profile=(
+                data.get("validation_profile") or DEFAULT_VALIDATION_PROFILE
+            ),
             last_error=data.get("last_error"),
             last_error_file=data.get("last_error_file"),
             original_prompt_file=data.get("original_prompt_file"),

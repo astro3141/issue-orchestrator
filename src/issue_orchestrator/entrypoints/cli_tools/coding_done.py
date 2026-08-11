@@ -360,8 +360,8 @@ def main() -> None:  # noqa: C901, PLR0912
     statuses_requiring_validation = {AgentStatus.COMPLETED}
     assets = None
     if status in statuses_requiring_validation:
-        validation_cmd, _ = load_validation_cmd(worktree_root)
-        if validation_cmd:
+        selection = load_validation_cmd(worktree_root)
+        if selection.cmd:
             if not record.session_id:
                 logger.error("[coding-done] Validation requires session_id but none found")
                 sys.exit(1)
@@ -374,6 +374,10 @@ def main() -> None:  # noqa: C901, PLR0912
                 assets = FileSystemSessionOutput().start_run(
                     worktree_root,
                     record.session_id,
+                    # Unmanaged run: the orchestrator never allocated one, so
+                    # the profile this session actually resolved is the only
+                    # honest thing to freeze onto it (#7059).
+                    validation_profile=selection.profile,
                 )
             validation_result = run_validation(
                 worktree_root,
