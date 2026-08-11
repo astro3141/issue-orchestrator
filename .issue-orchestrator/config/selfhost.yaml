@@ -71,14 +71,14 @@ review:
   max_rework_cycles: 1
 
 validation:
-  # LC_ALL=C is pinned because git emits localized stderr on this machine and
-  # at least one test asserts on English text. Measured: the assertion fails
-  # under the ambient Korean locale and passes under LC_ALL=C, on an unmodified
-  # checkout. That is an environment difference, not a defect.
+  # No locale workaround lives here. One upstream test asserts on English git
+  # stderr, so the orchestrator runtime must be started with LC_MESSAGES=C;
+  # that is a self-hosting environment requirement, recorded outside the repo,
+  # not something this config or any tracked source should carry.
   quick:
     # Focused on the #7059 change area rather than the whole suite, so rework
     # rounds stay short. Whole-repository regression duty belongs to publish.
-    cmd: "LC_ALL=C LANG=C .venv/bin/python -m pytest tests/unit tests/integration -q --tb=short -p no:cacheprovider -k 'validation or profile or config or prepush' && LC_ALL=C make typecheck"
+    cmd: ".venv/bin/python -m pytest tests/unit tests/integration -q --tb=short -p no:cacheprovider -k 'validation or profile or config or prepush' && make typecheck"
     timeout_seconds: 1800
   publish:
     # The upstream project's own gate, reproduced rather than invented:
@@ -92,7 +92,7 @@ validation:
     # back to the current git repo (tests/e2e/fixtures/github_utils.py:140) and
     # write issues into this fork. Upstream CI does not run it either. Run live
     # E2E separately against a throwaway E2E_TEST_REPO.
-    cmd: "LC_ALL=C LANG=C make validate-pr-raw"
+    cmd: "make validate-pr-raw"
     timeout_seconds: 5400
 
 retry:
