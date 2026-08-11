@@ -11,6 +11,7 @@ import argparse
 import json
 import logging
 import sys
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NoReturn, Optional, cast
@@ -56,10 +57,20 @@ from ...domain.artifact_contracts import ValidationFailed, ValidationPassed
 from ...domain.session_run import ValidationArtifactPaths
 from ...execution.run_evidence import RunEvidenceRecorder
 from ...execution.session_output_adapter import FileSystemSessionOutput
+from ...infra.validation_profiles import DEFAULT_VALIDATION_PROFILE
 from .agent_callback import (
     api_request_headers as _api_request_headers,
     resolve_control_api_port as _resolve_control_api_port,
 )
+
+
+@dataclass(frozen=True)
+class QuickValidationSelection:
+    """The quick gate this session runs, resolved from one config read."""
+
+    cmd: Optional[str]
+    timeout_seconds: int
+    profile: str
 
 
 class AgentStatus:
@@ -559,17 +570,21 @@ def find_worktree_root() -> Path:
     return cwd_root
 
 
-def load_validation_cmd(worktree: Path) -> tuple[Optional[str], int]:
+def load_validation_cmd(worktree: Path) -> QuickValidationSelection:
     """Load quick validation configuration from the worktree's config file.
 
     Reads from .issue-orchestrator/config/ in the worktree.
     This ensures tests are deterministic - no env var leakage from parent processes.
 
+    The validation profile frozen for this session selects which quick gate is
+    read (#7059); with no profile selected this is the top-level
+    ``validation.quick``, exactly as before.
+
     Args:
         worktree: Path to the worktree root
 
     Returns:
-        Tuple of (command, timeout_seconds) or (None, 0) if not configured
+        The resolved quick gate selection (``cmd is None`` when unconfigured)
     """
     from ...infra.config import load_runtime_validation_config
 
@@ -580,10 +595,15 @@ def load_validation_cmd(worktree: Path) -> tuple[Optional[str], int]:
 
     quick_config = validation_config.get("quick", {}) or {}
     cmd = quick_config.get("cmd")
+    profile = validation_config.get("profile") or DEFAULT_VALIDATION_PROFILE
     if cmd:
-        return cmd, quick_config.get("timeout_seconds", 300)
+        return QuickValidationSelection(
+            cmd=cmd,
+            timeout_seconds=quick_config.get("timeout_seconds", 300),
+            profile=profile,
+        )
 
-    return None, 0
+    return QuickValidationSelection(cmd=None, timeout_seconds=0, profile=profile)
 
 
 def run_validation(
@@ -601,12 +621,14 @@ def run_validation(
     Returns:
         AgentGateResult if validation was run, None if not configured
     """
-    cmd, timeout = load_validation_cmd(worktree)
-    if not cmd:
+    selection = load_validation_cmd(worktree)
+    if not selection.cmd:
         return None
 
     if verbose:
-        print(f"Running quick validation: {cmd}")
+        print(
+            f"Running quick validation [profile={selection.profile}]: {selection.cmd}"
+        )
 
     from ...execution import LocalCommandRunner, GitWorkingCopy
 
@@ -614,8 +636,9 @@ def run_validation(
         worktree,
         command_runner=LocalCommandRunner(),
         working_copy=GitWorkingCopy(),
-        command=cmd,
-        timeout_seconds=timeout,
+        command=selection.cmd,
+        timeout_seconds=selection.timeout_seconds,
+        profile=selection.profile,
     )
     result = gate.run(session_output_dir=session_output_dir)
 

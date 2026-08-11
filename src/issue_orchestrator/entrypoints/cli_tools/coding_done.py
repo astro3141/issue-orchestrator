@@ -360,8 +360,7 @@ def main() -> None:  # noqa: C901, PLR0912
     statuses_requiring_validation = {AgentStatus.COMPLETED}
     assets = None
     if status in statuses_requiring_validation:
-        validation_cmd, _ = load_validation_cmd(worktree_root)
-        if validation_cmd:
+        if load_validation_cmd(worktree_root).cmd:
             if not record.session_id:
                 logger.error("[coding-done] Validation requires session_id but none found")
                 sys.exit(1)
