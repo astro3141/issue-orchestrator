@@ -26,14 +26,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Iterable, Mapping
 
+from ..domain.validation_profile import DEFAULT_VALIDATION_PROFILE
 from .config_models import (
     PublishValidationConfig,
     ValidationCommandConfig,
     ValidationConfig,
     ValidationProfileConfig,
 )
-
-DEFAULT_VALIDATION_PROFILE = "default"
 
 __all__ = [
     "DEFAULT_VALIDATION_PROFILE",
@@ -103,14 +102,32 @@ class ValidationProfileRegistry:
 
     @classmethod
     def single(cls, profile: ValidationProfile) -> "ValidationProfileRegistry":
-        """Build a registry holding ``profile`` as its default.
+        """Build a registry holding ``profile`` under its own name.
 
         Used by callers that already hold one resolved contract (tests, and
         the completion path when it is handed explicit commands) so they still
         route every lookup through the one owner.
+
+        A non-default profile keeps its name: the top-level
+        ``ValidationConfig`` pair always means ``default``, so a named profile
+        is registered under ``profiles`` instead. Silently renaming it to
+        ``default`` would make ``resolve(profile.name)`` raise on the very
+        profile the caller handed in.
         """
-        registry = cls(ValidationConfig(quick=profile.quick, publish=profile.publish))
-        return registry
+        if profile.is_default:
+            return cls(
+                ValidationConfig(quick=profile.quick, publish=profile.publish)
+            )
+        return cls(
+            ValidationConfig(
+                profiles={
+                    profile.name: ValidationProfileConfig(
+                        quick=profile.quick,
+                        publish=profile.publish,
+                    )
+                }
+            )
+        )
 
     @property
     def names(self) -> tuple[str, ...]:
@@ -165,6 +182,26 @@ class ValidationProfileRegistry:
                 bypassed.
         """
         return self.resolve(self.name_for_agent(agent_label))
+
+    def freeze_for_run(self, agent_label: str | None) -> ValidationProfile:
+        """The contract a run launched for ``agent_label`` is frozen under.
+
+        This is the one launch-time operation. Run creation records
+        ``.name`` in the run manifest and the agent session env exports it,
+        so "which contract does this run get, and how is it recorded" is
+        answered here instead of being reassembled from ``name_for_agent`` +
+        a manifest key + an env export at each launch site.
+
+        Unlike :meth:`name_for_agent` this resolves the binding, so a launch
+        under a retired profile fails here rather than producing a run that
+        claims a contract nothing can execute.
+
+        Raises:
+            UnknownValidationProfileError: when the role's binding names an
+                undefined profile. Config validation fails closed on this
+                first, so reaching it at launch means the config was bypassed.
+        """
+        return self.for_agent(agent_label)
 
     def binding_errors(self) -> list[str]:
         """Config-validation errors for role → profile bindings.

@@ -93,6 +93,16 @@ Rules that make the choice auditable:
   a cached result, even when they happen to run the same command today.
 - A run naming a profile the current config no longer defines fails closed
   rather than silently validating under a different contract.
+- **Every** launch path states the contract. `SessionLauncher`, the
+  review-exchange coder/reviewer pair, and the interactive debug session all
+  freeze the same value through one owner call
+  (`Config.validation_profile_for_run`) and export it to the agent. The
+  exchange path reads the frozen value back off its `ReviewExchangeRun` rather
+  than re-resolving it, so the profile the run records and the profile its
+  agent executes cannot diverge. An AST guardrail
+  (`run_creation_states_validation_profile` in `tools/ast_guardrails.yml`)
+  fails the build if a new run-creation call site omits it, because the
+  omission would otherwise be a silent default rather than an error.
 
 This is the downstream implementation of upstream issue
 [#7059](https://github.com/issue-orchestrator/issue-orchestrator/issues/7059);

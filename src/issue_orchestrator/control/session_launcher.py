@@ -524,9 +524,7 @@ class SessionLauncher:
             run_dir=run_assets.run_dir,
             worktree_path=worktree_path,
             callback_endpoint=self._agent_callback_endpoint,
-            validation_profile=self.config.validation_profiles().name_for_agent(
-                agent_label
-            ),
+            validation_profile=self.config.validation_profile_for_run(agent_label),
         )
 
     # ─────────────────────────────────────────────────────────────────────────

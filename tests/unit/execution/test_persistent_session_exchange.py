@@ -50,12 +50,14 @@ def _start_exchange_run(
     issue_number: int,
     coder_label: str,
     parent_session_name: str = "coding-1",
+    validation_profile: str = "default",
 ) -> ReviewExchangeRun:
     return session_output.start_review_exchange_run(
         coder_worktree_path,
         issue_number=issue_number,
         parent_session_name=parent_session_name,
         agent_label=coder_label,
+        validation_profile=validation_profile,
     )
 
 
@@ -3137,6 +3139,7 @@ class TestCallerHooks:
             issue_number=42,
             parent_session_name="coding-1",
             agent_label="agent:backend",
+            validation_profile="default",
         )
         outcome = pse.run_persistent_session_exchange(
             exchange_run=exchange_run,
@@ -3197,6 +3200,7 @@ class TestCallerHooks:
             issue_number=42,
             parent_session_name="coding-1",
             agent_label="agent:backend",
+            validation_profile="default",
         )
         outcome = pse.run_persistent_session_exchange(
             exchange_run=exchange_run,
@@ -3284,6 +3288,7 @@ class TestCallerHooks:
             issue_number=42,
             parent_session_name="coding-1",
             agent_label="agent:backend",
+            validation_profile="default",
         )
         outcome = pse.run_persistent_session_exchange(
             exchange_run=exchange_run,
@@ -4187,6 +4192,7 @@ class TestRoleEnvironmentScrubbing:
             web_port=None,
             issue_number=4057,
             session_name="exchange-1",
+            validation_profile="default",
         )
 
         # Forbidden vars must be absent.
@@ -4226,6 +4232,7 @@ class TestRoleEnvironmentScrubbing:
             web_port=8080,
             issue_number=4057,
             session_name="exchange-1",
+            validation_profile="default",
         )
 
         # The orchestrator-side overrides we depend on must propagate.
@@ -4271,6 +4278,7 @@ class TestRoleEnvironmentScrubbing:
             web_port=8080,
             issue_number=4057,
             session_name="exchange-1",
+            validation_profile="default",
         )
 
         path_entries = env["PATH"].split(os.pathsep)
@@ -4308,6 +4316,7 @@ class TestRoleEnvironmentScrubbing:
             web_port=None,
             issue_number=4057,
             session_name="exchange-1",
+            validation_profile="default",
         )
         assert env.get("ISSUE_ORCHESTRATOR_AGENT_CALLBACK_TOKEN") == "scoped-cb-token"
 
@@ -4626,6 +4635,7 @@ class TestPerSessionRecordingMirror:
             issue_number=42,
             parent_session_name="coding-1",
             agent_label="agent:backend",
+            validation_profile="default",
         )
         stale_pair_root = tmp_path / "stale-persistent-pairs" / "issue-42"
         stale_pair = pse.PersistentExchangePair(

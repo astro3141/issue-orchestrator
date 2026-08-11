@@ -511,3 +511,68 @@ def test_an_exempt_function_does_not_shelter_its_module(tmp_path: Path) -> None:
     assert code == 2
     assert "provider-output-classifier] _is_claude_auth_failure" in out
     assert "_detect_blocked_from_output" not in out
+
+
+def test_blocks_start_run_without_validation_profile(tmp_path: Path) -> None:
+    """A launch path that omits the profile silently claims the default one."""
+    code = (
+        "def launch(session_output, worktree):\n"
+        "    return session_output.start_run(worktree, 'issue-7')\n"
+    )
+    code_out, output = _run_capturing(
+        tmp_path, code, "src/issue_orchestrator/control/some_launcher.py"
+    )
+    assert code_out == 2
+    assert "run_creation_states_validation_profile" in output
+    assert "validation_profile" in output
+
+
+def test_blocks_start_review_exchange_run_without_validation_profile(
+    tmp_path: Path,
+) -> None:
+    code = (
+        "def launch(session_output, worktree):\n"
+        "    return session_output.start_review_exchange_run(\n"
+        "        worktree, issue_number=7, parent_session_name='s',\n"
+        "        agent_label='agent:backend',\n"
+        "    )\n"
+    )
+    assert (
+        _run(tmp_path, code, "src/issue_orchestrator/control/some_launcher.py") == 2
+    )
+
+
+def test_allows_start_run_that_states_the_validation_profile(
+    tmp_path: Path,
+) -> None:
+    code = (
+        "def launch(session_output, worktree, profile):\n"
+        "    return session_output.start_run(\n"
+        "        worktree, 'issue-7', validation_profile=profile\n"
+        "    )\n"
+    )
+    assert (
+        _run(tmp_path, code, "src/issue_orchestrator/control/some_launcher.py") == 0
+    )
+
+
+def test_allows_kwargs_forwarding_of_start_run(tmp_path: Path) -> None:
+    """``**kwargs`` forwarding passes a decision through; it does not make one."""
+    code = (
+        "def forward(session_output, worktree, **kwargs):\n"
+        "    return session_output.start_run(worktree, 'issue-7', **kwargs)\n"
+    )
+    assert (
+        _run(tmp_path, code, "src/issue_orchestrator/control/some_launcher.py") == 0
+    )
+
+
+def test_allows_e2e_worker_start_run_name_collision(tmp_path: Path) -> None:
+    """E2EDB.start_run starts a test run row, which has no validation profile."""
+    code = (
+        "def launch(db):\n"
+        "    return db.start_run(trigger='manual')\n"
+    )
+    assert (
+        _run(tmp_path, code, "src/issue_orchestrator/entrypoints/e2e_worker.py") == 0
+    )

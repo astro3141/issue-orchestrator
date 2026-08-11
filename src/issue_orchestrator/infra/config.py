@@ -457,6 +457,16 @@ class Config(TechLeadActivationOwner):
             },
         )
 
+    def validation_profile_for_run(self, agent_label: Optional[str]) -> str:
+        """Freeze the validation contract for a run launched for ``agent_label``.
+
+        The single expression every run-creation and env-export site uses, so
+        the profile a run *records* and the profile its agent *executes* can
+        never be resolved two different ways (#7059). Callers store the
+        returned name; they never re-derive it from labels or branch state.
+        """
+        return self.validation_profiles().freeze_for_run(agent_label).name
+
     def get_filter_milestones(self) -> list[str]:
         """Return a list of milestone filters."""
         return self.filtering.get_milestones()

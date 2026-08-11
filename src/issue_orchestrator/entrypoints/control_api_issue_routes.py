@@ -526,12 +526,17 @@ async def launch_debug_session(  # noqa: C901 - debug session with validation an
         task_kind="code",
     )
 
+    # Freeze the debug role's validation contract onto the run and export it
+    # below, so an interactive `coding-done` runs the same gate the automated
+    # run for this role would have (#7059).
+    validation_profile = config.validation_profile_for_run(agent_type)
     run_assets = orchestrator.deps.session_output.start_run(
         worktree,
         session_name,
         issue_number=issue_number,
         agent_label=agent_type,
         backend=config.terminal_adapter or "subprocess",
+        validation_profile=validation_profile,
     )
     completion_path = get_completion_path(agent_type, run_dir=run_assets.run_dir.name)
     orchestrator.deps.session_output.update_manifest(
@@ -550,6 +555,7 @@ async def launch_debug_session(  # noqa: C901 - debug session with validation an
     env_exports += f" {ENV_PREFIX}COMPLETION_PATH='{completion_path}'"
     env_exports += f" {ENV_PREFIX}VALIDATION_OUTPUT_DIR='{run_assets.run_dir}'"
     env_exports += f" {ENV_PREFIX}RUN_DIR='{run_assets.run_dir}'"
+    env_exports += f" {ENV_PREFIX}VALIDATION_PROFILE='{validation_profile}'"
     orch_bin = Path(sys.executable).parent
     env_exports += f' PATH="{orch_bin}:$PATH"'
     command = f"{env_exports} && {base_command}"

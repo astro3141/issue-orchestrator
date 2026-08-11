@@ -289,7 +289,7 @@ class WorktreeContext:
             retention_pinned=False,
             # Freeze the role's validation contract into the run directory at
             # creation, so it survives an orchestrator restart (#7059).
-            validation_profile=config.validation_profiles().name_for_agent(agent_label),
+            validation_profile=config.validation_profile_for_run(agent_label),
         )
 
         return cls(

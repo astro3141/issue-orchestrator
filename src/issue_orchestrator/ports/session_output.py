@@ -34,7 +34,7 @@ if TYPE_CHECKING:
 from ..domain.review_exchange_run import ReviewExchangeRunAssets
 from ..domain.review_exchange_summary import ReviewExchangeSummaryV1
 from ..domain.session_run import SessionRunAssets
-from ..infra.validation_profiles import DEFAULT_VALIDATION_PROFILE
+from ..domain.validation_profile import DEFAULT_VALIDATION_PROFILE
 
 
 @dataclass(frozen=True)
@@ -494,8 +494,16 @@ class SessionOutput(Protocol):
         issue_number: int,
         parent_session_name: str,
         agent_label: str,
+        validation_profile: str,
     ) -> "ReviewExchangeRun":
-        """Allocate a typed run directory for one review exchange."""
+        """Allocate a typed run directory for one review exchange.
+
+        ``validation_profile`` is required, not optional: the in-exchange
+        coder runs this repo's authoritative ``agent_gate``, so a caller that
+        omitted the contract silently produced records stamped ``default``
+        while a differently-launched run of the same role validated
+        correctly (#7059).
+        """
         ...
 
     def store_review_exchange_summary(

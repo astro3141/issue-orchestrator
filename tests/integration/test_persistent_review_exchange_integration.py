@@ -211,6 +211,7 @@ def _run_review_exchange_for_test(
         issue_number=issue_number,
         parent_session_name=session_name,
         agent_label=agent_label,
+        validation_profile="default",
     )
     return cre.run_review_exchange_loop(
         exchange_run=exchange_run,

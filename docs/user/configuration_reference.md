@@ -8,6 +8,25 @@ which surface to use, how to emit JUnit XML, how to capture artifacts, and the
 path rules those globs must obey — see
 [Client Test Integrations](test-integrations.md).
 
+## Fields not in the generated table
+
+The generated reference below lists fixed fields only. Two validation settings
+are user-named maps, so they have no fixed key to generate a row for:
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `validation.profiles.<name>.quick.cmd` / `.timeout_seconds` | string / integer | unset / `300` | Quick gate for the named profile. Same shape and defaults as `validation.quick`. |
+| `validation.profiles.<name>.publish.cmd` / `.timeout_seconds` / `.dirty_check` | string / integer / string | unset / `1800` / `tracked` | Publish gate for the named profile. Same shape and defaults as `validation.publish`. |
+| `agents.<label>.validation_profile` | string (optional) | unset | Binds one agent role to a profile name. Unset means the `default` profile. |
+
+`default` is reserved: it always names the top-level `validation.quick` /
+`validation.publish` pair, so a repository that never mentions profiles is
+unaffected. An `agents.<label>.validation_profile` naming an undefined profile
+fails config validation at startup and reports the offending role.
+
+See [Named validation profiles](../architecture/validation.md#named-validation-profiles) for how a role's
+profile is frozen onto a run and recorded in its validation records.
+
 <!-- BEGIN AUTO-GENERATED CONFIG REFERENCE — regenerate via: pytest tests/unit/test_settings_schema.py::TestDriftDetection::test_config_reference_not_stale -->
 # Settings Reference
 
@@ -55,9 +74,9 @@ _Auto-generated from settings schema._
 
 | Field | Type | Default | Description | Examples | Notes |
 |-------|------|---------|-------------|----------|-------|
-| `validation.quick.cmd` | string (optional) | `None` | Fast command run by coding-done and review exchange loops | `./scripts/validate-fast.sh`, `make test-fast` | Keep this fast enough for agent/reviewer back-and-forth. Put repo-specific policy checks such as banned test skips here. |
+| `validation.quick.cmd` | string (optional) | `None` | Fast command run by coding-done and review exchange loops | `./scripts/validate-fast.sh`, `make test-fast` | Keep this fast enough for agent/reviewer back-and-forth. Put repo-specific policy checks such as banned test skips here. Together with validation.publish this is the profile named 'default'; see 'Named validation profiles' in docs/architecture/validation.md for per-role contracts. |
 | `validation.quick.timeout_seconds` | integer | `300` | Timeout for quick validation | `120`, `300`, `600` | Lower values keep review loops responsive. |
-| `validation.publish.cmd` | string (optional) | `None` | Authoritative command run before push/publish | `./scripts/validate-pr.sh`, `./scripts/validate-pr-suite.sh` | This should match the repo's authoritative local PR/pre-push gate. If make validate-pr wraps the cache-aware verify hook, configure a private non-recursive suite command instead. |
+| `validation.publish.cmd` | string (optional) | `None` | Authoritative command run before push/publish | `./scripts/validate-pr.sh`, `./scripts/validate-pr-suite.sh` | This should match the repo's authoritative local PR/pre-push gate. If make validate-pr wraps the cache-aware verify hook, configure a private non-recursive suite command instead. Together with validation.quick this is the profile named 'default'; see 'Named validation profiles' in docs/architecture/validation.md for per-role contracts. |
 | `validation.publish.timeout_seconds` | integer | `1800` | Timeout for publish validation | `600`, `1800`, `3600` | Allow enough time for the deeper publish gate. |
 | `validation.publish.dirty_check` | string | `tracked` | Dirty-tree policy enforced before push actions | `tracked`, `unstaged`, `all`, `off` | Use tracked for normal agent worktrees. Use off only when another guard owns dirty-tree safety. |
 | `validation.junit_xml_paths` | string | `` | Relative JUnit XML files or globs emitted by validation commands | `test-results.xml`, `build/test-results/test/*.xml` | When set, failed validations render a structured test-results view in the dashboard. Evidence only: reports that do not resolve or cannot be parsed leave the view empty without changing the validation command's own outcome. |

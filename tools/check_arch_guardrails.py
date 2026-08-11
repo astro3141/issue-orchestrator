@@ -233,6 +233,64 @@ def check_attr_call_rules(path: Path, tree: ast.AST, rules: dict) -> list[Violat
     return violations
 
 
+def check_required_call_kwargs(
+    path: Path, tree: ast.AST, rules: dict
+) -> list[Violation]:
+    """Check that named calls always state required keyword arguments.
+
+    Used for owned facts that must be decided at the call site rather than
+    silently defaulted — a launch path that omits the fact produces state
+    which *claims* the default instead of failing.
+    """
+    violations: list[Violation] = []
+    kwarg_rules = rules.get("require_call_kwargs", []) or []
+
+    for rule in kwarg_rules:
+        require_in = rule.get("require_in", []) or []
+        call_names = set(rule.get("call_names", []) or [])
+        required_kwargs = rule.get("required_kwargs", []) or []
+        allow = rule.get("allow", []) or []
+        rule_name = rule.get("name", "require-call-kwarg")
+
+        p = path.as_posix()
+        in_scope = any(p.startswith(prefix.rstrip("/")) for prefix in require_in)
+        is_allowed_file = any(
+            p == allowed or p.startswith(allowed.rstrip("/") + "/") for allowed in allow
+        )
+        if not in_scope or is_allowed_file:
+            continue
+
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            if isinstance(node.func, ast.Attribute):
+                called = node.func.attr
+            elif isinstance(node.func, ast.Name):
+                called = node.func.id
+            else:
+                continue
+            if called not in call_names:
+                continue
+            # ``**kwargs`` forwarding (keyword.arg is None) is a pass-through,
+            # not a call site that decides the value.
+            if any(keyword.arg is None for keyword in node.keywords):
+                continue
+            supplied = {keyword.arg for keyword in node.keywords}
+            missing = [name for name in required_kwargs if name not in supplied]
+            if missing:
+                violations.append(
+                    Violation(
+                        path.as_posix(),
+                        node.lineno,
+                        node.col_offset,
+                        rule_name,
+                        f"{called}(...) missing {', '.join(missing)}=",
+                    )
+                )
+
+    return violations
+
+
 def check_symbol_ref_rules(path: Path, tree: ast.AST, rules: dict) -> list[Violation]:
     """Check symbol reference rules (e.g., no GitHub symbols in core layers)."""
     violations: list[Violation] = []
@@ -1096,6 +1154,7 @@ def check_file(
     # Check layer boundary rules first
     violations.extend(check_layer_boundaries(path, tree, rules))
     violations.extend(check_attr_call_rules(path, tree, rules))
+    violations.extend(check_required_call_kwargs(path, tree, rules))
     violations.extend(check_symbol_ref_rules(path, tree, rules))
     violations.extend(check_review_exchange_typed_flow_rules(path, tree))
     violations.extend(

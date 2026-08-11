@@ -663,3 +663,268 @@ class TestProfileContinuityAcrossRounds:
 
         with pytest.raises(UnknownValidationProfileError, match="retired-profile"):
             _run_gate(controller, worktree, "issue-7", run)
+
+
+# ---------------------------------------------------------------------------
+# 8. CLI seam: the agent-side loader through to the record it stamps
+#
+# The gates below are reached the way an agent reaches them — through
+# ``coding-done`` / ``prepush-check`` — because the loader-to-gate wiring is a
+# distinct seam from the gate itself. Testing only ``AgentGate(profile=...)``
+# leaves the wiring that connects the profile-aware loader to the
+# record-stamping gate uncovered, which is exactly where it broke once.
+# ---------------------------------------------------------------------------
+
+
+def _agent_worktree(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """A worktree whose config the agent-side loaders will find."""
+    worktree = (tmp_path / "worktree").resolve()
+    write_config(worktree, PROFILE_CONFIG)
+    monkeypatch.delenv("ISSUE_ORCHESTRATOR_CONFIG_PATH", raising=False)
+    monkeypatch.delenv("ISSUE_ORCHESTRATOR_CONFIG_NAME", raising=False)
+    monkeypatch.delenv("ISSUE_ORCHESTRATOR_VALIDATION_PROFILE", raising=False)
+    return worktree
+
+
+class TestQuickGateCliSeam:
+    """``coding-done``'s loader and its gate must agree on the contract."""
+
+    def test_loader_selects_the_exported_profiles_command(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from issue_orchestrator.entrypoints.cli_tools.agent_done import (
+            load_validation_cmd,
+        )
+
+        worktree = _agent_worktree(tmp_path, monkeypatch)
+        monkeypatch.setenv("ISSUE_ORCHESTRATOR_VALIDATION_PROFILE", "foundation")
+
+        selection = load_validation_cmd(worktree)
+
+        assert selection.profile == "foundation"
+        assert selection.cmd == "make quick-foundation"
+        assert selection.timeout_seconds == 222
+
+    def test_loader_without_an_exported_profile_selects_the_default(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from issue_orchestrator.entrypoints.cli_tools.agent_done import (
+            load_validation_cmd,
+        )
+
+        worktree = _agent_worktree(tmp_path, monkeypatch)
+
+        selection = load_validation_cmd(worktree)
+
+        assert selection.profile == DEFAULT_VALIDATION_PROFILE
+        assert selection.cmd == "make quick-default"
+
+    def test_run_validation_stamps_the_selected_profile_on_the_record(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The seam that broke: gate built from the selection, not beside it."""
+        from issue_orchestrator.entrypoints.cli_tools import agent_done
+
+        worktree = _agent_worktree(tmp_path, monkeypatch)
+        monkeypatch.setenv("ISSUE_ORCHESTRATOR_VALIDATION_PROFILE", "foundation")
+        runner = RecordingCommandRunner()
+        monkeypatch.setattr(
+            "issue_orchestrator.execution.LocalCommandRunner", lambda: runner
+        )
+        monkeypatch.setattr(
+            "issue_orchestrator.execution.GitWorkingCopy", StubWorkingCopy
+        )
+
+        result = agent_done.run_validation(
+            worktree, session_output_dir=worktree / "out"
+        )
+
+        assert result is not None
+        assert runner.commands == ["make quick-foundation"]
+        assert result.record is not None
+        assert result.record.profile == "foundation"
+
+
+class TestPublishGateCliSeam:
+    """``prepush-check``'s loader and its gate must agree on the contract."""
+
+    def test_loader_selects_the_exported_profiles_publish_contract(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from issue_orchestrator.entrypoints.cli_tools.prepush_check import (
+            load_validation_cmd,
+        )
+
+        worktree = _agent_worktree(tmp_path, monkeypatch)
+        monkeypatch.setenv("ISSUE_ORCHESTRATOR_VALIDATION_PROFILE", "foundation")
+
+        selection = load_validation_cmd(worktree)
+
+        assert selection.profile == "foundation"
+        assert selection.cmd == "make publish-foundation"
+        assert selection.dirty_check == "all"
+
+    def test_validation_gate_stamps_the_selected_profile_on_the_record(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from issue_orchestrator.entrypoints.cli_tools import prepush_check
+
+        worktree = _agent_worktree(tmp_path, monkeypatch)
+        monkeypatch.setenv("ISSUE_ORCHESTRATOR_VALIDATION_PROFILE", "foundation")
+        runner = RecordingCommandRunner()
+        monkeypatch.setattr(prepush_check, "LocalCommandRunner", lambda: runner)
+        monkeypatch.setattr(prepush_check, "GitWorkingCopy", StubWorkingCopy)
+
+        selection = prepush_check.load_validation_cmd(worktree)
+        outcome = prepush_check._run_validation_gate(  # noqa: SLF001
+            worktree, selection, False
+        )
+
+        assert outcome.exit_code == 0
+        assert runner.commands == ["make publish-foundation"]
+        record_path = (
+            worktree / ".issue-orchestrator" / "validation" / "abcdef1234567890.json"
+        )
+        assert json.loads(record_path.read_text())["profile"] == "foundation"
+
+
+# ---------------------------------------------------------------------------
+# 9. One owner for "freeze the role's contract onto a run"
+# ---------------------------------------------------------------------------
+
+
+class TestFrozenProfileOwnership:
+    """Every launch path asks the same owner and gets the same answer."""
+
+    def test_config_freezes_the_bound_profile_for_a_role(
+        self, tmp_path: Path
+    ) -> None:
+        config = Config.load(write_config(tmp_path, PROFILE_CONFIG))
+
+        assert config.validation_profile_for_run("agent:foundation") == "foundation"
+        assert config.validation_profile_for_run("agent:legacy") == (
+            DEFAULT_VALIDATION_PROFILE
+        )
+        assert config.validation_profile_for_run(None) == DEFAULT_VALIDATION_PROFILE
+
+    def test_freezing_a_retired_binding_fails_at_launch(self, tmp_path: Path) -> None:
+        """``name_for_agent`` alone would hand back an unrunnable name."""
+        data = {
+            **PROFILE_CONFIG,
+            "validation": {
+                "quick": {"cmd": "make quick-default"},
+                "publish": {"cmd": "make publish-default"},
+            },
+        }
+        registry = Config.load(
+            write_config(tmp_path, data, name="retired.yaml")
+        ).validation_profiles()
+
+        assert registry.name_for_agent("agent:foundation") == "foundation"
+        with pytest.raises(UnknownValidationProfileError, match="foundation"):
+            registry.freeze_for_run("agent:foundation")
+
+    def test_single_registry_keeps_a_named_profiles_own_name(self) -> None:
+        """A registry built from one profile must still resolve it by name."""
+        from issue_orchestrator.infra.config_models import (
+            PublishValidationConfig,
+            ValidationCommandConfig,
+        )
+        from issue_orchestrator.infra.validation_profiles import ValidationProfile
+
+        profile = ValidationProfile(
+            name="foundation",
+            quick=ValidationCommandConfig(cmd="make quick-foundation"),
+            publish=PublishValidationConfig(cmd="make publish-foundation"),
+        )
+
+        registry = ValidationProfileRegistry.single(profile)
+
+        assert registry.resolve("foundation").quick.cmd == "make quick-foundation"
+
+
+# ---------------------------------------------------------------------------
+# 10. Cross-path parity: every launch path exports the frozen contract
+#
+# The review-exchange coder writes this repo's authoritative ``agent_gate``
+# record. Before #7059's second round it was the one launch path that never
+# received a profile, so the same role validated differently depending on
+# which path started it.
+# ---------------------------------------------------------------------------
+
+
+class TestLaunchPathParity:
+    """A role's contract does not depend on which path launched it."""
+
+    def test_review_exchange_run_freezes_the_coder_roles_profile(
+        self, tmp_path: Path
+    ) -> None:
+        worktree = (tmp_path / "worktree").resolve()
+        worktree.mkdir(parents=True)
+        session_output = FileSystemSessionOutput()
+
+        run = session_output.start_review_exchange_run(
+            worktree,
+            issue_number=7,
+            parent_session_name="issue-7",
+            agent_label="agent:foundation",
+            validation_profile="foundation",
+        )
+
+        assert run.validation_profile == "foundation"
+        manifest = session_output.read_manifest(run.assets.run_dir)
+        assert manifest is not None
+        assert manifest["validation_profile"] == "foundation"
+
+    def test_exchange_role_env_exports_the_runs_frozen_profile(
+        self, tmp_path: Path
+    ) -> None:
+        from issue_orchestrator.domain.runtime_config import RuntimeConfigReference
+        from issue_orchestrator.execution import persistent_session_exchange as pse
+
+        run_dir = tmp_path / ".issue-orchestrator" / "sessions" / "run-1"
+        run_dir.mkdir(parents=True)
+        worktree = tmp_path / "wt"
+        worktree.mkdir()
+        config_path = write_config(tmp_path / "cfgrepo", PROFILE_CONFIG)
+
+        env = pse._build_role_env(  # noqa: SLF001 — testing the env contract
+            role="coder",
+            response_file=run_dir / "coder" / "review-response.json",
+            review_report_file=None,
+            completion_path=run_dir / "coder" / "completion-coder.json",
+            validation_output_dir=run_dir,
+            worktree=worktree,
+            runtime_config=RuntimeConfigReference(
+                config_path=config_path, config_name="default.yaml"
+            ),
+            agent_label="agent:foundation",
+            web_port=None,
+            issue_number=7,
+            session_name="review-exchange-7",
+            validation_profile="foundation",
+        )
+
+        assert env["ISSUE_ORCHESTRATOR_VALIDATION_PROFILE"] == "foundation"
+
+    def test_session_launcher_env_exports_the_same_frozen_profile(
+        self, tmp_path: Path
+    ) -> None:
+        """The launcher path is the comparison the exchange path must match."""
+        config = Config.load(write_config(tmp_path, PROFILE_CONFIG))
+        run_dir = tmp_path / ".issue-orchestrator" / "sessions" / "run-1"
+        run_dir.mkdir(parents=True)
+
+        exports = build_session_env_exports(
+            config=config,
+            completion_path="completion.json",
+            session_id="issue-7",
+            agent_label="agent:foundation",
+            issue_number=7,
+            run_dir=run_dir,
+            worktree_path=tmp_path,
+            callback_endpoint=ready_callback_endpoint(),
+            validation_profile=config.validation_profile_for_run("agent:foundation"),
+        )
+
+        assert "ISSUE_ORCHESTRATOR_VALIDATION_PROFILE='foundation'" in exports

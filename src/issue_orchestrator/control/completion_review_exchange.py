@@ -1079,11 +1079,23 @@ class CompletionReviewExchange:
         parent_session_name: str,
         agent_label: str,
     ) -> ReviewExchangeRun:
+        if self._config is None:
+            # Unreachable via the real flow — exchange-mode selection already
+            # returns None without a config — but the run's validation
+            # contract has no defensible default, so this fails loudly rather
+            # than allocating a run that misreports which gate it ran.
+            raise RuntimeError(
+                "review exchange run requires a config to freeze its "
+                "validation profile"
+            )
         return self._session_output.start_review_exchange_run(
             worktree,
             issue_number=issue_number,
             parent_session_name=parent_session_name,
             agent_label=agent_label,
+            # Same owner call every other launch path uses, so the exchange
+            # coder validates under the contract its role is bound to (#7059).
+            validation_profile=self._config.validation_profile_for_run(agent_label),
         )
 
     @staticmethod

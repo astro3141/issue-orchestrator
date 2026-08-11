@@ -269,7 +269,15 @@ class FileSystemSessionOutput(RunDirectoryArtifacts):
         existing = self.find_run_dir(worktree_path, session_name=session_name)
         if existing:
             return existing
-        run = self.start_run(worktree_path, session_name)
+        run = self.start_run(
+            worktree_path,
+            session_name,
+            # Not a launch path: this backfills a directory for a session
+            # nobody allocated one for, so there is no role binding to freeze.
+            # Stating the default explicitly keeps every start_run call site
+            # honest about the contract it claims (#7059).
+            validation_profile=DEFAULT_VALIDATION_PROFILE,
+        )
         return run.run_dir
 
     def prune_runs(
@@ -664,6 +672,7 @@ Timestamp: {self._now_iso()}
         issue_number: int,
         parent_session_name: str,
         agent_label: str,
+        validation_profile: str,
     ) -> ReviewExchangeRun:
         return _start_review_exchange_run(
             self.start_run,
@@ -671,6 +680,7 @@ Timestamp: {self._now_iso()}
             issue_number=issue_number,
             parent_session_name=parent_session_name,
             agent_label=agent_label,
+            validation_profile=validation_profile,
         )
 
     def store_review_exchange_summary(
