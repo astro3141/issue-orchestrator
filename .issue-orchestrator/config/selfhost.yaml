@@ -68,7 +68,15 @@ execution:
 review:
   enabled: true
   default: agent:reviewer
-  max_rework_cycles: 1
+  # Raised from 1 for issue #6. The first rework round was spent on a review
+  # that had not yet stated the requirement properly: it asked for the hidden
+  # work to be preserved but not for the check to precede the destructive step,
+  # nor for the regression test to drive the production create_worktree/reuse
+  # path instead of the internal helper. The agent addressed what was asked.
+  # This is a changed requirement, not the same defect twice, so one more
+  # automatic round is warranted. Repeated failure against the *same* stated
+  # requirement still escalates.
+  max_rework_cycles: 2
 
 validation:
   # No locale workaround lives here. One upstream test asserts on English git

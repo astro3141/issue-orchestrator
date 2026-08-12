@@ -37,6 +37,12 @@ fails, usually in a way that does not name the real cause.
 | Playwright Chromium **at `~/.cache/ms-playwright`** | `Makefile:77` pins `PLAYWRIGHT_BROWSERS_PATH ?= $(HOME)/.cache/ms-playwright`. Installing to the default macOS cache leaves the gate looking somewhere else. | `PLAYWRIGHT_BROWSERS_PATH="$HOME/.cache/ms-playwright" .venv/bin/playwright install chromium` |
 | `packages/vscode/node_modules` | `test-vscode` self-skips only when `GITHUB_ACTIONS` is set. Locally it runs and fails closed without deps. | `make install-vscode-extensions` |
 | `LC_MESSAGES=C` on the runtime | One test asserts on English git stderr. Under a non-English locale it fails on an unmodified checkout. | Export when starting the orchestrator |
+| `NO_COLOR=1` **and** `TERM=dumb` | `test_ai_gate_cli.py` matches plain substrings against Rich-formatted output. `NO_COLOR` alone is not enough: it drops colour but leaves bold/dim sequences mid-string and the assertions still fail. | Export both when starting the orchestrator, and when pushing |
+
+These last two share one root: tests assert on substrings of human-facing
+output, and that output changes with the environment. Neither names its own
+cause — both surface as an assertion diff that looks unrelated to the change
+under test, on an unmodified checkout.
 
 `LC_MESSAGES=C` is sufficient — `LC_ALL` is not needed. Verified: the test fails
 with the variable unset and passes with it, and git switches to English.
@@ -68,7 +74,7 @@ debugging a "config not found":
 
 ```sh
 cd ~/io-fork/issue-orchestrator
-LC_MESSAGES=C ISSUE_ORCHESTRATOR_CONFIG_NAME=selfhost.yaml \
+LC_MESSAGES=C NO_COLOR=1 TERM=dumb ISSUE_ORCHESTRATOR_CONFIG_NAME=selfhost.yaml \
   ~/io-tools/issue-orchestrator/.venv/bin/issue-orchestrator \
   --config .issue-orchestrator/config/selfhost.yaml \
   start --issue N --ui-mode web --port 8080 --debug
