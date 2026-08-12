@@ -1,8 +1,9 @@
 # Self-hosting runbook — astro3141/issue-orchestrator fork
 
 Operating notes for running Issue-Orchestrator against this fork. Everything
-here was measured on 2026-08-11, not assumed. Where a number appears, it came
-from an actual run on this machine.
+here was measured on 2026-08-11, not assumed, and re-checked against the code
+on 2026-08-12 after the fork's issue #6 landed and the runtime was promoted.
+Where a number appears, it came from an actual run on this machine.
 
 ## Where these files live, and why not under `.issue-orchestrator/`
 
@@ -18,17 +19,36 @@ self-hosting documentation and tooling under `docs/selfhosting/`.
 
 ## The boundary
 
-The **trusted pinned runtime** at `~/io-tools/issue-orchestrator` orchestrates
-this repository as a **candidate**. The candidate's own IO source — modified or
-not — never runs itself.
+A **trusted pinned runtime** — a separate checkout, held at a fixed commit —
+orchestrates this repository as a **candidate**. The candidate's own IO source
+— modified or not — never runs itself.
 
-Promoting this fork to runtime is a separate decision, taken only after a PR
-passes independent review and the publish gate, and followed by its own
-smoke/self-host test. Until then `~/io-tools` is not touched.
+| | Runtime | Commit |
+|---|---|---|
+| **R1**, current | `~/io-runtime-r1/issue-orchestrator` | `81c11ae1` |
+| R0, predecessor | `~/io-tools/issue-orchestrator` | `74575869` |
+
+R1 was promoted on 2026-08-12, after #6's PR passed independent review and the
+publish gate and the canary of fork issue #8 exercised it end to end.
+`~/io-runtime-r1/TRUSTED_RUNTIME.md` — outside the repository, next to the
+runtime it describes — records what that canary established; it is not
+restated here.
+
+**The pin is `81c11ae1`, not current `main`, deliberately.** What makes a
+runtime trusted is the evidence attached to a specific artifact, and R1 is the
+build that actually ran the canary. Rebuilding from current `main` would
+promote a commit no canary exercised, on the strength of a run some other
+artifact performed, which breaks the bootstrap chain that the pin exists to
+keep. So product `main` running ahead of the runtime (it is already at
+`6d478b23`) is expected and is not drift. Moving the pin is its own decision,
+taken the same way: review, publish gate, canary, then promote.
+
+R0 stays on disk untouched, so the chain remains auditable and a rollback needs
+no rebuild.
 
 ## Environment requirements
 
-Four things live outside the repository. Miss any one and startup or the gate
+Five things live outside the repository. Miss any one and startup or the gate
 fails, usually in a way that does not name the real cause.
 
 | Requirement | Why | Install |
@@ -75,7 +95,7 @@ debugging a "config not found":
 ```sh
 cd ~/io-fork/issue-orchestrator
 LC_MESSAGES=C NO_COLOR=1 TERM=dumb ISSUE_ORCHESTRATOR_CONFIG_NAME=selfhost.yaml \
-  ~/io-tools/issue-orchestrator/.venv/bin/issue-orchestrator \
+  ~/io-runtime-r1/issue-orchestrator/.venv/bin/issue-orchestrator \
   --config .issue-orchestrator/config/selfhost.yaml \
   start --issue N --ui-mode web --port 8080 --debug
 ```
@@ -249,8 +269,26 @@ clean while pytest and static analysis read files the branch did not contain
 (fork issue #6; hit on #3 and #5).
 
 Setup now refuses to plant over a path the target repository tracks, and undoes
-any overlay an older run left behind. Confirm a managed worktree before
-trusting its gate:
+any overlay an older run left behind. The same change corrected the other
+direction: an *untracked* file under that directory is no longer assumed to be
+a planting, because here it is a CLI tool the candidate is adding, and hiding
+it let a branch be pushed without source the validated tree contained.
+
+Both directions ask one question of the index — does the target repository
+track `src/issue_orchestrator/entrypoints/cli_tools/`? — and every surface
+takes the answer from the same seam (`execution/git_planted_paths.py`, or the
+worktree adapter's `repo_owns_cli_tools` for the planting step itself). The
+practical consequence for reading a managed worktree of *this* repository:
+
+- **`git status` is trustworthy for those paths.** Nothing is planted there,
+  no `--skip-worktree` bit is applied there, and no dirty guard filters what
+  git reports there. What it shows is the candidate's, and what it does not
+  show is not there.
+- `coding-done`, `prepush-check` and the orchestrator's publish gate read that
+  same status, so a clean tree at completion means the branch carries every
+  CLI tool the gate graded.
+
+Confirm a managed worktree before trusting its gate:
 
 ```sh
 git -C <managed-worktree> ls-files -v -- src/issue_orchestrator/entrypoints/cli_tools
@@ -258,9 +296,31 @@ git -C <managed-worktree> ls-files -v -- src/issue_orchestrator/entrypoints/cli_
 ```
 
 `.claude/settings.json` is still `--skip-worktree` by design — the Stop hook is
-runtime configuration, and nothing in the gate reads it as source.
+runtime configuration, and nothing in the gate reads it as source. It and
+`.issue-orchestrator/session-latest.json` are the whole of
+`WORKTREE_TRACKED_RUNTIME_PATHS`, and the second is untracked in this
+repository, so `.claude/settings.json` is the only `S` a managed worktree here
+should show:
+
+```sh
+git -C <managed-worktree> ls-files -v | grep '^S'
+```
+
+A cheaper check is available on every run, and it costs nothing to read:
+`coding-done` logs `CODING_DONE_SOURCE_ID` on the startup diagnostic of each
+invocation, so the log says which copy of that module executed. Its unit tests
+carry `planted` in their names because the quick profile selects that keyword —
+a canary the gate deselects proves nothing — and they fail on a copy whose id
+is absent, stale or different. Fork issue #8 armed and ran this against a
+candidate that deliberately modified `cli_tools/coding_done.py`; the result is
+in `~/io-runtime-r1/TRUSTED_RUNTIME.md`.
 
 #### When setup refuses a worktree over a hidden CLI tool
+
+Only a worktree an older run set up can reach this. Nothing applies
+`--skip-worktree` to those paths any more, so the hidden state this repairs is
+always a leftover, never something the current runtime created — and once
+repaired it does not come back.
 
 Undoing the overlay only reverts files the orchestrator can prove it planted
 (byte-identical to the copy in its own package). `--skip-worktree` never made
@@ -302,7 +362,14 @@ in both directions — but it is a deadline, not a reprieve.
 Same rule, one level up. `validation.quick` in
 `.issue-orchestrator/config/selfhost.yaml` is a `-k` filter, so a `passed=true`
 recorded by a run that deselected every test the branch added is evidence about
-somebody else's code. `-k` matches module names, so widening it is cheap:
+somebody else's code.
+
+`-k` matches the names in a test's node id — file name, class, function — and
+**not** the directory segments above it. The profile's `cli_tools` keyword
+selects `test_worktree_cli_tools_ownership.py` because the string is in that
+file's name; it selects nothing in `tests/unit/test_agent_done.py`, and that is
+how issue #8's first canary was recorded green without ever running. Check what
+a profile actually executed before believing it:
 
 ```sh
 # what the recorded gate actually executed
@@ -311,7 +378,9 @@ grep -c 'PASSED\|passed' <session>/validation/validation-stdout.log
   --collect-only -k '<the profile expression>' | grep <your test module>
 ```
 
-When an issue's change area falls outside the current keywords, add them to the
+When an issue's change area falls outside the current keywords, the cheaper
+move is often to name the new tests for a keyword the profile already selects
+— that arms them with no config churn at all. Otherwise add the keywords to the
 tracked config in the same commit — but **that edit does not take effect for the
 branch that makes it.** `load_runtime_validation_config` gives
 `ISSUE_ORCHESTRATOR_CONFIG_PATH` precedence over any repo-local search, and the
