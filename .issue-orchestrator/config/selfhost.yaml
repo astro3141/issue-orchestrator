@@ -99,7 +99,14 @@ validation:
     # binding's own suites, `review_artifacts` reaches the decision-approval
     # tests, and `Verdict` reaches `TestExactShaVerdictBinding`, whose module
     # name carries none of the others.
-    cmd: ".venv/bin/python -m pytest tests/unit tests/integration -q --tb=short -p no:cacheprovider -k 'validation or profile or config or prepush or planted or cli_tools or dirty or worktree or review_verdict or review_exchange_records or review_artifacts or Verdict' && make typecheck"
+    #
+    # #22 (Codex home isolation) added `codex_home`. Without it exactly one of
+    # the change's ~30 tests was selected — `profile` happened to match a single
+    # provisioning case — and the integration proof that the guard actually
+    # fails a leaking test was deselected entirely. `codex_home` reaches both
+    # `tests/unit/test_codex_home_isolation.py` and
+    # `tests/integration/test_codex_home_isolation.py`.
+    cmd: ".venv/bin/python -m pytest tests/unit tests/integration -q --tb=short -p no:cacheprovider -k 'validation or profile or config or prepush or planted or cli_tools or dirty or worktree or review_verdict or review_exchange_records or review_artifacts or Verdict or codex_home' && make typecheck"
     timeout_seconds: 1800
   publish:
     # The upstream project's own gate, reproduced rather than invented:

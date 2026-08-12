@@ -14,12 +14,28 @@ Two mechanisms live here, and they are deliberately different in kind:
     applied to two of the six files that reach for the codex binary.
 
 ``codex_home_guard``
-    Function-scoped, autouse.  Wraps the two primitives that can actually
-    start a process - ``subprocess.Popen`` and ``pexpect.spawn`` - and, when
-    the command being started is the codex binary, asserts on the environment
-    that spawn would hand to it.  It checks the effective env, not whether a
-    fixture was listed, so a newly added live test cannot leak by omission
-    even if the session default is later broken.
+    Function-scoped, autouse.  Wraps ``subprocess.Popen`` and
+    ``pexpect.spawn`` - the only two spawn primitives this repository uses -
+    and, when the command being started is the codex binary, asserts on the
+    environment that spawn would hand to it.  It checks the effective env, not
+    whether a fixture was listed, so a newly added live test cannot leak by
+    omission even if the session default is later broken.
+
+Two boundaries are worth knowing before trusting the guard:
+
+*It wraps module attributes, not the OS.*  ``subprocess.run`` and asyncio's
+subprocess transports go through ``subprocess.Popen`` as a module global, and
+``pexpect.run`` through ``pexpect.spawn``, so those are covered.  A direct
+``os.posix_spawn``/``pty.fork``/``ptyprocess`` call, or a
+``from subprocess import Popen`` binding taken before the patch, would not be.
+None exist in this repository today; adding one means extending this module.
+
+*It is single-level.*  The guard sees the process pytest starts, not that
+process's children.  A spawn whose own command carries no ``codex`` word and
+which passes an explicit ``env=`` is not inspected, so a codex run launched
+through an intermediary that owns its own environment - a tmux server is the
+concrete shape - is out of reach.  Nothing on the canonical gate's path spawns
+codex that way.
 """
 
 from __future__ import annotations
@@ -53,14 +69,42 @@ CODEX_HOME_ENV: Final[str] = "CODEX_HOME"
 
 @dataclass(frozen=True, slots=True)
 class CodexHomePolicy:
-    """Owns the single rule: no spawned Codex may write into *operator_home*.
+    """Owns the single rule: no spawned Codex may write into a protected home.
 
     ``operator_home`` is the Codex home the *operator* owns - resolved once,
     from the environment as it was before any fixture touched it, so the rule
-    keeps its meaning after the session default has been installed.
+    keeps its meaning after the session default has been installed.  It is also
+    what an isolated home is seeded from.
+
+    ``extra_protected_homes`` carries the homes that are off limits without
+    being the seed source.  The account default ``~/.codex`` goes here when
+    ``CODEX_HOME`` points somewhere else: exporting ``CODEX_HOME=~/.codex/ci``
+    must not stop ``~/.codex`` itself from being protected.
     """
 
     operator_home: Path
+    extra_protected_homes: tuple[Path, ...] = ()
+
+    @classmethod
+    def for_environment(cls, env: Mapping[str, str]) -> CodexHomePolicy:
+        """Build the policy *env* implies, mirroring Codex's own resolution.
+
+        ``$CODEX_HOME`` wins when set, exactly as ``resolve_codex_home`` does,
+        and the account default is protected either way.
+        """
+        account_home = (Path.home() / ".codex").resolve()
+        configured = env.get(CODEX_HOME_ENV)
+        if not configured:
+            return cls(account_home)
+        operator_home = Path(configured).expanduser().resolve()
+        if operator_home == account_home:
+            return cls(operator_home)
+        return cls(operator_home, (account_home,))
+
+    @property
+    def protected_homes(self) -> tuple[Path, ...]:
+        """Every Codex home a spawned CLI must stay out of."""
+        return (self.operator_home, *self.extra_protected_homes)
 
     def selected_home(self, env: Mapping[str, str]) -> Path | None:
         """Return the Codex home *env* selects, or ``None`` if it selects none.
@@ -77,15 +121,17 @@ class CodexHomePolicy:
         """Describe how *env* would leak Codex state, or ``None`` when safe."""
         home = self.selected_home(env)
         if home is None:
+            homes = ", ".join(str(path) for path in self.protected_homes)
             return (
                 f"{CODEX_HOME_ENV} is unset, so Codex would write its sessions "
-                f"to the operator's home {self.operator_home}"
+                f"to the operator's home ({homes})"
             )
-        if home == self.operator_home or self.operator_home in home.parents:
-            return (
-                f"{CODEX_HOME_ENV}={home} resolves inside the operator's Codex "
-                f"home {self.operator_home}"
-            )
+        for protected in self.protected_homes:
+            if home == protected or protected in home.parents:
+                return (
+                    f"{CODEX_HOME_ENV}={home} resolves inside the operator's "
+                    f"Codex home {protected}"
+                )
         return None
 
     def enforce(self, env: Mapping[str, str], *, spawning: str) -> None:
@@ -93,6 +139,7 @@ class CodexHomePolicy:
         leak = self.describe_leak(env)
         if leak is None:
             return
+        protected = ", ".join(str(path) for path in self.protected_homes)
         raise AssertionError(
             f"Codex home leak: {spawning} would run with a leaking environment "
             f"({leak}).\n"
@@ -100,24 +147,14 @@ class CodexHomePolicy:
             f"isolated {CODEX_HOME_ENV}. The whole tests/ tree gets one by "
             f"default from the autouse 'codex_home_session' fixture; a test "
             f"that needs its own pristine home requests 'isolated_codex_home'. "
-            f"Do not point {CODEX_HOME_ENV} back at {self.operator_home}."
+            f"Do not point {CODEX_HOME_ENV} back at {protected}."
         )
 
 
-def _operator_codex_home() -> Path:
-    """Resolve the operator's Codex home before any fixture redirects it.
-
-    Evaluated at import time - that is, while ``CODEX_HOME`` still holds
-    whatever the operator (or CI) exported - so the guard keeps comparing
-    against the real home rather than the session's throwaway one.
-    """
-    configured = os.environ.get(CODEX_HOME_ENV)
-    if configured:
-        return Path(configured).expanduser().resolve()
-    return (Path.home() / ".codex").resolve()
-
-
-CODEX_HOME_POLICY: Final[CodexHomePolicy] = CodexHomePolicy(_operator_codex_home())
+# Resolved at import time - that is, while ``CODEX_HOME`` still holds whatever
+# the operator (or CI) exported - so the guard keeps comparing against the real
+# home rather than the session's throwaway one.
+CODEX_HOME_POLICY: Final[CodexHomePolicy] = CodexHomePolicy.for_environment(os.environ)
 
 
 def provision_codex_home(destination: Path, *, source: Path) -> Path:

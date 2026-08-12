@@ -211,6 +211,7 @@ Rules:
 - Do **not** re-point `CODEX_HOME` at `~/.codex`; the guard fails the test at spawn time, naming the command and the leak.
 - Live Codex tests stay live. Isolation is not a reason to mock, skip, or reclassify them.
 - The guard asserts on the *effective environment of the spawn*, not on whether a fixture was listed, so a newly added live test cannot leak by omission.
+- The guard is **single-level** and wraps the two spawn primitives this repo uses. A codex run started by an intermediary that owns its own environment (a tmux server), or through a primitive nothing here uses today (`os.posix_spawn`, `pty.fork`, `from subprocess import Popen`), is outside its reach — if you add one, extend `tests/codex_home.py` rather than assuming coverage.
 
 ---
 

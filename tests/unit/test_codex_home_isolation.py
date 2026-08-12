@@ -85,6 +85,54 @@ class TestCodexHomePolicy:
         policy.enforce({CODEX_HOME_ENV: str(tmp_path)}, spawning="codex")
 
 
+class TestProtectedHomeResolution:
+    """Which homes the policy protects, given the environment it starts from."""
+
+    @pytest.fixture
+    def account_home(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+        """Stand in for the operator's account, so ``~`` is a temp directory."""
+        home = tmp_path / "operator"
+        (home / ".codex").mkdir(parents=True)
+        monkeypatch.setenv("HOME", str(home))
+        return (home / ".codex").resolve()
+
+    def test_unset_codex_home_protects_the_account_default(
+        self, account_home: Path
+    ) -> None:
+        policy = CodexHomePolicy.for_environment({})
+        assert policy.protected_homes == (account_home,)
+
+    def test_codex_home_below_the_account_default_protects_both(
+        self, account_home: Path
+    ) -> None:
+        """A subdirectory config must not demote ``~/.codex`` to a bystander."""
+        policy = CodexHomePolicy.for_environment(
+            {CODEX_HOME_ENV: str(account_home / "ci")}
+        )
+
+        assert policy.operator_home == account_home / "ci"
+        assert policy.describe_leak({CODEX_HOME_ENV: str(account_home)}) is not None
+        leak = policy.describe_leak({CODEX_HOME_ENV: str(account_home / "sibling")})
+        assert leak is not None
+
+    def test_codex_home_elsewhere_still_protects_the_account_default(
+        self, account_home: Path, tmp_path: Path
+    ) -> None:
+        elsewhere = (tmp_path / "shared-codex").resolve()
+        policy = CodexHomePolicy.for_environment({CODEX_HOME_ENV: str(elsewhere)})
+
+        assert policy.protected_homes == (elsewhere, account_home)
+        assert policy.describe_leak({CODEX_HOME_ENV: str(account_home)}) is not None
+
+    def test_account_default_is_not_listed_twice(self, account_home: Path) -> None:
+        policy = CodexHomePolicy.for_environment({CODEX_HOME_ENV: str(account_home)})
+        assert policy.protected_homes == (account_home,)
+
+    def test_this_session_protects_the_real_account_default(self) -> None:
+        """The policy the whole suite runs under, not a constructed one."""
+        assert (Path.home() / ".codex").resolve() in CODEX_HOME_POLICY.protected_homes
+
+
 class TestCodexSpawnDetection:
     """Which commands the guard treats as starting the real Codex CLI."""
 
@@ -147,6 +195,22 @@ class TestEffectiveSpawnEnvironment:
         env = build_filtered_env()
         assert env[CODEX_HOME_ENV] == os.environ[CODEX_HOME_ENV]
         assert CODEX_HOME_POLICY.describe_leak(env) is None
+
+    def test_allowlist_filtered_environment_fails_closed_rather_than_leaking(
+        self,
+    ) -> None:
+        """Allowlist mode drops ``CODEX_HOME``; the guard must then refuse.
+
+        ``CODEX_HOME`` is not in ``ALWAYS_PASSTHROUGH_ENV_VARS``, so an agent
+        spec that opts into ``passthrough_vars`` hands Codex an environment
+        with no home at all - which resolves to the operator's. That must be a
+        loud spawn-time failure, not a silent leak.
+        """
+        env = build_filtered_env(passthrough_vars=["PATH"])
+
+        assert CODEX_HOME_ENV not in env
+        with pytest.raises(AssertionError, match="Codex home leak"):
+            CODEX_HOME_POLICY.enforce(env, spawning="subprocess.Popen(['codex'])")
 
     def test_shell_isolation_prefix_does_not_strip_the_isolated_home(
         self, tmp_path: Path
