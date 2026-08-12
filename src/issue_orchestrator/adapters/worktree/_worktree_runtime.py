@@ -15,7 +15,12 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from ...infra.runtime_artifacts import RUNTIME_IGNORE_FILE, load_runtime_ignore_patterns
+from ...infra.runtime_artifacts import (
+    ORCHESTRATOR_CLI_TOOLS_DIR,
+    RUNTIME_IGNORE_FILE,
+    load_runtime_ignore_patterns,
+)
+from ...ports.git import GitError
 from ._worktree_errors import WorktreeError
 from ._worktree_git import _git_run
 
@@ -68,9 +73,13 @@ WORKTREE_TRACKED_RUNTIME_PATHS: tuple[Path, ...] = (
     Path(".issue-orchestrator/session-latest.json"),
 )
 
+# Worktree-relative destination for the orchestrator's runtime CLI helpers.
+CLI_TOOLS_WORKTREE_DIR = ORCHESTRATOR_CLI_TOOLS_DIR.as_posix()
+
 __all__ = [
     "ALLOW_NO_VERIFY_DRY_RUN_PATH",
     "CLAUDE_SETTINGS_FOR_AGENTS",
+    "CLI_TOOLS_WORKTREE_DIR",
     "WORKTREE_ID_MARKER",
     "WORKTREE_LOCAL_EXCLUDE_PATHS",
     "WORKTREE_TRACKED_RUNTIME_PATHS",
@@ -132,25 +141,102 @@ def _link_repo_venv_into_worktree(repo_root: Path, worktree_path: Path) -> None:
     )
 
 
-def sync_cli_tools(worktree_path: Path) -> list[Path]:
+def _git_or_fail(worktree_path: Path, argv: list[str], *, what: str) -> str:
+    """Run a git command whose failure must not be papered over.
+
+    Every caller below is either deciding whether the worktree's filesystem is
+    allowed to differ from its commit, or repairing a case where it already
+    does. A swallowed failure there produces exactly the silent divergence this
+    step exists to prevent, so the result is checked and translated into this
+    module's own failure vocabulary.
+
+    Raises:
+        WorktreeError: If the git command fails.
     """
-    Sync CLI tools from the orchestrator package to worktree.
+    try:
+        return _git_run(worktree_path, argv, check=True).stdout
+    except GitError as exc:
+        raise WorktreeError(f"Failed to {what} in {worktree_path}: {exc}") from exc
 
-    This ensures the worktree has the latest orchestrator tools (especially
-    coding-done/reviewer-done) regardless of when the worktree was created or what branch
-    it's on.
 
-    Uses package-relative paths so this works even when the target repo is
-    a foreign (non-orchestrator) repository.
+def _repo_owns_cli_tools(worktree_path: Path) -> bool:
+    """Return True when the target repository tracks the CLI-tools path itself.
 
-    Args:
-        worktree_path: Path to the worktree
+    This is the whole self-hosting discriminator, and it is a property of the
+    repository rather than of any individual file. In a foreign repository
+    ``src/issue_orchestrator/entrypoints/cli_tools/`` is orchestrator runtime
+    and nothing else, so planting there invents files the repository has no
+    opinion about. In Issue-Orchestrator's own repository the same path is
+    product source the candidate branch may be changing, and a planted copy
+    shadows the very commit validation and review are supposed to be reading.
+
+    Asked once for the whole directory rather than per file on purpose: a
+    half-planted directory would be a third answer to "which copy is
+    authoritative", which is the defect, not a smaller version of the fix.
+    """
+    listed = _git_or_fail(
+        worktree_path,
+        ["ls-files", "--", CLI_TOOLS_WORKTREE_DIR],
+        what="list tracked CLI tool paths",
+    )
+    return bool(listed.strip())
+
+
+def _hidden_cli_tool_paths(worktree_path: Path) -> list[str]:
+    """Return repo-owned CLI tool paths an earlier run marked ``--skip-worktree``."""
+    listed = _git_or_fail(
+        worktree_path,
+        ["ls-files", "-v", "--", CLI_TOOLS_WORKTREE_DIR],
+        what="read CLI tool index flags",
+    )
+    return [line[2:] for line in listed.splitlines() if line.startswith("S ")]
+
+
+def _restore_repo_owned_cli_tools(worktree_path: Path) -> None:
+    """Undo an overlay an earlier run planted over repo-owned CLI tools.
+
+    Worktrees are long-lived and reused, so declining to plant is not enough on
+    its own: a worktree set up before this rule existed still carries the
+    planted copies, the ``--skip-worktree`` bits that stop git reporting them,
+    and exclude entries that would hide a CLI tool the candidate *adds*. All
+    three are cleared here, in the same step that decides not to plant, so
+    there is one place that answers "what is in this directory".
+
+    Restoring from the index cannot discard agent work. ``--skip-worktree``
+    makes git refuse to stage those paths at all, so nothing written under them
+    was ever committable; paths git is tracking normally are left untouched.
+    """
+    hidden = _hidden_cli_tool_paths(worktree_path)
+    if hidden:
+        _git_or_fail(
+            worktree_path,
+            ["update-index", "--no-skip-worktree", "--", *hidden],
+            what="clear --skip-worktree on repo-owned CLI tools",
+        )
+        # Clearing the bit does not restore content git was told to ignore.
+        _git_or_fail(
+            worktree_path,
+            ["checkout", "--", *hidden],
+            what="restore repo-owned CLI tools from the index",
+        )
+        logger.warning(
+            "Restored %d repo-owned CLI tool file(s) shadowed by an earlier "
+            "orchestrator overlay in %s",
+            len(hidden),
+            worktree_path,
+        )
+    _drop_worktree_exclude_entries(worktree_path, f"{CLI_TOOLS_WORKTREE_DIR}/")
+
+
+def _plant_cli_tools(worktree_path: Path) -> list[Path]:
+    """Copy the orchestrator's CLI tools into a worktree that does not own them.
+
+    Uses package-relative paths so this works when the target repo is a foreign
+    (non-orchestrator) repository with no such directory of its own.
     """
     package_root = Path(__file__).resolve().parents[2]
     src_cli_tools = package_root / "entrypoints" / "cli_tools"
-    dst_cli_tools = (
-        worktree_path / "src" / "issue_orchestrator" / "entrypoints" / "cli_tools"
-    )
+    dst_cli_tools = worktree_path / ORCHESTRATOR_CLI_TOOLS_DIR
 
     if not src_cli_tools.exists():
         logger.debug(
@@ -172,6 +258,53 @@ def sync_cli_tools(worktree_path: Path) -> list[Path]:
 
     logger.info("Synced cli_tools from orchestrator package to worktree")
     return synced_paths
+
+
+def sync_cli_tools(worktree_path: Path) -> list[Path]:
+    """Make a worktree's CLI-tools directory correct for its target repository.
+
+    Two repositories, one path, and only one of them may own it:
+
+    * A foreign target repository does not track
+      ``src/issue_orchestrator/entrypoints/cli_tools/``. The orchestrator owns
+      it there, so its copies are planted and their worktree-relative paths
+      returned for the caller to hide from plain ``git status``.
+    * Issue-Orchestrator's own repository tracks that path as product source,
+      so the *candidate commit* owns it. Nothing is planted, any overlay a
+      previous run left behind is undone, and an empty list is returned — the
+      worktree's CLI tools are already the ones the branch is proposing.
+
+    Planting over the second case is what breaks ``validated candidate
+    filesystem == candidate Git HEAD``: static analysis and pytest read the
+    worktree, so an overlay makes the gate report on source the candidate
+    branch does not contain.
+
+    An agent keeps its tools either way. ``coding-done`` and friends run from
+    the orchestrator's venv on ``PATH`` with the orchestrator's ``src`` on
+    ``PYTHONPATH`` (see ``control.session_env.build_session_env_exports``), so
+    the planted copies are never the code that executes.
+
+    Args:
+        worktree_path: Path to the worktree.
+
+    Returns:
+        Worktree-relative paths of the files planted; empty when the target
+        repository owns the destination.
+
+    Raises:
+        WorktreeError: If git cannot say whether the repository owns the
+            destination, or an existing overlay cannot be undone. Guessing
+            either way reintroduces the divergence this function prevents.
+    """
+    if _repo_owns_cli_tools(worktree_path):
+        logger.info(
+            "Target repository tracks %s; leaving the candidate's own CLI "
+            "tools in place so the worktree matches its commit",
+            CLI_TOOLS_WORKTREE_DIR,
+        )
+        _restore_repo_owned_cli_tools(worktree_path)
+        return []
+    return _plant_cli_tools(worktree_path)
 
 
 def _read_worktree_identity(marker_path: Path) -> str | None:
@@ -301,16 +434,62 @@ def _append_exclude_entries(exclude_path: Path, paths: list[Path]) -> None:
             handle.write(f"{entry}\n")
 
 
-def _write_worktree_exclude_entries(worktree_path: Path, paths: list[Path]) -> None:
+def _remove_exclude_entries(exclude_path: Path, prefix: str) -> int:
+    """Drop exclude entries under ``prefix``; return how many were removed.
+
+    The inverse of ``_append_exclude_entries``, and needed for the same reason
+    the skip-worktree bits are cleared: an exclude entry written when the
+    orchestrator owned a path keeps hiding that path from ``git status`` after
+    the repository turns out to own it, including a file the candidate adds.
+    """
+    if not exclude_path.exists():
+        return 0
+    lines = exclude_path.read_text(encoding="utf-8").splitlines()
+    kept = [line for line in lines if not line.strip().startswith(prefix)]
+    removed = len(lines) - len(kept)
+    if removed:
+        exclude_path.write_text(
+            "".join(f"{line}\n" for line in kept), encoding="utf-8"
+        )
+    return removed
+
+
+def _worktree_exclude_files(worktree_path: Path) -> list[Path]:
+    """Return every exclude file git reads for this worktree.
+
+    A linked worktree has its own ``info/exclude`` *and* reads the common git
+    dir's. Both are returned so an entry is written — and removed — everywhere
+    git would honour it; a stale entry left in the common dir would leak across
+    every other worktree of the same repository.
+    """
     git_dir = _worktree_git_dir(worktree_path)
     if git_dir is None:
-        return
+        return []
     common_dir = _worktree_git_common_dir(worktree_path)
     exclude_paths = [git_dir / "info" / "exclude"]
     if common_dir is not None and common_dir != git_dir:
         exclude_paths.append(common_dir / "info" / "exclude")
-    for exclude_path in exclude_paths:
+    return exclude_paths
+
+
+def _write_worktree_exclude_entries(worktree_path: Path, paths: list[Path]) -> None:
+    for exclude_path in _worktree_exclude_files(worktree_path):
         _append_exclude_entries(exclude_path, paths)
+
+
+def _drop_worktree_exclude_entries(worktree_path: Path, prefix: str) -> None:
+    removed = sum(
+        _remove_exclude_entries(exclude_path, prefix)
+        for exclude_path in _worktree_exclude_files(worktree_path)
+    )
+    if removed:
+        logger.warning(
+            "Removed %d stale git exclude entr(ies) under %s in %s; the "
+            "repository owns that path",
+            removed,
+            prefix,
+            worktree_path,
+        )
 
 
 def _worktree_git_exclude_paths(
@@ -340,8 +519,18 @@ def _hide_runtime_artifacts_from_git_status(
     worktree_path: Path,
     synced_cli_tool_paths: list[Path],
 ) -> None:
-    tracked_paths = [*WORKTREE_TRACKED_RUNTIME_PATHS, *synced_cli_tool_paths]
-    for path in tracked_paths:
+    """Keep runtime artifacts out of plain ``git status`` for this worktree.
+
+    ``--skip-worktree`` is applied only to ``WORKTREE_TRACKED_RUNTIME_PATHS``:
+    paths the orchestrator rewrites in place and whose content is runtime
+    configuration in every repository. It is deliberately *not* applied to
+    planted CLI tools. The bit tells git to stop reporting a path as modified,
+    so on a path the target repository tracks it would hide a divergence
+    between the worktree and candidate HEAD — and ``sync_cli_tools`` only ever
+    returns paths in a repository that does not track them, where an exclude
+    entry is both sufficient and honest.
+    """
+    for path in WORKTREE_TRACKED_RUNTIME_PATHS:
         normalized = str(path).replace("\\", "/")
         tracked = _git_run(
             worktree_path,

@@ -9,11 +9,12 @@ Two categories of paths that dirty-tree guardrails must ignore:
    dirty-tree surface regardless of tracked/untracked status.
 
 2. **Orchestrator-planted source** — files the orchestrator copies into
-   every worktree at creation time (see
+   a *foreign* worktree at creation time (see
    ``adapters/worktree/_worktree_runtime.sync_cli_tools``). In the
-   orchestrator's own repo these files are tracked source (legitimate
-   dev edits *must* count as dirty). In a *foreign* target repo the
-   same files are untracked plantings that should never register as
+   orchestrator's own repo these files are tracked product source, so
+   nothing is planted there at all and legitimate dev edits *must*
+   count as dirty. In a foreign target repo the same paths are
+   untracked plantings that should never register as
    dirty — otherwise every ``coding-done`` call in a foreign worktree
    fails the guard, the agent tries to work around it by editing
    ``.git/info/exclude`` (Claude Code's sensitive-file gate blocks
@@ -58,11 +59,16 @@ RUNTIME_DIRTY_IGNORE_PREFIXES: tuple[str, ...] = (
     ".claude/",
 )
 
-# Paths ``sync_cli_tools`` plants into every worktree. Trailing slash is
+# The one destination ``sync_cli_tools`` plants into. The planting step and
+# the untracked-planted filter below are derived from this single value so the
+# two can never disagree about which path the orchestrator owns.
+ORCHESTRATOR_CLI_TOOLS_DIR = Path("src/issue_orchestrator/entrypoints/cli_tools")
+
+# Paths ``sync_cli_tools`` plants into a *foreign* worktree. Trailing slash is
 # part of the prefix so the match doesn't accidentally swallow a future
 # sibling like ``src/issue_orchestrator_tests/``.
 ORCHESTRATOR_UNTRACKED_PLANTED_PREFIXES: tuple[str, ...] = (
-    "src/issue_orchestrator/entrypoints/cli_tools/",
+    f"{ORCHESTRATOR_CLI_TOOLS_DIR.as_posix()}/",
 )
 
 CLEANUP_SAFE_UNTRACKED_EXACT: frozenset[str] = frozenset(

@@ -232,6 +232,28 @@ duplicates them.
 `make test` is **not** the project's gate. It carries `-x`, and on a fresh fork
 it aborts in ~128s inside `tests/e2e`.
 
+### The gate must read the commit it reports on
+
+A gate result is evidence about a commit only if the tree it read *is* that
+commit. Self-hosting is the one case where that can quietly stop being true:
+`src/issue_orchestrator/entrypoints/cli_tools/` is orchestrator runtime in
+every other repository, but product source here. Worktree setup used to plant
+its own copies there and mark them `--skip-worktree`, so `git status` looked
+clean while pytest and static analysis read files the branch did not contain
+(fork issue #6; hit on #3 and #5).
+
+Setup now refuses to plant over a path the target repository tracks, and undoes
+any overlay an older run left behind. Confirm a managed worktree before
+trusting its gate:
+
+```sh
+git -C <managed-worktree> ls-files -v -- src/issue_orchestrator/entrypoints/cli_tools
+# every line must start with H; an S means the tree is not the commit
+```
+
+`.claude/settings.json` is still `--skip-worktree` by design — the Stop hook is
+runtime configuration, and nothing in the gate reads it as source.
+
 ### tests/e2e is a separate live contract
 
 It requires `gh auth` and `E2E_TEST_REPO`. With that variable unset,

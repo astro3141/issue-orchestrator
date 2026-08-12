@@ -693,24 +693,12 @@ class TestCreateWorktree:
         ]
         assert ["update-index", "--skip-worktree", "--", ".claude/settings.json"] in skip_worktree_calls
         assert ["update-index", "--skip-worktree", "--", ".issue-orchestrator/session-latest.json"] in skip_worktree_calls
-        assert [
-            "update-index",
-            "--skip-worktree",
-            "--",
-            "src/issue_orchestrator/entrypoints/cli_tools/coding_done.py",
-        ] in skip_worktree_calls
-        assert [
-            "update-index",
-            "--skip-worktree",
-            "--",
-            "src/issue_orchestrator/entrypoints/cli_tools/validate_runner.py",
-        ] in skip_worktree_calls
-        assert [
-            "update-index",
-            "--skip-worktree",
-            "--",
-            "src/issue_orchestrator/entrypoints/cli_tools/_runtime_models.py",
-        ] in skip_worktree_calls
+        # Planted CLI tools are hidden with an exclude entry, never with
+        # --skip-worktree: that bit stops git reporting a path as modified, so
+        # on a repo-owned path it would hide a divergence from candidate HEAD.
+        assert not [
+            call for call in skip_worktree_calls if "cli_tools" in call[-1]
+        ]
         exclude_text = exclude_path.read_text()
         assert ".agent-done-marker" in exclude_text
         assert ".venv" in exclude_text
@@ -783,8 +771,9 @@ class TestCreateWorktree:
         assert ".issue-orchestrator/sessions" in (gitdir / "info" / "exclude").read_text()
 
     def test_sync_cli_tools_copies_runtime_support_files(self, tmp_path):
-        worktree_path = tmp_path / "worktree"
-        worktree_path.mkdir()
+        # A real repository that does not track cli_tools — i.e. a foreign
+        # target repo, the only case where the orchestrator owns that path.
+        worktree_path = make_git_worktree(tmp_path).worktree_path
 
         synced_paths = sync_cli_tools(worktree_path)
 
