@@ -198,6 +198,19 @@ enough to follow what the agent is doing. A blocked session (the trust dialog)
 and a working one are immediately distinguishable here, where they look
 identical from the orchestrator log.
 
+**Which validation contract a run executed is on disk, not only in the
+timeline.** Every validation run writes one record per HEAD SHA to
+`<worktree>/.issue-orchestrator/validation/<sha>.json`
+(`control/validation_record_cache.py`), and that record carries a `profile`
+field naming the validation profile the run executed, alongside `suite`
+(`agent_gate` or `publish_gate`), `command`, `passed` and `exit_code`. Read it
+when you need to prove *which* gate a SHA actually satisfied: reuse is
+profile-aware, so a cached record only counts for a later gate when the SHA,
+the command and the profile all match, and a record written before profiles
+existed reads back as `default`. The dashboard's **Open Validation Record**
+action opens the run-scoped copy in the session run directory, which carries
+the same fields.
+
 Two things about the dashboard have already cost work here.
 
 **Control Center's close button terminates the orchestrator process**, and the
