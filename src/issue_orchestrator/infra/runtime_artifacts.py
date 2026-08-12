@@ -10,17 +10,27 @@ Two categories of paths that dirty-tree guardrails must ignore:
 
 2. **Orchestrator-planted source** — files the orchestrator copies into
    a *foreign* worktree at creation time (see
-   ``adapters/worktree/_worktree_runtime.sync_cli_tools``). In the
-   orchestrator's own repo these files are tracked product source, so
-   nothing is planted there at all and legitimate dev edits *must*
-   count as dirty. In a foreign target repo the same paths are
-   untracked plantings that should never register as
-   dirty — otherwise every ``coding-done`` call in a foreign worktree
-   fails the guard, the agent tries to work around it by editing
+   ``adapters/worktree/_worktree_runtime.sync_cli_tools``). In a foreign
+   target repo these paths are untracked plantings that should never
+   register as dirty — otherwise every ``coding-done`` call in a foreign
+   worktree fails the guard, the agent tries to work around it by editing
    ``.git/info/exclude`` (Claude Code's sensitive-file gate blocks
    interactively), and sessions silently burn 90 minutes to the
-   session-level timeout. Filtered **only when untracked** so developer
-   modifications in the orchestrator repo still fire the guard.
+   session-level timeout.
+
+   Two conditions gate that filter, and both are needed:
+
+   * **Only when untracked** — a tracked modification is a developer
+     edit in the orchestrator's own repo and must still fire the guard.
+   * **Only when the target repository does not own the destination**
+     (``repo_owns_planted_dir=False``) — the same discriminator
+     ``sync_cli_tools`` decides to plant by. Where the repository tracks
+     that directory nothing is planted, so an *untracked* file under it
+     is the candidate's own new product source. Filtering it there would
+     let a new CLI tool pass every dirty guard and never reach the
+     branch: the tree that was validated would contain a file the pushed
+     commit does not, which is the divergence this whole registry exists
+     to prevent.
 """
 
 from __future__ import annotations
@@ -201,13 +211,25 @@ def filter_runtime_managed_dirty_paths(
     return [path for path in paths if not is_runtime_managed_dirty_path(path, worktree)]
 
 
-def is_orchestrator_untracked_planted(path: str) -> bool:
+def is_orchestrator_untracked_planted(
+    path: str, *, repo_owns_planted_dir: bool
+) -> bool:
     """Return True for paths ``sync_cli_tools`` plants into worktrees.
 
     Caller MUST only consult this for paths git reports as untracked.
     Tracked/modified versions of the same paths in the orchestrator's
     own repo are legitimate dev edits that the dirty-tree guard must
     still report.
+
+    ``repo_owns_planted_dir`` is the fact ``sync_cli_tools`` plants by:
+    whether the *target repository* tracks
+    ``ORCHESTRATOR_CLI_TOOLS_DIR``. When it does, the orchestrator plants
+    nothing there, so nothing under it is orchestrator-owned and this
+    predicate is always False — an untracked file is then the candidate's
+    own new source and every dirty guard must report it. It is keyword-only
+    and required because there is no answer that is right for both cases:
+    defaulting either way would silently give one target repository the
+    other's semantics.
 
     Accepts both individual-file paths
     (``src/issue_orchestrator/entrypoints/cli_tools/coding_done.py``)
@@ -224,6 +246,8 @@ def is_orchestrator_untracked_planted(path: str) -> bool:
     remove it under the assumption that per-file input is always
     available.
     """
+    if repo_owns_planted_dir:
+        return False
     normalized = path.replace("\\", "/")
     if not normalized:
         return False
@@ -241,14 +265,23 @@ def is_orchestrator_untracked_planted(path: str) -> bool:
     return False
 
 
-def filter_orchestrator_untracked_planted(paths: list[str]) -> list[str]:
+def filter_orchestrator_untracked_planted(
+    paths: list[str], *, repo_owns_planted_dir: bool
+) -> list[str]:
     """Return only the untracked paths that are NOT orchestrator-planted.
 
     Input must already be scoped to git-untracked paths; the caller owns
     the tracked-vs-untracked classification (git status codes, separate
-    ``ls-files --others`` invocation, etc.).
+    ``ls-files --others`` invocation, etc.) and the ownership fact — see
+    :func:`is_orchestrator_untracked_planted` for what it means.
     """
-    return [path for path in paths if not is_orchestrator_untracked_planted(path)]
+    return [
+        path
+        for path in paths
+        if not is_orchestrator_untracked_planted(
+            path, repo_owns_planted_dir=repo_owns_planted_dir
+        )
+    ]
 
 
 def _path_matches_root(path: str, root: str) -> bool:
@@ -262,13 +295,20 @@ def _has_dependency_output_component(path: str) -> bool:
     return any(part in DEPENDENCY_OUTPUT_DIR_NAMES for part in parts)
 
 
-def is_cleanup_safe_untracked_path(path: str, worktree: Path | None = None) -> bool:
+def is_cleanup_safe_untracked_path(
+    path: str, worktree: Path | None = None, *, repo_owns_planted_dir: bool
+) -> bool:
     """Return True when an untracked path is owned runtime/dependency output.
 
     This is intentionally narrower than ``is_runtime_managed_dirty_path``. Dirty
     guards hide broad runtime roots, but forced worktree removal must only
     discard paths with explicit runtime/dependency ownership and path-boundary
     matches.
+
+    ``repo_owns_planted_dir`` carries the same meaning as in
+    :func:`is_orchestrator_untracked_planted`, and matters more here than
+    anywhere else: answering it wrongly makes forced removal delete a CLI
+    tool the candidate wrote but had not committed.
     """
     normalized = _normalize_runtime_pattern(path)
     if not normalized:
@@ -287,7 +327,9 @@ def is_cleanup_safe_untracked_path(path: str, worktree: Path | None = None) -> b
         for pattern in load_runtime_ignore_patterns(worktree)
     ):
         return True
-    if is_orchestrator_untracked_planted(normalized):
+    if is_orchestrator_untracked_planted(
+        normalized, repo_owns_planted_dir=repo_owns_planted_dir
+    ):
         return True
     return _has_dependency_output_component(normalized)
 

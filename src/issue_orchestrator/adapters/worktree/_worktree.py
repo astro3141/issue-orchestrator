@@ -18,6 +18,7 @@ from ...infra.worktree_base import resolve_base_branch
 from ._worktree_errors import WorktreeError as WorktreeError
 from ._worktree_git import _git, _git_env_no_prompt, _git_run
 from ._worktree_hooks import HOOKS_DIR as HOOKS_DIR
+from ._worktree_runtime import repo_owns_cli_tools
 from ._worktree_runtime_setup import WorktreeRuntimeSetup
 
 
@@ -1424,11 +1425,20 @@ def has_uncommitted_changes(worktree_path: Path) -> bool:
 
 
 def can_remove_without_user_changes(worktree_path: Path) -> bool:
-    """Return true when forced removal would not discard user source changes."""
+    """Return true when forced removal would not discard user source changes.
+
+    Orchestrator-planted CLI tools are discardable, but only in a repository
+    that does not own that path — where it does, an untracked file there is
+    product source the agent wrote and has not committed. ``repo_owns_cli_tools``
+    answers that, and a failure to answer propagates as ``WorktreeError`` rather
+    than resolving to "safe to delete".
+    """
     worktree_path = Path(worktree_path)
 
     if not worktree_path.exists():
         raise WorktreeError(f"Worktree does not exist at {worktree_path}")
+
+    repo_owns_planted_dir = repo_owns_cli_tools(worktree_path)
 
     try:
         result = _git_run(
@@ -1444,7 +1454,11 @@ def can_remove_without_user_changes(worktree_path: Path) -> bool:
 
         for line in result.stdout.splitlines():
             if line.startswith("?? "):
-                if not is_cleanup_safe_untracked_path(line[3:], worktree_path):
+                if not is_cleanup_safe_untracked_path(
+                    line[3:],
+                    worktree_path,
+                    repo_owns_planted_dir=repo_owns_planted_dir,
+                ):
                     return False
                 continue
             return False

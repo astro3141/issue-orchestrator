@@ -17,6 +17,7 @@ from ..adapters.git.git_cli import GitCLI
 from ..execution import git_push_operations as git_push_ops
 from ..execution.command_runner import LocalCommandRunner
 from ..execution.git_push_operations import GitAuthEnvProvider
+from ..execution.git_planted_paths import repo_owns_planted_cli_tools
 from ..infra.runtime_artifacts import filter_orchestrator_untracked_planted
 from ..ports.command_runner import OutputNewlines
 from ..ports.git import Git, GitError, GitResult
@@ -263,13 +264,18 @@ class GitWorkingCopy:
                     worktree,
                     ["ls-files", "--others", "--exclude-standard", "-z"],
                 )
-                # ``sync_cli_tools`` plants files into every worktree. In a
-                # foreign repo they appear here as untracked and must not
-                # count as dirty. The filter is scoped to this untracked
-                # branch so tracked-modified versions of the same paths in
-                # the orchestrator's own repo (picked up above via
-                # ``diff --name-only``) still fire the guard.
-                untracked_paths = filter_orchestrator_untracked_planted(untracked_paths)
+                # Planted CLI tools appear here as untracked in a repository
+                # that does not own them, and must not count as dirty. Scoped
+                # to the untracked branch so tracked edits (found above) still
+                # fire, and to repositories that do not own the path so a CLI
+                # tool the candidate *adds* is reported. A ``GitError`` from the
+                # ownership query lands below, failing the gate closed.
+                untracked_paths = filter_orchestrator_untracked_planted(
+                    untracked_paths,
+                    repo_owns_planted_dir=repo_owns_planted_cli_tools(
+                        self._git, worktree
+                    ),
+                )
                 files.update(untracked_paths)
 
             return sorted(files)

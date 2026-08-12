@@ -29,6 +29,7 @@ import pytest
 from issue_orchestrator.adapters.worktree.api import (
     WorktreeError,
     WorktreeRuntimeSetup,
+    can_remove_without_user_changes,
     sync_cli_tools,
 )
 from issue_orchestrator.infra.runtime_artifacts import ORCHESTRATOR_CLI_TOOLS_DIR
@@ -183,6 +184,33 @@ def test_runtime_setup_leaves_self_hosting_worktree_equal_to_head(tmp_path) -> N
     assert set(_index_flags(worktree_path).values()) == {"H"}
     dirty = _git("status", "--porcelain", cwd=worktree_path)
     assert CLI_TOOLS_DIR not in dirty
+
+
+# ---------------------------------------------------------------------------
+# The same discriminator, consumed by forced worktree removal
+#
+# "Discardable orchestrator planting" and "uncommitted product source" are the
+# same path in the two repositories, so cleanup has to ask the same question
+# the planting step does — otherwise it deletes a CLI tool the agent wrote.
+# ---------------------------------------------------------------------------
+
+
+def test_forced_removal_keeps_an_uncommitted_cli_tool_the_candidate_added(
+    tmp_path,
+) -> None:
+    worktree_path = _self_hosting_worktree(tmp_path).worktree_path
+    (worktree_path / f"{CLI_TOOLS_DIR}/new_tool.py").write_text("# new tool\n")
+
+    assert can_remove_without_user_changes(worktree_path) is False
+
+
+def test_forced_removal_still_discards_planted_cli_tools_in_a_foreign_repo(
+    tmp_path,
+) -> None:
+    worktree_path = make_git_worktree(tmp_path).worktree_path
+    sync_cli_tools(worktree_path)
+
+    assert can_remove_without_user_changes(worktree_path) is True
 
 
 # ---------------------------------------------------------------------------

@@ -88,6 +88,7 @@ __all__ = [
     "_install_worktree_identity",
     "_link_repo_venv_into_worktree",
     "install_claude_settings",
+    "repo_owns_cli_tools",
     "sync_cli_tools",
 ]
 
@@ -159,8 +160,20 @@ def _git_or_fail(worktree_path: Path, argv: list[str], *, what: str) -> str:
         raise WorktreeError(f"Failed to {what} in {worktree_path}: {exc}") from exc
 
 
-def _repo_owns_cli_tools(worktree_path: Path) -> bool:
+def repo_owns_cli_tools(worktree_path: Path) -> bool:
     """Return True when the target repository tracks the CLI-tools path itself.
+
+    Consumed beyond the planting step: forced worktree removal must not treat
+    an untracked file here as discardable runtime output when the repository
+    owns the directory, so it asks the same question through this function
+    rather than restating it.
+
+    ``execution.git_planted_paths`` answers the identical question for callers
+    outside this adapter. They are separate functions because an adapter may not
+    depend on the execution layer, and because the two failure vocabularies
+    differ (``WorktreeError`` here, ``GitError`` there) — but both read the same
+    evidence, ``ORCHESTRATOR_CLI_TOOLS_DIR`` in the index, and neither owns a
+    policy about what the answer means.
 
     This is the whole self-hosting discriminator, and it is a property of the
     repository rather than of any individual file. In a foreign repository
@@ -296,7 +309,7 @@ def sync_cli_tools(worktree_path: Path) -> list[Path]:
             destination, or an existing overlay cannot be undone. Guessing
             either way reintroduces the divergence this function prevents.
     """
-    if _repo_owns_cli_tools(worktree_path):
+    if repo_owns_cli_tools(worktree_path):
         logger.info(
             "Target repository tracks %s; leaving the candidate's own CLI "
             "tools in place so the worktree matches its commit",

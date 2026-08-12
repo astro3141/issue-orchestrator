@@ -33,6 +33,17 @@ def git_error(*_args, **kwargs) -> GitError:
     return GitError(git_result(stdout=stdout, stderr=stderr, returncode=1))
 
 
+def _repository_owns_cli_tools(mock_git, owns: bool) -> None:
+    """Set what the index says about the planted CLI-tools path.
+
+    ``list_dirty_files`` reads this through the ``Git`` port rather than its own
+    helper, so the answer is staged on the injected port: non-empty ``ls-files``
+    output means the target repository tracks that path and owns what is there.
+    """
+    listing = "src/issue_orchestrator/entrypoints/cli_tools/coding_done.py\0"
+    mock_git.run.return_value = git_result(stdout=listing if owns else "")
+
+
 @pytest.fixture
 def mock_git():
     """Create a mock Git client for injection."""
@@ -267,8 +278,9 @@ class TestListDirtyFiles:
 
             assert files == ["a.txt", "b.txt"]
 
-    def test_list_dirty_files_all_mode(self, git_wc, worktree_path):
+    def test_list_dirty_files_all_mode(self, git_wc, mock_git, worktree_path):
         """All mode should include tracked and untracked files."""
+        _repository_owns_cli_tools(mock_git, False)
         with patch.object(git_wc, "_run_git") as mock_run:
             mock_run.side_effect = [
                 MagicMock(returncode=0, stdout="tracked-unstaged.py\0", stderr=""),
@@ -302,7 +314,7 @@ class TestListDirtyFiles:
             assert files is None
 
     def test_list_dirty_files_all_mode_filters_untracked_planted(
-        self, git_wc, worktree_path
+        self, git_wc, mock_git, worktree_path
     ):
         """Untracked orchestrator-planted paths are filtered in all-mode.
 
@@ -311,6 +323,7 @@ class TestListDirtyFiles:
         dirty-tree guard — otherwise coding-done fails in every worktree.
         """
         planted = "src/issue_orchestrator/entrypoints/cli_tools/coding_done.py"
+        _repository_owns_cli_tools(mock_git, False)
         with patch.object(git_wc, "_run_git") as mock_run:
             mock_run.side_effect = [
                 MagicMock(returncode=0, stdout="", stderr=""),
@@ -325,6 +338,43 @@ class TestListDirtyFiles:
             files = git_wc.list_dirty_files(worktree_path, "all")
 
             assert files == ["new-real-file.txt"]
+
+    def test_list_dirty_files_all_mode_reports_new_cli_tool_owned_by_repository(
+        self, git_wc, mock_git, worktree_path
+    ):
+        """Self-hosting: an untracked CLI tool in this repo is the candidate's own.
+
+        Where the target repository tracks the CLI-tools directory,
+        ``sync_cli_tools`` plants nothing, so an untracked file there is
+        product source the agent added. Filtering it would let the tree that
+        passed validation contain a file the pushed commit does not.
+        """
+        new_tool = "src/issue_orchestrator/entrypoints/cli_tools/new_tool.py"
+        _repository_owns_cli_tools(mock_git, True)
+        with patch.object(git_wc, "_run_git") as mock_run:
+            mock_run.side_effect = [
+                MagicMock(returncode=0, stdout="", stderr=""),
+                MagicMock(returncode=0, stdout="", stderr=""),
+                MagicMock(returncode=0, stdout=f"{new_tool}\0", stderr=""),
+            ]
+
+            files = git_wc.list_dirty_files(worktree_path, "all")
+
+            assert files == [new_tool]
+
+    def test_list_dirty_files_ownership_query_failure_fails_closed(
+        self, git_wc, mock_git, worktree_path
+    ):
+        """An unanswerable ownership question must not resolve to a clean tree."""
+        mock_git.run.side_effect = git_error(stderr="fatal: not a git repository")
+        with patch.object(git_wc, "_run_git") as mock_run:
+            mock_run.side_effect = [
+                MagicMock(returncode=0, stdout="", stderr=""),
+                MagicMock(returncode=0, stdout="", stderr=""),
+                MagicMock(returncode=0, stdout="new-real-file.txt\0", stderr=""),
+            ]
+
+            assert git_wc.list_dirty_files(worktree_path, "all") is None
 
     def test_list_dirty_files_tracked_mode_keeps_planted_modifications(
         self, git_wc, worktree_path
