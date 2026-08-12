@@ -18,7 +18,14 @@
 
 set -u
 ISSUE="${1:-}"
-REPO_ROOT=$(cd "$(dirname "$0")/.." && pwd)
+# Resolve the repository root from git rather than counting "../" hops: this
+# script moved from .issue-orchestrator/ to docs/selfhosting/ and the relative
+# path silently kept pointing one level too high, so every store lookup below
+# found nothing and printed nothing.
+REPO_ROOT=$(cd "$(dirname "$0")" && git rev-parse --show-toplevel 2>/dev/null)
+if [ -z "${REPO_ROOT}" ]; then
+    REPO_ROOT=$(cd "$(dirname "$0")/../.." && pwd)
+fi
 TOKEN_FILE="$HOME/.issue-orchestrator/api-token"
 
 # --- process -----------------------------------------------------------------
@@ -79,6 +86,44 @@ if not (d.get('sessions') or []):
           ' the run already finished or was detached)')
 "
 fi
+
+# --- recorded state: what the orchestrator believes, process or no process ---
+# Live-process checks answer "is something running now". They do not answer
+# "what disposition does this issue have", and when the orchestrator is stopped
+# they report nothing at all — which reads as "nothing happened" even when the
+# dashboard is showing a blocked item from persisted state. These read the
+# stores directly, so the answer survives a stopped engine.
+if [ -n "${ISSUE}" ]; then
+    echo "  recorded state for #${ISSUE}:"
+
+    QC="${REPO_ROOT}/.issue-orchestrator/state/queue_cache.sqlite"
+    if [ -f "${QC}" ]; then
+        ROW=$(sqlite3 "${QC}" "select labels from queue_issues where number=${ISSUE};" 2>/dev/null)
+        WM=$(sqlite3 "${QC}" "select value from meta where key='watermark';" 2>/dev/null)
+        if [ -n "${ROW}" ]; then
+            echo "    queue    : present  labels=${ROW}"
+            case "${ROW}" in
+                *proposed-tech-lead*|*blocked*|*needs-human*|*failed*)
+                    echo "               ^ carries a blocking-class label — will not be scheduled" ;;
+            esac
+        else
+            echo "    queue    : not in cache (watermark ${WM:-?})"
+        fi
+    fi
+
+    TL="${REPO_ROOT}/.issue-orchestrator/state/timeline.sqlite"
+    if [ -f "${TL}" ]; then
+        EV=$(sqlite3 -separator ' ' "${TL}" \
+             "select substr(timestamp,12,8), event from timeline_events where issue_number=${ISSUE} order by timestamp desc limit 5;" 2>/dev/null)
+        if [ -n "${EV}" ]; then
+            echo "    timeline : (most recent first)"
+            printf '%s\n' "${EV}" | sed 's/^/               /'
+        else
+            echo "    timeline : no events — never reached a lifecycle transition"
+        fi
+    fi
+fi
+echo ""
 
 # --- is the agent actually working -------------------------------------------
 # Claim renewal and active=1 prove liveness, not progress. These two do.
