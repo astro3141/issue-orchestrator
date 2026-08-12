@@ -12,6 +12,7 @@ import json
 import logging
 import shutil
 import uuid
+from enum import Enum, auto
 from pathlib import Path
 from typing import Any
 
@@ -231,6 +232,68 @@ def _package_cli_tools_dir() -> Path:
     return Path(__file__).resolve().parents[2] / "entrypoints" / "cli_tools"
 
 
+class PlantedProvenance(Enum):
+    """Who wrote a file sitting under the repo-owned CLI-tools directory.
+
+    Both repairs below are destructive — one deletes an untracked leftover, the
+    other reverts a tracked file to the index — so both ask this first and act
+    only on ``ORCHESTRATOR_COPY``. One predicate rather than two, because the
+    two paths were drifting: the untracked one already refused to touch bytes it
+    could not explain, and the tracked one did not.
+
+    Attributes:
+        NOT_PLANTABLE: A path planting would never write, so nothing about it is
+            the orchestrator's to repair.
+        ORCHESTRATOR_COPY: Byte-identical to the copy planting writes there.
+        UNEXPLAINED: The path planting targets, holding something else — the
+            candidate's, until proven otherwise.
+    """
+
+    NOT_PLANTABLE = auto()
+    ORCHESTRATOR_COPY = auto()
+    UNEXPLAINED = auto()
+
+
+def _planted_provenance(worktree_path: Path, rel_path: str) -> PlantedProvenance:
+    """Classify one file under the CLI-tools directory by who wrote it.
+
+    Byte-identity against the *currently packaged* copy is the only evidence
+    available, so a copy planted by an older orchestrator whose CLI tools have
+    since changed classifies as ``UNEXPLAINED``. That asymmetry is deliberate:
+    that misreading costs a preserved file and a loud failure, while the
+    opposite one costs the file itself.
+
+    A file that is not there classifies the same way. Its absence is exactly as
+    unexplained as unexpected content, and restoring it would overwrite a
+    deletion someone made.
+
+    Raises:
+        WorktreeError: If a file that exists cannot be read. Unreadable is not
+            evidence of provenance, and both callers act destructively on the
+            answer.
+    """
+    if Path(rel_path).parent.as_posix() != CLI_TOOLS_WORKTREE_DIR:
+        # Planting is flat and by name, so nothing nested was ever planted.
+        return PlantedProvenance.NOT_PLANTABLE
+    packaged = _package_cli_tools_dir() / Path(rel_path).name
+    if not packaged.is_file():
+        return PlantedProvenance.NOT_PLANTABLE
+    candidate = worktree_path / rel_path
+    if not candidate.is_file():
+        return PlantedProvenance.UNEXPLAINED
+    try:
+        planted = candidate.read_bytes() == packaged.read_bytes()
+    except OSError as exc:
+        raise WorktreeError(
+            f"Failed to read CLI tool {rel_path} in {worktree_path}: {exc}"
+        ) from exc
+    return (
+        PlantedProvenance.ORCHESTRATOR_COPY
+        if planted
+        else PlantedProvenance.UNEXPLAINED
+    )
+
+
 def _untracked_cli_tool_files(worktree_path: Path) -> list[str]:
     """Return untracked paths under the CLI-tools directory.
 
@@ -268,23 +331,17 @@ def _discard_planted_leftovers(worktree_path: Path) -> None:
             place is the divergence this step exists to end, so it fails loudly
             rather than reporting a repair it did not make.
     """
-    package_dir = _package_cli_tools_dir()
     discarded: list[str] = []
     unexplained: list[str] = []
     for rel_path in _untracked_cli_tool_files(worktree_path):
-        # Planting is flat and by name, so nothing nested and no name the
-        # package does not ship can be an orchestrator copy.
-        if Path(rel_path).parent.as_posix() != CLI_TOOLS_WORKTREE_DIR:
+        provenance = _planted_provenance(worktree_path, rel_path)
+        if provenance is PlantedProvenance.NOT_PLANTABLE:
             continue
-        packaged = package_dir / Path(rel_path).name
-        if not packaged.is_file():
+        if provenance is PlantedProvenance.UNEXPLAINED:
+            unexplained.append(rel_path)
             continue
-        leftover = worktree_path / rel_path
         try:
-            if leftover.read_bytes() != packaged.read_bytes():
-                unexplained.append(rel_path)
-                continue
-            leftover.unlink()
+            (worktree_path / rel_path).unlink()
         except OSError as exc:
             raise WorktreeError(
                 f"Failed to discard planted CLI tool {rel_path} in {worktree_path}: {exc}"
@@ -310,6 +367,86 @@ def _discard_planted_leftovers(worktree_path: Path) -> None:
         )
 
 
+def _cli_tools_diverging_from_index(
+    worktree_path: Path, paths: list[str]
+) -> list[str]:
+    """Return which of ``paths`` the worktree no longer matches the index on.
+
+    Asked through ``git status`` rather than by comparing bytes here: it settles
+    the stat cache and compares content, so a path it omits is one no repair is
+    owed and must not be second-guessed into a failure. A deletion counts as
+    divergence — the absence is the difference.
+
+    ``--no-renames`` keeps every record to a single path field; rename detection
+    would emit two and turn parsing into guesswork.
+    """
+    records = _git_z_records(
+        worktree_path,
+        [
+            "status",
+            "--porcelain",
+            "-z",
+            "--untracked-files=no",
+            "--no-renames",
+            "--",
+            *paths,
+        ],
+        what="compare repo-owned CLI tools with the index",
+    )
+    reported = {record[3:] for record in records}
+    return [path for path in paths if path in reported]
+
+
+def _unhide_repo_owned_cli_tools(worktree_path: Path) -> list[str]:
+    """Stop hiding repo-owned CLI tools, undo the overlay, name what is left.
+
+    The ``--skip-worktree`` bits come off first and stay off. While they are set
+    git reports these paths as clean whatever they hold, so every later question
+    — and every human who inspects this worktree afterwards — would be answered
+    against a filesystem git refuses to describe.
+
+    Only files this orchestrator can prove it planted are reverted to the index.
+    ``--skip-worktree`` never made a path read-only; it hid writes to it. A
+    session that died mid-edit leaves real work git calls clean, and reverting
+    that would destroy it as invisibly as it was made. Those paths keep their
+    content and are returned instead, now visible to ``git status``.
+
+    Returns:
+        Worktree-relative paths that diverge from the index and that no
+        orchestrator copy explains.
+    """
+    hidden = _hidden_cli_tool_paths(worktree_path)
+    if not hidden:
+        return []
+    _git_or_fail(
+        worktree_path,
+        ["update-index", "--no-skip-worktree", "--", *hidden],
+        what="clear --skip-worktree on repo-owned CLI tools",
+    )
+    diverged = _cli_tools_diverging_from_index(worktree_path, hidden)
+    planted = [
+        path
+        for path in diverged
+        if _planted_provenance(worktree_path, path)
+        is PlantedProvenance.ORCHESTRATOR_COPY
+    ]
+    if planted:
+        # Clearing the bit does not restore content git was told to ignore.
+        _git_or_fail(
+            worktree_path,
+            ["checkout", "--", *planted],
+            what="restore repo-owned CLI tools from the index",
+        )
+        logger.warning(
+            "Restored %d repo-owned CLI tool file(s) shadowed by an earlier "
+            "orchestrator overlay in %s: %s",
+            len(planted),
+            worktree_path,
+            ", ".join(planted),
+        )
+    return [path for path in diverged if path not in set(planted)]
+
+
 def _restore_repo_owned_cli_tools(worktree_path: Path) -> None:
     """Undo an overlay an earlier run planted over repo-owned CLI tools.
 
@@ -321,31 +458,29 @@ def _restore_repo_owned_cli_tools(worktree_path: Path) -> None:
     one place that answers "what is in this directory" — including the planted
     files the branch does not track, which the index cannot restore.
 
-    Restoring from the index cannot discard agent work. ``--skip-worktree``
-    makes git refuse to stage those paths at all, so nothing written under them
-    was ever committable; paths git is tracking normally are left untouched.
+    Every un-hiding runs before the failure is raised, so the worktree is left
+    fully described by git either way, and a rerun after a human resolves the
+    named files finds nothing hidden and proceeds normally.
+
+    Raises:
+        WorktreeError: If a formerly hidden CLI tool holds content no
+            orchestrator copy explains. The content is preserved and the
+            worktree is not handed to an agent: something wrote product source
+            that git was told not to report, and only a human can say whether
+            it is work to keep.
     """
-    hidden = _hidden_cli_tool_paths(worktree_path)
-    if hidden:
-        _git_or_fail(
-            worktree_path,
-            ["update-index", "--no-skip-worktree", "--", *hidden],
-            what="clear --skip-worktree on repo-owned CLI tools",
-        )
-        # Clearing the bit does not restore content git was told to ignore.
-        _git_or_fail(
-            worktree_path,
-            ["checkout", "--", *hidden],
-            what="restore repo-owned CLI tools from the index",
-        )
-        logger.warning(
-            "Restored %d repo-owned CLI tool file(s) shadowed by an earlier "
-            "orchestrator overlay in %s",
-            len(hidden),
-            worktree_path,
-        )
+    unexplained = _unhide_repo_owned_cli_tools(worktree_path)
     _drop_worktree_exclude_entries(worktree_path, f"{CLI_TOOLS_WORKTREE_DIR}/")
     _discard_planted_leftovers(worktree_path)
+    if unexplained:
+        raise WorktreeError(
+            f"Repo-owned CLI tool(s) in {worktree_path} diverge from the index "
+            "and no orchestrator copy explains them: "
+            f"{', '.join(unexplained)}. An earlier run hid them with "
+            "--skip-worktree, so the changes were never reportable; that is now "
+            "cleared and git status shows them. They were left untouched — "
+            "commit or discard them before this worktree is reused."
+        )
 
 
 def _plant_cli_tools(worktree_path: Path) -> list[Path]:
@@ -412,8 +547,10 @@ def sync_cli_tools(worktree_path: Path) -> list[Path]:
 
     Raises:
         WorktreeError: If git cannot say whether the repository owns the
-            destination, or an existing overlay cannot be undone. Guessing
-            either way reintroduces the divergence this function prevents.
+            destination — guessing either way reintroduces the divergence this
+            function prevents — or if undoing an earlier overlay uncovers
+            repo-owned content no orchestrator copy explains, which is a human's
+            call rather than a file to overwrite.
     """
     if repo_owns_cli_tools(worktree_path):
         logger.info(

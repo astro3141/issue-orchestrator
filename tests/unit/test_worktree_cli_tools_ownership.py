@@ -39,10 +39,16 @@ from tests.unit.worktree_git_helpers import GitWorktree, make_git_worktree
 CLI_TOOLS_DIR = ORCHESTRATOR_CLI_TOOLS_DIR.as_posix()
 CANDIDATE_TOOL = f"{CLI_TOOLS_DIR}/coding_done.py"
 CANDIDATE_SOURCE = "# candidate branch version of coding_done\n"
+# An edit made while the path was hidden: neither the committed version nor any
+# copy the orchestrator plants, and invisible to ``git status`` until unhidden.
+HIDDEN_AGENT_WORK = "# agent's in-progress edit, written while hidden\n"
 
 # The copies the orchestrator plants from — the only content a repair may treat
 # as provably orchestrator-owned.
 PACKAGE_CLI_TOOLS = Path(str(orchestrator_cli_tools.__file__)).parent
+# What planting actually writes over CANDIDATE_TOOL: a byte copy of the package
+# file of that name. Anything else under that path is unproven provenance.
+PLANTED_COPY = (PACKAGE_CLI_TOOLS / Path(CANDIDATE_TOOL).name).read_text()
 # A tool the package ships that the fixture repository does not track, which is
 # what "planted, and the index cannot restore it" looks like.
 UNTRACKED_PACKAGE_TOOL = f"{CLI_TOOLS_DIR}/reviewer_done.py"
@@ -90,11 +96,25 @@ def _exclude(git_worktree: GitWorktree, entry: str) -> None:
             handle.write(f"{entry}\n")
 
 
-def _plant_stale_overlay(git_worktree: GitWorktree) -> None:
-    """Reproduce the pre-fix state: planted copy, hidden bit, exclude entry."""
+def _hide_tracked_path(git_worktree: GitWorktree, rel_path: str, body: str) -> None:
+    """Write ``body`` over a tracked path and set ``--skip-worktree`` on it.
+
+    The bit does not make the file read-only, it makes writes to it invisible —
+    which is how an agent's edit ends up hidden, not just a planted copy.
+    """
     worktree_path = git_worktree.worktree_path
-    (worktree_path / CANDIDATE_TOOL).write_text("# orchestrator runtime copy\n")
-    _git("update-index", "--skip-worktree", "--", CANDIDATE_TOOL, cwd=worktree_path)
+    (worktree_path / rel_path).write_text(body)
+    _git("update-index", "--skip-worktree", "--", rel_path, cwd=worktree_path)
+
+
+def _plant_stale_overlay(git_worktree: GitWorktree) -> None:
+    """Reproduce the pre-fix state: planted copy, hidden bit, exclude entry.
+
+    The body is the packaged file itself, because that is what planting copies.
+    A stand-in string would reproduce the shape of the overlay but not its
+    provenance, and provenance is the whole basis on which a repair is allowed.
+    """
+    _hide_tracked_path(git_worktree, CANDIDATE_TOOL, PLANTED_COPY)
     _exclude(git_worktree, CANDIDATE_TOOL)
 
 
@@ -192,27 +212,132 @@ def test_agent_edits_to_cli_tools_are_left_alone(tmp_path) -> None:
     assert CANDIDATE_TOOL in _git("status", "--porcelain", cwd=worktree_path)
 
 
-def test_a_path_git_has_to_quote_is_still_restored(tmp_path) -> None:
-    """Parsing ``ls-files`` output without ``-z`` would hand git a quoted name.
+def test_a_path_git_has_to_quote_is_still_handled(tmp_path) -> None:
+    """Parsing git's output without ``-z`` would hand git back a quoted name.
 
     Git quotes any path holding a control character or a non-ASCII byte, and
-    that quoted string fed back to ``update-index``/``checkout`` names a file
-    that does not exist — the repair then fails on a path git reported
-    perfectly well.
+    that quoted string fed to ``update-index`` or matched against ``status``
+    output names a file that does not exist — the path is then never unhidden
+    and never reported, on a name git described perfectly well.
+
+    The package ships no tool by this name, so no repair can prove it planted
+    this file; the outcome asserted is therefore the conservative one, reached
+    through the exact path git named.
     """
     git_worktree = _self_hosting_worktree(tmp_path)
     worktree_path = git_worktree.worktree_path
     quoted_tool = f"{CLI_TOOLS_DIR}/needs\tquoting.py"
     (worktree_path / quoted_tool).write_text(CANDIDATE_SOURCE)
     _git("add", "--", quoted_tool, cwd=worktree_path)
-    _git("commit", "-m", "tool with a space", cwd=worktree_path)
-    (worktree_path / quoted_tool).write_text("# orchestrator runtime copy\n")
-    _git("update-index", "--skip-worktree", "--", quoted_tool, cwd=worktree_path)
+    _git("commit", "-m", "tool with a tab in its name", cwd=worktree_path)
+    _hide_tracked_path(git_worktree, quoted_tool, HIDDEN_AGENT_WORK)
 
-    sync_cli_tools(worktree_path)
+    with pytest.raises(WorktreeError, match="no orchestrator copy explains"):
+        sync_cli_tools(worktree_path)
 
-    assert (worktree_path / quoted_tool).read_text() == CANDIDATE_SOURCE
+    assert (worktree_path / quoted_tool).read_text() == HIDDEN_AGENT_WORK
     assert set(_index_flags(worktree_path).values()) == {"H"}
+    # ``-z`` here for the same reason production uses it: plain porcelain would
+    # quote this name, which is not the name anything else works with.
+    assert quoted_tool in _git("status", "--porcelain", "-z", cwd=worktree_path)
+
+
+# ---------------------------------------------------------------------------
+# Hidden is not the same as worthless
+#
+# --skip-worktree does not make a path read-only; it makes writes to it
+# invisible. A session that died mid-edit therefore leaves real work that
+# ``git status`` calls clean, and a repair that reverts every hidden path to the
+# index destroys it exactly as invisibly as it was made.
+# ---------------------------------------------------------------------------
+
+
+def test_hidden_agent_work_is_preserved_rather_than_reverted(tmp_path) -> None:
+    """Hidden, and neither the index version nor the copy the orchestrator plants."""
+    git_worktree = _self_hosting_worktree(tmp_path)
+    worktree_path = git_worktree.worktree_path
+    _hide_tracked_path(git_worktree, CANDIDATE_TOOL, HIDDEN_AGENT_WORK)
+    # Precondition: this is the dangerous combination, not either half of it.
+    assert HIDDEN_AGENT_WORK not in (CANDIDATE_SOURCE, PLANTED_COPY)
+    assert _git("status", "--porcelain", cwd=worktree_path).strip() == ""
+
+    with pytest.raises(WorktreeError, match=CANDIDATE_TOOL):
+        sync_cli_tools(worktree_path)
+
+    assert (worktree_path / CANDIDATE_TOOL).read_text() == HIDDEN_AGENT_WORK
+
+
+def test_preserved_work_is_left_visible_to_git(tmp_path) -> None:
+    """Preserving it while still hidden would only postpone the same loss."""
+    git_worktree = _self_hosting_worktree(tmp_path)
+    worktree_path = git_worktree.worktree_path
+    _hide_tracked_path(git_worktree, CANDIDATE_TOOL, HIDDEN_AGENT_WORK)
+
+    with pytest.raises(WorktreeError):
+        sync_cli_tools(worktree_path)
+
+    assert set(_index_flags(worktree_path).values()) == {"H"}
+    assert CANDIDATE_TOOL in _git("status", "--porcelain", cwd=worktree_path)
+
+
+def test_setup_proceeds_once_the_work_is_no_longer_hidden(tmp_path) -> None:
+    """The failure is one-shot: nothing is hidden any more, so a rerun is normal.
+
+    Without this the escalation would be a dead end — every later run would
+    refuse the same worktree over a file git is now reporting like any other.
+    """
+    git_worktree = _self_hosting_worktree(tmp_path)
+    worktree_path = git_worktree.worktree_path
+    _hide_tracked_path(git_worktree, CANDIDATE_TOOL, HIDDEN_AGENT_WORK)
+    with pytest.raises(WorktreeError):
+        sync_cli_tools(worktree_path)
+
+    assert sync_cli_tools(worktree_path) == []
+
+    assert (worktree_path / CANDIDATE_TOOL).read_text() == HIDDEN_AGENT_WORK
+
+
+def test_a_hidden_file_matching_the_index_is_not_an_escalation(tmp_path) -> None:
+    """Nothing diverges, so there is nothing for a human to decide."""
+    git_worktree = _self_hosting_worktree(tmp_path)
+    worktree_path = git_worktree.worktree_path
+    _hide_tracked_path(git_worktree, CANDIDATE_TOOL, CANDIDATE_SOURCE)
+
+    assert sync_cli_tools(worktree_path) == []
+
+    assert (worktree_path / CANDIDATE_TOOL).read_text() == CANDIDATE_SOURCE
+    assert set(_index_flags(worktree_path).values()) == {"H"}
+
+
+def test_a_hidden_deletion_is_preserved_rather_than_undone(tmp_path) -> None:
+    """An absent file is as unexplained as unexpected content, and as final."""
+    git_worktree = _self_hosting_worktree(tmp_path)
+    worktree_path = git_worktree.worktree_path
+    _hide_tracked_path(git_worktree, CANDIDATE_TOOL, HIDDEN_AGENT_WORK)
+    (worktree_path / CANDIDATE_TOOL).unlink()
+
+    with pytest.raises(WorktreeError, match=CANDIDATE_TOOL):
+        sync_cli_tools(worktree_path)
+
+    assert not (worktree_path / CANDIDATE_TOOL).exists()
+
+
+def test_a_planted_copy_is_still_undone_next_to_work_that_is_not(tmp_path) -> None:
+    """Per file, not per directory: one proven overlay, one file that is not."""
+    git_worktree = _self_hosting_worktree(tmp_path)
+    worktree_path = git_worktree.worktree_path
+    second_tool = f"{CLI_TOOLS_DIR}/reviewer_done.py"
+    (worktree_path / second_tool).write_text(CANDIDATE_SOURCE)
+    _git("add", "--", second_tool, cwd=worktree_path)
+    _git("commit", "-m", "second candidate tool", cwd=worktree_path)
+    _plant_stale_overlay(git_worktree)
+    _hide_tracked_path(git_worktree, second_tool, HIDDEN_AGENT_WORK)
+
+    with pytest.raises(WorktreeError, match=second_tool):
+        sync_cli_tools(worktree_path)
+
+    assert (worktree_path / CANDIDATE_TOOL).read_text() == CANDIDATE_SOURCE
+    assert (worktree_path / second_tool).read_text() == HIDDEN_AGENT_WORK
 
 
 # ---------------------------------------------------------------------------

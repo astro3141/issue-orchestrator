@@ -254,6 +254,30 @@ git -C <managed-worktree> ls-files -v -- src/issue_orchestrator/entrypoints/cli_
 `.claude/settings.json` is still `--skip-worktree` by design — the Stop hook is
 runtime configuration, and nothing in the gate reads it as source.
 
+#### When setup refuses a worktree over a hidden CLI tool
+
+Undoing the overlay only reverts files the orchestrator can prove it planted
+(byte-identical to the copy in its own package). `--skip-worktree` never made
+those paths read-only, it only hid writes to them, so a session that died
+mid-edit can leave real work behind that `git status` called clean. Setup
+preserves anything it cannot explain, clears the bit so git reports it, and
+then fails rather than running an agent on it:
+
+```
+Repo-owned CLI tool(s) in <worktree> diverge from the index and no orchestrator
+copy explains them: <paths>
+```
+
+Decide per file — the content is on disk and now visible:
+
+```sh
+git -C <managed-worktree> diff -- <path>   # keep it: commit on the branch
+git -C <managed-worktree> checkout -- <path>   # discard it
+```
+
+Either way the path is no longer hidden, so the next setup on that worktree
+proceeds normally; the failure does not repeat on its own.
+
 ### …and it must read the code that changed
 
 Same rule, one level up. `validation.quick` in
