@@ -11,6 +11,7 @@ from issue_orchestrator.domain.review_exchange import (
     REVIEWER_WORKTREE_CHECKOUT_FAILURE_MARKER,
 )
 from issue_orchestrator.execution.reviewer_worktree import (
+    ReviewerCandidatePresentation,
     ReviewerWorktreeError,
     create_reviewer_worktree,
     fast_forward_reviewer_worktree,
@@ -120,6 +121,116 @@ class TestReviewerWorktreeLifecycle:
 
         # Must not raise — orchestrator shutdown paths rely on idempotence.
         remove_reviewer_worktree(reviewer)
+
+
+class TestReviewerCandidatePresentation:
+    """What the reviewer is given, and what the orchestrator says it gave.
+
+    The reported SHA becomes ``review-verdict.json``'s ``reviewed_sha``
+    (``docs/foundation/VALIDATED_WORK_DISPOSITION.md`` §4), so it has to be the
+    commit the reviewer's worktree actually holds — not wherever the coder's
+    branch has got to by the time anyone asks.
+    """
+
+    def test_presents_the_branch_tip_and_reports_it(self, tmp_path: Path) -> None:
+        repo_root, coder, branch = _bootstrap_repo_with_branch(tmp_path)
+        reviewer = create_reviewer_worktree(
+            coder_worktree=coder, coder_branch=branch, timestamp="T",
+        )
+        (coder / "work.py").write_text("print('second')\n")
+        _git(coder, "add", "work.py")
+        _git(coder, "commit", "-q", "-m", "second commit")
+
+        presented = ReviewerCandidatePresentation(
+            reviewer_worktree_path=reviewer.path,
+            coder_branch=branch,
+        ).present(round_index=1)
+
+        assert presented == _git(repo_root, "rev-parse", branch)
+        assert presented == _git(reviewer.path, "rev-parse", "HEAD")
+
+    def test_reports_what_it_checked_out_when_the_branch_then_moves(
+        self, tmp_path: Path
+    ) -> None:
+        """A commit landing after the checkout does not change the answer.
+
+        This is the race the binding exists to survive: the coder's branch is
+        advanced by the per-round hook, i.e. immediately after the reviewer was
+        given the previous tip. The reviewer's filesystem still holds that tip,
+        so that is what must be reported.
+        """
+        _, coder, branch = _bootstrap_repo_with_branch(tmp_path)
+        reviewer = create_reviewer_worktree(
+            coder_worktree=coder, coder_branch=branch, timestamp="T",
+        )
+        sha_a = _git(reviewer.path, "rev-parse", "HEAD")
+
+        def _advance_branch(_round_index: int) -> None:
+            (coder / "work.py").write_text("print('later')\n")
+            _git(coder, "add", "work.py")
+            _git(coder, "commit", "-q", "-m", "landed mid-review")
+
+        presented = ReviewerCandidatePresentation(
+            reviewer_worktree_path=reviewer.path,
+            coder_branch=branch,
+            before_round=_advance_branch,
+        ).present(round_index=1)
+
+        assert presented == sha_a
+        assert _git(coder, "rev-parse", "HEAD") != sha_a
+        assert _git(reviewer.path, "rev-parse", "HEAD") == sha_a
+
+    def test_without_a_branch_reports_the_reviewer_worktrees_own_head(
+        self, tmp_path: Path
+    ) -> None:
+        """Nothing re-points the worktree, so it still holds what it was made at."""
+        _, coder, branch = _bootstrap_repo_with_branch(tmp_path)
+        reviewer = create_reviewer_worktree(
+            coder_worktree=coder, coder_branch=branch, timestamp="T",
+        )
+        created_at = _git(reviewer.path, "rev-parse", "HEAD")
+        # The coder moves on; with no branch to track, that must not leak in.
+        (coder / "work.py").write_text("print('later')\n")
+        _git(coder, "add", "work.py")
+        _git(coder, "commit", "-q", "-m", "later")
+
+        presented = ReviewerCandidatePresentation(
+            reviewer_worktree_path=reviewer.path,
+            coder_branch=None,
+        ).present(round_index=1)
+
+        assert presented == created_at
+
+    def test_unestablishable_commit_is_reported_as_unknown(
+        self, tmp_path: Path
+    ) -> None:
+        """Not a git worktree at all: None, never a stand-in commit."""
+        bare = tmp_path / "not-a-worktree"
+        bare.mkdir()
+
+        presented = ReviewerCandidatePresentation(
+            reviewer_worktree_path=bare,
+            coder_branch=None,
+        ).present(round_index=1)
+
+        assert presented is None
+
+    def test_caller_hook_runs_for_every_round(self, tmp_path: Path) -> None:
+        _, coder, branch = _bootstrap_repo_with_branch(tmp_path)
+        reviewer = create_reviewer_worktree(
+            coder_worktree=coder, coder_branch=branch, timestamp="T",
+        )
+        seen: list[int] = []
+
+        presentation = ReviewerCandidatePresentation(
+            reviewer_worktree_path=reviewer.path,
+            coder_branch=branch,
+            before_round=seen.append,
+        )
+        presentation.present(round_index=1)
+        presentation.present(round_index=2)
+
+        assert seen == [1, 2]
 
 
 class TestReviewerWorktreeDiagnostics:

@@ -215,6 +215,81 @@ def test_address_policy_routes_approved_nits_to_rework():
     assert review_requires_nit_rework(decision) is True
 
 
+def test_is_approval_follows_the_decision_not_the_response_type():
+    """A reviewer can send ``response_type=ok`` with a decision that isn't one.
+
+    Anything promoting a review to authority asks the decision itself; the two
+    fields travel separately and the transport does not reconcile them.
+    """
+    decision = ReviewDecision.from_agent_payload(
+        {
+            "decision": {
+                "verdict": "changes_requested",
+                "blocking_findings": [{"id": "F1", "title": "Unhandled None"}],
+                "abstraction_review": _no_issues_abstraction(),
+            }
+        },
+        response_type="ok",
+        response_text="Approving, apparently.",
+        nit_policy="surface",
+    )
+
+    assert decision.is_approval() is False
+
+
+def test_is_approval_is_true_only_for_a_clean_approval():
+    approved = ReviewDecision.from_agent_payload(
+        {
+            "decision": {
+                "verdict": "approved",
+                "nits": [{"id": "N1", "title": "Rename helper"}],
+                "abstraction_review": _no_issues_abstraction(),
+            }
+        },
+        response_type="ok",
+        response_text="Approved.",
+        nit_policy="surface",
+    )
+    deferred_abstraction = ReviewDecision.from_agent_payload(
+        {
+            "decision": {
+                "verdict": "approved",
+                "abstraction_review": {
+                    "status": "deferred",
+                    "follow_up_issue_url": "https://example.test/issues/1",
+                },
+            }
+        },
+        response_type="ok",
+        response_text="Approved with a deferral.",
+        nit_policy="surface",
+    )
+
+    # Surfaced nits and an explicitly deferred abstraction finding still
+    # describe an approval; neither blocks the work.
+    assert approved.is_approval() is True
+    assert deferred_abstraction.is_approval() is True
+
+
+def test_is_approval_rejects_required_abstraction_changes():
+    decision = ReviewDecision.from_agent_payload(
+        {
+            "decision": {
+                "verdict": "changes_requested",
+                "abstraction_review": {
+                    "status": "changes_requested",
+                    "findings": [{"id": "A1", "title": "No owner"}],
+                },
+            }
+        },
+        response_type="ok",
+        response_text="Approving, apparently.",
+        nit_policy="surface",
+    )
+
+    assert decision.is_approval() is False
+
+
 def test_abstraction_review_is_authoritative_in_decision_json(tmp_path):
     report = tmp_path / "authored.md"
     report.write_text(

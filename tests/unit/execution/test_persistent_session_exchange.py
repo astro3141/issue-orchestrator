@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -27,12 +28,17 @@ from issue_orchestrator.domain.review_artifacts import ReviewDecision
 from issue_orchestrator.domain.review_exchange import ReviewExchangeResponse
 from issue_orchestrator.domain.review_exchange_run import ReviewExchangeRun
 from issue_orchestrator.domain.review_exchange_summary import ReviewExchangeSummaryV1
+from issue_orchestrator.domain.review_verdict_binding import (
+    BoundReviewVerdict,
+    ReviewVerdictOutcome,
+)
 from issue_orchestrator.domain.runtime_config import RuntimeConfigReference
 from issue_orchestrator.events import EventContext, EventName
 from issue_orchestrator.execution import persistent_session_exchange as pse
 from issue_orchestrator.execution.persistent_role_prompt_policy import (
     role_session_needs_fresh_prompt_process,
 )
+from issue_orchestrator.execution.review_exchange_records import load_review_verdict
 from issue_orchestrator.execution.session_output_adapter import FileSystemSessionOutput
 from issue_orchestrator.ports import TraceEvent
 from tests.callback_endpoint_helpers import ready_callback_endpoint
@@ -7345,3 +7351,475 @@ class TestSpawnPartialConstructionCleanup:
         assert registry.acquired == [], (
             "no pair must reach the registry on partial spawn failure"
         )
+
+
+# ---------------------------------------------------------------------------
+# Exact-SHA verdict binding
+# ---------------------------------------------------------------------------
+
+
+_VERDICT_SHA_B = "b" * 40
+
+
+class _BindingRepo:
+    """A real git repo laid out the way an exchange finds one.
+
+    The binding names a commit, so these tests use real commits: a coder
+    worktree on a branch, and a sibling reviewer worktree detached at that
+    branch's tip — exactly the shape ``create_reviewer_worktree`` produces.
+    Asserting ``reviewed_sha`` against a real ``git rev-parse`` in the reviewer
+    worktree is the only way to catch a binding that names a commit the
+    reviewer's filesystem never held.
+
+    The reviewer worktree is deliberately named ``reviewer-wt``: the fake
+    session opener in this module discriminates roles by that basename.
+    """
+
+    def __init__(self, tmp_path: Path) -> None:
+        self.repo_root = tmp_path / "repo"
+        self.repo_root.mkdir()
+        self._git(self.repo_root, "init", "-q", "-b", "main")
+        self._git(self.repo_root, "config", "user.email", "test@example.com")
+        self._git(self.repo_root, "config", "user.name", "Test")
+        (self.repo_root / "README").write_text("hello\n", encoding="utf-8")
+        self._git(self.repo_root, "add", "README")
+        self._git(self.repo_root, "commit", "-q", "-m", "initial")
+
+        self.branch = "issue-42"
+        self.coder_wt = tmp_path / "coder-wt"
+        self._git(
+            self.repo_root, "worktree", "add", "-q", "-b", self.branch,
+            str(self.coder_wt),
+        )
+        self.commit("first candidate")
+        self.reviewer_wt = tmp_path / "reviewer-wt"
+        self._git(
+            self.repo_root, "worktree", "add", "-q", "--detach",
+            str(self.reviewer_wt), self.coder_head(),
+        )
+
+    @staticmethod
+    def _git(cwd: Path, *args: str) -> str:
+        result = subprocess.run(
+            ["git", *args], cwd=cwd, check=True, capture_output=True, text=True,
+        )
+        return result.stdout.strip()
+
+    def commit(self, message: str) -> str:
+        """Add a commit on the coder's branch; return its SHA."""
+        work = self.coder_wt / "work.py"
+        work.write_text(f"# {message}\n", encoding="utf-8")
+        self._git(self.coder_wt, "add", "work.py")
+        self._git(self.coder_wt, "commit", "-q", "-m", message)
+        return self.coder_head()
+
+    def coder_head(self) -> str:
+        return self._git(self.coder_wt, "rev-parse", "HEAD")
+
+    def reviewer_head(self) -> str:
+        return self._git(self.reviewer_wt, "rev-parse", "HEAD")
+
+
+def _run_binding_exchange(
+    *,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    response_script: dict[str, list[Any]],
+    repo: _BindingRepo | None = None,
+    unobservable_head: bool = False,
+    before_reviewer_round: Any = None,
+    max_rounds: int = 1,
+    max_no_progress: int = 2,
+    require_validation: bool = False,
+    initial_validation_record_path: Path | None = None,
+) -> Any:
+    """Run one exchange over a real coder branch and reviewer worktree.
+
+    ``before_reviewer_round`` runs after the reviewer worktree has been
+    prepared for a round — the window in which the coder's branch can advance
+    past what the reviewer was just given.
+
+    ``unobservable_head`` drops the git-backed worktrees for bare directories,
+    modelling an exchange whose presented commit cannot be established at all.
+    """
+    prompt_path = tmp_path / "p.md"
+    prompt_path.write_text("Prompt", encoding="utf-8")
+    if unobservable_head:
+        coder_wt, reviewer_wt = _setup_worktrees(tmp_path)
+        coder_branch = None
+    else:
+        repo = repo or _BindingRepo(tmp_path)
+        coder_wt, reviewer_wt = repo.coder_wt, repo.reviewer_wt
+        coder_branch = repo.branch
+    session_output = FileSystemSessionOutput()
+    state = _patch_persistent_runner(monkeypatch, response_script=response_script)
+    return pse.run_persistent_session_exchange(
+        exchange_run=_start_exchange_run(
+            session_output=session_output,
+            coder_worktree_path=coder_wt,
+            issue_number=42,
+            coder_label="agent:backend",
+        ),
+        session_output=session_output,
+        pair_registry=state["registry"],
+        persistent_pair_root=tmp_path / "persistent-pairs",
+        coder_worktree_path=coder_wt,
+        reviewer_worktree_factory=lambda: reviewer_wt,
+        coder_branch=coder_branch,
+        issue_number=42,
+        issue_title="Test",
+        coder_label="agent:backend",
+        reviewer_label="agent:reviewer",
+        coder_agent=_make_agent(prompt_path),
+        reviewer_agent=_make_agent(prompt_path),
+        runtime_config=_runtime_config(tmp_path),
+        max_rounds=max_rounds,
+        max_no_progress=max_no_progress,
+        require_validation=require_validation,
+        initial_validation_record_path=initial_validation_record_path,
+        before_reviewer_round=before_reviewer_round,
+    )
+
+
+class TestExactShaVerdictBinding:
+    """The verdict and the commit it was rendered against, as one record.
+
+    Foundation admission (``docs/foundation/VALIDATED_WORK_DISPOSITION.md`` §4)
+    needs ``review.reviewed_sha`` to mean the commit the orchestrator actually
+    presented. These tests pin that meaning at the seam that produces it.
+    """
+
+    def test_approval_binds_the_presented_head(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        repo = _BindingRepo(tmp_path)
+        presented = repo.coder_head()
+
+        outcome = _run_binding_exchange(
+            tmp_path=tmp_path,
+            monkeypatch=monkeypatch,
+            repo=repo,
+            response_script={
+                "reviewer": [
+                    {
+                        "response_type": "ok",
+                        "response_text": "Looks good",
+                        "getting_closer": True,
+                    }
+                ],
+                "coder": [],
+            },
+        )
+
+        binding = load_review_verdict(outcome.run_assets.exchange_dir)
+        assert binding is not None
+        assert binding.verdict is ReviewVerdictOutcome.APPROVED
+        assert binding.reviewed_sha == presented
+        assert binding.reviewed_sha == repo.reviewer_head()
+        assert binding.approves(presented) is True
+        # Ordinary review semantics are untouched by recording the binding.
+        assert (outcome.status, outcome.reason, outcome.rounds) == (
+            "ok",
+            "reviewer_ok",
+            1,
+        )
+
+    def test_reviewer_cannot_choose_the_recorded_sha(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The reviewer names a commit in its own decision JSON; it is ignored."""
+        repo = _BindingRepo(tmp_path)
+        presented = repo.coder_head()
+
+        outcome = _run_binding_exchange(
+            tmp_path=tmp_path,
+            monkeypatch=monkeypatch,
+            repo=repo,
+            response_script={
+                "reviewer": [
+                    {
+                        "response_type": "ok",
+                        "response_text": "Looks good",
+                        "getting_closer": True,
+                        "decision": {
+                            "verdict": "approved",
+                            "risk": "low",
+                            "abstraction_review": {"status": "no_issues"},
+                            "reviewed_sha": _VERDICT_SHA_B,
+                            "head_sha": _VERDICT_SHA_B,
+                        },
+                    }
+                ],
+                "coder": [],
+            },
+        )
+
+        binding = load_review_verdict(outcome.run_assets.exchange_dir)
+        assert binding is not None
+        assert binding.reviewed_sha == presented
+        assert binding.approves(_VERDICT_SHA_B) is False
+
+    def test_binding_names_what_the_reviewer_was_checked_out_at(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The coder branch advances right after the reviewer is given A.
+
+        The reviewer's worktree holds A for the whole round; only the coder's
+        branch moves on to D. A binding taken from a later read of the coder
+        worktree would name D — an approval artifact for a commit no reviewer
+        ever opened. ``reviewed_sha`` must be A, and D must not be approved.
+        """
+        repo = _BindingRepo(tmp_path)
+        sha_a = repo.coder_head()
+        moved: dict[str, str] = {}
+
+        def _advance_coder_branch(_round_index: int) -> None:
+            # Runs after the reviewer worktree has been prepared for the round
+            # — precisely the window between checkout and capture.
+            moved["sha_d"] = repo.commit("landed while the reviewer worked")
+
+        outcome = _run_binding_exchange(
+            tmp_path=tmp_path,
+            monkeypatch=monkeypatch,
+            repo=repo,
+            before_reviewer_round=_advance_coder_branch,
+            response_script={
+                "reviewer": [
+                    {
+                        "response_type": "ok",
+                        "response_text": "Looks good",
+                        "getting_closer": True,
+                    }
+                ],
+                "coder": [],
+            },
+        )
+
+        sha_d = moved["sha_d"]
+        assert sha_d != sha_a
+        assert repo.reviewer_head() == sha_a, (
+            "fixture invariant: the reviewer worktree must still hold A"
+        )
+        binding = load_review_verdict(outcome.run_assets.exchange_dir)
+        assert binding is not None
+        assert binding.reviewed_sha == sha_a
+        assert binding.approves(sha_d) is False
+        assert binding.is_stale_for(sha_d) is True
+
+    def test_binding_is_recoverable_from_storage_alone(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Nothing but the exchange directory is needed after a restart."""
+        repo = _BindingRepo(tmp_path)
+        presented = repo.coder_head()
+
+        outcome = _run_binding_exchange(
+            tmp_path=tmp_path,
+            monkeypatch=monkeypatch,
+            repo=repo,
+            response_script={
+                "reviewer": [
+                    {
+                        "response_type": "ok",
+                        "response_text": "Looks good",
+                        "getting_closer": True,
+                    }
+                ],
+                "coder": [],
+            },
+        )
+
+        exchange_dir = Path(str(outcome.run_assets.exchange_dir))
+        payload = json.loads((exchange_dir / "review-verdict.json").read_text())
+
+        assert BoundReviewVerdict.from_payload(payload).approves(presented)
+
+    def test_orchestrator_verdict_wins_over_the_reviewers_own_verdict(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A reviewer 'approved' that policy sent back is not a bound approval.
+
+        Validation evidence names a different commit than the presented HEAD,
+        so the orchestrator routes the round to rework. The reviewer's own
+        decision JSON still records ``verdict=approved``; the binding records
+        what the orchestrator concluded.
+        """
+        repo = _BindingRepo(tmp_path)
+        presented = repo.coder_head()
+        stale_record = tmp_path / "stale-validation-record.json"
+        stale_record.write_text(
+            json.dumps({"passed": True, "head_sha": _VERDICT_SHA_B}),
+            encoding="utf-8",
+        )
+
+        outcome = _run_binding_exchange(
+            tmp_path=tmp_path,
+            monkeypatch=monkeypatch,
+            repo=repo,
+            response_script={
+                "reviewer": [
+                    {
+                        "response_type": "ok",
+                        "response_text": "Looks good",
+                        "getting_closer": True,
+                    }
+                ],
+                "coder": [],
+            },
+            max_rounds=2,
+            max_no_progress=1,
+            require_validation=True,
+            initial_validation_record_path=stale_record,
+        )
+
+        assert outcome.reason == "reviewer_reports_no_progress"
+        binding = load_review_verdict(outcome.run_assets.exchange_dir)
+        assert binding is not None
+        assert binding.verdict is ReviewVerdictOutcome.CHANGES_REQUESTED
+        assert binding.reviewed_sha == presented
+        assert binding.approves(presented) is False
+
+    def test_response_type_ok_cannot_approve_a_changes_requested_decision(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The transport field says approved; the decision it carries does not.
+
+        ``response_type`` and ``decision`` are separate fields and the transport
+        layer does not make them agree. Authority follows the decision: no
+        approved binding is produced, and the round is routed to rework with the
+        blocking finding intact.
+        """
+        repo = _BindingRepo(tmp_path)
+
+        outcome = _run_binding_exchange(
+            tmp_path=tmp_path,
+            monkeypatch=monkeypatch,
+            repo=repo,
+            response_script={
+                "reviewer": [
+                    {
+                        "response_type": "ok",
+                        "response_text": "Approving, apparently",
+                        "getting_closer": True,
+                        "decision": {
+                            "verdict": "changes_requested",
+                            "risk": "medium",
+                            "abstraction_review": {"status": "no_issues"},
+                            "blocking_findings": [
+                                {"id": "F1", "title": "Unhandled None"}
+                            ],
+                        },
+                    }
+                ],
+                "coder": [],
+            },
+            max_rounds=1,
+            max_no_progress=1,
+        )
+
+        binding = load_review_verdict(outcome.run_assets.exchange_dir)
+        assert binding is not None
+        assert binding.verdict is ReviewVerdictOutcome.CHANGES_REQUESTED
+        assert binding.approves(repo.coder_head()) is False
+        assert outcome.reason == "reviewer_reports_no_progress"
+
+    def test_response_type_ok_cannot_approve_over_abstraction_changes(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """An abstraction finding requiring changes is not an approval either."""
+        repo = _BindingRepo(tmp_path)
+
+        outcome = _run_binding_exchange(
+            tmp_path=tmp_path,
+            monkeypatch=monkeypatch,
+            repo=repo,
+            response_script={
+                "reviewer": [
+                    {
+                        "response_type": "ok",
+                        "response_text": "Approving, apparently",
+                        "getting_closer": True,
+                        "decision": {
+                            "verdict": "changes_requested",
+                            "risk": "low",
+                            "abstraction_review": {
+                                "status": "changes_requested",
+                                "findings": [{"id": "A1", "title": "No owner"}],
+                            },
+                        },
+                    }
+                ],
+                "coder": [],
+            },
+            max_rounds=1,
+            max_no_progress=1,
+        )
+
+        binding = load_review_verdict(outcome.run_assets.exchange_dir)
+        assert binding is not None
+        assert binding.verdict is ReviewVerdictOutcome.CHANGES_REQUESTED
+
+    def test_terminal_without_a_reviewer_decision_binds_nothing(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """No verdict was rendered, so there is no verdict to bind."""
+        from issue_orchestrator.execution.persistent_round_runner import (
+            PersistentRoundTimeoutError,
+        )
+
+        outcome = _run_binding_exchange(
+            tmp_path=tmp_path,
+            monkeypatch=monkeypatch,
+            response_script={
+                "reviewer": [PersistentRoundTimeoutError("simulated timeout")],
+                "coder": [],
+            },
+        )
+
+        assert (outcome.status, outcome.reason) == ("error", "reviewer_no_completion")
+        assert load_review_verdict(outcome.run_assets.exchange_dir) is None
+
+    def test_unobservable_head_records_no_binding(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """An approval the orchestrator cannot pin to a commit is not recorded.
+
+        The review itself still completes exactly as before — evidence
+        recording never changes the outcome it describes.
+        """
+        outcome = _run_binding_exchange(
+            tmp_path=tmp_path,
+            monkeypatch=monkeypatch,
+            response_script={
+                "reviewer": [
+                    {
+                        "response_type": "ok",
+                        "response_text": "Looks good",
+                        "getting_closer": True,
+                    }
+                ],
+                "coder": [],
+            },
+            unobservable_head=True,
+        )
+
+        assert (outcome.status, outcome.reason) == ("ok", "reviewer_ok")
+        assert load_review_verdict(outcome.run_assets.exchange_dir) is None

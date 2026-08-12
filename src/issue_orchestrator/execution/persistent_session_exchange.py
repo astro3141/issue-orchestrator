@@ -10,9 +10,9 @@ to "where the reviewer's round-2 comments start."
 
 The reviewer runs in a separate worktree from the coder; the caller is
 responsible for creating that worktree before invoking this runner and
-removing it after. Between rounds the caller may inject a
-``before_reviewer_round`` callback to e.g. fast-forward the reviewer
-worktree to the coder's branch tip.
+removing it after. Each round's candidate is put in front of the reviewer by
+``ReviewerCandidatePresentation``, which also reports which commit that was;
+the caller may inject a ``before_reviewer_round`` callback that runs after it.
 
 This module owns the round-loop semantics — validation gating,
 no-progress termination, and event emission.
@@ -88,7 +88,10 @@ from ..domain.review_exchange_turn import (
 )
 from ..ports.turn_mailbox import TurnMailbox
 from ..domain.review_exchange_run import ReviewExchangeRun, ReviewExchangeRunAssets
-from ..domain.review_exchange_summary import ReviewExchangeReason, ReviewExchangeStatus, ReviewExchangeSummaryArtifactRef, ReviewExchangeSummaryV1, ReviewExchangeTerminalState
+from ..domain.review_exchange_summary import ReviewExchangeReason, ReviewExchangeStatus
+from ..domain.review_verdict_binding import ReviewVerdictOutcome
+from .review_exchange_records import bind_review_verdict, write_exchange_summary
+from .reviewer_worktree import ReviewerCandidatePresentation
 from ..domain.runtime_config import RuntimeConfigReference
 from ..domain import review_exchange_turn_artifacts as turn_artifacts
 from ..events import EventContext, EventName
@@ -627,28 +630,16 @@ def run_persistent_session_exchange(  # noqa: PLR0913
         emit=_emit,
     )
 
-    # Always fast-forward the reviewer worktree at the start of every
-    # reviewer round, including round 1. Round 1 of a *fresh* pair is a
-    # no-op (the worktree was just created at the coder tip); round 1
-    # of a *cached* pair from a previous exchange is the load-bearing
-    # case — the coder may have advanced its branch between exchanges
-    # and the reviewer needs the new tip. The caller-supplied
-    # ``before_reviewer_round`` (if any) runs after the FF.
-    def _ff_then_caller_hook(round_index: int) -> None:
-        if coder_branch is not None:
-            from .reviewer_worktree import (
-                ReviewerWorktree,
-                fast_forward_reviewer_worktree,
-            )
-
-            fast_forward_reviewer_worktree(
-                ReviewerWorktree(
-                    path=pair.reviewer_worktree_path,
-                    coder_branch=coder_branch,
-                ),
-            )
-        if before_reviewer_round is not None:
-            before_reviewer_round(round_index)
+    # Presents the candidate at the start of every reviewer round, including
+    # round 1. Round 1 of a *fresh* pair is a no-op (the worktree was just
+    # created at the coder tip); round 1 of a *cached* pair is the
+    # load-bearing case — the coder may have advanced its branch between
+    # exchanges and the reviewer needs the new tip.
+    reviewer_presentation = ReviewerCandidatePresentation(
+        reviewer_worktree_path=pair.reviewer_worktree_path,
+        coder_branch=coder_branch,
+        before_round=before_reviewer_round,
+    )
 
     # Build per-role mirrors after the pair is acquired so the slice
     # bases are sampled from the *current* pair recording size — i.e.
@@ -782,7 +773,7 @@ def run_persistent_session_exchange(  # noqa: PLR0913
                 approval_gate=approval_gate,
                 coder_provider=_agent_provider(coder_agent),
                 reviewer_provider=_agent_provider(reviewer_agent),
-                before_reviewer_round=_ff_then_caller_hook,
+                reviewer_presentation=reviewer_presentation,
                 emit=_emit,
                 coder_mirror=coder_mirror,
                 reviewer_mirror=reviewer_mirror,
@@ -863,10 +854,24 @@ class _PairValidationMirror:
         self._replace_from(source)
         return None
 
+    def observe_candidate_head(self) -> str | None:
+        """The commit the *coder worktree* currently holds, or None.
+
+        This is the commit validation evidence must name to still be current,
+        and nothing else. Deliberately not the source of the verdict binding's
+        ``reviewed_sha``, which names what the reviewer's worktree was checked
+        out at — the coder's branch can move in between.
+        ``docs/foundation/VALIDATED_WORK_DISPOSITION.md`` §4 requires the two
+        to agree; agreement is *checked* (stale validation routes the round to
+        rework; a bound verdict re-derives ``approves`` against current HEAD),
+        never assumed by reading one worktree and calling it both.
+        """
+        return get_repo_head_sha(self.coder_worktree_path)
+
     def current_validation_error(self) -> str | None:
         return _validation_record_error(
             self.record_path,
-            current_head_sha=get_repo_head_sha(self.coder_worktree_path),
+            current_head_sha=self.observe_candidate_head(),
         )
 
     def _completion_validation_source(
@@ -1505,9 +1510,19 @@ def _reviewer_response_for_addressable_nits(
 
 @dataclass(frozen=True)
 class _ReviewerDecisionResult:
+    """What the orchestrator concluded from one reviewer turn.
+
+    ``effective_verdict`` is the orchestrator's own conclusion, derived once
+    here from every policy input (reviewer intent, validation freshness, the
+    approval gate, nit policy, decision consistency). It is what the verdict
+    binding records, so no terminal has to re-decide "was this an approval?"
+    from a field that only partly answers it.
+    """
+
     reviewer: ReviewExchangeResponse
     artifact_pair: ReviewArtifactPair
     addressable_nit_rework: bool
+    effective_verdict: ReviewVerdictOutcome
     policy_rework_feedback: str | None = None
 
 
@@ -1541,14 +1556,9 @@ def _finalize_reviewer_decision(
         approval_error = approval_gate.rejection_reason()
     policy_rework_feedback = validation_error or approval_error
     if reviewer.response_type == "ok" and policy_rework_feedback is not None:
-        reviewer = ReviewExchangeResponse(
-            response_type="changes_requested",
-            response_text=(
-                f"{policy_rework_feedback} Address it and continue."
-            ),
-            getting_closer=False,
-            raw_json=None,
-            raw_output=reviewer.raw_output,
+        reviewer = _reviewer_response_for_policy_rework(
+            reviewer,
+            policy_rework_feedback,
         )
 
     artifact_pair = _persist_reviewer_artifact_pair(
@@ -1558,17 +1568,64 @@ def _finalize_reviewer_decision(
         authored_report_path=reviewer_report_path,
         nit_policy=nit_policy,
     )
-    addressable_nit_rework = review_requires_nit_rework(artifact_pair.decision)
+    decision = artifact_pair.decision
+    addressable_nit_rework = review_requires_nit_rework(decision)
     if addressable_nit_rework:
-        reviewer = _reviewer_response_for_addressable_nits(
+        reviewer = _reviewer_response_for_addressable_nits(reviewer, decision)
+    elif reviewer.response_type == "ok" and not decision.is_approval():
+        # The reviewer's transport field says "ok" while its own decision says
+        # otherwise. The two are separate fields and the transport layer does
+        # not make them agree, so an approval is only ever concluded from a
+        # decision that is one — a disagreement is rework, never an approval.
+        policy_rework_feedback = _approval_disagreement_feedback(decision)
+        logger.warning(
+            "[REVIEW_EXCHANGE] reviewer response_type=ok contradicts its own "
+            "decision (verdict=%s blocking=%s abstraction=%s); routing to "
+            "rework and binding no approval",
+            decision.verdict,
+            [item.id for item in decision.blocking_findings],
+            decision.abstraction_review.status,
+        )
+        reviewer = _reviewer_response_for_policy_rework(
             reviewer,
-            artifact_pair.decision,
+            policy_rework_feedback,
         )
     return _ReviewerDecisionResult(
         reviewer=reviewer,
         artifact_pair=artifact_pair,
         addressable_nit_rework=addressable_nit_rework,
+        effective_verdict=(
+            ReviewVerdictOutcome.APPROVED
+            if reviewer.response_type == "ok"
+            else ReviewVerdictOutcome.CHANGES_REQUESTED
+        ),
         policy_rework_feedback=policy_rework_feedback,
+    )
+
+
+def _reviewer_response_for_policy_rework(
+    reviewer: ReviewExchangeResponse,
+    feedback: str,
+) -> ReviewExchangeResponse:
+    """Turn a reviewer 'ok' the orchestrator cannot accept into rework."""
+    return ReviewExchangeResponse(
+        response_type="changes_requested",
+        response_text=f"{feedback} Address it and continue.",
+        getting_closer=False,
+        raw_json=None,
+        raw_output=reviewer.raw_output,
+    )
+
+
+def _approval_disagreement_feedback(decision: ReviewDecision) -> str:
+    blocking = ", ".join(item.id for item in decision.blocking_findings)
+    detail = f" Blocking findings: {blocking}." if blocking else ""
+    return (
+        "The review response was sent as an approval, but the decision it "
+        f"carries is not one (verdict={decision.verdict}, "
+        f"abstraction_review={decision.abstraction_review.status}).{detail} "
+        "The orchestrator records what the decision says, not what the "
+        "response type claims."
     )
 
 
@@ -1681,7 +1738,7 @@ class _DriveRoundsCommand:
     approval_gate: ReviewExchangeApprovalGate | None
     coder_provider: AgentProvider
     reviewer_provider: AgentProvider
-    before_reviewer_round: Callable[[int], None] | None
+    reviewer_presentation: ReviewerCandidatePresentation
     emit: Callable[[EventName, dict[str, Any]], None]
     coder_mirror: _RoleSliceMirror
     reviewer_mirror: _RoleSliceMirror
@@ -1720,7 +1777,7 @@ def _drive_rounds(command: _DriveRoundsCommand) -> ReviewExchangeOutcome:
     approval_gate = command.approval_gate
     coder_provider = command.coder_provider
     reviewer_provider = command.reviewer_provider
-    before_reviewer_round = command.before_reviewer_round
+    reviewer_presentation = command.reviewer_presentation
     emit = command.emit
     coder_mirror = command.coder_mirror
     reviewer_mirror = command.reviewer_mirror
@@ -1748,10 +1805,13 @@ def _drive_rounds(command: _DriveRoundsCommand) -> ReviewExchangeOutcome:
     )
 
     for round_index in range(1, max_rounds + 1):
-        if before_reviewer_round is not None:
-            before_reviewer_round(round_index)
-
         # ----- Reviewer turn -----
+        # Preparing the reviewer's round and learning which commit it will read
+        # are one act, not two: the presentation owner reports the commit it
+        # checked out. Nothing between here and the verdict binding below
+        # re-observes it, so neither a commit landing mid-review nor a coder
+        # branch advancing mid-checkout can end up inside an approval.
+        presented_head_sha = reviewer_presentation.present(round_index)
         reviewer_packet = ReviewExchangeTurnPacket(
             issue_number=issue_number,
             issue_title=issue_title,
@@ -1914,11 +1974,13 @@ def _drive_rounds(command: _DriveRoundsCommand) -> ReviewExchangeOutcome:
                 round_index=round_index,
                 reviewer=reviewer,
                 decision=artifact_pair.decision,
+                verdict=decision_result.effective_verdict,
                 review_artifacts=artifact_pair.to_event_artifacts(),
                 emit=emit,
                 issue_number=issue_number,
                 session_name=session_name,
                 validation_record_path=validation_record_path,
+                presented_head_sha=presented_head_sha,
             )
         if reviewer.getting_closer is False:
             no_progress_count += 1
@@ -1931,11 +1993,13 @@ def _drive_rounds(command: _DriveRoundsCommand) -> ReviewExchangeOutcome:
                 round_index=round_index,
                 reviewer=reviewer,
                 decision=artifact_pair.decision,
+                verdict=decision_result.effective_verdict,
                 review_artifacts=artifact_pair.to_event_artifacts(),
                 emit=emit,
                 issue_number=issue_number,
                 session_name=session_name,
                 validation_record_path=validation_record_path,
+                presented_head_sha=presented_head_sha,
             )
 
         last_reviewer_text = reviewer.response_text
@@ -2101,7 +2165,7 @@ def _drive_rounds(command: _DriveRoundsCommand) -> ReviewExchangeOutcome:
         )
         last_coder_text = coder.response_text
 
-    summary = _write_summary(
+    summary = write_exchange_summary(
         exchange_dir, max_rounds,
         status=ReviewExchangeStatus.STOPPED,
         reason=ReviewExchangeReason.MAX_ROUNDS_EXCEEDED,
@@ -2713,19 +2777,30 @@ def _complete_with_reviewer_ok(
     round_index: int,
     reviewer: ReviewExchangeResponse,
     decision: ReviewDecision,
+    verdict: ReviewVerdictOutcome,
     review_artifacts: list[dict[str, str]],
     emit: Callable[[EventName, dict[str, Any]], None],
     issue_number: int,
     session_name: str,
     validation_record_path: Path,
+    presented_head_sha: str | None,
 ) -> ReviewExchangeOutcome:
-    summary = _write_summary(
+    summary = write_exchange_summary(
         exchange_dir, round_index,
         status=ReviewExchangeStatus.OK,
         reason=ReviewExchangeReason.REVIEWER_OK,
         reviewer_response=reviewer,
         review_artifacts=review_artifacts,
         validation_record_path=validation_record_path,
+    )
+    # The orchestrator's single derivation, passed in rather than assumed
+    # here: binding states what it concluded, and never promotes the
+    # reviewer's own claim to authority.
+    bind_review_verdict(
+        exchange_dir=exchange_dir,
+        verdict=verdict,
+        presented_head_sha=presented_head_sha,
+        completed_rounds=round_index,
     )
     _emit_built_event(emit, make_review_exchange_round_completed_event({
         "issue_number": issue_number,
@@ -2767,19 +2842,27 @@ def _stop_for_no_progress(
     round_index: int,
     reviewer: ReviewExchangeResponse,
     decision: ReviewDecision,
+    verdict: ReviewVerdictOutcome,
     review_artifacts: list[dict[str, str]],
     emit: Callable[[EventName, dict[str, Any]], None],
     issue_number: int,
     session_name: str,
     validation_record_path: Path,
+    presented_head_sha: str | None,
 ) -> ReviewExchangeOutcome:
-    summary = _write_summary(
+    summary = write_exchange_summary(
         exchange_dir, round_index,
         status=ReviewExchangeStatus.STOPPED,
         reason=ReviewExchangeReason.REVIEWER_REPORTS_NO_PROGRESS,
         reviewer_response=reviewer,
         review_artifacts=review_artifacts,
         validation_record_path=validation_record_path,
+    )
+    bind_review_verdict(
+        exchange_dir=exchange_dir,
+        verdict=verdict,
+        presented_head_sha=presented_head_sha,
+        completed_rounds=round_index,
     )
     _emit_built_event(emit, make_review_exchange_round_completed_event({
         "issue_number": issue_number,
@@ -2827,7 +2910,7 @@ def _build_outcome_for_reviewer_decision_error(
     validation_record_path: Path,
 ) -> ReviewExchangeOutcome:
     detail = f"reviewer produced invalid decision JSON: {error}"
-    summary = _write_summary(
+    summary = write_exchange_summary(
         exchange_dir, round_index,
         status=ReviewExchangeStatus.ERROR,
         reason=ReviewExchangeReason.REVIEWER_DECISION_INVALID,
@@ -2876,7 +2959,7 @@ def _build_outcome_for_role_timeout(
 ) -> ReviewExchangeOutcome:
     """Build the terminal ``error`` outcome when a role fails to complete."""
     reason = _no_completion_reason_for_role(role)
-    summary = _write_summary(
+    summary = write_exchange_summary(
         exchange_dir, round_index,
         status=ReviewExchangeStatus.ERROR,
         reason=reason,
@@ -2927,7 +3010,7 @@ def _build_outcome_for_protocol_error(
     REVIEW_EXCHANGE_ROUND_COMPLETED with the partial round's data plus a
     REVIEW_EXCHANGE_COMPLETED with status=error and protocol_error reason.
     """
-    summary = _write_summary(
+    summary = write_exchange_summary(
         exchange_dir, round_index,
         status=ReviewExchangeStatus.ERROR,
         reason=ReviewExchangeReason.CODER_PROTOCOL_ERROR,
@@ -2976,89 +3059,6 @@ def _write_review_exchange_manifest_header(
     ``update_manifest`` API.
     """
     session_output.update_manifest(run_dir, header.to_manifest_fields())
-
-
-def _read_validation_facts(path: Path | None) -> tuple[str | None, bool | None]:
-    """Read ``(head_sha, passed)`` from a validation-record.json.
-
-    Returns ``(None, None)`` when the path is None, missing, or
-    unreadable as JSON. ``head_sha`` is None when the field is
-    absent/empty; ``passed`` is None when the field is absent or
-    not a bool.
-
-    The summary writer (and the cache loader, in a later commit)
-    use this to populate ``ResumeFacts`` without leaking validation-
-    record schema concerns into other modules.
-    """
-    if path is None or not path.exists():
-        return None, None
-    try:
-        data = json.loads(path.read_text())
-    except (OSError, json.JSONDecodeError):
-        return None, None
-    head_sha = data.get("head_sha")
-    if not isinstance(head_sha, str) or not head_sha:
-        head_sha = None
-    passed = data.get("passed")
-    if not isinstance(passed, bool):
-        passed = None
-    return head_sha, passed
-
-
-def _write_summary(
-    exchange_dir: Path,
-    round_index: int,
-    *,
-    status: ReviewExchangeStatus,
-    reason: ReviewExchangeReason,
-    reviewer_response: ReviewExchangeResponse | None,
-    validation_record_path: Path | None,
-    review_artifacts: list[dict[str, str]] | None = None,
-    detail: str | None = None,
-) -> ReviewExchangeSummaryV1:
-    """Persist summary.json atomically.
-
-    The summary records *facts* about the exchange that just ran:
-    ``status``, ``reason``, ``completed_rounds``, ``response_text``,
-    ``timestamp``, plus — when the validation record is readable —
-    ``head_sha`` and ``validation_passed``. Policy (cacheable / halt
-    / retry / stale) is NOT encoded here; the cache loader feeds
-    these fields into ``ReviewExchangeResumeDecision.decide`` to
-    determine the next-tick action.
-
-    Pre-this-commit, the writer encoded policy by selectively
-    omitting ``head_sha`` based on status. That dual-purpose use of
-    one field (fact AND control signal) was the root cause of the
-    PR #6270 review-feedback whack-a-mole: every patch that adjusted
-    "which statuses cache-hit" mutated which facts got persisted,
-    and downstream consumers re-inferred policy at three different
-    sites. Recording facts unconditionally and centralizing policy
-    in one named helper ends that drift.
-
-    ``head_sha`` and ``validation_passed`` are still omitted (rather
-    than written as None) when the validation record cannot be
-    read at all — the caller should treat absence as "we don't
-    know" rather than "validation explicitly failed." The cache
-    loader's ``ResumeFacts`` mapping handles each case.
-    """
-    terminal = ReviewExchangeTerminalState(status=status, reason=reason)
-    head_sha, passed = _read_validation_facts(validation_record_path)
-    artifacts = tuple(
-        ReviewExchangeSummaryArtifactRef.from_payload(artifact)
-        for artifact in (review_artifacts or [])
-    )
-    summary = ReviewExchangeSummaryV1(
-        completed_rounds=round_index,
-        terminal=terminal,
-        response_text=reviewer_response.response_text if reviewer_response else None,
-        timestamp=datetime.now(timezone.utc).isoformat(),
-        head_sha=head_sha,
-        validation_passed=passed,
-        artifacts=artifacts,
-        detail=detail,
-    )
-    _atomic_write_json(exchange_dir / "summary.json", summary.to_payload())
-    return summary
 
 
 # ---------------------------------------------------------------------------
@@ -3229,10 +3229,8 @@ def _validate_coder_completion(
     return None
 
 
-# ``_atomic_write_json`` is the shared helper from ``infra.atomic_io``;
-# re-export under the private name so the existing test that monkeypatches
-# ``pse.os.replace`` continues to find the same write path.
+# ``_atomic_write_bytes`` is the shared helper from ``infra.atomic_io``,
+# re-exported under the private name this module has always used.
 from ..infra.atomic_io import (  # noqa: E402
     atomic_write_bytes as _atomic_write_bytes,
-    atomic_write_json as _atomic_write_json,
 )

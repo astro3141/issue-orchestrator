@@ -62,6 +62,63 @@ Both artifacts describe the same review item IDs. The markdown is the review con
 
 The decision JSON also carries an `abstraction_review` object. Reviewers must use it to say whether the change uses the right owner/port/command abstraction. If a bounded abstraction should be added in the same PR, reviewers set `abstraction_review.status` to `changes_requested` and include `A1`, `A2`, ... findings. An approved decision cannot carry required abstraction changes. If abstraction work is explicitly deferred, the reviewer must set `status` to `deferred` and include `follow_up_issue_url`.
 
+### review-verdict.json — the exact-SHA verdict binding
+
+`review-report.md` and `review-decision.json` are reviewer-authored. Alongside
+them the orchestrator writes its own record, `review-verdict.json`, in the
+review-exchange directory:
+
+```json
+{
+  "schema_version": 1,
+  "verdict": "approved",
+  "reviewed_sha": "<40-hex commit>",
+  "decided_at": "2026-08-12T00:00:00+00:00",
+  "completed_rounds": 1
+}
+```
+
+It exists so a verdict is never separable from the commit it was rendered
+against — the property Foundation admission depends on
+(`docs/foundation/VALIDATED_WORK_DISPOSITION.md` §4, `review.reviewed_sha`).
+Four things make it authority rather than convenience:
+
+- **Neither half is agent-supplied.** `verdict` is the orchestrator's own
+  conclusion, derived once per reviewer turn from every policy input at once:
+  reviewer intent, validation freshness, the approval gate, nit policy, and
+  whether the reviewer's decision JSON is an approval at all. A reviewer that
+  sends `response_type: ok` while its decision says `changes_requested` (they
+  are separate fields, and the transport does not make them agree) is routed
+  to rework and binds `changes_requested` — authority follows the decision,
+  never the transport field.
+- **`reviewed_sha` is what the reviewer was actually given.** It is the commit
+  the orchestrator checked out into the reviewer's worktree for that round,
+  reported by the checkout itself. It is deliberately not a later reading of
+  the coder worktree: the coder's branch can advance between the checkout and
+  the read, which would name a commit no reviewer ever opened.
+- **The pairing is structural.** A payload naming one half without the other
+  does not parse.
+- **Validity is re-derived, never remembered.** `BoundReviewVerdict.approves(head_sha)`
+  answers False once HEAD moves; the binding is then detectably stale.
+
+Only two terminals produce a binding: the `reviewer_ok` completion, which binds
+`approved`, and the no-progress stop, which binds `changes_requested`. Neither
+picks that value itself — both write the verdict the single derivation above
+produced, which is why a reviewer whose transport field disagrees with its own
+decision never reaches the approving terminal at all. Every other way an exchange can end
+— max rounds exceeded, a protocol failure, a timeout — writes no
+`review-verdict.json`, because no reviewer verdict describes the commit the
+exchange left behind: max rounds is reached after a coder turn that was asked to
+move HEAD past the last reviewed commit, and the other terminals end before a
+verdict is rendered at all. Absence is therefore not a gap to fill in later; it
+means this exchange produced no verdict any gate may admit.
+
+The binding is written next to `summary.json` and reloaded from there, so it
+survives an orchestrator restart. If the orchestrator cannot observe the
+presented commit, it records **no** binding rather than guessing — an
+unbound verdict is one no later gate can admit, and an unusable observation
+never changes the outcome of the review it describes.
+
 Nits are classified in the same reviewer pass as blockers. They do not get a separate review pass. When `review.nits.default_policy` or a per-agent override is `address`, an approved review with only nits is converted into normal coder rework before PR creation. `surface` records and shows nits without blocking PR creation. `ignore` keeps them only in the persisted artifacts.
 
 ### via-mcp
