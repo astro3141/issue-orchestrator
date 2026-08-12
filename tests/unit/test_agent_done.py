@@ -10,6 +10,7 @@ The orchestrator handles all side effects (push, PR, comments, labels).
 
 import argparse
 import json
+import logging
 import os
 import sys
 import tempfile
@@ -44,6 +45,7 @@ from issue_orchestrator.infra.validation_profiles import DEFAULT_VALIDATION_PROF
 from issue_orchestrator.entrypoints.cli_tools.coding_done import (
     main as coding_done_main,
     check_dirty_files,
+    CODING_DONE_SOURCE_ID,
 )
 from issue_orchestrator.entrypoints.cli_tools.reviewer_done import main as reviewer_done_main
 from issue_orchestrator.execution.session_output_adapter import FileSystemSessionOutput
@@ -56,6 +58,12 @@ from issue_orchestrator.domain.models import (
     COMPLETION_RECORD_PATH,
 )
 from issue_orchestrator.ports.session_output import ValidationRecord
+
+# The value the repository's own ``coding_done`` module must carry. Written out
+# here rather than imported from that module on purpose: a planted copy would
+# supply both sides of an ``x == x`` comparison and agree with itself. Pinning
+# the literal in the test file is what makes the copy under test falsifiable.
+_REPO_CODING_DONE_SOURCE_ID = "repo:issue_orchestrator.entrypoints.cli_tools.coding_done"
 
 
 def _orchestrator_env(run_dir: Path, *, session_id: str = "test-123") -> dict[str, str]:
@@ -851,6 +859,45 @@ class TestCheckDirtyFiles:
         with _porcelain(""):
             result = check_dirty_files()
         assert result == []
+
+
+class TestPlantedCodingDoneCopyIsDetected:
+    """Prove the ``coding_done`` module under test is the repository's own copy.
+
+    ``coding_done.py`` is tracked product source and also one of the CLI tools
+    the orchestrator syncs into agent worktrees, so a planted copy can occupy
+    this exact import path. Both tests reach the constant through the installed
+    module path — the same path a planted copy would shadow — and compare it
+    against the literal pinned in this file, so each one fails on a copy whose
+    id is absent, stale, or different, rather than passing vacuously.
+
+    The names carry ``planted`` deliberately: the self-hosting ``quick`` gate
+    selects with ``-k '... or planted or ...'``, and a canary the gate deselects
+    proves nothing. Keep an already-selected keyword in these names.
+    """
+
+    def test_a_planted_copy_fails_the_source_id_value_check(self):
+        assert CODING_DONE_SOURCE_ID == _REPO_CODING_DONE_SOURCE_ID
+
+    def test_a_planted_copy_fails_the_startup_diagnostic_check(self, caplog):
+        """The repository's own id reaches the log line coding-done emits."""
+        with patch('sys.argv', [
+            'coding-done', 'completed',
+            '--implementation', 'Added feature',
+            '--problems', 'None',
+            '--dry-run'
+        ]):
+            with patch('issue_orchestrator.entrypoints.cli_tools.agent_done.get_session_id', return_value='test-123'):
+                with caplog.at_level(
+                    logging.INFO,
+                    logger="issue_orchestrator.entrypoints.cli_tools.coding_done",
+                ):
+                    coding_done_main()
+
+        assert any(
+            _REPO_CODING_DONE_SOURCE_ID in message and "coding-done" in message.lower()
+            for message in (record.getMessage() for record in caplog.records)
+        )
 
 
 class TestMain:
