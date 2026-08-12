@@ -8,7 +8,7 @@ there accumulates transcripts in a personal directory forever.
 Two mechanisms live here, and they are deliberately different in kind:
 
 ``codex_home_session``
-    Session-scoped, autouse for the whole ``tests/`` tree.  Isolation is what
+    Session-scoped, autouse for every test the run collects.  Isolation is what
     happens by default, not what a test opts into.  Per-test ``usefixtures``
     is exactly what failed before: the fixture existed and simply was not
     applied to two of the six files that reach for the codex binary.
@@ -21,14 +21,31 @@ Two mechanisms live here, and they are deliberately different in kind:
     whether a fixture was listed, so a newly added live test cannot leak by
     omission even if the session default is later broken.
 
-Two boundaries are worth knowing before trusting the guard:
+Three boundaries are worth knowing before trusting the guard:
+
+*It is registered by the repository-root ``conftest.py``.*  ``conftest.py`` is
+directory-scoped and ``pyproject.toml`` declares two testpaths (``tests`` and
+``packages/agent_runner/tests``), so registering under ``tests/`` would leave
+the second root unguarded.  The root conftest is the one ancestor both share,
+which is what makes "cannot leak by omission" true of every testpath rather
+than of one tree;
+``packages/agent_runner/tests/test_codex_home_guard_registration.py`` proves it
+from inside the second root, since no test under ``tests/`` can.  The boundary
+is the rootdir: point pytest *only* at ``packages/agent_runner`` and its own
+``[tool.pytest.ini_options]`` wins the rootdir search, which puts this
+registration above ``confcutdir`` and leaves that run unguarded.  The unit lane
+names both roots in one invocation, so the repository stays the rootdir and the
+registration holds.
 
 *It wraps module attributes, not the OS.*  ``subprocess.run`` and asyncio's
-subprocess transports go through ``subprocess.Popen`` as a module global, and
-``pexpect.run`` through ``pexpect.spawn``, so those are covered.  A direct
-``os.posix_spawn``/``pty.fork``/``ptyprocess`` call, or a
-``from subprocess import Popen`` binding taken before the patch, would not be.
-None exist in this repository today; adding one means extending this module.
+subprocess transports go through ``subprocess.Popen`` as a module global, so
+those are covered.  What is not: a direct
+``os.posix_spawn``/``pty.fork``/``ptyprocess`` call, a
+``from subprocess import Popen`` binding taken before the patch, and
+``pexpect.run`` - which reaches ``spawn`` through its own
+``from .pty_spawn import spawn`` rather than the ``pexpect`` package attribute
+patched here.  None exist in this repository today; adding one means extending
+this module.
 
 *It is single-level.*  The guard sees the process pytest starts, not that
 process's children.  A spawn whose own command carries no ``codex`` word and
@@ -144,7 +161,7 @@ class CodexHomePolicy:
             f"Codex home leak: {spawning} would run with a leaking environment "
             f"({leak}).\n"
             f"Every test that spawns the real Codex CLI must run against an "
-            f"isolated {CODEX_HOME_ENV}. The whole tests/ tree gets one by "
+            f"isolated {CODEX_HOME_ENV}. Every collected test gets one by "
             f"default from the autouse 'codex_home_session' fixture; a test "
             f"that needs its own pristine home requests 'isolated_codex_home'. "
             f"Do not point {CODEX_HOME_ENV} back at {protected}."
@@ -255,7 +272,7 @@ def codex_home_session(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Pat
     """Point ``CODEX_HOME`` at a throwaway home for the entire test session.
 
     Session-scoped rather than per-test because the redirect is what makes
-    isolation the default for every test package; a per-test home is still
+    isolation the default for every test root; a per-test home is still
     available through :func:`isolated_codex_home` for tests that want one.
     """
     home = provision_codex_home(
