@@ -59,6 +59,12 @@ from issue_orchestrator.domain.models import (
 )
 from issue_orchestrator.ports.session_output import ValidationRecord
 
+# The value the repository's own ``coding_done`` module must carry. Written out
+# here rather than imported from that module on purpose: a planted copy would
+# supply both sides of an ``x == x`` comparison and agree with itself. Pinning
+# the literal in the test file is what makes the copy under test falsifiable.
+_REPO_CODING_DONE_SOURCE_ID = "repo:issue_orchestrator.entrypoints.cli_tools.coding_done"
+
 
 def _orchestrator_env(run_dir: Path, *, session_id: str = "test-123") -> dict[str, str]:
     return {
@@ -855,25 +861,26 @@ class TestCheckDirtyFiles:
         assert result == []
 
 
-class TestCodingDoneSourceId:
+class TestPlantedCodingDoneCopyIsDetected:
     """Prove the ``coding_done`` module under test is the repository's own copy.
 
     ``coding_done.py`` is tracked product source and also one of the CLI tools
     the orchestrator syncs into agent worktrees, so a planted copy can occupy
-    this exact import path. Both assertions below are imported through the
-    installed module path, which is the same path a planted copy would shadow:
-    if validation ever runs against a copy carrying no constant or a stale one,
-    these fail rather than passing vacuously.
+    this exact import path. Both tests reach the constant through the installed
+    module path — the same path a planted copy would shadow — and compare it
+    against the literal pinned in this file, so each one fails on a copy whose
+    id is absent, stale, or different, rather than passing vacuously.
+
+    The names carry ``planted`` deliberately: the self-hosting ``quick`` gate
+    selects with ``-k '... or planted or ...'``, and a canary the gate deselects
+    proves nothing. Keep an already-selected keyword in these names.
     """
 
-    def test_source_id_has_its_stable_value(self):
-        assert (
-            CODING_DONE_SOURCE_ID
-            == "repo:issue_orchestrator.entrypoints.cli_tools.coding_done"
-        )
+    def test_a_planted_copy_fails_the_source_id_value_check(self):
+        assert CODING_DONE_SOURCE_ID == _REPO_CODING_DONE_SOURCE_ID
 
-    def test_startup_diagnostic_reports_the_source_id(self, caplog):
-        """The id reaches the log line coding-done already emits on every run."""
+    def test_a_planted_copy_fails_the_startup_diagnostic_check(self, caplog):
+        """The repository's own id reaches the log line coding-done emits."""
         with patch('sys.argv', [
             'coding-done', 'completed',
             '--implementation', 'Added feature',
@@ -888,7 +895,7 @@ class TestCodingDoneSourceId:
                     coding_done_main()
 
         assert any(
-            CODING_DONE_SOURCE_ID in message and "coding-done" in message.lower()
+            _REPO_CODING_DONE_SOURCE_ID in message and "coding-done" in message.lower()
             for message in (record.getMessage() for record in caplog.records)
         )
 
