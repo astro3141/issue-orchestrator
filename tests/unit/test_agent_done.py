@@ -10,6 +10,7 @@ The orchestrator handles all side effects (push, PR, comments, labels).
 
 import argparse
 import json
+import logging
 import os
 import sys
 import tempfile
@@ -44,6 +45,7 @@ from issue_orchestrator.infra.validation_profiles import DEFAULT_VALIDATION_PROF
 from issue_orchestrator.entrypoints.cli_tools.coding_done import (
     main as coding_done_main,
     check_dirty_files,
+    CODING_DONE_SOURCE_ID,
 )
 from issue_orchestrator.entrypoints.cli_tools.reviewer_done import main as reviewer_done_main
 from issue_orchestrator.execution.session_output_adapter import FileSystemSessionOutput
@@ -851,6 +853,44 @@ class TestCheckDirtyFiles:
         with _porcelain(""):
             result = check_dirty_files()
         assert result == []
+
+
+class TestCodingDoneSourceId:
+    """Prove the ``coding_done`` module under test is the repository's own copy.
+
+    ``coding_done.py`` is tracked product source and also one of the CLI tools
+    the orchestrator syncs into agent worktrees, so a planted copy can occupy
+    this exact import path. Both assertions below are imported through the
+    installed module path, which is the same path a planted copy would shadow:
+    if validation ever runs against a copy carrying no constant or a stale one,
+    these fail rather than passing vacuously.
+    """
+
+    def test_source_id_has_its_stable_value(self):
+        assert (
+            CODING_DONE_SOURCE_ID
+            == "repo:issue_orchestrator.entrypoints.cli_tools.coding_done"
+        )
+
+    def test_startup_diagnostic_reports_the_source_id(self, caplog):
+        """The id reaches the log line coding-done already emits on every run."""
+        with patch('sys.argv', [
+            'coding-done', 'completed',
+            '--implementation', 'Added feature',
+            '--problems', 'None',
+            '--dry-run'
+        ]):
+            with patch('issue_orchestrator.entrypoints.cli_tools.agent_done.get_session_id', return_value='test-123'):
+                with caplog.at_level(
+                    logging.INFO,
+                    logger="issue_orchestrator.entrypoints.cli_tools.coding_done",
+                ):
+                    coding_done_main()
+
+        assert any(
+            CODING_DONE_SOURCE_ID in message and "coding-done" in message.lower()
+            for message in (record.getMessage() for record in caplog.records)
+        )
 
 
 class TestMain:

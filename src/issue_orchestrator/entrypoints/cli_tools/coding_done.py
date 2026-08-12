@@ -58,6 +58,18 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+# Identifies which copy of this module actually ran.
+#
+# This path is tracked product source *and* one of the CLI tools the
+# orchestrator syncs into agent worktrees, so a run can execute either the
+# repository's own version or a planted copy occupying the same import path.
+# The startup diagnostic below carries this id so the answer is visible in the
+# logs of any real run, and the unit test that asserts its value fails outright
+# if validation is ever run against a copy that does not carry it — which is
+# what makes "the validated tree is the tree the branch contains" checkable
+# rather than assumed.
+CODING_DONE_SOURCE_ID = "repo:issue_orchestrator.entrypoints.cli_tools.coding_done"
+
 CODING_STATUSES = [
     AgentStatus.COMPLETED,
     AgentStatus.BLOCKED,
@@ -335,9 +347,17 @@ def main() -> None:  # noqa: C901, PLR0912
     issue_number = get_issue_number()
 
     if issue_number:
-        logger.info(issue_log(issue_number, "coding-done starting: status=%s"), status)
+        logger.info(
+            issue_log(issue_number, "coding-done starting: source=%s status=%s"),
+            CODING_DONE_SOURCE_ID,
+            status,
+        )
     else:
-        logger.info("[coding-done] Starting (standalone): status=%s", status)
+        logger.info(
+            "[coding-done] Starting (standalone): source=%s status=%s",
+            CODING_DONE_SOURCE_ID,
+            status,
+        )
 
     # 1. Validate required fields
     validate_fields(status, args)
