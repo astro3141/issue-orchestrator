@@ -47,6 +47,23 @@ canary, then promote.
 R0 stays on disk untouched, so the chain remains auditable and a rollback needs
 no rebuild.
 
+## Promotion: ship the runtime you verified
+
+The trusted runtime is pinned to a **specific commit that was actually
+exercised**, not to whatever `main` holds.
+
+When a runtime candidate passes its canary, promote **that build**. Rebuilding
+from a newer `main` — even one that merely adds the canary's own PR — promotes
+something no canary ever ran, and breaks the chain of evidence that the
+promotion rests on. Product `main` moving ahead of the runtime pin is expected
+and is not drift.
+
+**The predecessor stays on disk.** R0 is not deleted after promotion: it keeps
+the chain auditable and makes rollback a path change rather than a rebuild. A
+rebuilt "equivalent" of a predecessor is not the predecessor.
+
+Current pins are in the table under "The boundary".
+
 ## Environment requirements
 
 Five things live outside the repository. Miss any one and startup or the gate
@@ -90,6 +107,17 @@ debugging a "config not found":
 - The orchestrator's own startup discovery uses `find_config_file`, which looks
   for `DEFAULT_CONFIG_NAME` (`default.yaml`) and ignores that variable.
 - So `start` needs **`--config <path>`**. The CLI takes a path, not a name.
+
+Full precedence for the validation loader, highest first:
+
+1. `ISSUE_ORCHESTRATOR_CONFIG_PATH` / `ORCHESTRATOR_CONFIG_PATH` — an explicit file
+2. `ISSUE_ORCHESTRATOR_CONFIG_NAME` / `ORCHESTRATOR_CONFIG_NAME` — a name resolved in the config dir
+3. the repo-local `default.yaml` search
+
+Passing `--config` and exporting `ISSUE_ORCHESTRATOR_CONFIG_NAME` together is
+not redundant: the first steers startup, the second steers validation, and a run
+where they disagree validates under a contract the orchestrator did not start
+with.
 
 ## Starting
 
@@ -421,6 +449,46 @@ repository — so running it writes real issues into this fork. Two
 `[E2E-CLAIM] Coordination test issue` items (#1, #2) were created that way
 before this was understood. Upstream CI does not run e2e either. If live E2E is
 needed, point `E2E_TEST_REPO` at a throwaway repository.
+
+## Changing the quick profile mid-issue: widen only
+
+The quick gate selects by keyword. During #6 the selection was widened, and the
+direction matters more than the specific keywords.
+
+**Widening is safe. Narrowing is not.** A `passed=true` from a profile that
+deselected the tests covering the change is worse than no result at all: it
+carries the authority of a gate while having examined nothing relevant. If a
+rework round shows the profile misses the change area, add keywords — never
+remove them to make a run go green.
+
+This is also why the canary tests carry `planted` in their names. The keyword
+list selects them; a canary the gate deselects proves nothing.
+
+## Hidden work has a preservation deadline
+
+When setup repairs a worktree — clearing `--skip-worktree` bits, restoring files
+from the index, dropping stale `info/exclude` entries — it is touching files an
+agent may have edited while they were hidden from `git status`.
+
+**Repair must therefore establish ownership before doing anything destructive,
+not partway through.** #6's first rework round was spent exactly here: the fix
+preserved hidden work but ran the check inside the setup step rather than as a
+precondition of reuse, leaving a window where the repair could discard an
+agent's edits. The ordering is the requirement, not an implementation detail.
+
+The general rule: any step that can destroy uncommitted agent work must be
+preceded — not accompanied — by the check that decides whether it may run.
+
+## test-web is timing-sensitive
+
+Playwright dashboard tests can time out under load without anything being wrong
+with the change. Observed: `Locator.select_option` on an `e2e-run-row` exceeding
+its 30s budget during a push whose commit touched only documentation, then the
+same target passing 56/56 in an isolated rerun 74s later.
+
+Re-run `gmake test-web` alone before treating a lone failure there as a
+regression. If it reproduces, it is a real finding; if it does not, note the
+flake rather than silently retrying until green.
 
 ## Baseline health
 
