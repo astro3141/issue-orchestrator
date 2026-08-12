@@ -101,7 +101,11 @@ Four things make it authority rather than convenience:
 - **Validity is re-derived, never remembered.** `BoundReviewVerdict.approves(head_sha)`
   answers False once HEAD moves; the binding is then detectably stale.
 
-Only those two terminals produce a binding. Every other way an exchange can end
+Only two terminals produce a binding: the `reviewer_ok` completion, which binds
+`approved`, and the no-progress stop, which binds `changes_requested`. Neither
+picks that value itself — both write the verdict the single derivation above
+produced, which is why a reviewer whose transport field disagrees with its own
+decision never reaches the approving terminal at all. Every other way an exchange can end
 — max rounds exceeded, a protocol failure, a timeout — writes no
 `review-verdict.json`, because no reviewer verdict describes the commit the
 exchange left behind: max rounds is reached after a coder turn that was asked to

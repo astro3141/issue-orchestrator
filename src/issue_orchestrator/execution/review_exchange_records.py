@@ -65,9 +65,8 @@ def read_validation_facts(path: Path | None) -> tuple[str | None, bool | None]:
     absent/empty; ``passed`` is None when the field is absent or
     not a bool.
 
-    The summary writer (and the cache loader) use this to populate
-    ``ResumeFacts`` without leaking validation-record schema concerns into
-    other modules.
+    The summary writer uses this to populate ``ResumeFacts`` without leaking
+    validation-record schema concerns into other modules.
     """
     if path is None or not path.exists():
         return None, None
