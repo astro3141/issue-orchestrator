@@ -18,6 +18,7 @@ from ...infra.worktree_base import resolve_base_branch
 from ._worktree_errors import WorktreeError as WorktreeError
 from ._worktree_git import _git, _git_env_no_prompt, _git_run
 from ._worktree_hooks import HOOKS_DIR as HOOKS_DIR
+from ._worktree_runtime import repo_owns_cli_tools
 from ._worktree_runtime_setup import WorktreeRuntimeSetup
 
 
@@ -590,6 +591,7 @@ def _try_reuse_worktree(
     reuse_push_preflight: bool,
     allow_no_verify_dry_run_preflight: bool,
     base_branch: str | None,
+    runtime_setup: WorktreeRuntimeSetup,
     preserve_branch: bool = False,
 ) -> _WorktreeReuseResult:
     """Try to reuse an existing worktree, validating and preparing it.
@@ -602,6 +604,12 @@ def _try_reuse_worktree(
 
     Returns:
         _WorktreeReuseResult indicating success/failure with details.
+
+    Raises:
+        WorktreeError: If the runtime owner refuses the worktree in preflight —
+            see ``WorktreeRuntimeSetup.preflight_reuse``. Reuse stops rather
+            than degrading to a recreate: recreating deletes the worktree, and
+            the content preflight refused to reset over would go with it.
     """
     # Policy: validate worktree can be reused
     validation = policy.validate_for_reuse(worktree_path, branch_name, repo_root)
@@ -615,6 +623,13 @@ def _try_reuse_worktree(
             success=False,
             recreated_reason=f"validation_failed: {validation.reason}",
         )
+
+    # Nothing below this line may run while the worktree is hiding repo-owned
+    # source behind --skip-worktree: the update discards uncommitted work by
+    # design, and work git was told not to report would go with it unannounced.
+    # The runtime owner establishes provenance and un-hides first, and stops
+    # reuse here if what it finds is nobody's to overwrite.
+    runtime_setup.preflight_reuse(worktree_path)
 
     # Rebase onto latest base branch (critical for reruns with stale branches).
     # A tech_lead investigation reads the subject's branch as evidence, so it must
@@ -908,7 +923,10 @@ def create_worktree(
         commits_discarded: count of commits that were discarded (on rebase failure)
 
     Raises:
-        WorktreeError: If worktree creation fails
+        WorktreeError: If worktree creation fails, or if a reusable worktree
+            fails the runtime owner's reuse preflight — the one case where
+            "validate or delete" does not apply, because the worktree is being
+            refused precisely to keep what deleting it would destroy.
     """
     try:
         ctx = _init_worktree_context(
@@ -1025,6 +1043,7 @@ def _try_reuse_by_branch(
         reuse_options.reuse_push_preflight,
         reuse_options.allow_no_verify_dry_run_preflight,
         base_branch,
+        runtime_setup,
         preserve_branch=reuse_options.preserve_branch,
     )
 
@@ -1101,6 +1120,7 @@ def _try_reuse_by_path(
         reuse_options.reuse_push_preflight,
         reuse_options.allow_no_verify_dry_run_preflight,
         base_branch,
+        runtime_setup,
         preserve_branch=reuse_options.preserve_branch,
     )
 
@@ -1424,11 +1444,20 @@ def has_uncommitted_changes(worktree_path: Path) -> bool:
 
 
 def can_remove_without_user_changes(worktree_path: Path) -> bool:
-    """Return true when forced removal would not discard user source changes."""
+    """Return true when forced removal would not discard user source changes.
+
+    Orchestrator-planted CLI tools are discardable, but only in a repository
+    that does not own that path — where it does, an untracked file there is
+    product source the agent wrote and has not committed. ``repo_owns_cli_tools``
+    answers that, and a failure to answer propagates as ``WorktreeError`` rather
+    than resolving to "safe to delete".
+    """
     worktree_path = Path(worktree_path)
 
     if not worktree_path.exists():
         raise WorktreeError(f"Worktree does not exist at {worktree_path}")
+
+    repo_owns_planted_dir = repo_owns_cli_tools(worktree_path)
 
     try:
         result = _git_run(
@@ -1444,7 +1473,11 @@ def can_remove_without_user_changes(worktree_path: Path) -> bool:
 
         for line in result.stdout.splitlines():
             if line.startswith("?? "):
-                if not is_cleanup_safe_untracked_path(line[3:], worktree_path):
+                if not is_cleanup_safe_untracked_path(
+                    line[3:],
+                    worktree_path,
+                    repo_owns_planted_dir=repo_owns_planted_dir,
+                ):
                     return False
                 continue
             return False

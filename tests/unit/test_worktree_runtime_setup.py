@@ -27,6 +27,7 @@ from issue_orchestrator.adapters.worktree._worktree_runtime import (
     WORKTREE_ID_MARKER,
 )
 from tests.unit.worktree_git_helpers import (
+    GitWorktree,
     block_worktree_config_writes,
     effective_hooks_path,
     make_git_worktree,
@@ -55,22 +56,27 @@ def _break_read_of(
 
 
 @pytest.fixture
-def repo_root(tmp_path: Path) -> Path:
-    root = tmp_path / "repo"
-    (root / ".git").mkdir(parents=True)
-    (root / ".venv" / "bin").mkdir(parents=True)
-    return root
+def git_worktree(tmp_path: Path) -> GitWorktree:
+    """A real repository plus one linked worktree, with a venv to share.
+
+    Real Git rather than a hand-built ``.git``: setup asks the repository
+    whether it owns the CLI-tools path before planting anything there, and a
+    fabricated ``.git`` directory has no answer to give — which the owner
+    treats as a failure rather than a licence to guess.
+    """
+    worktree = make_git_worktree(tmp_path, name="repo-123")
+    (worktree.main_repo / ".venv" / "bin").mkdir(parents=True)
+    return worktree
 
 
 @pytest.fixture
-def worktree_path(tmp_path: Path, repo_root: Path) -> Path:
-    """A worktree linked to ``repo_root`` the way ``git worktree add`` links it."""
-    path = tmp_path / "repo-123"
-    path.mkdir()
-    gitdir = repo_root / ".git" / "worktrees" / "repo-123"
-    gitdir.mkdir(parents=True)
-    (path / ".git").write_text(f"gitdir: {gitdir}")
-    return path
+def repo_root(git_worktree: GitWorktree) -> Path:
+    return git_worktree.main_repo
+
+
+@pytest.fixture
+def worktree_path(git_worktree: GitWorktree) -> Path:
+    return git_worktree.worktree_path
 
 
 def _setup(repo_root: Path, **overrides) -> WorktreeRuntimeSetup:

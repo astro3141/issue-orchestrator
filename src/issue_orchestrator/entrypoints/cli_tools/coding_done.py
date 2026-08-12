@@ -44,12 +44,15 @@ from .dirty_retry_budget import (
 )
 from .orchestrator_resume import trigger_orchestrator_resume
 from .orchestrator_run_assets import require_orchestrator_run_assets_for_session
+
+from ...execution.git_planted_paths import local_repo_owns_planted_cli_tools
 from ...infra.env import get_env
 from ...infra.logging_config import issue_log
 from ...infra.runtime_artifacts import (
     is_orchestrator_untracked_planted,
     is_runtime_managed_dirty_path,
 )
+from ...ports.git import GitError
 
 import logging
 
@@ -66,6 +69,32 @@ def _is_managed_session() -> bool:
     return bool(get_env("SESSION_ID") or os.environ.get("ORCHESTRATOR_SESSION_ID"))
 
 
+def _repo_owns_cli_tools_here(worktree_root: Path | None) -> bool:
+    """Answer the ownership question through the seam every dirty surface uses.
+
+    Same function the orchestrator's publish gate calls, so the agent's check
+    and the gate that overrules it cannot disagree about whose CLI tools are in
+    the worktree.
+
+    On a git failure the answer is "the repository owns it", which reports the
+    files instead of hiding them. Both errors are possible here and they are not
+    symmetric: a wrongly reported planting is visible and recoverable, while a
+    wrongly hidden file is the silent divergence between the validated tree and
+    the pushed commit that this filter exists to avoid.
+    """
+    worktree = worktree_root if worktree_root is not None else Path.cwd()
+    try:
+        return local_repo_owns_planted_cli_tools(worktree)
+    except GitError as exc:
+        logger.warning(
+            "Could not determine whether %s owns the orchestrator CLI-tools "
+            "path (%s); treating untracked files there as the candidate's own",
+            worktree,
+            exc,
+        )
+        return True
+
+
 def check_dirty_files(worktree_root: Path | None = None) -> list[str]:
     """Return dirty porcelain lines the agent is responsible for.
 
@@ -75,8 +104,11 @@ def check_dirty_files(worktree_root: Path | None = None) -> list[str]:
       always ignored, never source.
     - Orchestrator-planted sync targets under
       ``src/issue_orchestrator/entrypoints/cli_tools/`` — ignored **only
-      when untracked**. A tracked modification in the orchestrator's own
-      repo remains a legitimate developer edit and still counts as dirty.
+      when untracked** and **only where the target repository does not own
+      that path**. A tracked modification in the orchestrator's own repo
+      remains a legitimate developer edit; an untracked file there is a CLI
+      tool the candidate is adding, and hiding it would let the agent
+      complete with product source that never reaches the branch.
 
     Uses ``--untracked-files=all`` so git lists each untracked file
     individually rather than summarising a subtree to its topmost
@@ -84,6 +116,7 @@ def check_dirty_files(worktree_root: Path | None = None) -> list[str]:
     the prior prefix filter — ``src/`` doesn't match
     ``src/issue_orchestrator/entrypoints/cli_tools/``.
     """
+    repo_owns_planted_dir = _repo_owns_cli_tools_here(worktree_root)
     try:
         result = subprocess.run(
             ["git", "status", "--porcelain", "--untracked-files=all"],
@@ -114,7 +147,9 @@ def check_dirty_files(worktree_root: Path | None = None) -> list[str]:
         is_untracked = status_code == "??"
         if is_runtime_managed_dirty_path(path, worktree_root):
             continue
-        if is_untracked and is_orchestrator_untracked_planted(path):
+        if is_untracked and is_orchestrator_untracked_planted(
+            path, repo_owns_planted_dir=repo_owns_planted_dir
+        ):
             continue
         dirty.append(line.strip())
     return dirty

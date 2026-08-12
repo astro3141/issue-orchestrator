@@ -6,9 +6,13 @@ guard surface (``coding-done`` CLI, ``GitWorkingCopy.list_dirty_files``,
 filter exists: ``sync_cli_tools`` copies ``src/issue_orchestrator/
 entrypoints/cli_tools/*`` into every worktree, and in a foreign target
 repo (Kotlin, etc.) those files appear as untracked — tripping the
-dirty-tree guard on every ``coding-done`` call. The filter removes them
-only when untracked so the orchestrator's own repo still catches real
-developer edits.
+dirty-tree guard on every ``coding-done`` call.
+
+Two conditions bound the filter, and both have a test class below: it
+removes a path only when git reports it *untracked*, so the orchestrator's
+own repo still catches real developer edits, and only when the target
+repository does not own the planted directory, so a CLI tool the candidate
+*adds* in this repo is reported rather than silently kept off the branch.
 """
 
 from __future__ import annotations
@@ -32,13 +36,15 @@ from issue_orchestrator.infra.runtime_artifacts import (
 
 def test_matches_individual_planted_file() -> None:
     assert is_orchestrator_untracked_planted(
-        "src/issue_orchestrator/entrypoints/cli_tools/coding_done.py"
+        "src/issue_orchestrator/entrypoints/cli_tools/coding_done.py",
+        repo_owns_planted_dir=False,
     )
 
 
 def test_matches_planted_prefix_itself() -> None:
     assert is_orchestrator_untracked_planted(
-        "src/issue_orchestrator/entrypoints/cli_tools/"
+        "src/issue_orchestrator/entrypoints/cli_tools/",
+        repo_owns_planted_dir=False,
     )
 
 
@@ -47,30 +53,43 @@ def test_matches_summary_dir_form_from_porcelain() -> None:
     # The agent's reported error was ``?? src/`` — git had collapsed the
     # whole untracked subtree to its root. The helper must recognise this
     # because the only known planted root lives under src/.
-    assert is_orchestrator_untracked_planted("src/")
-    assert is_orchestrator_untracked_planted("src/issue_orchestrator/")
+    assert is_orchestrator_untracked_planted("src/", repo_owns_planted_dir=False)
+    assert is_orchestrator_untracked_planted(
+        "src/issue_orchestrator/", repo_owns_planted_dir=False
+    )
 
 
 def test_rejects_unrelated_src_files() -> None:
     """A real source file under src/ (non-cli_tools) is not planted."""
-    assert not is_orchestrator_untracked_planted("src/main.py")
-    assert not is_orchestrator_untracked_planted("src/foo/bar.py")
+    assert not is_orchestrator_untracked_planted(
+        "src/main.py", repo_owns_planted_dir=False
+    )
+    assert not is_orchestrator_untracked_planted(
+        "src/foo/bar.py", repo_owns_planted_dir=False
+    )
 
 
 def test_rejects_unrelated_paths() -> None:
-    assert not is_orchestrator_untracked_planted("README.md")
-    assert not is_orchestrator_untracked_planted(".githooks/pre-push")
-    assert not is_orchestrator_untracked_planted("")
+    assert not is_orchestrator_untracked_planted(
+        "README.md", repo_owns_planted_dir=False
+    )
+    assert not is_orchestrator_untracked_planted(
+        ".githooks/pre-push", repo_owns_planted_dir=False
+    )
+    assert not is_orchestrator_untracked_planted("", repo_owns_planted_dir=False)
 
 
 def test_rejects_sibling_prefix_outside_planted_tree() -> None:
     """``src/issue_orchestrator_tests/`` shares a prefix but is not planted."""
-    assert not is_orchestrator_untracked_planted("src/issue_orchestrator_tests/foo.py")
+    assert not is_orchestrator_untracked_planted(
+        "src/issue_orchestrator_tests/foo.py", repo_owns_planted_dir=False
+    )
 
 
 def test_normalizes_windows_separators() -> None:
     assert is_orchestrator_untracked_planted(
-        "src\\issue_orchestrator\\entrypoints\\cli_tools\\coding_done.py"
+        "src\\issue_orchestrator\\entrypoints\\cli_tools\\coding_done.py",
+        repo_owns_planted_dir=False,
     )
 
 
@@ -82,9 +101,44 @@ def test_filter_strips_planted_keeps_others() -> None:
         "tests/test_foo.py",
     ]
 
-    kept = filter_orchestrator_untracked_planted(paths)
+    kept = filter_orchestrator_untracked_planted(paths, repo_owns_planted_dir=False)
 
     assert kept == ["docs/README.md", "tests/test_foo.py"]
+
+
+# ---------------------------------------------------------------------------
+# Self-hosting: the same paths in a repository that owns them
+#
+# ``sync_cli_tools`` plants nothing where the target repository tracks that
+# directory, so nothing under it is orchestrator-owned there. An untracked
+# file is then the candidate's own new product source, and hiding it would
+# let the agent complete with source the pushed commit does not contain.
+# ---------------------------------------------------------------------------
+
+
+def test_nothing_is_planted_when_repository_owns_the_directory() -> None:
+    for path in (
+        "src/issue_orchestrator/entrypoints/cli_tools/coding_done.py",
+        "src/issue_orchestrator/entrypoints/cli_tools/new_tool.py",
+        "src/issue_orchestrator/entrypoints/cli_tools/",
+        "src/",
+        "src\\issue_orchestrator\\entrypoints\\cli_tools\\coding_done.py",
+    ):
+        assert not is_orchestrator_untracked_planted(
+            path, repo_owns_planted_dir=True
+        ), path
+
+
+def test_filter_keeps_new_cli_tool_when_repository_owns_the_directory() -> None:
+    """A CLI tool the candidate adds must reach the dirty guard, not be filtered."""
+    paths = [
+        "src/issue_orchestrator/entrypoints/cli_tools/new_tool.py",
+        "docs/README.md",
+    ]
+
+    kept = filter_orchestrator_untracked_planted(paths, repo_owns_planted_dir=True)
+
+    assert kept == paths
 
 
 # ---------------------------------------------------------------------------
@@ -134,23 +188,43 @@ def test_runtime_metadata_filter_strips_claude_scheduled_tasks_lock() -> None:
 
 def test_cleanup_safe_untracked_paths_cover_completed_session_artifacts() -> None:
     """Forced cleanup can discard known run artifacts without a second allowlist."""
-    assert is_cleanup_safe_untracked_path(".agent-done-marker")
-    assert is_cleanup_safe_untracked_path(".issue-orchestrator/validation/abc123.json")
     assert is_cleanup_safe_untracked_path(
-        ".issue-orchestrator/sessions/run-1/validation-record.json"
+        ".agent-done-marker", repo_owns_planted_dir=False
     )
     assert is_cleanup_safe_untracked_path(
-        ".issue-orchestrator/persistent-pairs/issue-1/coder/terminal.jsonl"
+        ".issue-orchestrator/validation/abc123.json", repo_owns_planted_dir=False
     )
-    assert is_cleanup_safe_untracked_path("web/node_modules/.cache/state.json")
+    assert is_cleanup_safe_untracked_path(
+        ".issue-orchestrator/sessions/run-1/validation-record.json",
+        repo_owns_planted_dir=False,
+    )
+    assert is_cleanup_safe_untracked_path(
+        ".issue-orchestrator/persistent-pairs/issue-1/coder/terminal.jsonl",
+        repo_owns_planted_dir=False,
+    )
+    assert is_cleanup_safe_untracked_path(
+        "web/node_modules/.cache/state.json", repo_owns_planted_dir=False
+    )
 
 
 def test_cleanup_safe_untracked_paths_are_path_boundary_safe() -> None:
-    assert not is_cleanup_safe_untracked_path(".issue-orchestrator/stateful-notes")
     assert not is_cleanup_safe_untracked_path(
-        ".issue-orchestrator/review-report.md.backup"
+        ".issue-orchestrator/stateful-notes", repo_owns_planted_dir=False
     )
-    assert not is_cleanup_safe_untracked_path("packages/app_node_modules/file.txt")
+    assert not is_cleanup_safe_untracked_path(
+        ".issue-orchestrator/review-report.md.backup", repo_owns_planted_dir=False
+    )
+    assert not is_cleanup_safe_untracked_path(
+        "packages/app_node_modules/file.txt", repo_owns_planted_dir=False
+    )
+
+
+def test_cleanup_keeps_planted_path_when_repository_owns_the_directory() -> None:
+    """Forced removal must not discard an uncommitted CLI tool the agent wrote."""
+    planted_path = "src/issue_orchestrator/entrypoints/cli_tools/new_tool.py"
+
+    assert is_cleanup_safe_untracked_path(planted_path, repo_owns_planted_dir=False)
+    assert not is_cleanup_safe_untracked_path(planted_path, repo_owns_planted_dir=True)
 
 
 def test_loads_repo_local_runtime_ignore_file(tmp_path, caplog) -> None:

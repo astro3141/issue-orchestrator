@@ -232,6 +232,105 @@ duplicates them.
 `make test` is **not** the project's gate. It carries `-x`, and on a fresh fork
 it aborts in ~128s inside `tests/e2e`.
 
+### The gate must read the commit it reports on
+
+A gate result is evidence about a commit only if the tree it read *is* that
+commit. Self-hosting is the one case where that can quietly stop being true:
+`src/issue_orchestrator/entrypoints/cli_tools/` is orchestrator runtime in
+every other repository, but product source here. Worktree setup used to plant
+its own copies there and mark them `--skip-worktree`, so `git status` looked
+clean while pytest and static analysis read files the branch did not contain
+(fork issue #6; hit on #3 and #5).
+
+Setup now refuses to plant over a path the target repository tracks, and undoes
+any overlay an older run left behind. Confirm a managed worktree before
+trusting its gate:
+
+```sh
+git -C <managed-worktree> ls-files -v -- src/issue_orchestrator/entrypoints/cli_tools
+# every line must start with H; an S means the tree is not the commit
+```
+
+`.claude/settings.json` is still `--skip-worktree` by design — the Stop hook is
+runtime configuration, and nothing in the gate reads it as source.
+
+#### When setup refuses a worktree over a hidden CLI tool
+
+Undoing the overlay only reverts files the orchestrator can prove it planted
+(byte-identical to the copy in its own package). `--skip-worktree` never made
+those paths read-only, it only hid writes to them, so a session that died
+mid-edit can leave real work behind that `git status` called clean. Setup
+preserves anything it cannot explain, clears the bit so git reports it, and
+then fails rather than running an agent on it.
+
+Reuse asks this **before** it rebases or hard-resets, so the run that reports
+the problem is also a run that has not touched the worktree: uncommitted work
+elsewhere in the tree is still there too. The message names the files:
+
+```
+Repo-owned CLI tool(s) in <worktree> diverge from the index and no orchestrator
+copy explains them: <paths>
+```
+
+Decide per file — the content is on disk and now visible:
+
+```sh
+git -C <managed-worktree> diff -- <path>   # keep it: commit on the branch
+git -C <managed-worktree> checkout -- <path>   # discard it
+```
+
+Either way the path is no longer hidden, so the next setup on that worktree
+proceeds normally; the failure does not repeat on its own.
+
+Deciding is the whole of the deadline. From the escalation onward the content
+is ordinary uncommitted work: the bit is cleared, so the *next* run finds
+nothing hidden, passes the same check, and reaches the `git reset --hard` and
+`git clean -fd` that reuse runs before setup ("we prioritize success over
+preserving uncommitted work") — which discards it. That is still the
+improvement over the old behaviour — the loss is now reported by `git status`
+beforehand and logged as a discard when it happens, instead of being invisible
+in both directions — but it is a deadline, not a reprieve.
+
+### …and it must read the code that changed
+
+Same rule, one level up. `validation.quick` in
+`.issue-orchestrator/config/selfhost.yaml` is a `-k` filter, so a `passed=true`
+recorded by a run that deselected every test the branch added is evidence about
+somebody else's code. `-k` matches module names, so widening it is cheap:
+
+```sh
+# what the recorded gate actually executed
+grep -c 'PASSED\|passed' <session>/validation/validation-stdout.log
+.venv/bin/python -m pytest tests/unit tests/integration -q -p no:cacheprovider \
+  --collect-only -k '<the profile expression>' | grep <your test module>
+```
+
+When an issue's change area falls outside the current keywords, add them to the
+tracked config in the same commit — but **that edit does not take effect for the
+branch that makes it.** `load_runtime_validation_config` gives
+`ISSUE_ORCHESTRATOR_CONFIG_PATH` precedence over any repo-local search, and the
+launcher exports it as the *main checkout's* config file:
+
+```sh
+echo "$ISSUE_ORCHESTRATOR_CONFIG_PATH"
+# /Users/<you>/io-fork/issue-orchestrator/.issue-orchestrator/config/selfhost.yaml
+```
+
+So the live gate is operator-owned and outside every agent worktree. A branch's
+own edit governs runs only after it lands there. To make a round's record carry
+the branch's own gate, point one run at the worktree copy:
+
+```sh
+ISSUE_ORCHESTRATOR_CONFIG_PATH=$PWD/.issue-orchestrator/config/selfhost.yaml \
+ORCHESTRATOR_CONFIG_PATH=$PWD/.issue-orchestrator/config/selfhost.yaml \
+  coding-done completed --implementation "…" --problems "…"
+```
+
+Only ever to *widen* the selection — an override that narrows it is the agent
+grading its own paper. Publish (`make validate-pr-raw`) running the whole suite
+later is a backstop against merging something broken, not a substitute for
+validating the change in review.
+
 ### tests/e2e is a separate live contract
 
 It requires `gh auth` and `E2E_TEST_REPO`. With that variable unset,

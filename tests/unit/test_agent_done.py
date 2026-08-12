@@ -13,6 +13,7 @@ import json
 import os
 import sys
 import tempfile
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from unittest.mock import Mock, patch, MagicMock
@@ -46,6 +47,7 @@ from issue_orchestrator.entrypoints.cli_tools.coding_done import (
 )
 from issue_orchestrator.entrypoints.cli_tools.reviewer_done import main as reviewer_done_main
 from issue_orchestrator.execution.session_output_adapter import FileSystemSessionOutput
+from issue_orchestrator.ports.git import GitError, GitResult
 from issue_orchestrator.domain.models import (
     CompletionOutcome,
     RequestedAction,
@@ -703,6 +705,33 @@ class TestWriteMarkerFile:
             os.chdir(original_cwd)
 
 
+OWNERSHIP_SEAM = (
+    "issue_orchestrator.entrypoints.cli_tools.coding_done"
+    ".local_repo_owns_planted_cli_tools"
+)
+
+
+@contextmanager
+def _porcelain(stdout: str, *, repo_owns_planted_dir: bool = False):
+    """Run ``check_dirty_files`` against a fixed porcelain listing.
+
+    Stubbing the ownership seam is what lets each test state *which repository*
+    it describes rather than inheriting whatever repo the suite runs in — and it
+    has to be stubbed rather than left to the real git call, because patching
+    ``subprocess.run`` for the porcelain listing would otherwise answer the
+    ownership query with the same canned output.
+
+    ``False`` is the foreign-repo case (the orchestrator planted the CLI tools);
+    ``True`` is self-hosting, where the candidate commit owns them.
+    """
+    with (
+        patch("subprocess.run") as mock_run,
+        patch(OWNERSHIP_SEAM, return_value=repo_owns_planted_dir),
+    ):
+        mock_run.return_value = Mock(returncode=0, stdout=stdout)
+        yield mock_run
+
+
 class TestCheckDirtyFiles:
     """Test check_dirty_files excludes orchestrator runtime artifacts.
 
@@ -712,9 +741,11 @@ class TestCheckDirtyFiles:
       ``.claude/``): always filtered regardless of tracked/untracked.
     - Orchestrator-planted source
       (``src/issue_orchestrator/entrypoints/cli_tools/``): filtered **only**
-      when git reports the path as untracked (status ``??``). A tracked
-      modification in the orchestrator's own repo is a legitimate
-      developer edit and must still fire the guard.
+      when git reports the path as untracked (status ``??``) **and** the target
+      repository does not own that directory. A tracked modification in the
+      orchestrator's own repo is a legitimate developer edit, and an untracked
+      file there is a CLI tool the candidate is adding — both must still fire
+      the guard.
     """
 
     def test_excludes_runtime_metadata(self):
@@ -724,15 +755,12 @@ class TestCheckDirtyFiles:
             " M .claude/settings.json\n"
             " M src/app.py\n"
         )
-        with patch("subprocess.run") as mock_run:
-            mock_run.return_value = Mock(returncode=0, stdout=porcelain)
+        with _porcelain(porcelain):
             result = check_dirty_files()
         assert result == ["M src/app.py"]
 
     def test_returns_all_when_no_orchestrator_files(self):
-        porcelain = "?? newfile.py\n M existing.py\n"
-        with patch("subprocess.run") as mock_run:
-            mock_run.return_value = Mock(returncode=0, stdout=porcelain)
+        with _porcelain("?? newfile.py\n M existing.py\n"):
             result = check_dirty_files()
         assert len(result) == 2
 
@@ -743,8 +771,7 @@ class TestCheckDirtyFiles:
             "?? src/issue_orchestrator/entrypoints/cli_tools/reviewer_done.py\n"
             " M src/app.py\n"
         )
-        with patch("subprocess.run") as mock_run:
-            mock_run.return_value = Mock(returncode=0, stdout=porcelain)
+        with _porcelain(porcelain):
             result = check_dirty_files()
         assert result == ["M src/app.py"]
 
@@ -754,9 +781,7 @@ class TestCheckDirtyFiles:
         foreign repo this is exactly how the planted ``cli_tools/`` tree
         shows up — the prior substring-based filter silently missed it.
         """
-        porcelain = "?? src/\n"
-        with patch("subprocess.run") as mock_run:
-            mock_run.return_value = Mock(returncode=0, stdout=porcelain)
+        with _porcelain("?? src/\n"):
             result = check_dirty_files()
         assert result == []
 
@@ -769,12 +794,45 @@ class TestCheckDirtyFiles:
             " M src/issue_orchestrator/entrypoints/cli_tools/coding_done.py\n"
             "M  src/issue_orchestrator/entrypoints/cli_tools/reviewer_done.py\n"
         )
-        with patch("subprocess.run") as mock_run:
-            mock_run.return_value = Mock(returncode=0, stdout=porcelain)
+        with _porcelain(porcelain):
             result = check_dirty_files()
         assert result == [
             "M src/issue_orchestrator/entrypoints/cli_tools/coding_done.py",
             "M  src/issue_orchestrator/entrypoints/cli_tools/reviewer_done.py",
+        ]
+
+    def test_reports_new_cli_tool_when_repository_owns_that_directory(self):
+        """Self-hosting: a CLI tool the candidate added must block completion.
+
+        Nothing is planted where the repository owns the path, so this file is
+        product source. Hiding it would let the agent complete having validated
+        a tree that contains a file the pushed commit does not.
+        """
+        porcelain = (
+            "?? src/issue_orchestrator/entrypoints/cli_tools/new_tool.py\n"
+            " M src/app.py\n"
+        )
+        with _porcelain(porcelain, repo_owns_planted_dir=True):
+            result = check_dirty_files()
+        assert result == [
+            "?? src/issue_orchestrator/entrypoints/cli_tools/new_tool.py",
+            "M src/app.py",
+        ]
+
+    def test_reports_untracked_planted_paths_when_ownership_is_unanswerable(self):
+        """A git failure must not resolve to "the orchestrator owns it"."""
+        porcelain = "?? src/issue_orchestrator/entrypoints/cli_tools/new_tool.py\n"
+        git_failure = GitError(
+            GitResult(argv=["git"], returncode=128, stdout="", stderr="fatal")
+        )
+        with (
+            patch("subprocess.run") as mock_run,
+            patch(OWNERSHIP_SEAM, side_effect=git_failure),
+        ):
+            mock_run.return_value = Mock(returncode=0, stdout=porcelain)
+            result = check_dirty_files()
+        assert result == [
+            "?? src/issue_orchestrator/entrypoints/cli_tools/new_tool.py"
         ]
 
     def test_uses_untracked_files_all_flag(self):
@@ -782,8 +840,7 @@ class TestCheckDirtyFiles:
         subtree doesn't get collapsed to ``?? src/`` and evade per-file
         filters elsewhere.
         """
-        with patch("subprocess.run") as mock_run:
-            mock_run.return_value = Mock(returncode=0, stdout="")
+        with _porcelain("") as mock_run:
             check_dirty_files()
         args = mock_run.call_args[0][0]
         assert args[:2] == ["git", "status"]
@@ -791,8 +848,7 @@ class TestCheckDirtyFiles:
         assert "--untracked-files=all" in args
 
     def test_clean_tree_returns_empty(self):
-        with patch("subprocess.run") as mock_run:
-            mock_run.return_value = Mock(returncode=0, stdout="")
+        with _porcelain(""):
             result = check_dirty_files()
         assert result == []
 

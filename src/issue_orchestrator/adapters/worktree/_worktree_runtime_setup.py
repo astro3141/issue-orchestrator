@@ -23,6 +23,7 @@ from ._worktree_runtime import (
     _link_repo_venv_into_worktree,
     install_claude_settings,
     sync_cli_tools,
+    unhide_repo_owned_cli_tools,
 )
 
 logger = logging.getLogger(__name__)
@@ -77,6 +78,42 @@ class WorktreeRuntimeSetup:
     enforce_hooks: bool = True
     pre_push_hook: Path | None = None
     allow_no_verify_dry_run_preflight: bool = False
+
+    def preflight_reuse(self, worktree_path: Path) -> None:
+        """Clear a reused worktree for the destructive steps reuse is about to run.
+
+        Reuse rebases, hard-resets and cleans before setup ever runs, so a
+        worktree hiding repo-owned CLI source behind ``--skip-worktree`` loses
+        that content before ``apply`` gets the chance to notice it — and loses
+        it invisibly, because the bit is precisely what stopped git reporting
+        the file. Preserving the work inside ``apply`` would then be preserving
+        whatever the reset happened to leave.
+
+        So the same question ``apply`` asks is asked here first, ahead of the
+        reset: establish provenance, put the paths back under git's eye, and
+        either repair what this orchestrator can prove it planted or stop the
+        reuse path outright. It is idempotent with the ``sync_cli_tools`` step
+        inside ``apply``: by the time that runs, nothing is hidden any more.
+
+        Called once validation has accepted the worktree, which is what makes
+        ``git`` answerable there at all — a path that is not a usable worktree
+        is deleted by the lifecycle before this point, and has no index to hold
+        a ``--skip-worktree`` bit in the first place.
+
+        Raises:
+            WorktreeError: If the worktree holds repo-owned CLI source that no
+                orchestrator copy explains. The content is preserved and made
+                visible to ``git status``; reuse stops rather than resetting
+                over work only a human can classify.
+        """
+        try:
+            unhide_repo_owned_cli_tools(worktree_path)
+        except WorktreeError:
+            raise
+        except Exception as exc:
+            raise WorktreeError(
+                f"Worktree reuse preflight failed for {worktree_path}: {exc}"
+            ) from exc
 
     def apply(self, worktree_path: Path) -> WorktreeRuntimeState:
         """Bring ``worktree_path`` to a runnable state for an agent session.
