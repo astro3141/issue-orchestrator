@@ -27,12 +27,17 @@ from issue_orchestrator.domain.review_artifacts import ReviewDecision
 from issue_orchestrator.domain.review_exchange import ReviewExchangeResponse
 from issue_orchestrator.domain.review_exchange_run import ReviewExchangeRun
 from issue_orchestrator.domain.review_exchange_summary import ReviewExchangeSummaryV1
+from issue_orchestrator.domain.review_verdict_binding import (
+    BoundReviewVerdict,
+    ReviewVerdictOutcome,
+)
 from issue_orchestrator.domain.runtime_config import RuntimeConfigReference
 from issue_orchestrator.events import EventContext, EventName
 from issue_orchestrator.execution import persistent_session_exchange as pse
 from issue_orchestrator.execution.persistent_role_prompt_policy import (
     role_session_needs_fresh_prompt_process,
 )
+from issue_orchestrator.execution.review_exchange_records import load_review_verdict
 from issue_orchestrator.execution.session_output_adapter import FileSystemSessionOutput
 from issue_orchestrator.ports import TraceEvent
 from tests.callback_endpoint_helpers import ready_callback_endpoint
@@ -7345,3 +7350,303 @@ class TestSpawnPartialConstructionCleanup:
         assert registry.acquired == [], (
             "no pair must reach the registry on partial spawn failure"
         )
+
+
+# ---------------------------------------------------------------------------
+# Exact-SHA verdict binding
+# ---------------------------------------------------------------------------
+
+
+_VERDICT_SHA_A = "a" * 40
+_VERDICT_SHA_B = "b" * 40
+
+
+def _run_binding_exchange(
+    *,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    response_script: dict[str, list[Any]],
+    head_sha: str | None = _VERDICT_SHA_A,
+    head_moves_to: str | None = None,
+    max_rounds: int = 1,
+    max_no_progress: int = 2,
+    require_validation: bool = False,
+    initial_validation_record_path: Path | None = None,
+) -> Any:
+    """Run one exchange over a coder worktree whose HEAD the test controls.
+
+    ``head_sha`` is what the orchestrator observes in the coder worktree.
+    When ``head_moves_to`` is set, HEAD advances to it as soon as the
+    reviewer's turn returns — modelling a commit that lands while the round
+    is being reviewed.
+    """
+    prompt_path = tmp_path / "p.md"
+    prompt_path.write_text("Prompt", encoding="utf-8")
+    coder_wt, reviewer_wt = _setup_worktrees(tmp_path)
+    session_output = FileSystemSessionOutput()
+    state = _patch_persistent_runner(monkeypatch, response_script=response_script)
+    head = {"sha": head_sha}
+    monkeypatch.setattr(pse, "get_repo_head_sha", lambda _worktree: head["sha"])
+    if head_moves_to is not None:
+        scripted_send = pse.send_round
+
+        def _send_then_move_head(session: Any, **kwargs: Any) -> Any:
+            result = scripted_send(session, **kwargs)
+            if session.role == "reviewer":
+                head["sha"] = head_moves_to
+            return result
+
+        monkeypatch.setattr(pse, "send_round", _send_then_move_head)
+    return pse.run_persistent_session_exchange(
+        exchange_run=_start_exchange_run(
+            session_output=session_output,
+            coder_worktree_path=coder_wt,
+            issue_number=42,
+            coder_label="agent:backend",
+        ),
+        session_output=session_output,
+        pair_registry=state["registry"],
+        persistent_pair_root=tmp_path / "persistent-pairs",
+        coder_worktree_path=coder_wt,
+        reviewer_worktree_factory=lambda: reviewer_wt,
+        issue_number=42,
+        issue_title="Test",
+        coder_label="agent:backend",
+        reviewer_label="agent:reviewer",
+        coder_agent=_make_agent(prompt_path),
+        reviewer_agent=_make_agent(prompt_path),
+        runtime_config=_runtime_config(tmp_path),
+        max_rounds=max_rounds,
+        max_no_progress=max_no_progress,
+        require_validation=require_validation,
+        initial_validation_record_path=initial_validation_record_path,
+    )
+
+
+class TestExactShaVerdictBinding:
+    """The verdict and the commit it was rendered against, as one record.
+
+    Foundation admission (``docs/foundation/VALIDATED_WORK_DISPOSITION.md`` §4)
+    needs ``review.reviewed_sha`` to mean the commit the orchestrator actually
+    presented. These tests pin that meaning at the seam that produces it.
+    """
+
+    def test_approval_binds_the_presented_head(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        outcome = _run_binding_exchange(
+            tmp_path=tmp_path,
+            monkeypatch=monkeypatch,
+            response_script={
+                "reviewer": [
+                    {
+                        "response_type": "ok",
+                        "response_text": "Looks good",
+                        "getting_closer": True,
+                    }
+                ],
+                "coder": [],
+            },
+        )
+
+        binding = load_review_verdict(outcome.run_assets.exchange_dir)
+        assert binding is not None
+        assert binding.verdict is ReviewVerdictOutcome.APPROVED
+        assert binding.reviewed_sha == _VERDICT_SHA_A
+        assert binding.approves(_VERDICT_SHA_A) is True
+        # Ordinary review semantics are untouched by recording the binding.
+        assert (outcome.status, outcome.reason, outcome.rounds) == (
+            "ok",
+            "reviewer_ok",
+            1,
+        )
+
+    def test_reviewer_cannot_choose_the_recorded_sha(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The reviewer names a commit in its own decision JSON; it is ignored."""
+        outcome = _run_binding_exchange(
+            tmp_path=tmp_path,
+            monkeypatch=monkeypatch,
+            response_script={
+                "reviewer": [
+                    {
+                        "response_type": "ok",
+                        "response_text": "Looks good",
+                        "getting_closer": True,
+                        "decision": {
+                            "verdict": "approved",
+                            "risk": "low",
+                            "abstraction_review": {"status": "no_issues"},
+                            "reviewed_sha": _VERDICT_SHA_B,
+                            "head_sha": _VERDICT_SHA_B,
+                        },
+                    }
+                ],
+                "coder": [],
+            },
+        )
+
+        binding = load_review_verdict(outcome.run_assets.exchange_dir)
+        assert binding is not None
+        assert binding.reviewed_sha == _VERDICT_SHA_A
+        assert binding.approves(_VERDICT_SHA_B) is False
+
+    def test_head_moving_during_review_cannot_be_approved(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A commit landing after the round was presented is not approved.
+
+        The first observation is the one the reviewer was given; every later
+        observation sees the moved HEAD. If the binding were captured at
+        decision time instead, the new commit would inherit the approval.
+        """
+        outcome = _run_binding_exchange(
+            tmp_path=tmp_path,
+            monkeypatch=monkeypatch,
+            response_script={
+                "reviewer": [
+                    {
+                        "response_type": "ok",
+                        "response_text": "Looks good",
+                        "getting_closer": True,
+                    }
+                ],
+                "coder": [],
+            },
+            head_sha=_VERDICT_SHA_A,
+            head_moves_to=_VERDICT_SHA_B,
+        )
+
+        binding = load_review_verdict(outcome.run_assets.exchange_dir)
+        assert binding is not None
+        assert binding.reviewed_sha == _VERDICT_SHA_A
+        assert binding.approves(_VERDICT_SHA_B) is False
+        assert binding.is_stale_for(_VERDICT_SHA_B) is True
+
+    def test_binding_is_recoverable_from_storage_alone(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Nothing but the exchange directory is needed after a restart."""
+        outcome = _run_binding_exchange(
+            tmp_path=tmp_path,
+            monkeypatch=monkeypatch,
+            response_script={
+                "reviewer": [
+                    {
+                        "response_type": "ok",
+                        "response_text": "Looks good",
+                        "getting_closer": True,
+                    }
+                ],
+                "coder": [],
+            },
+        )
+
+        exchange_dir = Path(str(outcome.run_assets.exchange_dir))
+        payload = json.loads((exchange_dir / "review-verdict.json").read_text())
+
+        assert BoundReviewVerdict.from_payload(payload).approves(_VERDICT_SHA_A)
+
+    def test_orchestrator_verdict_wins_over_the_reviewers_own_verdict(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A reviewer 'approved' that policy sent back is not a bound approval.
+
+        Validation evidence names a different commit than the presented HEAD,
+        so the orchestrator routes the round to rework. The reviewer's own
+        decision JSON still records ``verdict=approved``; the binding records
+        what the orchestrator concluded.
+        """
+        stale_record = tmp_path / "stale-validation-record.json"
+        stale_record.write_text(
+            json.dumps({"passed": True, "head_sha": _VERDICT_SHA_B}),
+            encoding="utf-8",
+        )
+
+        outcome = _run_binding_exchange(
+            tmp_path=tmp_path,
+            monkeypatch=monkeypatch,
+            response_script={
+                "reviewer": [
+                    {
+                        "response_type": "ok",
+                        "response_text": "Looks good",
+                        "getting_closer": True,
+                    }
+                ],
+                "coder": [],
+            },
+            max_rounds=2,
+            max_no_progress=1,
+            require_validation=True,
+            initial_validation_record_path=stale_record,
+        )
+
+        assert outcome.reason == "reviewer_reports_no_progress"
+        binding = load_review_verdict(outcome.run_assets.exchange_dir)
+        assert binding is not None
+        assert binding.verdict is ReviewVerdictOutcome.CHANGES_REQUESTED
+        assert binding.reviewed_sha == _VERDICT_SHA_A
+        assert binding.approves(_VERDICT_SHA_A) is False
+
+    def test_terminal_without_a_reviewer_decision_binds_nothing(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """No verdict was rendered, so there is no verdict to bind."""
+        from issue_orchestrator.execution.persistent_round_runner import (
+            PersistentRoundTimeoutError,
+        )
+
+        outcome = _run_binding_exchange(
+            tmp_path=tmp_path,
+            monkeypatch=monkeypatch,
+            response_script={
+                "reviewer": [PersistentRoundTimeoutError("simulated timeout")],
+                "coder": [],
+            },
+        )
+
+        assert (outcome.status, outcome.reason) == ("error", "reviewer_no_completion")
+        assert load_review_verdict(outcome.run_assets.exchange_dir) is None
+
+    def test_unobservable_head_records_no_binding(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """An approval the orchestrator cannot pin to a commit is not recorded.
+
+        The review itself still completes exactly as before — evidence
+        recording never changes the outcome it describes.
+        """
+        outcome = _run_binding_exchange(
+            tmp_path=tmp_path,
+            monkeypatch=monkeypatch,
+            response_script={
+                "reviewer": [
+                    {
+                        "response_type": "ok",
+                        "response_text": "Looks good",
+                        "getting_closer": True,
+                    }
+                ],
+                "coder": [],
+            },
+            head_sha=None,
+        )
+
+        assert (outcome.status, outcome.reason) == ("ok", "reviewer_ok")
+        assert load_review_verdict(outcome.run_assets.exchange_dir) is None

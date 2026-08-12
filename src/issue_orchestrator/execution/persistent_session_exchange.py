@@ -88,7 +88,9 @@ from ..domain.review_exchange_turn import (
 )
 from ..ports.turn_mailbox import TurnMailbox
 from ..domain.review_exchange_run import ReviewExchangeRun, ReviewExchangeRunAssets
-from ..domain.review_exchange_summary import ReviewExchangeReason, ReviewExchangeStatus, ReviewExchangeSummaryArtifactRef, ReviewExchangeSummaryV1, ReviewExchangeTerminalState
+from ..domain.review_exchange_summary import ReviewExchangeReason, ReviewExchangeStatus
+from ..domain.review_verdict_binding import ReviewVerdictOutcome
+from .review_exchange_records import bind_review_verdict, write_exchange_summary
 from ..domain.runtime_config import RuntimeConfigReference
 from ..domain import review_exchange_turn_artifacts as turn_artifacts
 from ..events import EventContext, EventName
@@ -1752,6 +1754,11 @@ def _drive_rounds(command: _DriveRoundsCommand) -> ReviewExchangeOutcome:
             before_reviewer_round(round_index)
 
         # ----- Reviewer turn -----
+        # The candidate this round is rendered against, observed by the
+        # orchestrator before the reviewer sees anything. Captured here rather
+        # than at decision time so a commit landing mid-review can never end up
+        # inside the verdict binding written below.
+        presented_head_sha = get_repo_head_sha(pair_validation.coder_worktree_path)
         reviewer_packet = ReviewExchangeTurnPacket(
             issue_number=issue_number,
             issue_title=issue_title,
@@ -1919,6 +1926,7 @@ def _drive_rounds(command: _DriveRoundsCommand) -> ReviewExchangeOutcome:
                 issue_number=issue_number,
                 session_name=session_name,
                 validation_record_path=validation_record_path,
+                presented_head_sha=presented_head_sha,
             )
         if reviewer.getting_closer is False:
             no_progress_count += 1
@@ -1936,6 +1944,7 @@ def _drive_rounds(command: _DriveRoundsCommand) -> ReviewExchangeOutcome:
                 issue_number=issue_number,
                 session_name=session_name,
                 validation_record_path=validation_record_path,
+                presented_head_sha=presented_head_sha,
             )
 
         last_reviewer_text = reviewer.response_text
@@ -2101,7 +2110,7 @@ def _drive_rounds(command: _DriveRoundsCommand) -> ReviewExchangeOutcome:
         )
         last_coder_text = coder.response_text
 
-    summary = _write_summary(
+    summary = write_exchange_summary(
         exchange_dir, max_rounds,
         status=ReviewExchangeStatus.STOPPED,
         reason=ReviewExchangeReason.MAX_ROUNDS_EXCEEDED,
@@ -2718,14 +2727,21 @@ def _complete_with_reviewer_ok(
     issue_number: int,
     session_name: str,
     validation_record_path: Path,
+    presented_head_sha: str | None,
 ) -> ReviewExchangeOutcome:
-    summary = _write_summary(
+    summary = write_exchange_summary(
         exchange_dir, round_index,
         status=ReviewExchangeStatus.OK,
         reason=ReviewExchangeReason.REVIEWER_OK,
         reviewer_response=reviewer,
         review_artifacts=review_artifacts,
         validation_record_path=validation_record_path,
+    )
+    bind_review_verdict(
+        exchange_dir=exchange_dir,
+        verdict=ReviewVerdictOutcome.APPROVED,
+        presented_head_sha=presented_head_sha,
+        completed_rounds=round_index,
     )
     _emit_built_event(emit, make_review_exchange_round_completed_event({
         "issue_number": issue_number,
@@ -2772,14 +2788,21 @@ def _stop_for_no_progress(
     issue_number: int,
     session_name: str,
     validation_record_path: Path,
+    presented_head_sha: str | None,
 ) -> ReviewExchangeOutcome:
-    summary = _write_summary(
+    summary = write_exchange_summary(
         exchange_dir, round_index,
         status=ReviewExchangeStatus.STOPPED,
         reason=ReviewExchangeReason.REVIEWER_REPORTS_NO_PROGRESS,
         reviewer_response=reviewer,
         review_artifacts=review_artifacts,
         validation_record_path=validation_record_path,
+    )
+    bind_review_verdict(
+        exchange_dir=exchange_dir,
+        verdict=ReviewVerdictOutcome.CHANGES_REQUESTED,
+        presented_head_sha=presented_head_sha,
+        completed_rounds=round_index,
     )
     _emit_built_event(emit, make_review_exchange_round_completed_event({
         "issue_number": issue_number,
@@ -2827,7 +2850,7 @@ def _build_outcome_for_reviewer_decision_error(
     validation_record_path: Path,
 ) -> ReviewExchangeOutcome:
     detail = f"reviewer produced invalid decision JSON: {error}"
-    summary = _write_summary(
+    summary = write_exchange_summary(
         exchange_dir, round_index,
         status=ReviewExchangeStatus.ERROR,
         reason=ReviewExchangeReason.REVIEWER_DECISION_INVALID,
@@ -2876,7 +2899,7 @@ def _build_outcome_for_role_timeout(
 ) -> ReviewExchangeOutcome:
     """Build the terminal ``error`` outcome when a role fails to complete."""
     reason = _no_completion_reason_for_role(role)
-    summary = _write_summary(
+    summary = write_exchange_summary(
         exchange_dir, round_index,
         status=ReviewExchangeStatus.ERROR,
         reason=reason,
@@ -2927,7 +2950,7 @@ def _build_outcome_for_protocol_error(
     REVIEW_EXCHANGE_ROUND_COMPLETED with the partial round's data plus a
     REVIEW_EXCHANGE_COMPLETED with status=error and protocol_error reason.
     """
-    summary = _write_summary(
+    summary = write_exchange_summary(
         exchange_dir, round_index,
         status=ReviewExchangeStatus.ERROR,
         reason=ReviewExchangeReason.CODER_PROTOCOL_ERROR,
@@ -2976,89 +2999,6 @@ def _write_review_exchange_manifest_header(
     ``update_manifest`` API.
     """
     session_output.update_manifest(run_dir, header.to_manifest_fields())
-
-
-def _read_validation_facts(path: Path | None) -> tuple[str | None, bool | None]:
-    """Read ``(head_sha, passed)`` from a validation-record.json.
-
-    Returns ``(None, None)`` when the path is None, missing, or
-    unreadable as JSON. ``head_sha`` is None when the field is
-    absent/empty; ``passed`` is None when the field is absent or
-    not a bool.
-
-    The summary writer (and the cache loader, in a later commit)
-    use this to populate ``ResumeFacts`` without leaking validation-
-    record schema concerns into other modules.
-    """
-    if path is None or not path.exists():
-        return None, None
-    try:
-        data = json.loads(path.read_text())
-    except (OSError, json.JSONDecodeError):
-        return None, None
-    head_sha = data.get("head_sha")
-    if not isinstance(head_sha, str) or not head_sha:
-        head_sha = None
-    passed = data.get("passed")
-    if not isinstance(passed, bool):
-        passed = None
-    return head_sha, passed
-
-
-def _write_summary(
-    exchange_dir: Path,
-    round_index: int,
-    *,
-    status: ReviewExchangeStatus,
-    reason: ReviewExchangeReason,
-    reviewer_response: ReviewExchangeResponse | None,
-    validation_record_path: Path | None,
-    review_artifacts: list[dict[str, str]] | None = None,
-    detail: str | None = None,
-) -> ReviewExchangeSummaryV1:
-    """Persist summary.json atomically.
-
-    The summary records *facts* about the exchange that just ran:
-    ``status``, ``reason``, ``completed_rounds``, ``response_text``,
-    ``timestamp``, plus — when the validation record is readable —
-    ``head_sha`` and ``validation_passed``. Policy (cacheable / halt
-    / retry / stale) is NOT encoded here; the cache loader feeds
-    these fields into ``ReviewExchangeResumeDecision.decide`` to
-    determine the next-tick action.
-
-    Pre-this-commit, the writer encoded policy by selectively
-    omitting ``head_sha`` based on status. That dual-purpose use of
-    one field (fact AND control signal) was the root cause of the
-    PR #6270 review-feedback whack-a-mole: every patch that adjusted
-    "which statuses cache-hit" mutated which facts got persisted,
-    and downstream consumers re-inferred policy at three different
-    sites. Recording facts unconditionally and centralizing policy
-    in one named helper ends that drift.
-
-    ``head_sha`` and ``validation_passed`` are still omitted (rather
-    than written as None) when the validation record cannot be
-    read at all — the caller should treat absence as "we don't
-    know" rather than "validation explicitly failed." The cache
-    loader's ``ResumeFacts`` mapping handles each case.
-    """
-    terminal = ReviewExchangeTerminalState(status=status, reason=reason)
-    head_sha, passed = _read_validation_facts(validation_record_path)
-    artifacts = tuple(
-        ReviewExchangeSummaryArtifactRef.from_payload(artifact)
-        for artifact in (review_artifacts or [])
-    )
-    summary = ReviewExchangeSummaryV1(
-        completed_rounds=round_index,
-        terminal=terminal,
-        response_text=reviewer_response.response_text if reviewer_response else None,
-        timestamp=datetime.now(timezone.utc).isoformat(),
-        head_sha=head_sha,
-        validation_passed=passed,
-        artifacts=artifacts,
-        detail=detail,
-    )
-    _atomic_write_json(exchange_dir / "summary.json", summary.to_payload())
-    return summary
 
 
 # ---------------------------------------------------------------------------
@@ -3229,10 +3169,8 @@ def _validate_coder_completion(
     return None
 
 
-# ``_atomic_write_json`` is the shared helper from ``infra.atomic_io``;
-# re-export under the private name so the existing test that monkeypatches
-# ``pse.os.replace`` continues to find the same write path.
+# ``_atomic_write_bytes`` is the shared helper from ``infra.atomic_io``,
+# re-exported under the private name this module has always used.
 from ..infra.atomic_io import (  # noqa: E402
     atomic_write_bytes as _atomic_write_bytes,
-    atomic_write_json as _atomic_write_json,
 )

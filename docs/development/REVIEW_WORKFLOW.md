@@ -62,6 +62,44 @@ Both artifacts describe the same review item IDs. The markdown is the review con
 
 The decision JSON also carries an `abstraction_review` object. Reviewers must use it to say whether the change uses the right owner/port/command abstraction. If a bounded abstraction should be added in the same PR, reviewers set `abstraction_review.status` to `changes_requested` and include `A1`, `A2`, ... findings. An approved decision cannot carry required abstraction changes. If abstraction work is explicitly deferred, the reviewer must set `status` to `deferred` and include `follow_up_issue_url`.
 
+### review-verdict.json — the exact-SHA verdict binding
+
+`review-report.md` and `review-decision.json` are reviewer-authored. Alongside
+them the orchestrator writes its own record, `review-verdict.json`, in the
+review-exchange directory:
+
+```json
+{
+  "schema_version": 1,
+  "verdict": "approved",
+  "reviewed_sha": "<40-hex commit>",
+  "decided_at": "2026-08-12T00:00:00+00:00",
+  "completed_rounds": 1
+}
+```
+
+It exists so a verdict is never separable from the commit it was rendered
+against — the property Foundation admission depends on
+(`docs/foundation/VALIDATED_WORK_DISPOSITION.md` §4, `review.reviewed_sha`).
+Three things make it authority rather than convenience:
+
+- **Neither half is agent-supplied.** `verdict` is derived from the terminal
+  state the orchestrator recorded (`reviewer_ok` → `approved`, a no-progress
+  stop → `changes_requested`), so a reviewer "approved" that policy sent back
+  to rework is not recorded as an approval. `reviewed_sha` is the coder
+  worktree HEAD the orchestrator observed **before** presenting the round, so
+  a commit landing mid-review cannot inherit the verdict.
+- **The pairing is structural.** A payload naming one half without the other
+  does not parse.
+- **Validity is re-derived, never remembered.** `BoundReviewVerdict.approves(head_sha)`
+  answers False once HEAD moves; the binding is then detectably stale.
+
+The binding is written next to `summary.json` and reloaded from there, so it
+survives an orchestrator restart. If the orchestrator cannot observe the
+presented commit, it records **no** binding rather than guessing — an
+unbound verdict is one no later gate can admit, and writing the binding never
+changes the outcome of the review it describes.
+
 Nits are classified in the same reviewer pass as blockers. They do not get a separate review pass. When `review.nits.default_policy` or a per-agent override is `address`, an approved review with only nits is converted into normal coder rework before PR creation. `surface` records and shows nits without blocking PR creation. `ignore` keeps them only in the persisted artifacts.
 
 ### via-mcp
