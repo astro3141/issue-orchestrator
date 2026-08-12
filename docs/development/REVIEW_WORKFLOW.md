@@ -94,11 +94,19 @@ Three things make it authority rather than convenience:
 - **Validity is re-derived, never remembered.** `BoundReviewVerdict.approves(head_sha)`
   answers False once HEAD moves; the binding is then detectably stale.
 
+Only those two terminals produce a binding. Every other way an exchange can end
+— max rounds exceeded, a protocol failure, a timeout — writes no
+`review-verdict.json`, because no reviewer verdict describes the commit the
+exchange left behind: max rounds is reached *after* a coder turn has moved HEAD
+past the last reviewed commit, and the other terminals end before a verdict is
+rendered at all. Absence is therefore not a gap to fill in later; it means this
+exchange produced no verdict any gate may admit.
+
 The binding is written next to `summary.json` and reloaded from there, so it
 survives an orchestrator restart. If the orchestrator cannot observe the
 presented commit, it records **no** binding rather than guessing — an
-unbound verdict is one no later gate can admit, and writing the binding never
-changes the outcome of the review it describes.
+unbound verdict is one no later gate can admit, and an unusable observation
+never changes the outcome of the review it describes.
 
 Nits are classified in the same reviewer pass as blockers. They do not get a separate review pass. When `review.nits.default_policy` or a per-agent override is `address`, an approved review with only nits is converted into normal coder rework before PR creation. `surface` records and shows nits without blocking PR creation. `ignore` keeps them only in the persisted artifacts.
 

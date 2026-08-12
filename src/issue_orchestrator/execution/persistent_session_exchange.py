@@ -865,10 +865,23 @@ class _PairValidationMirror:
         self._replace_from(source)
         return None
 
+    def observe_candidate_head(self) -> str | None:
+        """The commit currently presented as the candidate for review.
+
+        One owner answers "which commit is the candidate", because the
+        evidence rule and the verdict binding are two halves of one
+        invariant: validation's ``head_sha``, the reviewed SHA, and the
+        candidate must all name the same commit
+        (``docs/foundation/VALIDATED_WORK_DISPOSITION.md`` §4). Observing it
+        twice, from two call sites, would let the halves drift apart
+        silently. Returns None when HEAD cannot be observed.
+        """
+        return get_repo_head_sha(self.coder_worktree_path)
+
     def current_validation_error(self) -> str | None:
         return _validation_record_error(
             self.record_path,
-            current_head_sha=get_repo_head_sha(self.coder_worktree_path),
+            current_head_sha=self.observe_candidate_head(),
         )
 
     def _completion_validation_source(
@@ -1757,8 +1770,10 @@ def _drive_rounds(command: _DriveRoundsCommand) -> ReviewExchangeOutcome:
         # The candidate this round is rendered against, observed by the
         # orchestrator before the reviewer sees anything. Captured here rather
         # than at decision time so a commit landing mid-review can never end up
-        # inside the verdict binding written below.
-        presented_head_sha = get_repo_head_sha(pair_validation.coder_worktree_path)
+        # inside the verdict binding written below. Asked of the same owner
+        # that decides validation freshness, so both halves of the
+        # evidence/verdict pairing name one commit.
+        presented_head_sha = pair_validation.observe_candidate_head()
         reviewer_packet = ReviewExchangeTurnPacket(
             issue_number=issue_number,
             issue_title=issue_title,

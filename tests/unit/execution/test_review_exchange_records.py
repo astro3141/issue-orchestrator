@@ -74,7 +74,7 @@ class TestBindReviewVerdict:
         assert binding.verdict is ReviewVerdictOutcome.CHANGES_REQUESTED
         assert binding.approves(SHA_B) is False
 
-    @pytest.mark.parametrize("observed", [None, "", "abc123", "not-a-sha"])
+    @pytest.mark.parametrize("observed", [None, "", "abc123", "not-a-sha", "HEAD"])
     def test_unusable_head_records_nothing_rather_than_guessing(
         self,
         tmp_path: Path,
@@ -83,7 +83,9 @@ class TestBindReviewVerdict:
         """No observed commit means no binding — never a fabricated one.
 
         An absent binding is a verdict no later gate can admit, which is the
-        safe direction; a fabricated SHA would be the unsafe one.
+        safe direction; a fabricated SHA would be the unsafe one. Returning
+        rather than raising is the other half: an unusable observation must
+        not turn a completed review into an exception.
         """
         assert (
             bind_review_verdict(
@@ -95,21 +97,6 @@ class TestBindReviewVerdict:
             is None
         )
         assert not review_verdict_path(tmp_path).exists()
-
-    def test_binding_never_raises_into_the_review_it_describes(
-        self,
-        tmp_path: Path,
-    ) -> None:
-        """Recording evidence about a review must not change its outcome."""
-        assert (
-            bind_review_verdict(
-                exchange_dir=tmp_path,
-                verdict=ReviewVerdictOutcome.APPROVED,
-                presented_head_sha="HEAD",
-                completed_rounds=1,
-            )
-            is None
-        )
 
 
 class TestLoadReviewVerdict:

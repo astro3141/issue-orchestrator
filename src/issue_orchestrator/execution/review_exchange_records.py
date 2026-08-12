@@ -162,8 +162,9 @@ def bind_review_verdict(
     unbound verdict is a verdict no later gate can admit, which is the safe
     direction. Fabricating a SHA, binding an unusable observation, or binding
     whatever HEAD happens to be current at decision time would be the unsafe
-    ones. Binding never fails the review it describes: recording evidence about
-    a review must not change that review's outcome.
+    ones. An unusable observation therefore never fails the review it
+    describes. A failing *write* is not softened that way: an unwritable
+    authority artifact raises, per the repository's fail-fast stance.
     """
     try:
         reviewed_sha = normalize_reviewed_sha(presented_head_sha)
