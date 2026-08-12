@@ -551,6 +551,35 @@ is happening. Check, in order:
 
 A recording of ~2KB that has not grown is a session that never got started.
 
+## Removing a worktree can break the primary checkout's venv
+
+The repository's editable install is a path, and that path can end up pointing
+at a worktree. Running `make venv` or `uv sync` from inside a managed worktree
+rewrites `.venv/lib/python*/site-packages/_editable_impl_issue_orchestrator.pth`
+to that worktree's `src`. Worktrees are disposable; the venv is not. Deleting
+the worktree then leaves the primary checkout unable to import its own package.
+
+Observed after cleaning up a spike worktree: the next push died in **2 seconds**
+with
+
+```
+ModuleNotFoundError: No module named 'issue_orchestrator'
+```
+
+which is not a validation result at all — the gate runner itself could not
+start. It is easy to misread as a gate failure.
+
+Check before deleting a worktree, and after any `uv sync` you did not run from
+the primary checkout:
+
+```sh
+cat .venv/lib/python*/site-packages/_editable_impl_issue_orchestrator.pth
+# must be <primary checkout>/src
+```
+
+Repair by writing the primary checkout's `src` path back into that file, then
+confirm with `.venv/bin/python -c 'import issue_orchestrator'`.
+
 ## Recovering from a stalled run
 
 1. Kill the agent process, then the orchestrator
