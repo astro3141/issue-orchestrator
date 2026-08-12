@@ -4,6 +4,18 @@ Operating notes for running Issue-Orchestrator against this fork. Everything
 here was measured on 2026-08-11, not assumed. Where a number appears, it came
 from an actual run on this machine.
 
+## Where these files live, and why not under `.issue-orchestrator/`
+
+`.issue-orchestrator/` is a guarded runtime-artifact root. `runtime_artifacts.py`
+allows exactly three tracked things under it — `allow-no-verify-dry-run`,
+`runtime-ignore`, and `config/**` — and rejects everything else on an agent
+branch by default, so the guard fails safe as the runtime surface grows.
+
+This runbook first lived there. It blocked issue #6's publish with
+`Forbidden artifacts: .issue-orchestrator/SELFHOST_RUNBOOK.md` the moment an
+agent touched it. The guard was right; the file was in the wrong place. Keep
+self-hosting documentation and tooling under `docs/selfhosting/`.
+
 ## The boundary
 
 The **trusted pinned runtime** at `~/io-tools/issue-orchestrator` orchestrates

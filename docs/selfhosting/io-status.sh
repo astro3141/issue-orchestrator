@@ -14,7 +14,7 @@
 #     wrapper that launched it, which reads as "the orchestrator is alive" when
 #     it is not.
 #
-# Usage:  sh .issue-orchestrator/io-status.sh [issue-number]
+# Usage:  sh docs/selfhosting/io-status.sh [issue-number]
 
 set -u
 ISSUE="${1:-}"
