@@ -261,7 +261,11 @@ Undoing the overlay only reverts files the orchestrator can prove it planted
 those paths read-only, it only hid writes to them, so a session that died
 mid-edit can leave real work behind that `git status` called clean. Setup
 preserves anything it cannot explain, clears the bit so git reports it, and
-then fails rather than running an agent on it:
+then fails rather than running an agent on it.
+
+Reuse asks this **before** it rebases or hard-resets, so the run that reports
+the problem is also a run that has not touched the worktree: uncommitted work
+elsewhere in the tree is still there too. The message names the files:
 
 ```
 Repo-owned CLI tool(s) in <worktree> diverge from the index and no orchestrator
@@ -279,9 +283,10 @@ Either way the path is no longer hidden, so the next setup on that worktree
 proceeds normally; the failure does not repeat on its own.
 
 Deciding is the whole of the deadline. From the escalation onward the content
-is ordinary uncommitted work, and reusing a worktree runs `git reset --hard`
-and `git clean -fd` before setup ("we prioritize success over preserving
-uncommitted work"), so the next reuse discards it. That is still the
+is ordinary uncommitted work: the bit is cleared, so the *next* run finds
+nothing hidden, passes the same check, and reaches the `git reset --hard` and
+`git clean -fd` that reuse runs before setup ("we prioritize success over
+preserving uncommitted work") — which discards it. That is still the
 improvement over the old behaviour — the loss is now reported by `git status`
 beforehand and logged as a discard when it happens, instead of being invisible
 in both directions — but it is a deadline, not a reprieve.

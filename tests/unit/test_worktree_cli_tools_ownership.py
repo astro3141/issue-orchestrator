@@ -31,10 +31,12 @@ from issue_orchestrator.adapters.worktree.api import (
     WorktreeError,
     WorktreeRuntimeSetup,
     can_remove_without_user_changes,
+    create_worktree,
     sync_cli_tools,
 )
 from issue_orchestrator.entrypoints import cli_tools as orchestrator_cli_tools
 from issue_orchestrator.infra.runtime_artifacts import ORCHESTRATOR_CLI_TOOLS_DIR
+from issue_orchestrator.ports.worktree_manager import WorktreeReuseOptions
 from tests.unit.worktree_git_helpers import GitWorktree, make_git_worktree
 
 CLI_TOOLS_DIR = ORCHESTRATOR_CLI_TOOLS_DIR.as_posix()
@@ -53,6 +55,15 @@ PLANTED_COPY = (PACKAGE_CLI_TOOLS / Path(CANDIDATE_TOOL).name).read_text()
 # A tool the package ships that the fixture repository does not track, which is
 # what "planted, and the index cannot restore it" looks like.
 UNTRACKED_PACKAGE_TOOL = f"{CLI_TOOLS_DIR}/reviewer_done.py"
+
+# Reuse discards uncommitted work on purpose: ``git reset --hard HEAD`` reverts
+# tracked files and ``git clean -fd`` removes untracked ones. These two are how
+# a test tells "the reset has not run yet" from "the reset ran and happened to
+# leave this file alone" — the distinction the whole ordering requirement is
+# about.
+RESET_WITNESS_TRACKED = "seed"
+RESET_WITNESS_TRACKED_EDIT = "seed edited after the last commit\n"
+RESET_WITNESS_UNTRACKED = "untracked-witness.txt"
 
 
 def _git(*argv: str, cwd: Path) -> str:
@@ -81,6 +92,56 @@ def _self_hosting_worktree(tmp_path: Path) -> GitWorktree:
     _git("add", CANDIDATE_TOOL, cwd=worktree_path)
     _git("commit", "-m", "candidate cli tools", cwd=worktree_path)
     return git_worktree
+
+
+def _reusable_self_hosting_worktree(tmp_path: Path) -> GitWorktree:
+    """A self-hosting worktree the production reuse path will actually take up.
+
+    Reuse needs a real ``origin``: the update step fetches the base branch
+    first and treats a failed fetch as "delete this worktree and start over",
+    which would prove nothing about the reset it never reached.
+
+    Both reset witnesses are placed here, so every test using this fixture can
+    say whether the destructive half of reuse ran.
+    """
+    git_worktree = _self_hosting_worktree(tmp_path)
+    main_repo = git_worktree.main_repo
+    worktree_path = git_worktree.worktree_path
+
+    origin = tmp_path / "origin.git"
+    _git("clone", "--bare", str(main_repo), str(origin), cwd=tmp_path)
+    # Named ``main`` regardless of what this git installation calls a first
+    # branch, because that is the base branch the reuse call asks for.
+    base_commit = _git("rev-parse", "HEAD", cwd=main_repo).strip()
+    _git("update-ref", "refs/heads/main", base_commit, cwd=origin)
+    _git("remote", "add", "origin", str(origin), cwd=main_repo)
+
+    (worktree_path / RESET_WITNESS_TRACKED).write_text(RESET_WITNESS_TRACKED_EDIT)
+    (worktree_path / RESET_WITNESS_UNTRACKED).write_text("witness\n")
+    return git_worktree
+
+
+def _reuse_worktree(
+    git_worktree: GitWorktree,
+) -> tuple[Path, str, str, str | None, bool, int, int]:
+    """Drive the production entry point down its reuse path.
+
+    ``create_worktree`` is what the orchestrator calls; the reuse branch of it
+    is reached because the fixture's worktree is already registered against the
+    branch being asked for. Nothing here reaches into the CLI-tools step — that
+    is the point: the ordering under test is whether the lifecycle consults it
+    before it starts resetting.
+    """
+    return create_worktree(
+        git_worktree.main_repo,
+        6,
+        "self-hosting reuse",
+        worktree_base=git_worktree.worktree_path.parent,
+        base_branch="main",
+        branch_name="feature",
+        enforce_hooks=False,
+        reuse_options=WorktreeReuseOptions(reuse_push_preflight=False),
+    )
 
 
 def _exclude_files(git_worktree: GitWorktree) -> tuple[Path, ...]:
@@ -368,6 +429,111 @@ def test_a_planted_copy_is_still_undone_next_to_work_that_is_not(tmp_path) -> No
 
     assert (worktree_path / CANDIDATE_TOOL).read_text() == CANDIDATE_SOURCE
     assert (worktree_path / second_tool).read_text() == HIDDEN_AGENT_WORK
+
+
+# ---------------------------------------------------------------------------
+# Ordering: the check is a precondition of reuse, not a step inside setup
+#
+# Reuse rebases, hard-resets and cleans the worktree *before* runtime setup runs
+# at all. Preserving hidden work only once setup is reached would therefore be
+# preserving whatever the reset happened to leave — so these drive the
+# production entry point, ``create_worktree``, rather than the CLI-tools helper,
+# and assert on the two witnesses the reset would have destroyed.
+# ---------------------------------------------------------------------------
+
+
+def test_reuse_stops_before_it_resets_over_hidden_agent_work(tmp_path) -> None:
+    """The whole ordering requirement, through the call the orchestrator makes."""
+    git_worktree = _reusable_self_hosting_worktree(tmp_path)
+    worktree_path = git_worktree.worktree_path
+    _hide_tracked_path(git_worktree, CANDIDATE_TOOL, HIDDEN_AGENT_WORK)
+    # Precondition: hidden, and holding neither the index version nor a copy
+    # the orchestrator plants — so no repair can claim it.
+    assert HIDDEN_AGENT_WORK not in (CANDIDATE_SOURCE, PLANTED_COPY)
+    assert CLI_TOOLS_DIR not in _git("status", "--porcelain", cwd=worktree_path)
+
+    with pytest.raises(WorktreeError, match=CANDIDATE_TOOL):
+        _reuse_worktree(git_worktree)
+
+    # The work itself, byte for byte.
+    assert (worktree_path / CANDIDATE_TOOL).read_text() == HIDDEN_AGENT_WORK
+    # And nothing destructive ran on the way to refusing: ``reset --hard``
+    # would have reverted the tracked witness, ``clean -fd`` removed the
+    # untracked one.
+    assert (worktree_path / RESET_WITNESS_TRACKED).read_text() == RESET_WITNESS_TRACKED_EDIT
+    assert (worktree_path / RESET_WITNESS_UNTRACKED).exists()
+
+
+def test_reuse_leaves_the_work_it_refused_to_reset_visible_to_git(tmp_path) -> None:
+    """Preserved but still hidden would leave the operator nothing to act on.
+
+    The escalation asks a human to commit or discard the file. That is only a
+    request they can answer if git reports it, which means the
+    ``--skip-worktree`` bit has to be gone by the time reuse stops.
+    """
+    git_worktree = _reusable_self_hosting_worktree(tmp_path)
+    worktree_path = git_worktree.worktree_path
+    _hide_tracked_path(git_worktree, CANDIDATE_TOOL, HIDDEN_AGENT_WORK)
+
+    with pytest.raises(WorktreeError):
+        _reuse_worktree(git_worktree)
+
+    assert set(_index_flags(worktree_path).values()) == {"H"}
+    assert CANDIDATE_TOOL in _git("status", "--porcelain", cwd=worktree_path)
+
+
+def test_reuse_is_not_downgraded_to_a_recreate(tmp_path) -> None:
+    """Recreating deletes the worktree — with the file that was just preserved.
+
+    Everywhere else in the lifecycle a worktree that cannot be prepared is
+    deleted and rebuilt. Here that policy is exactly wrong, so the refusal has
+    to leave the lifecycle rather than be reported back into it.
+    """
+    git_worktree = _reusable_self_hosting_worktree(tmp_path)
+    worktree_path = git_worktree.worktree_path
+    _hide_tracked_path(git_worktree, CANDIDATE_TOOL, HIDDEN_AGENT_WORK)
+
+    with pytest.raises(WorktreeError):
+        _reuse_worktree(git_worktree)
+
+    assert worktree_path.exists()
+    assert (worktree_path / CANDIDATE_TOOL).read_text() == HIDDEN_AGENT_WORK
+
+
+def test_reuse_proceeds_normally_when_nothing_is_hidden(tmp_path) -> None:
+    """The guard must gate reuse, not end it: the ordinary case still reuses.
+
+    Here the reset is expected to run, so the same two witnesses are asserted
+    the other way round — they are what proves the lifecycle got past the
+    precondition instead of quietly failing somewhere before it.
+    """
+    git_worktree = _reusable_self_hosting_worktree(tmp_path)
+    worktree_path = git_worktree.worktree_path
+
+    reused_path, branch, reuse_status, *_ = _reuse_worktree(git_worktree)
+
+    assert (reused_path, branch, reuse_status) == (worktree_path, "feature", "reused")
+    assert (worktree_path / CANDIDATE_TOOL).read_text() == CANDIDATE_SOURCE
+    assert (worktree_path / RESET_WITNESS_TRACKED).read_text() != RESET_WITNESS_TRACKED_EDIT
+    assert not (worktree_path / RESET_WITNESS_UNTRACKED).exists()
+
+
+def test_reuse_repairs_a_stale_overlay_and_carries_on(tmp_path) -> None:
+    """A provable planted copy is repaired in the precondition, not escalated.
+
+    Provenance decides between the two outcomes, and it decides it before the
+    reset either way: this is the branch where the answer is "the orchestrator
+    wrote that", so reuse continues with the candidate's own file restored.
+    """
+    git_worktree = _reusable_self_hosting_worktree(tmp_path)
+    worktree_path = git_worktree.worktree_path
+    _plant_stale_overlay(git_worktree)
+
+    _, _, reuse_status, *_ = _reuse_worktree(git_worktree)
+
+    assert reuse_status == "reused"
+    assert (worktree_path / CANDIDATE_TOOL).read_text() == CANDIDATE_SOURCE
+    assert set(_index_flags(worktree_path).values()) == {"H"}
 
 
 # ---------------------------------------------------------------------------

@@ -92,6 +92,7 @@ __all__ = [
     "install_claude_settings",
     "repo_owns_cli_tools",
     "sync_cli_tools",
+    "unhide_repo_owned_cli_tools",
 ]
 
 
@@ -502,6 +503,39 @@ def _restore_repo_owned_cli_tools(worktree_path: Path) -> None:
         )
 
 
+def unhide_repo_owned_cli_tools(worktree_path: Path) -> bool:
+    """Answer who owns the CLI-tools directory, and undo any overlay if the repo does.
+
+    Split out of ``sync_cli_tools`` because it is needed at two different
+    moments, and only the earlier one is about planting. Planting asks it to
+    decide what to write; the reuse lifecycle asks it as a *precondition*,
+    before a reset or a rebase touches a worktree that may be hiding repo-owned
+    source behind ``--skip-worktree``. One function so the two moments cannot
+    reach different verdicts about the same directory.
+
+    Args:
+        worktree_path: Path to the worktree.
+
+    Returns:
+        True when the target repository tracks the CLI-tools directory itself,
+        which is also the answer to "may the orchestrator plant there" — no.
+
+    Raises:
+        WorktreeError: If git cannot say who owns the destination, or if
+            undoing an earlier overlay uncovers repo-owned content no
+            orchestrator copy explains.
+    """
+    if not repo_owns_cli_tools(worktree_path):
+        return False
+    logger.info(
+        "Target repository tracks %s; leaving the candidate's own CLI "
+        "tools in place so the worktree matches its commit",
+        CLI_TOOLS_WORKTREE_DIR,
+    )
+    _restore_repo_owned_cli_tools(worktree_path)
+    return True
+
+
 def _plant_cli_tools(worktree_path: Path) -> list[Path]:
     """Copy the orchestrator's CLI tools into a worktree that does not own them.
 
@@ -571,13 +605,7 @@ def sync_cli_tools(worktree_path: Path) -> list[Path]:
             repo-owned content no orchestrator copy explains, which is a human's
             call rather than a file to overwrite.
     """
-    if repo_owns_cli_tools(worktree_path):
-        logger.info(
-            "Target repository tracks %s; leaving the candidate's own CLI "
-            "tools in place so the worktree matches its commit",
-            CLI_TOOLS_WORKTREE_DIR,
-        )
-        _restore_repo_owned_cli_tools(worktree_path)
+    if unhide_repo_owned_cli_tools(worktree_path):
         return []
     return _plant_cli_tools(worktree_path)
 
