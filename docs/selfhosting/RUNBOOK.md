@@ -39,9 +39,10 @@ runtime trusted is the evidence attached to a specific artifact, and R1 is the
 build that actually ran the canary. Rebuilding from current `main` would
 promote a commit no canary exercised, on the strength of a run some other
 artifact performed, which breaks the bootstrap chain that the pin exists to
-keep. So product `main` running ahead of the runtime (it is already at
-`6d478b23`) is expected and is not drift. Moving the pin is its own decision,
-taken the same way: review, publish gate, canary, then promote.
+keep. So product `main` running ahead of the runtime (it was at `6d478b23`
+when this was written) is expected and is not drift, however far it advances.
+Moving the pin is its own decision, taken the same way: review, publish gate,
+canary, then promote.
 
 R0 stays on disk untouched, so the chain remains auditable and a rollback needs
 no rebuild.
@@ -282,8 +283,10 @@ practical consequence for reading a managed worktree of *this* repository:
 
 - **`git status` is trustworthy for those paths.** Nothing is planted there,
   no `--skip-worktree` bit is applied there, and no dirty guard filters what
-  git reports there. What it shows is the candidate's, and what it does not
-  show is not there.
+  git reports there — nor does `.issue-orchestrator/runtime-ignore`, the one
+  repo-local hide list that could name such a path, and which this repository
+  does not have. What it shows is the candidate's, and what it does not show
+  is not there.
 - `coding-done`, `prepush-check` and the orchestrator's publish gate read that
   same status, so a clean tree at completion means the branch carries every
   CLI tool the gate graded.
@@ -365,17 +368,21 @@ recorded by a run that deselected every test the branch added is evidence about
 somebody else's code.
 
 `-k` matches the names in a test's node id — file name, class, function — and
-**not** the directory segments above it. The profile's `cli_tools` keyword
-selects `test_worktree_cli_tools_ownership.py` because the string is in that
-file's name; it selects nothing in `tests/unit/test_agent_done.py`, and that is
-how issue #8's first canary was recorded green without ever running. Check what
-a profile actually executed before believing it:
+**not** the directory segments above it, so selection is per test, not per
+file. The profile's `cli_tools` keyword takes all of
+`test_worktree_cli_tools_ownership.py` because the string is in that file's
+name; in `tests/unit/test_agent_done.py` it takes only the individual tests
+whose own names carry it. Issue #8's first canary lived in that second module,
+under class and function names matching none of the profile's keywords: the
+gate ran most of that file and never the canary, and recorded green. A module
+being selected says nothing about your test in it. Check what a profile
+actually executed before believing it:
 
 ```sh
 # what the recorded gate actually executed
 grep -c 'PASSED\|passed' <session>/validation/validation-stdout.log
 .venv/bin/python -m pytest tests/unit tests/integration -q -p no:cacheprovider \
-  --collect-only -k '<the profile expression>' | grep <your test module>
+  --collect-only -k '<the profile expression>' | grep <your test name>
 ```
 
 When an issue's change area falls outside the current keywords, the cheaper
