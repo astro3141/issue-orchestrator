@@ -21,6 +21,7 @@ hand-built ``.git``.
 
 from __future__ import annotations
 
+import re
 import subprocess
 from pathlib import Path
 
@@ -240,6 +241,35 @@ def test_a_path_git_has_to_quote_is_still_handled(tmp_path) -> None:
     # ``-z`` here for the same reason production uses it: plain porcelain would
     # quote this name, which is not the name anything else works with.
     assert quoted_tool in _git("status", "--porcelain", "-z", cwd=worktree_path)
+
+
+def test_a_path_git_would_read_as_a_glob_is_still_handled(tmp_path) -> None:
+    """A name holding ``[…]``, ``*`` or ``?`` reaches the same outcome.
+
+    Pathspecs glob, and every path here is handed back to git as one. Git
+    compares the whole string before it globs, so such a file is always found
+    under its own name and this outcome holds either way — what the
+    ``:(literal)`` prefix in production removes is the *surplus* matching, on
+    the restore path, where ``checkout -- 'tool[1].py'`` would revert
+    ``tool1.py`` alongside it. Only a name the orchestrator's own package ships
+    can reach that call, so it is not reproducible from here; the outcome for a
+    glob-shaped name is, and is what this pins.
+    """
+    git_worktree = _self_hosting_worktree(tmp_path)
+    worktree_path = git_worktree.worktree_path
+    glob_tool = f"{CLI_TOOLS_DIR}/needs[1]literal.py"
+    (worktree_path / glob_tool).write_text(CANDIDATE_SOURCE)
+    # Literal here too: as a pattern this name matches nothing that exists.
+    _git("add", "--", f":(literal){glob_tool}", cwd=worktree_path)
+    _git("commit", "-m", "tool with a glob character in its name", cwd=worktree_path)
+    _hide_tracked_path(git_worktree, glob_tool, HIDDEN_AGENT_WORK)
+
+    with pytest.raises(WorktreeError, match=re.escape(glob_tool)):
+        sync_cli_tools(worktree_path)
+
+    assert (worktree_path / glob_tool).read_text() == HIDDEN_AGENT_WORK
+    assert set(_index_flags(worktree_path).values()) == {"H"}
+    assert glob_tool in _git("status", "--porcelain", cwd=worktree_path)
 
 
 # ---------------------------------------------------------------------------

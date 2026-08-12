@@ -217,6 +217,25 @@ def _git_z_records(worktree_path: Path, argv: list[str], *, what: str) -> list[s
     return [record for record in listed.split("\0") if record]
 
 
+def _literal_pathspecs(paths: list[str]) -> list[str]:
+    """Wrap paths git reported so git reads them back as names, not patterns.
+
+    Every path here came out of ``ls-files``, so it names one existing file. A
+    pathspec is a glob by default, and a name holding ``*``, ``?`` or ``[…]``
+    is *also* a pattern — one that matches its own file (git compares the whole
+    string before it globs) but does not stop there. The surplus matches are
+    what this prevents: ``checkout -- 'tool[1].py'`` reverts ``tool1.py`` as
+    well, and on this directory that neighbour is a file the same run just
+    decided it could not explain and had to preserve.
+
+    Same class of bug as the quoting ``-z`` avoids, at the other end of the
+    round trip: there git names a file the code cannot find, here the code
+    hands git a name that reaches files it never asked about. ``update-index``
+    is exempt because it takes literal file names rather than pathspecs.
+    """
+    return [f":(literal){path}" for path in paths]
+
+
 def _hidden_cli_tool_paths(worktree_path: Path) -> list[str]:
     """Return repo-owned CLI tool paths an earlier run marked ``--skip-worktree``."""
     records = _git_z_records(
@@ -389,7 +408,7 @@ def _cli_tools_diverging_from_index(
             "--untracked-files=no",
             "--no-renames",
             "--",
-            *paths,
+            *_literal_pathspecs(paths),
         ],
         what="compare repo-owned CLI tools with the index",
     )
@@ -434,7 +453,7 @@ def _unhide_repo_owned_cli_tools(worktree_path: Path) -> list[str]:
         # Clearing the bit does not restore content git was told to ignore.
         _git_or_fail(
             worktree_path,
-            ["checkout", "--", *planted],
+            ["checkout", "--", *_literal_pathspecs(planted)],
             what="restore repo-owned CLI tools from the index",
         )
         logger.warning(

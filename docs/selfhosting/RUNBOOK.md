@@ -278,6 +278,14 @@ git -C <managed-worktree> checkout -- <path>   # discard it
 Either way the path is no longer hidden, so the next setup on that worktree
 proceeds normally; the failure does not repeat on its own.
 
+Deciding is the whole of the deadline. From the escalation onward the content
+is ordinary uncommitted work, and reusing a worktree runs `git reset --hard`
+and `git clean -fd` before setup ("we prioritize success over preserving
+uncommitted work"), so the next reuse discards it. That is still the
+improvement over the old behaviour — the loss is now reported by `git status`
+beforehand and logged as a discard when it happens, instead of being invisible
+in both directions — but it is a deadline, not a reprieve.
+
 ### …and it must read the code that changed
 
 Same rule, one level up. `validation.quick` in
