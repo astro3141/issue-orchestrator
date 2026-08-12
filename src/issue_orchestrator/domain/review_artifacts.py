@@ -255,6 +255,26 @@ class ReviewDecision:
             extra=dict(self.extra),
         )
 
+    def is_approval(self) -> bool:
+        """Whether this decision, read on its own terms, approves the work.
+
+        The transport field a reviewer sets (``response_type``) and the verdict
+        it writes into its decision JSON are separate values that can disagree.
+        Anything promoting a review to authority — an approval gate, the
+        exact-SHA verdict binding — must ask the decision itself, never infer
+        approval from the transport field alone.
+
+        Deliberately re-states what :meth:`validate` already rejects. The two
+        are different jobs: ``validate`` refuses to persist a self-contradictory
+        decision, this answers "is this an approval?" for a caller that must not
+        depend on validation having run.
+        """
+        return (
+            self.verdict == "approved"
+            and not self.blocking_findings
+            and self.abstraction_review.status != "changes_requested"
+        )
+
     def validate(self) -> None:
         if self.verdict == "approved" and self.blocking_findings:
             raise ValueError(

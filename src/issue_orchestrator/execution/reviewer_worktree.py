@@ -10,16 +10,21 @@ Lifecycle:
 - ``fast_forward_reviewer_worktree`` before each reviewer round so the
   reviewer always sees the latest committed state of the coder's branch.
 - ``remove_reviewer_worktree`` at exchange end.
+
+``ReviewerCandidatePresentation`` composes the per-round half of that
+lifecycle and reports which commit it put in front of the reviewer.
 """
 
 from __future__ import annotations
 
 import logging
 import subprocess
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
 from ..domain.review_exchange import REVIEWER_WORKTREE_CHECKOUT_FAILURE_MARKER
+from ..infra.repo_identity import get_repo_head_sha
 
 logger = logging.getLogger(__name__)
 
@@ -175,6 +180,56 @@ def fast_forward_reviewer_worktree(reviewer: ReviewerWorktree) -> str:
         tip_sha,
     )
     return tip_sha
+
+
+@dataclass(frozen=True)
+class ReviewerCandidatePresentation:
+    """Puts the candidate commit in front of the reviewer, and says which one.
+
+    One owner answers "what is the reviewer looking at this round", because the
+    answer is half of an authority record: the exact-SHA verdict binding pairs
+    the orchestrator's verdict with the commit the reviewer actually read
+    (``docs/foundation/VALIDATED_WORK_DISPOSITION.md`` §4).
+
+    The reported SHA therefore comes from the checkout that *put* the commit
+    there, never from a later independent observation. The coder's branch can
+    advance at any moment, so a read taken after the checkout can name a commit
+    the reviewer's filesystem never held — an approval for work no reviewer saw,
+    which is precisely what the binding exists to prevent.
+
+    ``before_round`` is the caller's own per-round hook. It runs after the
+    checkout, exactly as the exchange loop has always ordered it, and cannot
+    change what this reports.
+    """
+
+    reviewer_worktree_path: Path
+    coder_branch: str | None
+    before_round: Callable[[int], None] | None = None
+
+    def present(self, round_index: int) -> str | None:
+        """Prepare the reviewer's round; return the commit it will read.
+
+        Returns None only when the presented commit cannot be established at
+        all. Callers must treat that as "unknown", never as "current HEAD".
+        """
+        presented = self._checkout_candidate()
+        if self.before_round is not None:
+            self.before_round(round_index)
+        return presented
+
+    def _checkout_candidate(self) -> str | None:
+        if self.coder_branch is None:
+            # No branch to track, so nothing re-points the worktree: what the
+            # reviewer holds is whatever it was created at. Still read from the
+            # reviewer's own worktree — the coder's is a different filesystem
+            # and answers a different question.
+            return get_repo_head_sha(self.reviewer_worktree_path)
+        return fast_forward_reviewer_worktree(
+            ReviewerWorktree(
+                path=self.reviewer_worktree_path,
+                coder_branch=self.coder_branch,
+            ),
+        )
 
 
 def remove_reviewer_worktree(

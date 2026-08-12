@@ -110,6 +110,28 @@ class TestLoadReviewVerdict:
         with pytest.raises(json.JSONDecodeError):
             load_review_verdict(tmp_path)
 
+    def test_unknown_schema_version_fails_closed(self, tmp_path: Path) -> None:
+        """A future schema is not readable as v1 just because v1 fields fit.
+
+        An admission gate acting on fields this code may be misreading is
+        worse than one that refuses to read the record at all.
+        """
+        review_verdict_path(tmp_path).write_text(
+            json.dumps(
+                {
+                    "schema_version": 99,
+                    "verdict": "approved",
+                    "reviewed_sha": SHA_A,
+                    "decided_at": "2026-08-12T00:00:00+00:00",
+                    "completed_rounds": 1,
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        with pytest.raises(ValueError, match="schema_version"):
+            load_review_verdict(tmp_path)
+
     def test_half_a_binding_fails_loudly(self, tmp_path: Path) -> None:
         review_verdict_path(tmp_path).write_text(
             json.dumps(

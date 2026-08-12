@@ -52,6 +52,18 @@ class TestBindingIsOneRecord:
         with pytest.raises(ValueError, match="disagree"):
             BoundReviewVerdict.from_payload(payload)
 
+    def test_unknown_schema_version_does_not_parse(self) -> None:
+        """Unknown versions fail closed rather than being read as v1.
+
+        The payload's other fields fit v1 exactly; that is the point. A record
+        written by a schema this code does not know may mean something else by
+        the same field names, and an admission gate must not act on a guess.
+        """
+        payload = _approval().to_payload()
+        payload["schema_version"] = 99
+        with pytest.raises(ValueError, match="schema_version"):
+            BoundReviewVerdict.from_payload(payload)
+
     def test_round_trips_through_payload(self) -> None:
         binding = _approval()
         assert BoundReviewVerdict.from_payload(binding.to_payload()) == binding

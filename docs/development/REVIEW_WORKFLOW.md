@@ -81,14 +81,21 @@ review-exchange directory:
 It exists so a verdict is never separable from the commit it was rendered
 against — the property Foundation admission depends on
 (`docs/foundation/VALIDATED_WORK_DISPOSITION.md` §4, `review.reviewed_sha`).
-Three things make it authority rather than convenience:
+Four things make it authority rather than convenience:
 
-- **Neither half is agent-supplied.** `verdict` is derived from the terminal
-  state the orchestrator recorded (`reviewer_ok` → `approved`, a no-progress
-  stop → `changes_requested`), so a reviewer "approved" that policy sent back
-  to rework is not recorded as an approval. `reviewed_sha` is the coder
-  worktree HEAD the orchestrator observed **before** presenting the round, so
-  a commit landing mid-review cannot inherit the verdict.
+- **Neither half is agent-supplied.** `verdict` is the orchestrator's own
+  conclusion, derived once per reviewer turn from every policy input at once:
+  reviewer intent, validation freshness, the approval gate, nit policy, and
+  whether the reviewer's decision JSON is an approval at all. A reviewer that
+  sends `response_type: ok` while its decision says `changes_requested` (they
+  are separate fields, and the transport does not make them agree) is routed
+  to rework and binds `changes_requested` — authority follows the decision,
+  never the transport field.
+- **`reviewed_sha` is what the reviewer was actually given.** It is the commit
+  the orchestrator checked out into the reviewer's worktree for that round,
+  reported by the checkout itself. It is deliberately not a later reading of
+  the coder worktree: the coder's branch can advance between the checkout and
+  the read, which would name a commit no reviewer ever opened.
 - **The pairing is structural.** A payload naming one half without the other
   does not parse.
 - **Validity is re-derived, never remembered.** `BoundReviewVerdict.approves(head_sha)`
@@ -97,10 +104,10 @@ Three things make it authority rather than convenience:
 Only those two terminals produce a binding. Every other way an exchange can end
 — max rounds exceeded, a protocol failure, a timeout — writes no
 `review-verdict.json`, because no reviewer verdict describes the commit the
-exchange left behind: max rounds is reached *after* a coder turn has moved HEAD
-past the last reviewed commit, and the other terminals end before a verdict is
-rendered at all. Absence is therefore not a gap to fill in later; it means this
-exchange produced no verdict any gate may admit.
+exchange left behind: max rounds is reached after a coder turn that was asked to
+move HEAD past the last reviewed commit, and the other terminals end before a
+verdict is rendered at all. Absence is therefore not a gap to fill in later; it
+means this exchange produced no verdict any gate may admit.
 
 The binding is written next to `summary.json` and reloaded from there, so it
 survives an orchestrator restart. If the orchestrator cannot observe the

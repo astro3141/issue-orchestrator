@@ -14,9 +14,10 @@ Two properties make it an authority artifact rather than a convenience:
 
 * **Neither half is agent-supplied.** The verdict is derived from the terminal
   state the orchestrator recorded for the exchange, and ``reviewed_sha`` is the
-  commit the orchestrator observed in the coder worktree *before* it presented
-  the round to the reviewer. A reviewer claiming "I looked at X" is a claim; it
-  never reaches this record.
+  commit the orchestrator itself checked out into the reviewer's worktree for
+  that round — not a later reading of where the coder's branch has since got
+  to. A reviewer claiming "I looked at X" is a claim; it never reaches this
+  record.
 * **The pairing is structural.** A payload naming a verdict without a SHA, or a
   SHA without a verdict, does not parse. There is no state in which half of the
   binding exists.
@@ -90,8 +91,19 @@ class BoundReviewVerdict:
             raise ValueError("decided_at must be a non-empty str")
         if type(self.completed_rounds) is not int or self.completed_rounds < 1:
             raise ValueError("completed_rounds must be an int >= 1")
-        if type(self.schema_version) is not int or self.schema_version < 1:
-            raise ValueError("schema_version must be an int >= 1")
+        if (
+            type(self.schema_version) is not int
+            or self.schema_version != REVIEW_VERDICT_BINDING_SCHEMA_VERSION
+        ):
+            # Fails closed on purpose. A version this code does not know is a
+            # record written by a schema it cannot claim to understand;
+            # reading it as if it were v1 would let an admission gate act on
+            # fields it may be misreading.
+            raise ValueError(
+                "review verdict binding schema_version must be "
+                f"{REVIEW_VERDICT_BINDING_SCHEMA_VERSION}, got "
+                f"{self.schema_version!r}"
+            )
 
     def covers(self, head_sha: str) -> bool:
         """Whether this verdict was rendered against ``head_sha``."""

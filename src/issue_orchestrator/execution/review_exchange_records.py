@@ -10,8 +10,8 @@ agent:
 
 ``review-verdict.json``
     The exact-SHA verdict binding (:class:`~..domain.review_verdict_binding.BoundReviewVerdict`):
-    the verdict the orchestrator concluded, paired with the commit it observed
-    in the coder worktree *before* presenting the round to the reviewer.
+    the verdict the orchestrator concluded, paired with the commit it checked
+    out into the reviewer's worktree for that round.
 
 They are deliberately separate files. The summary records what happened; the
 binding is an authority artifact that a later admission gate checks, and it
@@ -152,10 +152,12 @@ def bind_review_verdict(
 ) -> BoundReviewVerdict | None:
     """Bind ``verdict`` to the commit the orchestrator presented for review.
 
-    ``presented_head_sha`` is the coder worktree HEAD observed *before* the
-    reviewer round ran, so a commit made while the reviewer was working cannot
-    end up inside an approval. Both halves come from the orchestrator: the
-    reviewer's own decision JSON is never consulted here.
+    ``presented_head_sha`` is the commit the orchestrator checked out into the
+    reviewer's worktree for that round, reported by the checkout itself, so
+    neither a commit made while the reviewer was working nor a coder branch
+    advancing right after the checkout can end up inside an approval. Both
+    halves come from the orchestrator: the reviewer's own decision JSON is
+    never consulted here.
 
     Returns ``None`` — writing nothing — when the orchestrator could not
     observe the presented commit as a canonical SHA. That is deliberate: an
