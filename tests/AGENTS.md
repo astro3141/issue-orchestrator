@@ -194,6 +194,26 @@ Reference: `tests/js/e2e_run_view_actions.test.js` covers every clickable surfac
 
 ---
 
+## Codex Home Isolation (Automatic)
+
+Codex writes a rollout transcript under `$CODEX_HOME/sessions` for every session it runs, and `~/.codex` is a live directory the operator's desktop app owns. **No test may spawn the real Codex CLI against it.**
+
+You do not have to do anything to get this — `tests/codex_home.py` is wired into `tests/conftest.py` and applies to every test package:
+
+| Fixture | Scope | What it does |
+|---------|-------|--------------|
+| `codex_home_session` | session, autouse | Points `CODEX_HOME` at a throwaway home seeded with `auth.json` only (never the operator's `config.toml`) |
+| `codex_home_guard` | function, autouse | Wraps `subprocess.Popen` and `pexpect.spawn`; if the command starts `codex`, asserts the env that spawn would hand it is not the operator's home |
+| `isolated_codex_home` | function, opt-in | A pristine per-test home, for tests that must prove Codex ignores operator config |
+
+Rules:
+
+- Do **not** re-point `CODEX_HOME` at `~/.codex`; the guard fails the test at spawn time, naming the command and the leak.
+- Live Codex tests stay live. Isolation is not a reason to mock, skip, or reclassify them.
+- The guard asserts on the *effective environment of the spawn*, not on whether a fixture was listed, so a newly added live test cannot leak by omission.
+
+---
+
 ## Subdirectory Guides
 
 - `unit/AGENTS.md` - Unit test patterns, fixtures, mocking
