@@ -254,6 +254,46 @@ git -C <managed-worktree> ls-files -v -- src/issue_orchestrator/entrypoints/cli_
 `.claude/settings.json` is still `--skip-worktree` by design — the Stop hook is
 runtime configuration, and nothing in the gate reads it as source.
 
+### …and it must read the code that changed
+
+Same rule, one level up. `validation.quick` in
+`.issue-orchestrator/config/selfhost.yaml` is a `-k` filter, so a `passed=true`
+recorded by a run that deselected every test the branch added is evidence about
+somebody else's code. `-k` matches module names, so widening it is cheap:
+
+```sh
+# what the recorded gate actually executed
+grep -c 'PASSED\|passed' <session>/validation/validation-stdout.log
+.venv/bin/python -m pytest tests/unit tests/integration -q -p no:cacheprovider \
+  --collect-only -k '<the profile expression>' | grep <your test module>
+```
+
+When an issue's change area falls outside the current keywords, add them to the
+tracked config in the same commit — but **that edit does not take effect for the
+branch that makes it.** `load_runtime_validation_config` gives
+`ISSUE_ORCHESTRATOR_CONFIG_PATH` precedence over any repo-local search, and the
+launcher exports it as the *main checkout's* config file:
+
+```sh
+echo "$ISSUE_ORCHESTRATOR_CONFIG_PATH"
+# /Users/<you>/io-fork/issue-orchestrator/.issue-orchestrator/config/selfhost.yaml
+```
+
+So the live gate is operator-owned and outside every agent worktree. A branch's
+own edit governs runs only after it lands there. To make a round's record carry
+the branch's own gate, point one run at the worktree copy:
+
+```sh
+ISSUE_ORCHESTRATOR_CONFIG_PATH=$PWD/.issue-orchestrator/config/selfhost.yaml \
+ORCHESTRATOR_CONFIG_PATH=$PWD/.issue-orchestrator/config/selfhost.yaml \
+  coding-done completed --implementation "…" --problems "…"
+```
+
+Only ever to *widen* the selection — an override that narrows it is the agent
+grading its own paper. Publish (`make validate-pr-raw`) running the whole suite
+later is a backstop against merging something broken, not a substitute for
+validating the change in review.
+
 ### tests/e2e is a separate live contract
 
 It requires `gh auth` and `E2E_TEST_REPO`. With that variable unset,

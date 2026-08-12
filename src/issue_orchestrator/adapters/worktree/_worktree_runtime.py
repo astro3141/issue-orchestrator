@@ -20,6 +20,7 @@ from ...infra.runtime_artifacts import (
     RUNTIME_IGNORE_FILE,
     load_runtime_ignore_patterns,
 )
+from ...ports.command_runner import OutputNewlines
 from ...ports.git import GitError
 from ._worktree_errors import WorktreeError
 from ._worktree_git import _git_run
@@ -142,7 +143,13 @@ def _link_repo_venv_into_worktree(repo_root: Path, worktree_path: Path) -> None:
     )
 
 
-def _git_or_fail(worktree_path: Path, argv: list[str], *, what: str) -> str:
+def _git_or_fail(
+    worktree_path: Path,
+    argv: list[str],
+    *,
+    what: str,
+    newlines: OutputNewlines = OutputNewlines.TRANSLATED,
+) -> str:
     """Run a git command whose failure must not be papered over.
 
     Every caller below is either deciding whether the worktree's filesystem is
@@ -155,7 +162,7 @@ def _git_or_fail(worktree_path: Path, argv: list[str], *, what: str) -> str:
         WorktreeError: If the git command fails.
     """
     try:
-        return _git_run(worktree_path, argv, check=True).stdout
+        return _git_run(worktree_path, argv, check=True, newlines=newlines).stdout
     except GitError as exc:
         raise WorktreeError(f"Failed to {what} in {worktree_path}: {exc}") from exc
 
@@ -195,14 +202,112 @@ def repo_owns_cli_tools(worktree_path: Path) -> bool:
     return bool(listed.strip())
 
 
+def _git_z_records(worktree_path: Path, argv: list[str], *, what: str) -> list[str]:
+    """Run a NUL-delimited git query and return its records.
+
+    ``-z`` is not a detail here. Without it git quotes any path containing a
+    space or a non-ASCII byte, and that quoted form — handed back to
+    ``update-index`` or ``checkout`` — names a file that does not exist, so the
+    whole setup fails on a path git reported perfectly well.
+    """
+    listed = _git_or_fail(
+        worktree_path, argv, what=what, newlines=OutputNewlines.PRESERVED
+    )
+    return [record for record in listed.split("\0") if record]
+
+
 def _hidden_cli_tool_paths(worktree_path: Path) -> list[str]:
     """Return repo-owned CLI tool paths an earlier run marked ``--skip-worktree``."""
-    listed = _git_or_fail(
+    records = _git_z_records(
         worktree_path,
-        ["ls-files", "-v", "--", CLI_TOOLS_WORKTREE_DIR],
+        ["ls-files", "-v", "-z", "--", CLI_TOOLS_WORKTREE_DIR],
         what="read CLI tool index flags",
     )
-    return [line[2:] for line in listed.splitlines() if line.startswith("S ")]
+    return [record[2:] for record in records if record.startswith("S ")]
+
+
+def _package_cli_tools_dir() -> Path:
+    """The orchestrator's own CLI tools — the copies planting takes from."""
+    return Path(__file__).resolve().parents[2] / "entrypoints" / "cli_tools"
+
+
+def _untracked_cli_tool_files(worktree_path: Path) -> list[str]:
+    """Return untracked paths under the CLI-tools directory.
+
+    Deliberately without ``--exclude-standard``: the leftovers this hunts for
+    are exactly the ones an orchestrator exclude entry was hiding, so asking
+    git to honour the exclude rules would hide them again.
+    """
+    return _git_z_records(
+        worktree_path,
+        ["ls-files", "--others", "-z", "--", CLI_TOOLS_WORKTREE_DIR],
+        what="list untracked CLI tool paths",
+    )
+
+
+def _discard_planted_leftovers(worktree_path: Path) -> None:
+    """Remove overlay files the index cannot restore, and name the rest.
+
+    Restoring from the index repairs only what the branch tracks. A file an
+    earlier run planted that this branch does *not* track — the orchestrator's
+    package ships a CLI tool the branch predates, or the candidate deleted one —
+    never carried a ``--skip-worktree`` bit; the exclude entry alone hid it.
+    Dropping that entry makes it visible, so without this it would sit in the
+    candidate's ``git status`` permanently, attributed to an agent that never
+    wrote it.
+
+    Only a file byte-identical to the copy this orchestrator plants is deleted,
+    because that is the one case where "the orchestrator put it there" is
+    provable. Anything else under the directory belongs to the candidate,
+    including a same-named file whose content differs: it is reported by name
+    and left alone, since deleting a CLI tool an agent wrote is the worse of the
+    two failures.
+
+    Raises:
+        WorktreeError: If a leftover cannot be read or removed. Leaving it in
+            place is the divergence this step exists to end, so it fails loudly
+            rather than reporting a repair it did not make.
+    """
+    package_dir = _package_cli_tools_dir()
+    discarded: list[str] = []
+    unexplained: list[str] = []
+    for rel_path in _untracked_cli_tool_files(worktree_path):
+        # Planting is flat and by name, so nothing nested and no name the
+        # package does not ship can be an orchestrator copy.
+        if Path(rel_path).parent.as_posix() != CLI_TOOLS_WORKTREE_DIR:
+            continue
+        packaged = package_dir / Path(rel_path).name
+        if not packaged.is_file():
+            continue
+        leftover = worktree_path / rel_path
+        try:
+            if leftover.read_bytes() != packaged.read_bytes():
+                unexplained.append(rel_path)
+                continue
+            leftover.unlink()
+        except OSError as exc:
+            raise WorktreeError(
+                f"Failed to discard planted CLI tool {rel_path} in {worktree_path}: {exc}"
+            ) from exc
+        discarded.append(rel_path)
+
+    if discarded:
+        logger.warning(
+            "Discarded %d untracked CLI tool file(s) an earlier orchestrator run "
+            "planted in %s: %s",
+            len(discarded),
+            worktree_path,
+            ", ".join(discarded),
+        )
+    if unexplained:
+        logger.warning(
+            "Untracked file(s) under %s in %s that no orchestrator copy explains: "
+            "%s. They are the repository's to resolve and will show as dirty "
+            "until it does.",
+            CLI_TOOLS_WORKTREE_DIR,
+            worktree_path,
+            ", ".join(unexplained),
+        )
 
 
 def _restore_repo_owned_cli_tools(worktree_path: Path) -> None:
@@ -211,9 +316,10 @@ def _restore_repo_owned_cli_tools(worktree_path: Path) -> None:
     Worktrees are long-lived and reused, so declining to plant is not enough on
     its own: a worktree set up before this rule existed still carries the
     planted copies, the ``--skip-worktree`` bits that stop git reporting them,
-    and exclude entries that would hide a CLI tool the candidate *adds*. All
-    three are cleared here, in the same step that decides not to plant, so
-    there is one place that answers "what is in this directory".
+    and exclude entries that would hide a CLI tool the candidate *adds*. All of
+    it is cleared here, in the same step that decides not to plant, so there is
+    one place that answers "what is in this directory" — including the planted
+    files the branch does not track, which the index cannot restore.
 
     Restoring from the index cannot discard agent work. ``--skip-worktree``
     makes git refuse to stage those paths at all, so nothing written under them
@@ -239,6 +345,7 @@ def _restore_repo_owned_cli_tools(worktree_path: Path) -> None:
             worktree_path,
         )
     _drop_worktree_exclude_entries(worktree_path, f"{CLI_TOOLS_WORKTREE_DIR}/")
+    _discard_planted_leftovers(worktree_path)
 
 
 def _plant_cli_tools(worktree_path: Path) -> list[Path]:
@@ -247,8 +354,7 @@ def _plant_cli_tools(worktree_path: Path) -> list[Path]:
     Uses package-relative paths so this works when the target repo is a foreign
     (non-orchestrator) repository with no such directory of its own.
     """
-    package_root = Path(__file__).resolve().parents[2]
-    src_cli_tools = package_root / "entrypoints" / "cli_tools"
+    src_cli_tools = _package_cli_tools_dir()
     dst_cli_tools = worktree_path / ORCHESTRATOR_CLI_TOOLS_DIR
 
     if not src_cli_tools.exists():

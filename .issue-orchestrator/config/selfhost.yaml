@@ -76,9 +76,15 @@ validation:
   # that is a self-hosting environment requirement, recorded outside the repo,
   # not something this config or any tracked source should carry.
   quick:
-    # Focused on the #7059 change area rather than the whole suite, so rework
-    # rounds stay short. Whole-repository regression duty belongs to publish.
-    cmd: ".venv/bin/python -m pytest tests/unit tests/integration -q --tb=short -p no:cacheprovider -k 'validation or profile or config or prepush' && make typecheck"
+    # Narrow so rework rounds stay short; whole-repository regression duty
+    # belongs to publish. Narrow is only legitimate while the selection still
+    # covers the change under review — a `passed=true` that deselected every
+    # test the change added is evidence about somebody else's code. Keep the
+    # keywords ahead of the work: the gate and dirty-guard terms below exist
+    # because #6 touches worktree setup, planted CLI tools, and dirty-tree
+    # classification, and the next issue elsewhere in the tree must add its
+    # own before relying on this profile.
+    cmd: ".venv/bin/python -m pytest tests/unit tests/integration -q --tb=short -p no:cacheprovider -k 'validation or profile or config or prepush or planted or cli_tools or dirty or worktree' && make typecheck"
     timeout_seconds: 1800
   publish:
     # The upstream project's own gate, reproduced rather than invented:

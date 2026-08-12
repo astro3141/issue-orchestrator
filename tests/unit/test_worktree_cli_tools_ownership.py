@@ -32,12 +32,20 @@ from issue_orchestrator.adapters.worktree.api import (
     can_remove_without_user_changes,
     sync_cli_tools,
 )
+from issue_orchestrator.entrypoints import cli_tools as orchestrator_cli_tools
 from issue_orchestrator.infra.runtime_artifacts import ORCHESTRATOR_CLI_TOOLS_DIR
 from tests.unit.worktree_git_helpers import GitWorktree, make_git_worktree
 
 CLI_TOOLS_DIR = ORCHESTRATOR_CLI_TOOLS_DIR.as_posix()
 CANDIDATE_TOOL = f"{CLI_TOOLS_DIR}/coding_done.py"
 CANDIDATE_SOURCE = "# candidate branch version of coding_done\n"
+
+# The copies the orchestrator plants from — the only content a repair may treat
+# as provably orchestrator-owned.
+PACKAGE_CLI_TOOLS = Path(str(orchestrator_cli_tools.__file__)).parent
+# A tool the package ships that the fixture repository does not track, which is
+# what "planted, and the index cannot restore it" looks like.
+UNTRACKED_PACKAGE_TOOL = f"{CLI_TOOLS_DIR}/reviewer_done.py"
 
 
 def _git(*argv: str, cwd: Path) -> str:
@@ -68,18 +76,38 @@ def _self_hosting_worktree(tmp_path: Path) -> GitWorktree:
     return git_worktree
 
 
+def _exclude_files(git_worktree: GitWorktree) -> tuple[Path, ...]:
+    return (
+        git_worktree.gitdir / "info" / "exclude",
+        git_worktree.main_repo / ".git" / "info" / "exclude",
+    )
+
+
+def _exclude(git_worktree: GitWorktree, entry: str) -> None:
+    for exclude in _exclude_files(git_worktree):
+        exclude.parent.mkdir(parents=True, exist_ok=True)
+        with exclude.open("a", encoding="utf-8") as handle:
+            handle.write(f"{entry}\n")
+
+
 def _plant_stale_overlay(git_worktree: GitWorktree) -> None:
     """Reproduce the pre-fix state: planted copy, hidden bit, exclude entry."""
     worktree_path = git_worktree.worktree_path
     (worktree_path / CANDIDATE_TOOL).write_text("# orchestrator runtime copy\n")
     _git("update-index", "--skip-worktree", "--", CANDIDATE_TOOL, cwd=worktree_path)
-    for exclude in (
-        git_worktree.gitdir / "info" / "exclude",
-        git_worktree.main_repo / ".git" / "info" / "exclude",
-    ):
-        exclude.parent.mkdir(parents=True, exist_ok=True)
-        with exclude.open("a", encoding="utf-8") as handle:
-            handle.write(f"{CANDIDATE_TOOL}\n")
+    _exclude(git_worktree, CANDIDATE_TOOL)
+
+
+def _plant_untracked_leftover(git_worktree: GitWorktree, rel_path: str, body: bytes) -> None:
+    """Plant a file the branch does not track, hidden only by the exclude entry.
+
+    No ``--skip-worktree`` bit exists for an untracked path, so this is the
+    overlay state the index cannot repair.
+    """
+    target = git_worktree.worktree_path / rel_path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(body)
+    _exclude(git_worktree, rel_path)
 
 
 # ---------------------------------------------------------------------------
@@ -162,6 +190,84 @@ def test_agent_edits_to_cli_tools_are_left_alone(tmp_path) -> None:
 
     assert (worktree_path / CANDIDATE_TOOL).read_text() == "# agent's in-progress edit\n"
     assert CANDIDATE_TOOL in _git("status", "--porcelain", cwd=worktree_path)
+
+
+def test_a_path_git_has_to_quote_is_still_restored(tmp_path) -> None:
+    """Parsing ``ls-files`` output without ``-z`` would hand git a quoted name.
+
+    Git quotes any path holding a control character or a non-ASCII byte, and
+    that quoted string fed back to ``update-index``/``checkout`` names a file
+    that does not exist — the repair then fails on a path git reported
+    perfectly well.
+    """
+    git_worktree = _self_hosting_worktree(tmp_path)
+    worktree_path = git_worktree.worktree_path
+    quoted_tool = f"{CLI_TOOLS_DIR}/needs\tquoting.py"
+    (worktree_path / quoted_tool).write_text(CANDIDATE_SOURCE)
+    _git("add", "--", quoted_tool, cwd=worktree_path)
+    _git("commit", "-m", "tool with a space", cwd=worktree_path)
+    (worktree_path / quoted_tool).write_text("# orchestrator runtime copy\n")
+    _git("update-index", "--skip-worktree", "--", quoted_tool, cwd=worktree_path)
+
+    sync_cli_tools(worktree_path)
+
+    assert (worktree_path / quoted_tool).read_text() == CANDIDATE_SOURCE
+    assert set(_index_flags(worktree_path).values()) == {"H"}
+
+
+# ---------------------------------------------------------------------------
+# Leftovers the index cannot restore
+#
+# A planted file the branch does not track never carried a --skip-worktree bit;
+# the exclude entry alone hid it. Dropping that entry makes it visible, so the
+# repair has to finish the job or the candidate inherits a permanently dirty
+# path nobody on the branch wrote.
+# ---------------------------------------------------------------------------
+
+
+def test_untracked_planted_leftover_is_discarded(tmp_path) -> None:
+    git_worktree = _self_hosting_worktree(tmp_path)
+    worktree_path = git_worktree.worktree_path
+    packaged = (PACKAGE_CLI_TOOLS / "reviewer_done.py").read_bytes()
+    _plant_untracked_leftover(git_worktree, UNTRACKED_PACKAGE_TOOL, packaged)
+
+    sync_cli_tools(worktree_path)
+
+    assert not (worktree_path / UNTRACKED_PACKAGE_TOOL).exists()
+    assert _git("status", "--porcelain", cwd=worktree_path).strip() == ""
+
+
+def test_untracked_file_the_orchestrator_cannot_claim_is_kept_and_reported(
+    tmp_path, caplog
+) -> None:
+    """Same name, different bytes: it is the candidate's until proven otherwise."""
+    git_worktree = _self_hosting_worktree(tmp_path)
+    worktree_path = git_worktree.worktree_path
+    _plant_untracked_leftover(
+        git_worktree, UNTRACKED_PACKAGE_TOOL, b"# the candidate's own new tool\n"
+    )
+
+    with caplog.at_level("WARNING"):
+        sync_cli_tools(worktree_path)
+
+    assert (
+        worktree_path / UNTRACKED_PACKAGE_TOOL
+    ).read_bytes() == b"# the candidate's own new tool\n"
+    assert UNTRACKED_PACKAGE_TOOL in _git("status", "--porcelain", cwd=worktree_path)
+    assert UNTRACKED_PACKAGE_TOOL in caplog.text
+
+
+def test_a_new_tool_the_package_does_not_ship_is_never_touched(tmp_path) -> None:
+    """The candidate is free to add a CLI tool the orchestrator has no copy of."""
+    git_worktree = _self_hosting_worktree(tmp_path)
+    worktree_path = git_worktree.worktree_path
+    new_tool = f"{CLI_TOOLS_DIR}/candidate_only_tool.py"
+    _plant_untracked_leftover(git_worktree, new_tool, b"# brand new\n")
+
+    sync_cli_tools(worktree_path)
+
+    assert (worktree_path / new_tool).read_bytes() == b"# brand new\n"
+    assert new_tool in _git("status", "--porcelain", cwd=worktree_path)
 
 
 # ---------------------------------------------------------------------------
