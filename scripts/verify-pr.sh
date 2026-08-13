@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # Managed by issue-orchestrator setup-guardrails: verify-pr
-# issue-orchestrator-selection: modes/default/main.yaml
+# issue-orchestrator-selection: modes/default/selfhost.yaml
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
@@ -13,8 +13,8 @@ cd "$repo_root"
 if [ -z "${ISSUE_ORCHESTRATOR_MODE:-}" ] ||
    [ -z "${ISSUE_ORCHESTRATOR_CONFIG_NAME:-}" ] ||
    [ -z "${ISSUE_ORCHESTRATOR_CONFIG_PATH:-}" ]; then
-  selected_config_rel=modes/default/main.yaml
-  export ISSUE_ORCHESTRATOR_CONFIG_NAME=main.yaml
+  selected_config_rel=modes/default/selfhost.yaml
+  export ISSUE_ORCHESTRATOR_CONFIG_NAME=selfhost.yaml
   export ISSUE_ORCHESTRATOR_CONFIG_PATH="$repo_root/.issue-orchestrator/config/$selected_config_rel"
   export ISSUE_ORCHESTRATOR_MODE=default
 fi
