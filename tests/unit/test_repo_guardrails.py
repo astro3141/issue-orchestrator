@@ -298,9 +298,15 @@ def test_checked_in_verify_pr_matches_portable_generated_output() -> None:
     repo_root = Path(__file__).resolve().parents[2]
     verify_path = repo_root / "scripts" / "verify-pr.sh"
 
+    # This fork's canonical guardrail selection is `selfhost.yaml`, not the
+    # upstream-owned `main.yaml`. The repository is operated by its own
+    # orchestrator, so the identity that runs the push gate must be the same
+    # one the runtime and agent sessions use; a push falling back to a config
+    # nothing else runs would gate against a contract the fork does not use.
+    # `main.yaml` stays checked in as the upstream-owned reference.
     assert verify_path.read_text() == _render_verify_pr_script(
         "make validate-pr-raw",
-        selected_config_name="modes/default/main.yaml",
+        selected_config_name="modes/default/selfhost.yaml",
     )
 
 

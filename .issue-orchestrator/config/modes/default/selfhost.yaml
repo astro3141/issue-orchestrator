@@ -1,11 +1,21 @@
 # Self-hosting configuration — astro3141/issue-orchestrator fork
 #
-# Deliberately a NAMED config, not default.yaml and not a merge into main.yaml.
-# The upstream repository already owns main.yaml, and scripts/verify-pr.sh (a
-# tracked upstream file) selects it by name. Creating default.yaml made
-# setup-guardrails rewrite that tracked file, which the repository's own
-# test_checked_in_verify_pr_matches_portable_generated_output correctly caught.
-# Select this file explicitly instead:
+# Deliberately a NAMED config, not default.yaml and not a merge into main.yaml:
+# main.yaml is upstream-owned and stays checked in as the upstream reference.
+#
+# This file is this fork's CANONICAL GUARDRAIL SELECTION. scripts/verify-pr.sh
+# is generated from it, so one identity is used everywhere:
+#
+#   orchestrator runtime   --config .../modes/default/selfhost.yaml
+#   agent sessions         ISSUE_ORCHESTRATOR_CONFIG_* exported from that run
+#   human push fallback    baked into scripts/verify-pr.sh
+#
+# An earlier revision of this comment said the named config existed to avoid
+# rewriting the tracked verify-pr.sh. That is no longer why: the fork now
+# regenerates it deliberately, so a push with no runtime selection gates
+# against the contract this repository actually runs rather than upstream's.
+#
+# Select this file explicitly:
 #
 #   ISSUE_ORCHESTRATOR_CONFIG_NAME=selfhost.yaml
 #
