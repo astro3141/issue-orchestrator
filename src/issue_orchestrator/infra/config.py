@@ -50,6 +50,7 @@ from .validation_profiles import (
     profiles_runtime_dict,
     profiles_yaml_dict,
 )
+from .config_identity import ConfigLaunchIdentity, RuntimeConfigReferenceOwner
 from .config_paths import (
     CONFIG_DIR as CONFIG_DIR,
     DEFAULT_CONFIG_NAME as DEFAULT_CONFIG_NAME,
@@ -61,8 +62,10 @@ from .config_paths import (
     get_config_dir as get_config_dir,
     get_config_path as get_config_path,
     list_configs as list_configs,
+    list_modes as list_modes,
     repo_root_from_config_path as repo_root_from_config_path,
     resolve_relative_path as resolve_relative_path,
+    selection_from_config_path as selection_from_config_path,
 )
 from . import github_config as _github_config
 from .config_sections import (
@@ -90,6 +93,12 @@ from .config_sections import (
     parse_milestone_order,
 )
 from .config_value_rules import resolve_tech_lead_watch_label
+from .config_review_projection import (
+    internal_review_dict,
+    runtime_exchange_dict,
+    runtime_run_audit_dict,
+    serialized_internal_review_dict,
+)
 from .validation_config_loader import (
     load_validation_config as load_validation_config,
     load_validation_config_from_file as load_validation_config_from_file,
@@ -104,7 +113,7 @@ def _put_if_truthy(target: dict, key: str, value: object) -> None:
 
 
 @dataclass
-class Config(TechLeadActivationOwner):
+class Config(ConfigLaunchIdentity, RuntimeConfigReferenceOwner, TechLeadActivationOwner):
     """Orchestrator configuration."""
 
     # Agent configurations keyed by label (e.g., "agent:web")
@@ -316,6 +325,11 @@ class Config(TechLeadActivationOwner):
     retrospective_reviewed_label: str = "retrospective-reviewed"
     retrospective_changes_requested_label: str = "retrospective-changes-requested"
 
+    # Fast coder-owned review loop that runs before any successful coder handoff.
+    internal_review_enabled: bool = False
+    internal_review_max_rounds: int = 5
+    internal_review_instructions: str = ".io/internal-review.md"
+
     # Review exchange mode (via-mcp, via-local-loop, or via-draft-pr review)
     review_exchange_mode: str = "via-local-loop"
     review_exchange_probe_schedule: str = "daily"  # startup, daily, interval, manual
@@ -524,25 +538,6 @@ class Config(TechLeadActivationOwner):
             }
         return exchange_dict
 
-    def _runtime_exchange_dict(self) -> dict[str, object]:
-        exchange_dict: dict[str, object] = {"mode": self.review_exchange_mode}
-        exchange_dict["probe"] = {
-            "schedule": self.review_exchange_probe_schedule,
-            "interval_days": self.review_exchange_probe_interval_days,
-        }
-        exchange_dict["loop"] = {
-            "max_rounds": self.review_exchange_max_rounds,
-            "max_no_progress": self.review_exchange_max_no_progress,
-            "require_validation": self.review_exchange_require_validation,
-        }
-        return exchange_dict
-
-    def _runtime_run_audit_dict(self) -> dict[str, object]:
-        return {
-            "min_runtime_minutes": self.review_run_audit_min_runtime_minutes,
-            "on_timeout": self.review_run_audit_on_timeout,
-        }
-
     def get_label_review_keep_current_approach(self) -> str:
         """Get the reviewer keep-current-approach label with prefix if configured."""
         return self.prefixed_label(self.review_keep_current_approach_label)
@@ -554,6 +549,7 @@ class Config(TechLeadActivationOwner):
         (YAML + command line overrides) for debugging.
         """
         result = {
+            "launch_selection": self.launch_identity_dict(),
             "repo": {
                 "name": self.repo,
                 "root": str(self.repo_root),
@@ -693,14 +689,15 @@ class Config(TechLeadActivationOwner):
                 "default": self.code_review_agent,
                 "code_review_label": self.code_review_label,
                 "code_reviewed_label": self.code_reviewed_label,
-                "run_audit": self._runtime_run_audit_dict(),
+                "run_audit": runtime_run_audit_dict(self),
                 "retrospective": {
                     "enabled": self.retrospective_review_enabled,
                     "trigger_label": self.retrospective_review_trigger_label,
                     "reviewed_label": self.retrospective_reviewed_label,
                     "changes_requested_label": self.retrospective_changes_requested_label,
                 },
-                "exchange": self._runtime_exchange_dict(),
+                "internal": internal_review_dict(self),
+                "exchange": runtime_exchange_dict(self),
                 "nits": {
                     "default_policy": self.review_nits_default_policy,
                     "by_agent": dict(self.review_nits_by_agent),
@@ -1045,6 +1042,8 @@ class Config(TechLeadActivationOwner):
                 "reviewed_label": self.retrospective_reviewed_label,
                 "changes_requested_label": self.retrospective_changes_requested_label,
             }
+        if internal_review := serialized_internal_review_dict(self):
+            review_dict["internal"] = internal_review
         if self.review_nits_default_policy != "surface" or self.review_nits_by_agent:
             nits_dict: dict[str, object] = {
                 "default_policy": self.review_nits_default_policy,
@@ -1250,6 +1249,7 @@ class Config(TechLeadActivationOwner):
 
         config = cls()
         config.config_path = config_path.resolve()
+        config.launch_selection = selection_from_config_path(config.config_path)
 
         # Extract all sections with validation
         sections = extract_config_sections(data, config_path)
@@ -1297,10 +1297,9 @@ class Config(TechLeadActivationOwner):
         config.ai_systems_allowed = parse_ai_systems_allowed(
             sections["ai_systems"].get("allowed", [])
         )
-
-
         # Parse complex optional configs
         apply_optional_sections(config, sections)
+        config.refresh_config_fingerprint()
         return config
 
     @classmethod
@@ -1308,6 +1307,7 @@ class Config(TechLeadActivationOwner):
         cls,
         start_path: Optional[Path] = None,
         config_name: str = DEFAULT_CONFIG_NAME,
+        mode: str = "default",
         overrides: Optional[list[str]] = None,
     ) -> "Config":
         """Find config file in current or parent directories and load it.
@@ -1317,7 +1317,7 @@ class Config(TechLeadActivationOwner):
             config_name: Name of config file to load (default: default.yaml)
             overrides: CLI overrides in path=value format
         """
-        config_file = find_config_file(start_path, config_name)
+        config_file = find_config_file(start_path, config_name, mode)
         if not config_file:
             raise FileNotFoundError(
                 f"No config found in {CONFIG_DIR}/ directory. "

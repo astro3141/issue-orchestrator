@@ -1,5 +1,5 @@
 # Example issue-orchestrator configuration
-# Copy to your repo as .issue-orchestrator/config/default.yaml
+# Copy to your repo as .issue-orchestrator/config/modes/default/default.yaml
 
 repo:
   # name: "owner/repo-name"      # Optional override; defaults to git remote
@@ -183,6 +183,13 @@ review:
   tech_lead_review_on_failure: true
   max_rework_cycles: 5
   reviewer_feedback_cache_minutes: 5
+  # Optional fast review loop owned by each coder turn. The configured file is
+  # appended to coder prompts; it tells the coder how to spawn and iterate with
+  # one internal reviewer before the normal independent review begins.
+  internal:
+    enabled: false
+    max_rounds: 5
+    instructions: ".io/internal-review.md"
   nits:
     default_policy: "surface"     # ignore, surface, address
     by_agent: {}                  # e.g. agent:frontend: address
@@ -223,13 +230,16 @@ merge_queue:
   # failure_action: "rework"        # how to route a failed queue entry: rework | needs_human
 
 cleanup:
+  # Orchestrator-owned issue worktrees are removed only after the applicable
+  # review gate. Timing is independent of the action flags below: disabling
+  # tab closure does not make worktree removal happen before review.
   with_tech_lead:
     close_ai_session_tabs: true
-    remove_worktrees: false
+    remove_worktrees: true
   without_tech_lead:
-    wait_for_code_review: true
+    wait_for_code_review: true  # false runs selected actions on completion
     close_ai_session_tabs: true
-    remove_worktrees: false
+    remove_worktrees: true      # false retains worktrees for inspection
 
 validation:
   quick:

@@ -33,9 +33,30 @@ from issue_orchestrator.entrypoints.setup_wizard_common import (
     plan_setup_labels,
     write_missing_setup_prompts,
 )
+from issue_orchestrator.execution.repository_setup_artifacts import (
+    plan_missing_setup_prompts,
+)
 from issue_orchestrator.ports.repository_setup import (
     RepositorySetupGitHubVerification,
 )
+
+
+@pytest.mark.parametrize(
+    ("review", "section", "wait_for_review"),
+    [
+        ({"tech_lead_review_agent": "agent:lead"}, "with_tech_lead", None),
+        ({"enabled": True}, "without_tech_lead", True),
+        ({}, "without_tech_lead", False),
+    ],
+)
+def test_generated_configs_default_to_review_gated_worktree_cleanup(
+    review: dict, section: str, wait_for_review: bool | None,
+) -> None:
+    cleanup = setup_wizard_module.default_cleanup_config({"review": review})
+
+    assert cleanup[section]["remove_worktrees"] is True
+    if wait_for_review is not None:
+        assert cleanup[section]["wait_for_code_review"] is wait_for_review
 
 
 @pytest.fixture(autouse=True)
@@ -94,6 +115,11 @@ class MockPrompter:
         return answer if answer != "" else default
 
     def yes_no(self, question: str, default: bool = True) -> bool:
+        if question == "Enable coder-owned internal reviewer loop?" and (
+            self.answer_index >= len(self.answers)
+            or not isinstance(self.answers[self.answer_index], bool)
+        ):
+            return default
         answer = self._get_answer(question)
         if isinstance(answer, bool):
             return answer
@@ -120,6 +146,74 @@ def test_prompt_int_retries_on_invalid_input() -> None:
 
     assert value == 8080
     assert any("Invalid number" in msg for msg in prompter.printed)
+
+
+def test_wizard_collects_internal_reviewer_configuration() -> None:
+    prompter = MockPrompter([True, "3", ".io/fast-review.md"])
+    config: dict[str, object] = {
+        "review": {"enabled": True},
+    }
+
+    setup_wizard_module._collect_internal_reviewer(prompter, config)  # noqa: SLF001
+
+    assert config["review"]["internal"] == {
+        "enabled": True,
+        "max_rounds": 3,
+        "instructions": ".io/fast-review.md",
+    }
+
+
+def test_wizard_preserves_existing_internal_reviewer_configuration(
+    tmp_path: Path,
+) -> None:
+    config: dict[str, object] = {
+        "review": {
+            "enabled": True,
+            "internal": {
+                "enabled": True,
+                "max_rounds": 7,
+                "instructions": ".io/custom-internal-review.md",
+            },
+        },
+    }
+    prompter = MockPrompter([True, "", ""])
+
+    setup_wizard_module._collect_internal_reviewer(prompter, config)  # noqa: SLF001
+
+    assert config["review"]["internal"] == {
+        "enabled": True,
+        "max_rounds": 7,
+        "instructions": ".io/custom-internal-review.md",
+    }
+    planned = plan_missing_setup_prompts(config, tmp_path)
+    assert [(item.agent, item.path) for item in planned] == [
+        ("internal-review", tmp_path / ".io/custom-internal-review.md"),
+    ]
+
+
+def test_wizard_explicitly_disables_existing_internal_reviewer(
+    tmp_path: Path,
+) -> None:
+    config: dict[str, object] = {
+        "review": {
+            "enabled": True,
+            "internal": {
+                "enabled": True,
+                "max_rounds": 7,
+                "instructions": ".io/custom-internal-review.md",
+            },
+        },
+    }
+    prompter = MockPrompter([False])
+
+    setup_wizard_module._collect_internal_reviewer(prompter, config)  # noqa: SLF001
+
+    assert config["review"]["internal"] == {
+        "enabled": False,
+        "max_rounds": 7,
+        "instructions": ".io/custom-internal-review.md",
+    }
+    assert plan_missing_setup_prompts(config, tmp_path) == ()
 
 
 def test_prompt_claude_session_interactions_enables_rule() -> None:

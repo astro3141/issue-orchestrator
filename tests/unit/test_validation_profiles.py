@@ -220,6 +220,10 @@ class TestProfileSelection:
         class EnvConfig:
             control_api_port = 8100
             config_path = None
+            # Upstream's session-env protocol gained this member
+            # (bb078b15, directory-backed configuration modes); the stub
+            # states it explicitly rather than relying on a default.
+            configuration_mode = "default"
 
         exports = build_session_env_exports(
             config=EnvConfig(),
@@ -894,6 +898,9 @@ class TestLaunchPathParity:
         self, tmp_path: Path
     ) -> None:
         from issue_orchestrator.domain.runtime_config import RuntimeConfigReference
+        from issue_orchestrator.domain.repository_launch_selection import (
+            RepositoryLaunchSelection,
+        )
         from issue_orchestrator.execution import persistent_session_exchange as pse
 
         run_dir = tmp_path / ".issue-orchestrator" / "sessions" / "run-1"
@@ -910,7 +917,13 @@ class TestLaunchPathParity:
             validation_output_dir=run_dir,
             worktree=worktree,
             runtime_config=RuntimeConfigReference(
-                config_path=config_path, config_name="default.yaml"
+                config_path=config_path,
+                # Upstream replaced the bare config_name with a typed
+                # launch selection (bb078b15); `config_name` survives as a
+                # derived property, so this states the same identity.
+                selection=RepositoryLaunchSelection.parse(
+                    mode="default", config_name="default.yaml"
+                ),
             ),
             agent_label="agent:foundation",
             web_port=None,
