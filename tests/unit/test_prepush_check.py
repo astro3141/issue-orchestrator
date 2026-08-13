@@ -340,7 +340,11 @@ validation:
             check=True,
         ).stdout.strip()
         record_path = (
-            temp_worktree / ".issue-orchestrator" / "validation" / f"{head_sha}.json"
+            temp_worktree
+            / ".issue-orchestrator"
+            / "validation"
+            / "publish"
+            / f"{head_sha}.json"
         )
         record = json.loads(record_path.read_text())
         stdout_path = temp_worktree / str(record["stdout_path"])

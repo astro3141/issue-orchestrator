@@ -53,6 +53,7 @@ from ..ports.provider_resilience import ProviderErrorType
 from ..infra.provider_resilience import ProviderStatus, read_provider_status
 from ..infra.logging_config import issue_log
 from ..infra.config_models import PublishValidationConfig, ValidationCommandConfig
+from ..domain.validation_profile import ValidationGateKind
 from ..infra.validation_profiles import (
     DEFAULT_VALIDATION_PROFILE,
     UnknownValidationProfileError as UnknownValidationProfileError,
@@ -85,8 +86,9 @@ from .session_decision import (
     provider_failure_from_status,
     provider_success_from_status,
 )
+from .publication_gate import RunValidationContracts
 from .session_run_resolution import resolve_run_assets
-from .validation import PublishGate
+from .validation import ValidationGate
 
 logger = logging.getLogger(__name__)
 
@@ -209,6 +211,9 @@ class SessionController:
                 publish=PublishValidationConfig(),
             )
         )
+        self._validation_contracts = RunValidationContracts(
+            session_output, self._validation_profiles
+        )
         self._validation_junit_xml_paths = tuple(validation_junit_xml_paths)
         self._validation_evidence_recorder = (
             validation_evidence_recorder
@@ -222,28 +227,15 @@ class SessionController:
     def _profile_for_run(self, run_dir: Path) -> ValidationProfile:
         """The validation contract frozen for this run (#7059).
 
-        Read from the run directory's manifest — durable state written when
-        the run was created — so a restarted orchestrator, a rework round, and
-        a retry all validate against the same contract the run was launched
-        under. Nothing here consults the issue's current labels or branch.
-
-        A run created before profiles existed, or by a launch path that did
-        not record one, reads back as the default profile: the pre-#7059
-        behavior, unchanged.
-
-        A run that names a profile the current config no longer defines
-        raises. Substituting another contract would let the run claim it
-        satisfied a gate it never executed, which is precisely the confusion
-        recording the profile exists to prevent.
+        Delegates to :class:`RunValidationContracts`, the one owner of that
+        question, so the controller's quick gate and the completion
+        processor's publication gate cannot resolve a run's profile
+        differently (#25).
 
         Raises:
             UnknownValidationProfileError: when the recorded profile is gone.
         """
-        manifest = self.session_output.read_manifest(run_dir) or {}
-        recorded = manifest.get("validation_profile")
-        return self._validation_profiles.resolve(
-            recorded if isinstance(recorded, str) and recorded else None
-        )
+        return self._validation_contracts.profile_for_run(run_dir)
 
     def decide_outcome(
         self,
@@ -1523,13 +1515,19 @@ class SessionController:
         issue_key: "IssueKey | None" = None,
         profile: ValidationProfile | None = None,
     ) -> tuple[bool, Optional[str], Optional[Path]]:
-        """Run validation command (with attempt-scoped caching) and return result.
+        """Run the quick validation contract and return the result.
 
-        Uses PublishGate for caching. When an attempt identity is available,
-        cached validation is scoped by issue identity and HEAD SHA. Older
-        SHA-only caching remains available for callers that have no issue
-        identity. The selected profile is part of the cache key either way, so
-        a result produced under one contract cannot satisfy another (#7059).
+        This is the *quick* gate: the completion/rework loop's fast feedback,
+        run with the run's frozen ``validation.quick`` contract and recorded
+        under the ``quick_gate`` suite. It is deliberately not the publication
+        gate — that one runs ``validation.publish`` and lives in
+        :class:`~.publication_gate.PublicationGate` (#25).
+
+        When an attempt identity is available, cached validation is scoped by
+        issue identity and HEAD SHA. Older SHA-only caching remains available
+        for callers that have no issue identity. The selected profile is part
+        of the cache key either way, so a result produced under one contract
+        cannot satisfy another (#7059).
 
         Args:
             worktree_path: Path to the worktree
@@ -1544,7 +1542,8 @@ class SessionController:
             Tuple of (passed, error_message, error_file_path)
         """
         selected = profile if profile is not None else self._profile_for_run(run_dir)
-        if not self._command_runner or not selected.quick.cmd:
+        contract = selected.contract(ValidationGateKind.QUICK)
+        if not self._command_runner or not contract.configured:
             return True, None, None
 
         target_run_dir = run_dir
@@ -1557,25 +1556,23 @@ class SessionController:
             head_sha=head_sha,
         )
 
-        # Use PublishGate for validation caching
-        gate = PublishGate(
+        gate = ValidationGate(
             worktree=worktree_path,
             command_runner=self._command_runner,
             working_copy=self._working_copy,
-            command=selected.quick.cmd,
-            timeout_seconds=selected.quick.timeout_seconds,
+            contract=contract,
             attempt_store=self._attempt_store,
             attempt_key=attempt_key,
-            profile=selected.name,
         )
 
         logger.info(
             issue_log(
                 issue_number,
-                "Running validation: profile=%s cmd=%s worktree=%s sha=%s",
+                "Running validation: gate=%s profile=%s cmd=%s worktree=%s sha=%s",
             ),
-            selected.name,
-            selected.quick.cmd,
+            contract.suite,
+            contract.profile,
+            contract.cmd,
             worktree_path,
             sha_display,
         )

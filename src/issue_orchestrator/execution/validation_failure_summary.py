@@ -283,9 +283,32 @@ def _resolve_run_artifact(
     fallback_name: str,
     worktree: str | None,
 ) -> Path | None:
+    """The artifact the manifest names, or the run root's copy if it names none.
+
+    Manifest first. The completion processor attaches the paths the gate that
+    actually ran wrote to, and since the publication gate writes into
+    ``publish-gate/`` those are no longer always the run root's. Preferring a
+    run-root file would re-derive a path this consumer has no business
+    choosing, and would render the *quick* gate's passing stdout, stderr and
+    record beside a publish-gate refusal (#25).
+
+    The run-root fallback stays for runs whose manifest carries no key, or
+    names a file that is gone.
+    """
+    recorded = _existing_manifest_artifact(run_dir, manifest_path, worktree=worktree)
+    if recorded is not None:
+        return recorded
     local_path = run_dir / fallback_name
-    if local_path.exists():
-        return local_path
+    return local_path if local_path.exists() else None
+
+
+def _existing_manifest_artifact(
+    run_dir: Path,
+    manifest_path: str | None,
+    *,
+    worktree: str | None,
+) -> Path | None:
+    """Resolve a manifest-recorded path, absolute or worktree/run relative."""
     if not manifest_path:
         return None
     candidate = Path(manifest_path)

@@ -12,7 +12,9 @@ from pathlib import Path
 import pytest
 import yaml
 
-from issue_orchestrator.control.validation import AgentGate, PublishGate
+from issue_orchestrator.control.validation import AgentGate, ValidationGate
+from issue_orchestrator.domain.validation_profile import ValidationGateKind
+from tests.validation_contract_helpers import publish_contract, quick_contract
 from issue_orchestrator.infra.config import Config
 from issue_orchestrator.infra.validation_config_loader import (
     extract_validation_config,
@@ -259,8 +261,7 @@ class TestProfileSelection:
             worktree,
             command_runner=runner,
             working_copy=StubWorkingCopy(),
-            command="make quick-foundation",
-            profile="foundation",
+            contract=quick_contract(cmd="make quick-foundation", profile="foundation"),
         )
         result = gate.run(session_output_dir=worktree / "out")
 
@@ -341,17 +342,23 @@ class TestArtifactBinding:
             worktree,
             command_runner=RecordingCommandRunner(),
             working_copy=StubWorkingCopy(),
-            command="make quick-foundation",
-            profile="foundation",
+            contract=quick_contract(cmd="make quick-foundation", profile="foundation"),
         )
 
         gate.run(session_output_dir=worktree / "out")
 
+        # Records live under the contract they were produced by, so a quick
+        # run cannot land where a publish record belongs (#25).
         record_path = (
-            worktree / ".issue-orchestrator" / "validation" / "abcdef1234567890.json"
+            worktree
+            / ".issue-orchestrator"
+            / "validation"
+            / "quick"
+            / "abcdef1234567890.json"
         )
         payload = json.loads(record_path.read_text())
         assert payload["profile"] == "foundation"
+        assert payload["suite"] == "agent_gate"
 
     def test_run_manifest_records_the_frozen_profile(self, tmp_path: Path) -> None:
         worktree = tmp_path / "worktree"
@@ -394,12 +401,11 @@ class TestCacheKeyBinding:
     """A cached result cannot cross a profile boundary."""
 
     def _gate(self, worktree: Path, runner, *, command: str, profile: str):
-        return PublishGate(
+        return ValidationGate(
             worktree,
             command_runner=runner,
             working_copy=StubWorkingCopy(),
-            command=command,
-            profile=profile,
+            contract=publish_contract(cmd=command, profile=profile),
         )
 
     def test_different_profiles_with_different_commands_do_not_share_a_result(
@@ -670,7 +676,8 @@ class TestProfileContinuityAcrossRounds:
 #
 # The gates below are reached the way an agent reaches them — through
 # ``coding-done`` / ``prepush-check`` — because the loader-to-gate wiring is a
-# distinct seam from the gate itself. Testing only ``AgentGate(profile=...)``
+# distinct seam from the gate itself. Testing only the gate's own
+# ``contract=`` argument
 # leaves the wiring that connects the profile-aware loader to the
 # record-stamping gate uncovered, which is exactly where it broke once.
 # ---------------------------------------------------------------------------
@@ -783,9 +790,16 @@ class TestPublishGateCliSeam:
         assert outcome.exit_code == 0
         assert runner.commands == ["make publish-foundation"]
         record_path = (
-            worktree / ".issue-orchestrator" / "validation" / "abcdef1234567890.json"
+            worktree
+            / ".issue-orchestrator"
+            / "validation"
+            / "publish"
+            / "abcdef1234567890.json"
         )
-        assert json.loads(record_path.read_text())["profile"] == "foundation"
+        payload = json.loads(record_path.read_text())
+        assert payload["profile"] == "foundation"
+        assert payload["suite"] == "publish_gate"
+        assert payload["command"] == "make publish-foundation"
 
 
 # ---------------------------------------------------------------------------

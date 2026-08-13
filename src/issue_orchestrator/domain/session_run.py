@@ -9,6 +9,11 @@ from typing import Any
 
 from .path_guards import require_absolute_path, require_path_under
 
+VALIDATION_RECORD_NAME = "validation-record.json"
+VALIDATION_STDOUT_NAME = "validation-stdout.log"
+VALIDATION_STDERR_NAME = "validation-stderr.log"
+"""What a validation gate's evidence is called, wherever it is written."""
+
 
 @dataclass(frozen=True, slots=True)
 class SessionRunIdentity:
@@ -39,7 +44,12 @@ class RunContainedFile:
 
 @dataclass(frozen=True, slots=True)
 class ValidationArtifactPaths:
-    """The validation artifacts active control writes for a run."""
+    """The validation artifacts active control writes for a run.
+
+    ``run_dir`` is the run whose manifest these artifacts belong to; the three
+    files may sit deeper, because a gate that shares the run root would
+    overwrite another gate's evidence.
+    """
 
     run_dir: Path
     record_path: Path
@@ -51,6 +61,23 @@ class ValidationArtifactPaths:
         _require_contained_file(self.record_path, self.run_dir, "record_path")
         _require_contained_file(self.stdout_path, self.run_dir, "stdout_path")
         _require_contained_file(self.stderr_path, self.run_dir, "stderr_path")
+
+    @classmethod
+    def in_directory(
+        cls, *, run_dir: Path, output_dir: Path
+    ) -> "ValidationArtifactPaths":
+        """The evidence a gate writing into ``output_dir`` produces for ``run_dir``.
+
+        One definition of what a gate's evidence *is* — record, stdout,
+        stderr, named the one way — so a gate with its own output directory
+        still reports a path set the run's manifest can be attached to.
+        """
+        return cls(
+            run_dir=run_dir,
+            record_path=output_dir / VALIDATION_RECORD_NAME,
+            stdout_path=output_dir / VALIDATION_STDOUT_NAME,
+            stderr_path=output_dir / VALIDATION_STDERR_NAME,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -202,11 +229,9 @@ class SessionRunAssets:
 
     @property
     def validation_artifacts(self) -> ValidationArtifactPaths:
-        return ValidationArtifactPaths(
-            run_dir=self.run_dir,
-            record_path=self.run_dir / "validation-record.json",
-            stdout_path=self.run_dir / "validation-stdout.log",
-            stderr_path=self.run_dir / "validation-stderr.log",
+        """The run root's evidence set — the quick contract's (#25)."""
+        return ValidationArtifactPaths.in_directory(
+            run_dir=self.run_dir, output_dir=self.run_dir
         )
 
     @property

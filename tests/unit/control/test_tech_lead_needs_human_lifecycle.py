@@ -1180,6 +1180,8 @@ class TestTheBlockOwnerIsNotBypassableInProduction:
         )
         git_adapter = MagicMock()
         git_adapter.get_current_branch.return_value = "branch"
+        # Publication authorization names the commit being published (#25).
+        git_adapter.get_head_sha.return_value = "a" * 40
         processor = CompletionProcessor(
             # Wired exactly as the composition root wires it: the governed
             # label is refused at the capability, and the typed outcome routes

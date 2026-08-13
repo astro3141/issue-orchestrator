@@ -71,7 +71,9 @@ from ..ports.review_exchange_runner import (
     ReviewExchangeRunner,
 )
 from ..ports.session_output import SessionOutput, ValidationRecord
-from .validation import PublishGate, ValidationRecordStore
+from .publication_gate import PublicationGate, PublicationGateOutcome
+from .validation import GateEvidence
+from .validation_record_cache import contract_record_path
 from .completion_pr_collision import (
     create_pr_with_collision_handling,
     get_open_pr_for_issue,
@@ -201,7 +203,7 @@ class CompletionProcessor:
         review_exchange_runner: ReviewExchangeRunner | None = None,
         event_bus: EventBus | None = None,
         label_config: dict[str, str] | None = None,
-        publish_gate: PublishGate | None = None,
+        publication_gate: PublicationGate | None = None,
         pre_publish_gate: PrePublishGate | None = None,
         config: "Config | None" = None,
         background_job_supervisor: "BackgroundJobSupervisor | None" = None,
@@ -227,7 +229,9 @@ class CompletionProcessor:
             session_output: Session output storage for artifacts.
             event_bus: Optional EventBus for emitting processing events.
             label_config: Optional mapping of label names (e.g., {"blocked": "blocked"}).
-            publish_gate: Optional PublishGate for validating before publish actions.
+            publication_gate: The orchestrator's pre-publication validation
+                owner. Runs the run's ``validation.publish`` contract before
+                any publish action. ``None`` disables the gate entirely.
             pre_publish_gate: Optional gate that runs the worktree's effective
                 pre-push hook before the authenticated push.
             background_job_supervisor: Owns failure-handling for the
@@ -253,7 +257,7 @@ class CompletionProcessor:
         self._trace_events: EventSink | None = None
         self._event_context: EventContext | None = None
         self.label_config = label_config or {}
-        self.publish_gate = publish_gate
+        self.publication_gate = publication_gate
         self.pre_publish_gate = pre_publish_gate
         self._config = config
         self._pr_collision_strategy = (
@@ -607,44 +611,54 @@ class CompletionProcessor:
             )
         )
 
-    def _requires_publish_gate(self, record: CompletionRecord) -> bool:
-        """Check if the completion record requests actions that require publish gate.
+    def _reaches_the_remote(self, record: CompletionRecord) -> bool:
+        """Whether this completion reaches the remote at all.
 
-        Args:
-            record: The completion record to check.
+        Named for what it asks, not for what it used to gate: the publish
+        contract is no longer one of its consumers. It gates the cheap
+        pre-publish guards (banned test skips, committed runtime
+        artifacts): anything that pushes must pass them, including a
+        blocked agent preserving work in progress. What the *publish
+        contract* applies to is the narrower
+        ``record.offers_a_change_for_review`` (#25).
 
         Returns:
-            True if any requested action requires publish gate validation.
+            True if any requested action reaches the remote.
         """
-        publish_actions = {RequestedAction.PUSH_BRANCH, RequestedAction.CREATE_PR}
-        return bool(set(record.requested_actions) & publish_actions)
+        remote_reaching_actions = {
+            RequestedAction.PUSH_BRANCH,
+            RequestedAction.CREATE_PR,
+        }
+        return bool(set(record.requested_actions) & remote_reaching_actions)
 
     def _check_publish_gate(
         self,
         worktree: Path,
-        session_output_dir: Path | None = None,
-    ) -> tuple[bool, str, ValidationRecord | None]:
-        """Check if publishing is allowed by the publish gate.
+        run_assets: SessionRunAssets,
+    ) -> PublicationGateOutcome | None:
+        """Run the run's publish contract and decide whether publishing may proceed.
 
         Args:
             worktree: Path to the worktree.
-            session_output_dir: If provided, validation output is written directly here.
+            run_assets: The owned run whose frozen profile selects the contract.
 
         Returns:
-            Tuple of (allowed, reason, record).
+            The gate's outcome, or ``None`` when no gate is configured at all.
         """
-        if self.publish_gate is None:
+        if self.publication_gate is None:
             # No gate configured = allowed
-            return True, "", None
+            return None
 
-        result = self.publish_gate.check(session_output_dir=session_output_dir)
-        if result.allowed:
-            cache_note = " (cached)" if result.cache_hit else ""
-            logger.info("Publish gate passed%s: %s", cache_note, result.reason)
-            return True, result.reason, result.record
+        outcome = self.publication_gate.check(
+            worktree=worktree,
+            run_assets=run_assets,
+        )
+        if outcome.allowed:
+            cache_note = " (cached)" if outcome.cache_hit else ""
+            logger.info("Publish gate passed%s: %s", cache_note, outcome.reason)
         else:
-            logger.warning("Publish gate failed: %s", result.reason)
-            return False, result.reason, result.record
+            logger.warning("Publish gate failed: %s", outcome.reason)
+        return outcome
 
     @staticmethod
     def _load_validation_record(record_path: Path) -> ValidationRecord | None:
@@ -673,7 +687,7 @@ class CompletionProcessor:
         """
         run_dir = validation_artifacts.run_dir
         if record_path is None and record is not None:
-            record_path = ValidationRecordStore(worktree).get_record_path(record.head_sha)
+            record_path = contract_record_path(worktree, record)
         run_dir_record_path = validation_artifacts.record_path
         effective_record_path = self._materialize_validation_record(
             worktree=worktree,
@@ -1114,7 +1128,7 @@ class CompletionProcessor:
                 session_name,
                 issue_number,
                 worktree_state.reason,
-                gate_record=None,
+                gate_evidence=None,
                 run_assets=run_assets,
             )
 
@@ -1140,7 +1154,7 @@ class CompletionProcessor:
         run_assets: SessionRunAssets,
     ) -> ProcessingResult | None:
         """Reject newly added test-skip constructs before review/publish."""
-        if not self._requires_publish_gate(record):
+        if not self._reaches_the_remote(record):
             return None
 
         base_ref = f"origin/{self._base_branch()}"
@@ -1155,7 +1169,7 @@ class CompletionProcessor:
                     "Could not scan branch diff for banned test skips "
                     f"against {base_ref}: {diff_result.error or 'unknown git error'}"
                 ),
-                gate_record=None,
+                gate_evidence=None,
                 run_assets=run_assets,
             )
 
@@ -1168,7 +1182,7 @@ class CompletionProcessor:
                 session_name,
                 issue_number,
                 f"Could not parse branch diff for banned test skips: {exc}",
-                gate_record=None,
+                gate_evidence=None,
                 run_assets=run_assets,
             )
         if not test_paths:
@@ -1186,7 +1200,7 @@ class CompletionProcessor:
                     "Could not read branch-tip test files for banned test-skip "
                     f"scan: {branch_files_result.error or 'unknown git error'}"
                 ),
-                gate_record=None,
+                gate_evidence=None,
                 run_assets=run_assets,
             )
         try:
@@ -1200,7 +1214,7 @@ class CompletionProcessor:
                 session_name,
                 issue_number,
                 f"Could not scan branch-tip test files for banned test skips: {exc}",
-                gate_record=None,
+                gate_evidence=None,
                 run_assets=run_assets,
             )
         if scan.ok:
@@ -1211,7 +1225,7 @@ class CompletionProcessor:
             session_name,
             issue_number,
             scan.reason(),
-            gate_record=None,
+            gate_evidence=None,
             run_assets=run_assets,
         )
 
@@ -1232,7 +1246,7 @@ class CompletionProcessor:
         Fail early here with an actionable message instead of letting the
         brittle reviewer-worktree checkout surface it opaquely mid-exchange.
         """
-        if not self._requires_publish_gate(record):
+        if not self._reaches_the_remote(record):
             return None
 
         base_ref = f"origin/{self._base_branch()}"
@@ -1250,7 +1264,7 @@ class CompletionProcessor:
                     f"against {base_ref}: "
                     f"{paths_result.error or 'unknown git error'}"
                 ),
-                gate_record=None,
+                gate_evidence=None,
                 run_assets=run_assets,
             )
 
@@ -1263,7 +1277,7 @@ class CompletionProcessor:
             session_name,
             issue_number,
             build_forbidden_runtime_artifact_reason(forbidden),
-            gate_record=None,
+            gate_evidence=None,
             run_assets=run_assets,
         )
 
@@ -1274,40 +1288,47 @@ class CompletionProcessor:
         issue_number: int,
         run_assets: SessionRunAssets,
     ) -> ProcessingResult | None:
-        """Check publish gate if actions require it.
+        """Run the publish contract before offering this work as a change.
 
         Returns:
             ProcessingResult if gate check failed, None if passed or not required.
         """
-        if not self._requires_publish_gate(record):
+        if not record.offers_a_change_for_review:
             return None
         gate_session_name = run_assets.session_name
-        session_output_dir = run_assets.run_dir
 
-        gate_passed, gate_reason, gate_record = self._check_publish_gate(
-            worktree, session_output_dir=session_output_dir
-        )
-        if not gate_passed:
+        outcome = self._check_publish_gate(worktree, run_assets)
+        if outcome is None:
+            return None
+        if not outcome.allowed:
             return self._handle_gate_failure(
                 worktree,
                 record,
                 gate_session_name,
                 issue_number,
-                gate_reason,
-                gate_record,
+                outcome.reason,
+                outcome.evidence,
                 run_assets=run_assets,
             )
         else:
             # Attach validation artifacts even on success
-            if gate_record:
-                record_path = ValidationRecordStore(worktree).get_record_path(gate_record.head_sha)
-                self._attach_validation_artifacts(
-                    worktree,
-                    run_assets.validation_artifacts,
-                    record=gate_record,
-                    record_path=record_path,
-                )
+            self._attach_gate_evidence(worktree, outcome.evidence)
         return None
+
+    def _attach_gate_evidence(
+        self,
+        worktree: Path,
+        evidence: GateEvidence,
+    ) -> None:
+        """Attach a gate's record together with the logs that gate wrote."""
+        if evidence.record is None:
+            return
+        self._attach_validation_artifacts(
+            worktree,
+            evidence.paths,
+            record=evidence.record,
+            record_path=contract_record_path(worktree, evidence.record),
+        )
 
     def _handle_gate_failure(
         self,
@@ -1316,19 +1337,18 @@ class CompletionProcessor:
         session_name: str | None,
         issue_number: int,
         gate_reason: str,
-        gate_record: ValidationRecord | None,
+        gate_evidence: GateEvidence | None,
         *,
         run_assets: SessionRunAssets,
     ) -> ProcessingResult:
-        """Handle publish gate failure."""
-        if gate_record and session_name:
-            record_path = ValidationRecordStore(worktree).get_record_path(gate_record.head_sha)
-            self._attach_validation_artifacts(
-                worktree,
-                run_assets.validation_artifacts,
-                record=gate_record,
-                record_path=record_path,
-            )
+        """Handle a failing gate: attach its evidence, label, comment, report.
+
+        Shared by the publish contract, the pre-push hook gate and the
+        runtime-artifact guard. Each supplies the evidence *it* produced, or
+        ``None`` when it produced no validation record at all.
+        """
+        if gate_evidence is not None and session_name:
+            self._attach_gate_evidence(worktree, gate_evidence)
         # Was previously a free-form dict update with the legacy
         # `validation_failure_reason` (note the inconsistent name vs
         # `validation_reason` used elsewhere) and a bare
@@ -1422,7 +1442,13 @@ class CompletionProcessor:
             gate_session_name,
             issue_number,
             result.reason,
-            self._pre_publish_validation_record(run_assets, result),
+            # The pre-push hook gate writes into the run root, which is
+            # where ``_persist_pre_publish_failure_artifacts`` just put its
+            # record and logs.
+            GateEvidence(
+                record=self._pre_publish_validation_record(run_assets, result),
+                paths=run_assets.validation_artifacts,
+            ),
             run_assets=run_assets,
         )
 

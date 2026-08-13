@@ -99,7 +99,18 @@ validation:
     # binding's own suites, `review_artifacts` reaches the decision-approval
     # tests, and `Verdict` reaches `TestExactShaVerdictBinding`, whose module
     # name carries none of the others.
-    cmd: ".venv/bin/python -m pytest tests/unit tests/integration -q --tb=short -p no:cacheprovider -k 'validation or profile or config or prepush or planted or cli_tools or dirty or worktree or review_verdict or review_exchange_records or review_artifacts or Verdict' && make typecheck"
+    #
+    # #25 (the publish gate must execute `validation.publish.cmd`) added
+    # `publication`, `publish`, `contract` and `gate`. Its central regression
+    # module — `test_publication_gate.py` — and the completion-processor cases
+    # that pin which completions are held to the publish contract match none
+    # of the terms above, so the profile would have reported `passed=true`
+    # having deselected every test the change added.
+    # #25 also adjusted one simulated-scenario assertion; the
+    # simulated suite stays out of this profile's paths on purpose (it is slow
+    # and rework rounds must stay short) and is covered by publish, which runs
+    # `make validate-pr-raw`.
+    cmd: ".venv/bin/python -m pytest tests/unit tests/integration -q --tb=short -p no:cacheprovider -k 'validation or profile or config or prepush or planted or cli_tools or dirty or worktree or review_verdict or review_exchange_records or review_artifacts or Verdict or publication or publish or contract or gate' && make typecheck"
     timeout_seconds: 1800
   publish:
     # The upstream project's own gate, reproduced rather than invented:

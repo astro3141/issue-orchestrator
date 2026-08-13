@@ -1070,6 +1070,7 @@ def build_orchestrator_for_testing(
     # Create CompletionProcessor for testing
     from ..control.completion_processor import CompletionProcessor
     from ..control.pre_publish_gate import PrePublishGate
+    from ..control.publication_gate import build_publication_gate
     from ..execution.persistent_review_exchange_runner import (
         PersistentReviewExchangeRunner,
     )
@@ -1126,6 +1127,12 @@ def build_orchestrator_for_testing(
         ),
         event_bus=None,
         label_config=label_manager.to_label_config_dict(),
+        publication_gate=build_publication_gate(
+            session_output=session_output,
+            profiles=config.validation_profiles(),
+            command_runner=command_runner,
+            working_copy=working_copy,
+        ),
         pre_publish_gate=PrePublishGate(command_runner) if config.enforce_hooks else None,
         config=config,
         background_job_supervisor=background_job_supervisor,

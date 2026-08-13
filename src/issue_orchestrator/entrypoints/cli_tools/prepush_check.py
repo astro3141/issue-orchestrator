@@ -21,10 +21,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from ...control.validation import PublishGate
+from ...control.validation import ValidationGate
+from ...domain.validation_profile import ValidationGateKind
 from ...execution import GitWorkingCopy, LocalCommandRunner
 from ...infra.runtime_artifacts import filter_runtime_managed_dirty_paths
-from ...infra.validation_profiles import DEFAULT_VALIDATION_PROFILE
+from ...infra.validation_profiles import (
+    DEFAULT_VALIDATION_PROFILE,
+    ValidationGateContract,
+)
 from ...infra.validation_timings import append_validation_timing, build_timing_envelope
 
 logger = logging.getLogger(__name__)
@@ -64,6 +68,21 @@ class PublishValidationSelection:
     timeout_seconds: int
     dirty_check: str
     profile: str
+
+    @property
+    def contract(self) -> ValidationGateContract:
+        """The typed publish contract this selection describes (#25).
+
+        The gate is constructed from this, so the command it runs and the
+        ``publish_gate`` suite it records are one decision, not two that can
+        disagree.
+        """
+        return ValidationGateContract(
+            kind=ValidationGateKind.PUBLISH,
+            profile=self.profile,
+            cmd=self.cmd,
+            timeout_seconds=self.timeout_seconds,
+        )
 
 
 def load_validation_cmd(worktree: Path) -> PublishValidationSelection:
@@ -168,13 +187,11 @@ def _run_validation_gate(
     if verbose:
         print(f"Validation configured [profile={selection.profile}]: {cmd}")
 
-    gate = PublishGate(
+    gate = ValidationGate(
         worktree,
         command_runner=LocalCommandRunner(),
         working_copy=GitWorkingCopy(),
-        command=cmd,
-        timeout_seconds=selection.timeout_seconds,
-        profile=selection.profile,
+        contract=selection.contract,
     )
     start = time.monotonic()
     result = gate.check(session_output_dir=_prepush_output_dir(worktree))

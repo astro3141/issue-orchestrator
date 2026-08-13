@@ -73,6 +73,44 @@ from tests.unit.session_run_helpers import make_session_run_assets
 # ==================== Fixtures ====================
 
 
+def publish_gate_outcome(
+    *,
+    allowed: bool = True,
+    reason: str = "Validation passed",
+    record: object | None = None,
+    cache_hit: bool = False,
+):
+    """A ``PublicationGate.check`` stand-in that reports its own evidence.
+
+    The real gate derives the evidence paths from the run it was handed, so
+    the fake does too: a fixed ``return_value`` could not, and a test using
+    one would not notice the processor attaching some *other* gate's
+    artifacts (#25 F1).
+    """
+    from issue_orchestrator.control.publication_gate import (
+        PublicationGateOutcome,
+        publish_gate_output_dir,
+    )
+    from issue_orchestrator.control.validation import GateEvidence
+    from issue_orchestrator.domain.session_run import ValidationArtifactPaths
+
+    def check(*, worktree: Path, run_assets):
+        return PublicationGateOutcome(
+            allowed=allowed,
+            reason=reason,
+            evidence=GateEvidence(
+                record=record,
+                paths=ValidationArtifactPaths.in_directory(
+                    run_dir=run_assets.run_dir,
+                    output_dir=publish_gate_output_dir(run_assets.run_dir),
+                ),
+            ),
+            cache_hit=cache_hit,
+        )
+
+    return check
+
+
 def _write_test_config(tmp_path: Path) -> Path:
     config_path = tmp_path / ".issue-orchestrator" / "config" / "default.yaml"
     config_path.parent.mkdir(parents=True, exist_ok=True)
@@ -3780,17 +3818,11 @@ class TestCompletionProcessorPublishGate:
 
     @pytest.fixture
     def mock_publish_gate(self):
-        """Mock PublishGate for testing."""
+        """Mock PublicationGate for testing."""
         from unittest.mock import Mock
-        from issue_orchestrator.control.validation import PublishGateResult
 
         gate = Mock()
-        gate.check = Mock(
-            return_value=PublishGateResult(
-                allowed=True,
-                reason="Validation passed",
-            )
-        )
+        gate.check = Mock(side_effect=publish_gate_outcome())
         return gate
 
     @pytest.fixture
@@ -3807,7 +3839,7 @@ class TestCompletionProcessorPublishGate:
             label_adapter=mock_label_adapter,
             pr_adapter=mock_pr_adapter,
             git_adapter=mock_git_adapter,
-            publish_gate=mock_publish_gate,
+            publication_gate=mock_publish_gate,
             session_output=FileSystemSessionOutput(),
         )
 
@@ -3840,10 +3872,8 @@ class TestCompletionProcessorPublishGate:
 
         This test proves the invariant: cannot publish without tests_passed.
         """
-        from issue_orchestrator.control.validation import PublishGateResult
-
         # Configure gate to fail
-        mock_publish_gate.check.return_value = PublishGateResult(
+        mock_publish_gate.check.side_effect = publish_gate_outcome(
             allowed=False,
             reason="Validation failed: pyright found 3 errors",
         )
@@ -3876,16 +3906,14 @@ class TestCompletionProcessorPublishGate:
         worktree_with_completion,
     ):
         """Publish actions proceed when validation passes."""
-        from issue_orchestrator.control.validation import PublishGateResult
-
-        mock_publish_gate.check.return_value = PublishGateResult(
+        mock_publish_gate.check.side_effect = publish_gate_outcome(
             allowed=True,
             reason="Validation passed",
         )
 
         record = make_record(
             outcome=CompletionOutcome.COMPLETED,
-            requested_actions=[RequestedAction.PUSH_BRANCH],
+            requested_actions=[RequestedAction.PUSH_BRANCH, RequestedAction.CREATE_PR],
             summary="Done",
         )
         worktree = worktree_with_completion(record)
@@ -3898,6 +3926,51 @@ class TestCompletionProcessorPublishGate:
         )
 
         assert result.success
+        mock_publish_gate.check.assert_called_once()
+        mock_git_adapter.push.assert_called_once()
+
+    @pytest.mark.parametrize(
+        "outcome",
+        [CompletionOutcome.BLOCKED, CompletionOutcome.NEEDS_HUMAN],
+    )
+    def test_a_completion_that_opens_no_pr_is_not_held_to_the_publish_contract(
+        self,
+        processor_with_gate,
+        mock_publish_gate,
+        mock_git_adapter,
+        worktree_with_completion,
+        outcome,
+    ):
+        """A blocked/needs-human push preserves work; it offers no change (#25).
+
+        The branch still reaches the remote, but the publish contract is what
+        a *change* must satisfy. Running it here would replace the agent's
+        question with a validation failure — and a blocked agent's work
+        usually does not pass, so it would do so almost every time.
+        """
+        label_action = (
+            RequestedAction.ADD_BLOCKED_LABEL
+            if outcome is CompletionOutcome.BLOCKED
+            else RequestedAction.ADD_NEEDS_HUMAN_LABEL
+        )
+        record = make_record(
+            outcome=outcome,
+            requested_actions=[RequestedAction.PUSH_BRANCH, label_action],
+            summary="Cannot proceed",
+            blocked_reason="upstream API is down",
+            question="which base branch should this target?",
+        )
+        worktree = worktree_with_completion(record)
+
+        result = processor_with_gate.process(
+            worktree,
+            run_assets=make_session_run_assets(worktree),
+            issue_number=123,
+            issue_title="Test",
+        )
+
+        assert result.success
+        mock_publish_gate.check.assert_not_called()
         mock_git_adapter.push.assert_called_once()
 
     def test_non_publish_actions_bypass_gate(
@@ -3908,10 +3981,8 @@ class TestCompletionProcessorPublishGate:
         worktree_with_completion,
     ):
         """Non-publish actions (labels, comments) don't require validation."""
-        from issue_orchestrator.control.validation import PublishGateResult
-
         # Gate would fail if checked, but shouldn't be checked for label-only actions
-        mock_publish_gate.check.return_value = PublishGateResult(
+        mock_publish_gate.check.side_effect = publish_gate_outcome(
             allowed=False,
             reason="Would fail",
         )
@@ -3944,10 +4015,8 @@ class TestCompletionProcessorPublishGate:
         worktree_with_completion,
     ):
         """When validation fails, the validation-failed label should be added to the issue."""
-        from issue_orchestrator.control.validation import PublishGateResult
-
         # Configure gate to fail
-        mock_publish_gate.check.return_value = PublishGateResult(
+        mock_publish_gate.check.side_effect = publish_gate_outcome(
             allowed=False,
             reason="Validation failed: tests failed",
         )
@@ -3980,12 +4049,22 @@ class TestCompletionProcessorPublishGate:
     def test_validation_failure_captured_in_session_output(
         self, processor_with_gate, mock_publish_gate, tmp_path
     ):
-        """Validation failure output should be written into session output."""
+        """A failed publish gate attaches its OWN record, stdout and stderr.
+
+        The run root holds the quick contract's evidence — the agent gate
+        wrote it at ``coding-done``. Attaching the publish gate's record
+        beside the quick gate's logs makes the manifest describe a run that
+        never happened: an operator opening "why was publication refused"
+        reads output from the command that *passed* (#25 F1).
+        """
+        from issue_orchestrator.control.publication_gate import (
+            publish_gate_output_dir,
+        )
         from issue_orchestrator.control.validation import (
-            PublishGateResult,
             ValidationRecord,
             ValidationRecordStore,
         )
+        from issue_orchestrator.domain.validation_profile import ValidationGateKind
         from issue_orchestrator.domain.models import CompletionRecord
         from issue_orchestrator.execution.session_output_adapter import (
             FileSystemSessionOutput,
@@ -4010,11 +4089,17 @@ class TestCompletionProcessorPublishGate:
         session_output = FileSystemSessionOutput()
         run = session_output.start_run(worktree, "issue-123", issue_number=123)
 
-        # Validation output is written directly to session output dir
-        (run.run_dir / "validation-stdout.log").write_text("validation stdout")
-        (run.run_dir / "validation-stderr.log").write_text("validation stderr")
+        # The quick/agent gate's evidence, already in the run root.
+        (run.run_dir / "validation-stdout.log").write_text("quick stdout")
+        (run.run_dir / "validation-stderr.log").write_text("quick stderr")
 
-        store = ValidationRecordStore(worktree)
+        # The publish gate's own evidence, in its isolated directory.
+        publish_dir = publish_gate_output_dir(run.run_dir)
+        publish_dir.mkdir(parents=True, exist_ok=True)
+        (publish_dir / "validation-stdout.log").write_text("publish stdout")
+        (publish_dir / "validation-stderr.log").write_text("publish stderr")
+
+        store = ValidationRecordStore(worktree, ValidationGateKind.PUBLISH)
         validation_record = ValidationRecord(
             schema_version=1,
             suite="publish_gate",
@@ -4026,15 +4111,15 @@ class TestCompletionProcessorPublishGate:
             ended_at=datetime.now(timezone.utc).isoformat(),
             timed_out=False,
             stdout_path=str(
-                (run.run_dir / "validation-stdout.log").relative_to(worktree)
+                (publish_dir / "validation-stdout.log").relative_to(worktree)
             ),
             stderr_path=str(
-                (run.run_dir / "validation-stderr.log").relative_to(worktree)
+                (publish_dir / "validation-stderr.log").relative_to(worktree)
             ),
         )
         store.write(validation_record)
 
-        mock_publish_gate.check.return_value = PublishGateResult(
+        mock_publish_gate.check.side_effect = publish_gate_outcome(
             allowed=False,
             reason="Validation failed",
             record=validation_record,
@@ -4049,13 +4134,29 @@ class TestCompletionProcessorPublishGate:
 
         assert not result.success
         run_dir = run.run_dir
-        assert (run_dir / "validation-stdout.log").read_text() == "validation stdout"
-        assert (run_dir / "validation-stderr.log").read_text() == "validation stderr"
-        assert (run_dir / "validation-record.json").exists()
         manifest = json.loads((run_dir / "manifest.json").read_text())
+
+        # The failing publish contract's record, and the logs of that same
+        # command — one run, described consistently.
+        assert (publish_dir / "validation-record.json").exists()
         assert manifest.get("validation_record_path") == str(
-            run_dir / "validation-record.json"
+            publish_dir / "validation-record.json"
         )
+        assert manifest.get("validation_stdout") == str(
+            publish_dir / "validation-stdout.log"
+        )
+        assert manifest.get("validation_stderr") == str(
+            publish_dir / "validation-stderr.log"
+        )
+        attached = json.loads((publish_dir / "validation-record.json").read_text())
+        assert attached["suite"] == "publish_gate"
+        assert attached["passed"] is False
+
+        # The quick gate's evidence is untouched: the publish gate neither
+        # overwrote it nor borrowed it.
+        assert (run_dir / "validation-stdout.log").read_text() == "quick stdout"
+        assert (run_dir / "validation-stderr.log").read_text() == "quick stderr"
+
         # Manifest carries the typed validation outcome via the three
         # legacy flat fields. The publish-gate-failed path used to write
         # `validation_failure_reason` (an inconsistent typo'd field) —
@@ -4081,7 +4182,7 @@ class TestCompletionProcessorPublishGate:
             label_adapter=mock_label_adapter,
             pr_adapter=mock_pr_adapter,
             git_adapter=mock_git_adapter,
-            publish_gate=mock_publish_gate,
+            publication_gate=mock_publish_gate,
             pre_publish_gate=mock_pre_publish_gate,
             session_output=FileSystemSessionOutput(),
         )
@@ -4130,7 +4231,7 @@ class TestCompletionProcessorPublishGate:
             label_adapter=mock_label_adapter,
             pr_adapter=mock_pr_adapter,
             git_adapter=mock_git_adapter,
-            publish_gate=mock_publish_gate,
+            publication_gate=mock_publish_gate,
             pre_publish_gate=pre_publish_gate,
             session_output=FileSystemSessionOutput(),
         )
@@ -4179,7 +4280,7 @@ class TestCompletionProcessorPublishGate:
             label_adapter=mock_label_adapter,
             pr_adapter=mock_pr_adapter,
             git_adapter=mock_git_adapter,
-            publish_gate=mock_publish_gate,
+            publication_gate=mock_publish_gate,
             background_job_supervisor=supervisor,
             session_output=FileSystemSessionOutput(),
         )
@@ -4241,7 +4342,7 @@ class TestCompletionProcessorPublishGate:
             label_adapter=mock_label_adapter,
             pr_adapter=mock_pr_adapter,
             git_adapter=mock_git_adapter,
-            publish_gate=mock_publish_gate,
+            publication_gate=mock_publish_gate,
             session_output=FileSystemSessionOutput(),
         )
         record = make_record(
@@ -4501,7 +4602,7 @@ class TestCompletionProcessorPublishGate:
             label_adapter=mock_label_adapter,
             pr_adapter=mock_pr_adapter,
             git_adapter=mock_git_adapter,
-            publish_gate=mock_publish_gate,
+            publication_gate=mock_publish_gate,
             pre_publish_gate=pre_publish_gate,
             session_output=FileSystemSessionOutput(),
             config=config,
@@ -4617,7 +4718,7 @@ class TestCompletionProcessorPublishGate:
             label_adapter=mock_label_adapter,
             pr_adapter=mock_pr_adapter,
             git_adapter=mock_git_adapter,
-            publish_gate=mock_publish_gate,
+            publication_gate=mock_publish_gate,
             pre_publish_gate=pre_publish_gate,
             session_output=FileSystemSessionOutput(),
             config=config,
@@ -4697,7 +4798,7 @@ class TestCompletionProcessorPublishGate:
             label_adapter=mock_label_adapter,
             pr_adapter=mock_pr_adapter,
             git_adapter=mock_git_adapter,
-            publish_gate=mock_publish_gate,
+            publication_gate=mock_publish_gate,
             session_output=FileSystemSessionOutput(),
         )
         record = make_record(
@@ -4740,7 +4841,7 @@ class TestCompletionProcessorPublishGate:
             label_adapter=mock_label_adapter,
             pr_adapter=mock_pr_adapter,
             git_adapter=mock_git_adapter,
-            publish_gate=mock_publish_gate,
+            publication_gate=mock_publish_gate,
             session_output=FileSystemSessionOutput(),
             config=config,
         )
@@ -4833,7 +4934,7 @@ class TestCompletionProcessorPublishGate:
             label_adapter=mock_label_adapter,
             pr_adapter=mock_pr_adapter,
             git_adapter=mock_git_adapter,
-            publish_gate=mock_publish_gate,
+            publication_gate=mock_publish_gate,
             session_output=FileSystemSessionOutput(),
             config=config,
             background_job_supervisor=supervisor,
@@ -4886,7 +4987,7 @@ class TestCompletionProcessorPublishGate:
             label_adapter=mock_label_adapter,
             pr_adapter=mock_pr_adapter,
             git_adapter=mock_git_adapter,
-            publish_gate=mock_publish_gate,
+            publication_gate=mock_publish_gate,
             session_output=FileSystemSessionOutput(),
             config=config,
         )
