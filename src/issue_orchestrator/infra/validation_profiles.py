@@ -26,7 +26,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Iterable, Mapping
 
-from ..domain.validation_profile import DEFAULT_VALIDATION_PROFILE
+from ..domain.validation_profile import (
+    DEFAULT_VALIDATION_PROFILE,
+    ValidationGateKind,
+)
 from .config_models import (
     PublishValidationConfig,
     ValidationCommandConfig,
@@ -37,6 +40,8 @@ from .config_models import (
 __all__ = [
     "DEFAULT_VALIDATION_PROFILE",
     "UnknownValidationProfileError",
+    "ValidationGateContract",
+    "ValidationGateKind",
     "ValidationProfile",
     "ValidationProfileRegistry",
 ]
@@ -55,6 +60,37 @@ class UnknownValidationProfileError(ValueError):
 
 
 @dataclass(frozen=True)
+class ValidationGateContract:
+    """What one gate run executes, and what it may claim to have executed.
+
+    The single value a gate is constructed from (#25). Command, timeout and
+    suite label are all read off it, so a gate cannot be handed the quick
+    command while stamping the publish suite onto its record: choosing the
+    ``kind`` chooses all three at once.
+    """
+
+    kind: ValidationGateKind
+    profile: str
+    cmd: str | None
+    timeout_seconds: int
+
+    @property
+    def suite(self) -> str:
+        """The suite label records produced by this contract carry."""
+        return self.kind.suite
+
+    @property
+    def configured(self) -> bool:
+        """Whether this profile actually defines a command for this gate."""
+        return bool(self.cmd)
+
+    @property
+    def is_quick(self) -> bool:
+        """Whether this is the profile's quick contract."""
+        return self.kind is ValidationGateKind.QUICK
+
+
+@dataclass(frozen=True)
 class ValidationProfile:
     """One resolved validation contract, frozen for a run/attempt."""
 
@@ -65,6 +101,31 @@ class ValidationProfile:
     @property
     def is_default(self) -> bool:
         return self.name == DEFAULT_VALIDATION_PROFILE
+
+    def contract(self, kind: ValidationGateKind) -> ValidationGateContract:
+        """The command/timeout this profile defines for ``kind``.
+
+        The only supported way to get a command out of a profile for a gate
+        run. Reaching for ``profile.quick.cmd`` at a gate construction site is
+        what let the publish gate execute the quick contract (#25); this
+        method makes the requested gate and the resolved command one decision.
+        """
+        # A total mapping rather than a branch: every kind names exactly one
+        # section, and a kind this profile cannot serve raises instead of
+        # silently resolving to the other contract.
+        sections: dict[
+            ValidationGateKind, ValidationCommandConfig | PublishValidationConfig
+        ] = {
+            ValidationGateKind.QUICK: self.quick,
+            ValidationGateKind.PUBLISH: self.publish,
+        }
+        section = sections[kind]
+        return ValidationGateContract(
+            kind=kind,
+            profile=self.name,
+            cmd=section.cmd or None,
+            timeout_seconds=section.timeout_seconds,
+        )
 
 
 class ValidationProfileRegistry:

@@ -5,7 +5,7 @@ answers *storage and reuse* questions (where a record for a SHA lives, whether
 a stored record still satisfies the request), while ``validation.py`` owns the
 gates that decide what to run.
 
-Storage location: ``.issue-orchestrator/validation/<HEAD_SHA>.json``
+Storage location: ``.issue-orchestrator/validation/<kind>/<HEAD_SHA>.json``
 """
 
 import json
@@ -13,6 +13,7 @@ import logging
 from pathlib import Path
 from typing import Optional
 
+from ..domain.validation_profile import ValidationGateKind
 from ..infra.atomic_json import atomic_write_json
 from ..infra.emit import emit_event
 from ..ports.session_output import ValidationRecord
@@ -26,33 +27,41 @@ VALIDATION_SCHEMA_VERSION = 1
 class ValidationRecordStore:
     """Reads and writes validation records to disk.
 
-    Storage layout (simplified - one location per SHA):
-        <worktree>/.issue-orchestrator/validation/<sha>.json
+    Storage layout — one location per contract per SHA::
 
-    This allows validation caching across gates - if agent_gate and publish_gate
-    use the same command, the result can be shared.
+        <worktree>/.issue-orchestrator/validation/<kind>/<sha>.json
+
+    Callers running the *same* contract share one location, so the agent-side
+    gate at ``coding-done`` and the orchestrator's own quick gate still reuse
+    each other's result. Callers running *different* contracts do not: a
+    single per-SHA file let a quick run overwrite the publish gate's record
+    and destroy the only evidence of what the publish contract actually did
+    (#25). Storage identity is the contract, never the caller.
     """
 
     VALIDATION_DIR = ".issue-orchestrator/validation"
 
-    def __init__(self, worktree: Path):
-        """Initialize store for a specific worktree.
+    def __init__(self, worktree: Path, kind: ValidationGateKind):
+        """Initialize store for a specific worktree and contract.
 
         Args:
             worktree: Path to the git worktree
+            kind: Which of the profile's contracts these records belong to
         """
         self.worktree = worktree
-        self.base_dir = worktree / self.VALIDATION_DIR
+        self.kind = kind
+        self.base_dir = worktree / self.VALIDATION_DIR / kind.value
 
     def get_record_path(self, sha: str) -> Path:
-        """Get the path for a validation record (one per SHA)."""
+        """Get the path for a validation record (one per contract per SHA)."""
         return self.base_dir / f"{sha}.json"
 
     def write(self, record: ValidationRecord) -> Path:
         """Write a validation record to disk atomically.
 
-        Atomicity matters because two gates (agent_gate, publish_gate) may
-        write the same per-SHA file concurrently in different threads, and
+        Atomicity matters because two callers running the same contract (the
+        agent gate and the orchestrator's quick gate) may write the same
+        per-SHA file concurrently in different threads, and
         readers (cache lookups, the review-exchange predicate) parse the
         file as JSON — a torn write would surface as JSONDecodeError or,
         worse, a partial-but-syntactically-valid prefix.
@@ -90,33 +99,33 @@ class ValidationRecordStore:
             logger.warning("Failed to read validation record at %s: %s", path, e)
             return None
 
-    # Legacy methods for backwards compatibility with old suite-based paths
-    def _get_legacy_record_path(self, suite: str, sha: str) -> Path:
-        """Get the legacy path for a validation record (per-suite)."""
-        return self.base_dir / suite / f"{sha}.json"
 
-    def read_legacy(self, suite: str, sha: str) -> Optional[ValidationRecord]:
-        """Read from legacy per-suite location for backwards compatibility."""
-        path = self._get_legacy_record_path(suite, sha)
+def contract_record_path(worktree: Path, record: ValidationRecord) -> Optional[Path]:
+    """Where ``record`` lives in the store, or ``None`` if it never lived there.
 
-        if not path.exists():
-            return None
-
-        try:
-            with open(path) as f:
-                data = json.load(f)
-            return ValidationRecord.from_dict(data)
-        except (json.JSONDecodeError, KeyError, TypeError) as e:
-            logger.warning("Failed to read legacy validation record at %s: %s", path, e)
-            return None
+    Not every ``ValidationRecord`` is a stored gate result. The pre-push hook
+    gate synthesizes one to report a hook failure, and it belongs to no
+    profile contract. Handing back a store path for it would name a file that
+    either does not exist or — worse — holds an unrelated contract's result.
+    """
+    try:
+        kind = ValidationGateKind.from_suite(record.suite)
+    except ValueError:
+        logger.debug(
+            "Validation record suite %r is not a profile contract; it has no "
+            "record-store location",
+            record.suite,
+        )
+        return None
+    return ValidationRecordStore(worktree, kind).get_record_path(record.head_sha)
 
 
 class ValidationCache:
     """Cache lookup for validation results.
 
     The cache is command-aware: a cached result is valid if it's for the same
-    SHA AND the same command. This allows agent_gate and publish_gate to share
-    validation results when they use the same command.
+    SHA AND the same command. This allows callers running the same contract to
+    share validation results.
 
     It is also profile-aware (#7059). Command equality alone is not the same
     question as contract equality — two profiles can share a command today and

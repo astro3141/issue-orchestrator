@@ -16,12 +16,15 @@ from issue_orchestrator.control.validation import (
     ValidationRecordStore,
     ValidationRunner,
     ValidationCache,
-    PublishGate,
+    ValidationGate,
     PublishGateResult,
     AgentGate,
     AgentGateResult,
     VALIDATION_SCHEMA_VERSION,
 )
+from issue_orchestrator.control.validation_record_cache import contract_record_path
+from issue_orchestrator.domain.validation_profile import ValidationGateKind
+from tests.validation_contract_helpers import publish_contract, quick_contract
 from issue_orchestrator.control.isolation import GRADLE_USER_HOME_ENV
 
 
@@ -43,6 +46,48 @@ def _timing_marker_command() -> str:
         "'[validate-timing] END target=test-unit status=0 elapsed=12s "
         "at=2026-03-14T09:10:25-0600'"
     )
+
+
+class TestContractRecordPath:
+    """Where a record lives — and when it lives nowhere.
+
+    Not every ``ValidationRecord`` is a stored gate result. Handing back a
+    store path for one that was never stored names a file that either does
+    not exist or holds a different contract's result (#25).
+    """
+
+    def _record(self, suite: str) -> ValidationRecord:
+        return ValidationRecord(
+            schema_version=1,
+            suite=suite,
+            head_sha="abc123",
+            passed=False,
+            exit_code=1,
+            command="make validate",
+            started_at="2024-01-01T12:00:00",
+            ended_at="2024-01-01T12:01:00",
+        )
+
+    def test_a_synthesized_non_contract_record_has_no_store_location(
+        self, tmp_path: Path
+    ) -> None:
+        """The pre-push hook gate's record belongs to no profile contract."""
+        assert contract_record_path(tmp_path, self._record("pre_publish_gate")) is None
+
+    @pytest.mark.parametrize(
+        ("suite", "kind"),
+        [
+            ("publish_gate", ValidationGateKind.PUBLISH),
+            ("quick_gate", ValidationGateKind.QUICK),
+            ("agent_gate", ValidationGateKind.QUICK),
+        ],
+    )
+    def test_a_contract_record_resolves_to_that_contracts_store(
+        self, tmp_path: Path, suite: str, kind: ValidationGateKind
+    ) -> None:
+        path = contract_record_path(tmp_path, self._record(suite))
+
+        assert path == ValidationRecordStore(tmp_path, kind).get_record_path("abc123")
 
 
 class TestValidationRecord:
@@ -134,7 +179,7 @@ class TestValidationRecordStore:
     @pytest.fixture
     def store(self, temp_worktree):
         """Create a store for the temp worktree."""
-        return ValidationRecordStore(temp_worktree)
+        return ValidationRecordStore(temp_worktree, ValidationGateKind.PUBLISH)
 
     def test_write_and_read_record(self, store):
         """Test writing and reading a record."""
@@ -201,7 +246,7 @@ class TestValidationRunner:
     @pytest.fixture
     def store(self, temp_worktree):
         """Create a store for the temp worktree."""
-        return ValidationRecordStore(temp_worktree)
+        return ValidationRecordStore(temp_worktree, ValidationGateKind.PUBLISH)
 
     @pytest.fixture
     def runner(self, store):
@@ -431,7 +476,7 @@ class TestValidationCache:
     @pytest.fixture
     def store(self, temp_worktree):
         """Create a store for the temp worktree."""
-        return ValidationRecordStore(temp_worktree)
+        return ValidationRecordStore(temp_worktree, ValidationGateKind.PUBLISH)
 
     @pytest.fixture
     def cache(self, store):
@@ -629,11 +674,11 @@ class TestPublishGate:
 
     def test_gate_disabled_when_no_command(self, temp_worktree):
         """Test gate is disabled when no command is configured."""
-        gate = PublishGate(
+        gate = ValidationGate(
             temp_worktree,
             command_runner=LocalCommandRunner(),
             working_copy=GitWorkingCopy(),
-            command=None,
+            contract=publish_contract(cmd=None),
         )
         result = gate.check()
 
@@ -653,12 +698,11 @@ class TestPublishGate:
         """Publish gate summaries should pin HEAD lookup failures."""
         working_copy = MagicMock()
         working_copy.get_head_sha.return_value = None
-        gate = PublishGate(
+        gate = ValidationGate(
             temp_worktree,
             command_runner=LocalCommandRunner(),
             working_copy=working_copy,
-            command="echo 'ok'",
-            timeout_seconds=10,
+            contract=publish_contract(cmd="echo 'ok'", timeout_seconds=10),
         )
 
         result = gate.check()
@@ -677,12 +721,11 @@ class TestPublishGate:
 
     def test_gate_passes_when_command_succeeds(self, temp_worktree, session_output_dir):
         """Test gate passes when validation command succeeds."""
-        gate = PublishGate(
+        gate = ValidationGate(
             temp_worktree,
             command_runner=LocalCommandRunner(),
             working_copy=GitWorkingCopy(),
-            command="echo 'ok'",
-            timeout_seconds=10,
+            contract=publish_contract(cmd="echo 'ok'", timeout_seconds=10),
         )
         result = gate.check(session_output_dir=session_output_dir)
 
@@ -695,12 +738,11 @@ class TestPublishGate:
         self, temp_worktree, session_output_dir
     ):
         """Publish gate checks should append an outer summary record."""
-        gate = PublishGate(
+        gate = ValidationGate(
             temp_worktree,
             command_runner=LocalCommandRunner(),
             working_copy=GitWorkingCopy(),
-            command="echo 'ok'",
-            timeout_seconds=10,
+            contract=publish_contract(cmd="echo 'ok'", timeout_seconds=10),
         )
 
         result = gate.check(session_output_dir=session_output_dir)
@@ -730,12 +772,11 @@ class TestPublishGate:
 
     def test_gate_fails_when_command_fails(self, temp_worktree, session_output_dir):
         """Test gate fails when validation command fails."""
-        gate = PublishGate(
+        gate = ValidationGate(
             temp_worktree,
             command_runner=LocalCommandRunner(),
             working_copy=GitWorkingCopy(),
-            command="exit 1",
-            timeout_seconds=10,
+            contract=publish_contract(cmd="exit 1", timeout_seconds=10),
         )
         result = gate.check(session_output_dir=session_output_dir)
 
@@ -746,12 +787,11 @@ class TestPublishGate:
 
     def test_gate_uses_cache_on_second_call(self, temp_worktree, session_output_dir):
         """Test gate uses cache on subsequent calls."""
-        gate = PublishGate(
+        gate = ValidationGate(
             temp_worktree,
             command_runner=LocalCommandRunner(),
             working_copy=GitWorkingCopy(),
-            command="echo 'ok'",
-            timeout_seconds=10,
+            contract=publish_contract(cmd="echo 'ok'", timeout_seconds=10),
         )
 
         # First call runs validation
@@ -787,25 +827,23 @@ class TestPublishGate:
         attempt_key = self._attempt_key(temp_worktree, "123")
         runner = CountingRunner()
 
-        first_gate = PublishGate(
+        first_gate = ValidationGate(
             temp_worktree,
             command_runner=runner,
             working_copy=GitWorkingCopy(),
-            command="make test",
-            timeout_seconds=10,
             attempt_store=attempt_store,
             attempt_key=attempt_key,
+            contract=publish_contract(cmd="make test", timeout_seconds=10),
         )
         first = first_gate.check(session_output_dir=session_output_dir)
 
-        second_gate = PublishGate(
+        second_gate = ValidationGate(
             temp_worktree,
             command_runner=runner,
             working_copy=GitWorkingCopy(),
-            command="make test",
-            timeout_seconds=10,
             attempt_store=attempt_store,
             attempt_key=attempt_key,
+            contract=publish_contract(cmd="make test", timeout_seconds=10),
         )
         second = second_gate.check(
             session_output_dir=self._session_dir(temp_worktree, "same-issue")
@@ -837,25 +875,23 @@ class TestPublishGate:
         attempt_store = SidecarAttemptStore(temp_worktree)
         runner = CountingRunner()
 
-        first_gate = PublishGate(
+        first_gate = ValidationGate(
             temp_worktree,
             command_runner=runner,
             working_copy=GitWorkingCopy(),
-            command="make test",
-            timeout_seconds=10,
             attempt_store=attempt_store,
             attempt_key=self._attempt_key(temp_worktree, "123"),
+            contract=publish_contract(cmd="make test", timeout_seconds=10),
         )
         first = first_gate.check(session_output_dir=session_output_dir)
 
-        second_gate = PublishGate(
+        second_gate = ValidationGate(
             temp_worktree,
             command_runner=runner,
             working_copy=GitWorkingCopy(),
-            command="make test",
-            timeout_seconds=10,
             attempt_store=attempt_store,
             attempt_key=self._attempt_key(temp_worktree, "124"),
+            contract=publish_contract(cmd="make test", timeout_seconds=10),
         )
         second = second_gate.check(
             session_output_dir=self._session_dir(temp_worktree, "different-issue")
@@ -867,12 +903,11 @@ class TestPublishGate:
 
     def test_gate_appends_summary_on_cache_hit(self, temp_worktree, session_output_dir):
         """Publish gate summaries should distinguish cache hits from validation runs."""
-        gate = PublishGate(
+        gate = ValidationGate(
             temp_worktree,
             command_runner=LocalCommandRunner(),
             working_copy=GitWorkingCopy(),
-            command="echo 'ok'",
-            timeout_seconds=10,
+            contract=publish_contract(cmd="echo 'ok'", timeout_seconds=10),
         )
 
         gate.check(session_output_dir=session_output_dir)
@@ -898,12 +933,11 @@ class TestPublishGate:
                     returncode=-1, stdout="", stderr="", timed_out=True
                 )
 
-        gate = PublishGate(
+        gate = ValidationGate(
             temp_worktree,
             command_runner=TimeoutRunner(),
             working_copy=GitWorkingCopy(),
-            command="sleep 10",
-            timeout_seconds=1,
+            contract=publish_contract(cmd="sleep 10", timeout_seconds=1),
         )
         result = gate.check(session_output_dir=session_output_dir)
 
@@ -920,12 +954,11 @@ class TestPublishGate:
         review-exchange cache predicate, UI) read whatever stale
         ``validation-record.json`` happens to be there from an earlier
         inline run and disagree with the gate's authoritative result."""
-        gate = PublishGate(
+        gate = ValidationGate(
             temp_worktree,
             command_runner=LocalCommandRunner(),
             working_copy=GitWorkingCopy(),
-            command="echo 'ok'",
-            timeout_seconds=10,
+            contract=publish_contract(cmd="echo 'ok'", timeout_seconds=10),
         )
 
         # First call runs validation and writes the record.
@@ -967,12 +1000,11 @@ class TestPublishGate:
         Failures are NOT trusted from cache because they might be due to flaky
         tests or transient issues. Only passes are cached and trusted.
         """
-        gate = PublishGate(
+        gate = ValidationGate(
             temp_worktree,
             command_runner=LocalCommandRunner(),
             working_copy=GitWorkingCopy(),
-            command="exit 1",
-            timeout_seconds=10,
+            contract=publish_contract(cmd="exit 1", timeout_seconds=10),
         )
 
         # First call fails
@@ -1037,7 +1069,7 @@ class TestAgentGate:
             temp_worktree,
             command_runner=LocalCommandRunner(),
             working_copy=GitWorkingCopy(),
-            command=None,
+            contract=quick_contract(cmd=None),
         )
         result = gate.run(session_output_dir)
 
@@ -1051,8 +1083,7 @@ class TestAgentGate:
             temp_worktree,
             command_runner=LocalCommandRunner(),
             working_copy=GitWorkingCopy(),
-            command="echo 'ok'",
-            timeout_seconds=10,
+            contract=quick_contract(cmd="echo 'ok'", timeout_seconds=10),
         )
         result = gate.run(session_output_dir)
 
@@ -1069,8 +1100,7 @@ class TestAgentGate:
             temp_worktree,
             command_runner=LocalCommandRunner(),
             working_copy=GitWorkingCopy(),
-            command="echo 'ok'",
-            timeout_seconds=10,
+            contract=quick_contract(cmd="echo 'ok'", timeout_seconds=10),
         )
 
         result = gate.run(session_output_dir)
@@ -1087,8 +1117,7 @@ class TestAgentGate:
             temp_worktree,
             command_runner=LocalCommandRunner(),
             working_copy=GitWorkingCopy(),
-            command="exit 1",
-            timeout_seconds=10,
+            contract=quick_contract(cmd="exit 1", timeout_seconds=10),
         )
         result = gate.run(session_output_dir)
 
@@ -1103,8 +1132,7 @@ class TestAgentGate:
             temp_worktree,
             command_runner=LocalCommandRunner(),
             working_copy=GitWorkingCopy(),
-            command="echo 'ok'",
-            timeout_seconds=10,
+            contract=quick_contract(cmd="echo 'ok'", timeout_seconds=10),
         )
 
         # First call runs validation
@@ -1132,8 +1160,7 @@ class TestAgentGate:
             temp_worktree,
             command_runner=TimeoutRunner(),
             working_copy=GitWorkingCopy(),
-            command="sleep 10",
-            timeout_seconds=1,
+            contract=quick_contract(cmd="sleep 10", timeout_seconds=1),
         )
         result = gate.run(session_output_dir)
 
@@ -1148,13 +1175,31 @@ class TestAgentGate:
             temp_worktree,
             command_runner=LocalCommandRunner(),
             working_copy=GitWorkingCopy(),
-            command="echo 'ok'",
-            timeout_seconds=10,
+            contract=quick_contract(cmd="echo 'ok'", timeout_seconds=10),
         )
         result = gate.run(session_output_dir)
 
         # Verify record was written (new API uses just sha)
-        store = ValidationRecordStore(temp_worktree)
+        store = ValidationRecordStore(temp_worktree, ValidationGateKind.QUICK)
         stored = store.read(result.record.head_sha)
         assert stored is not None
         assert stored.passed is True
+
+    def test_a_publish_contract_is_refused_rather_than_mislabelled(
+        self, temp_worktree
+    ):
+        """The agent gate runs the quick contract, and only that (#25).
+
+        Accepting a publish contract here would produce a record labelled
+        ``agent_gate`` — a quick-gate label — for a run of the publish
+        command, which is the original defect wearing the other hat.
+        """
+        with pytest.raises(ValueError) as excinfo:
+            AgentGate(
+                temp_worktree,
+                command_runner=LocalCommandRunner(),
+                working_copy=GitWorkingCopy(),
+                contract=publish_contract(cmd="echo 'publish'"),
+            )
+
+        assert "publish" in str(excinfo.value)

@@ -1125,10 +1125,14 @@ def test_validation_diagnostics_persisted_on_failure(scenario_repo: Path):
     worktree_root = scenario_repo / ".issue-orchestrator" / "worktrees"
     sim_worktrees = [p for p in worktree_root.iterdir() if p.is_dir()] if worktree_root.exists() else []
     assert sim_worktrees, "expected a simulated worktree to exist"
-    validation_dir = sim_worktrees[0] / ".issue-orchestrator" / "validation"
+    # Records are stored per contract, not per SHA alone (#25): the quick gate
+    # this scenario exercises writes under ``validation/quick/``.
+    validation_dir = (
+        sim_worktrees[0] / ".issue-orchestrator" / "validation" / "quick"
+    )
     record_files = list(validation_dir.glob("*.json")) if validation_dir.exists() else []
     assert record_files, (
-        f"expected validation/<sha>.json record under {validation_dir}; "
+        f"expected validation/quick/<sha>.json record under {validation_dir}; "
         "the failed-validation diagnostics action depends on it."
     )
     record = json.loads(record_files[0].read_text())

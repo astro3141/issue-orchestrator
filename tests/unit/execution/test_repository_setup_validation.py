@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from issue_orchestrator.control.repository_setup import RepositorySetupCommand
+from issue_orchestrator.domain.validation_profile import ValidationGateKind
 from issue_orchestrator.control.validation import (
     ValidationRecordStore,
     ValidationRunner,
@@ -49,7 +50,7 @@ def test_makefile_defaults_run_a_repository_gate_and_catch_failure(
     config = command.build_config(repository_setup_github_authorization_codec)
 
     record = ValidationRunner(
-        ValidationRecordStore(tmp_path),
+        ValidationRecordStore(tmp_path, ValidationGateKind.QUICK),
         LocalCommandRunner(),
     ).run(
         "agent_gate",

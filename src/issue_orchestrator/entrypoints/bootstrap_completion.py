@@ -118,6 +118,7 @@ def create_completion_components(
     """
     from ..control.completion_processor import CompletionProcessor
     from ..control.pre_publish_gate import PrePublishGate
+    from ..control.publication_gate import build_publication_gate
     from ..control.session_controller import SessionController
     from ..control.label_manager import LabelManager as _LM
     from ..execution.run_evidence import RunEvidenceRecorder
@@ -152,6 +153,24 @@ def create_completion_components(
             job_supervisor=background_job_supervisor,
         )
 
+    validation_profiles = config.validation_profiles()
+    # The orchestrator's pre-publication gate. Built here and nowhere else:
+    # this seam existed unwired, so ``validation.publish.cmd`` was never
+    # executed by the orchestrator while quick-gate records still claimed
+    # ``suite=publish_gate`` (#25).
+    #
+    # Built unconditionally. Whether a run has a publish contract to execute
+    # is a per-run question the gate answers from that run's frozen profile;
+    # deciding it once here, from whether *any* profile happens to configure
+    # one, would be a second place that answers it and a second place that
+    # can answer it differently.
+    publication_gate = build_publication_gate(
+        session_output=session_output,
+        profiles=validation_profiles,
+        command_runner=command_runner,
+        working_copy=working_copy,
+    )
+
     completion_processor = CompletionProcessor(
         # The governed shared block is refused here BY VALUE, so an
         # agent-supplied ``pr_labels`` entry cannot mint a cause-free block
@@ -171,6 +190,7 @@ def create_completion_components(
         ),
         event_bus=None,
         label_config=label_manager.to_label_config_dict(),
+        publication_gate=publication_gate,
         pre_publish_gate=PrePublishGate(command_runner) if config.enforce_hooks else None,
         config=config,
         background_job_supervisor=background_job_supervisor,
@@ -189,10 +209,10 @@ def create_completion_components(
         working_copy=working_copy,
         command_runner=(
             command_runner
-            if config.validation_profiles().any_quick_command_configured
+            if validation_profiles.any_quick_command_configured
             else None
         ),
-        validation_profiles=config.validation_profiles(),
+        validation_profiles=validation_profiles,
         validation_junit_xml_paths=_validation_junit_xml_paths(config),
         validation_evidence_recorder=RunEvidenceRecorder(session_output),
         attempt_store=attempt_store,

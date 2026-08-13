@@ -1,8 +1,14 @@
 """Validation gates for the orchestrator.
 
 - ``ValidationRunner`` executes a validation command and produces a record
-- ``PublishGate`` decides whether publishing is allowed (cache-aware)
-- ``AgentGate`` runs the quick gate at agent completion
+- ``ValidationGate`` runs one contract of a profile, cache-aware
+- ``AgentGate`` runs the quick contract at agent completion
+
+Every gate is constructed from a :class:`ValidationGateContract`, never from a
+free-form command plus a separately chosen suite label. That pairing is what
+allowed a record to read ``suite=publish_gate`` while executing the quick
+selector (#25); with the contract as the single input, the suite a record
+claims and the command it ran are two projections of one value.
 
 Record storage and cache-reuse rules live in
 :mod:`.validation_record_cache`; ``ValidationRecordStore``,
@@ -19,10 +25,20 @@ from pathlib import Path
 from typing import Optional
 
 from ..domain.attempt import Attempt, AttemptKey
+from ..domain.session_run import (
+    VALIDATION_RECORD_NAME,
+    VALIDATION_STDERR_NAME,
+    VALIDATION_STDOUT_NAME,
+    ValidationArtifactPaths,
+)
+from ..domain.validation_profile import AGENT_GATE_SUITE
 from ..infra import validation_timings as timings
 from ..infra.atomic_json import atomic_write_json
 from ..infra.emit import emit_event
-from ..infra.validation_profiles import DEFAULT_VALIDATION_PROFILE
+from ..infra.validation_profiles import (
+    DEFAULT_VALIDATION_PROFILE,
+    ValidationGateContract,
+)
 from ..ports import CommandRunner, CommandResult, WorkingCopy
 from ..ports.attempt_store import AttemptStore
 from ..ports.session_output import ValidationRecord
@@ -172,8 +188,8 @@ class ValidationRunner:
 
         # Write stdout/stderr files to session output dir
         session_output_dir.mkdir(parents=True, exist_ok=True)
-        stdout_path = session_output_dir / "validation-stdout.log"
-        stderr_path = session_output_dir / "validation-stderr.log"
+        stdout_path = session_output_dir / VALIDATION_STDOUT_NAME
+        stderr_path = session_output_dir / VALIDATION_STDERR_NAME
         stdout_path.write_text(stdout)
         stderr_path.write_text(stderr)
         logger.debug("Wrote validation output to session dir: %s", session_output_dir)
@@ -209,7 +225,7 @@ class ValidationRunner:
         # Persist run-scoped validation record only for real session run dirs.
         if _is_session_run_dir(session_output_dir, self.store.worktree):
             atomic_write_json(
-                session_output_dir / "validation-record.json",
+                session_output_dir / VALIDATION_RECORD_NAME,
                 record.to_dict(),
             )
 
@@ -240,9 +256,25 @@ class ValidationRunner:
         return record
 
 
+@dataclass(frozen=True, slots=True)
+class GateEvidence:
+    """A gate's validation record together with the paths that gate wrote.
+
+    The two travel as one value because they are only meaningful together:
+    the publish contract writes into ``publish-gate/`` while the quick
+    contract writes into the run root, so a record attached beside another
+    gate's stdout and stderr describes a run that never happened (#25). A
+    caller cannot pair a record with some other gate's paths without
+    saying so out loud.
+    """
+
+    record: ValidationRecord | None
+    paths: ValidationArtifactPaths
+
+
 @dataclass
 class PublishGateResult:
-    """Result of a publish gate check."""
+    """Result of a validation gate check."""
 
     allowed: bool
     reason: str
@@ -250,53 +282,68 @@ class PublishGateResult:
     cache_hit: bool = False
 
 
-class PublishGate:
-    """Facade for publish gate validation.
+class ValidationGate:
+    """Runs one contract of a validation profile, cache-aware.
 
-    Combines cache lookup and runner to provide a single check method.
-    Use this before allowing publish actions (push, PR creation).
+    Combines cache lookup and runner to provide a single check method. The
+    contract decides everything the record will claim: which command runs,
+    with which timeout, under which suite label and profile name.
+
+    Used for both contracts. ``kind=PUBLISH`` is the orchestrator's
+    pre-publication gate; ``kind=QUICK`` is the completion/rework gate. A
+    caller cannot ask for one and execute the other, because there is no
+    command parameter to disagree with the kind (#25).
     """
-
-    SUITE_NAME = "publish_gate"
 
     def __init__(
         self,
         worktree: Path,
         command_runner: CommandRunner,
         working_copy: WorkingCopy,
-        command: Optional[str] = None,
-        timeout_seconds: int = 1800,
+        contract: ValidationGateContract,
         attempt_store: AttemptStore | None = None,
         attempt_key: AttemptKey | None = None,
-        profile: str = DEFAULT_VALIDATION_PROFILE,
     ):
-        """Initialize publish gate for a worktree.
+        """Initialize a gate for a worktree and one profile contract.
 
         Args:
             worktree: Path to the git worktree
-            command: Validation command to run (None = gate disabled)
-            timeout_seconds: Timeout for validation command
+            contract: The profile contract this gate executes. An unconfigured
+                contract (no ``cmd``) means the gate is disabled.
             attempt_store: Attempt-scoped cache store. When provided with
                 attempt_key, validation cache hits are scoped by issue identity
                 plus HEAD SHA rather than by SHA alone.
             attempt_key: Stable issue-at-HEAD identity for cache lookup.
-            profile: Named validation profile this gate runs (#7059). Part of
-                the cache key, so a cached result from another profile is
-                never reused.
         """
         if attempt_key is not None and attempt_store is None:
             raise ValueError("attempt_key requires attempt_store")
         self.worktree = worktree
         self.command_runner = command_runner
         self.working_copy = working_copy
-        self.command = command
-        self.timeout_seconds = timeout_seconds
-        self.profile = profile
+        self.contract = contract
         self.attempt_store = attempt_store
         self.attempt_key = attempt_key
-        self.store = ValidationRecordStore(worktree)
+        self.store = ValidationRecordStore(worktree, contract.kind)
         self.cache = ValidationCache(self.store)
         self.runner = ValidationRunner(self.store, command_runner)
+
+    @property
+    def suite(self) -> str:
+        """Suite label records from this gate carry."""
+        return self.contract.suite
+
+    @property
+    def command(self) -> str | None:
+        """The command this gate runs; ``None`` when the gate is disabled."""
+        return self.contract.cmd
+
+    @property
+    def timeout_seconds(self) -> int:
+        return self.contract.timeout_seconds
+
+    @property
+    def profile(self) -> str:
+        return self.contract.profile
 
     def _get_head_sha(self) -> Optional[str]:
         """Get the current HEAD SHA."""
@@ -318,7 +365,7 @@ class PublishGate:
         record = result.record
         payload: dict[str, object] = {
             "kind": "validation_gate_summary",
-            "gate": self.SUITE_NAME,
+            "gate": self.suite,
             "profile": self.profile,
             "command": self.command,
             "timeout_seconds": self.timeout_seconds,
@@ -373,7 +420,8 @@ class PublishGate:
     ) -> bool:
         if record.schema_version != VALIDATION_SCHEMA_VERSION:
             logger.debug(
-                "Publish gate %s cache miss for %s: schema version mismatch (%d != %d)",
+                "%s: %s cache miss for %s: schema version mismatch (%d != %d)",
+                self.suite,
                 cache_source,
                 head_sha[:8],
                 record.schema_version,
@@ -382,23 +430,40 @@ class PublishGate:
             return False
         if record.head_sha != head_sha:
             logger.debug(
-                "Publish gate %s cache miss for %s: record SHA mismatch (%s)",
+                "%s: %s cache miss for %s: record SHA mismatch (%s)",
+                self.suite,
                 cache_source,
                 head_sha[:8],
                 record.head_sha[:8],
             )
             return False
+        # The contract the cached run executed, not the caller that produced
+        # it: the agent gate runs the same quick contract as this gate, so its
+        # record is reusable, while a record from the *other* contract never
+        # is — that reuse is exactly how a quick result could satisfy a
+        # publish request (#25).
+        if not self.contract.kind.produced(record.suite):
+            logger.debug(
+                "%s: %s cache miss for %s: contract mismatch (cached suite=%s)",
+                self.suite,
+                cache_source,
+                head_sha[:8],
+                record.suite,
+            )
+            return False
         if self.command and record.command != self.command:
             logger.debug(
-                "Publish gate %s cache miss for %s: command mismatch",
+                "%s: %s cache miss for %s: command mismatch",
+                self.suite,
                 cache_source,
                 head_sha[:8],
             )
             return False
         if record.profile != self.profile:
             logger.debug(
-                "Publish gate %s cache miss for %s: profile mismatch "
+                "%s: %s cache miss for %s: profile mismatch "
                 "(cached='%s', requested='%s')",
+                self.suite,
                 cache_source,
                 head_sha[:8],
                 record.profile,
@@ -412,14 +477,15 @@ class PublishGate:
             return None
         attempt = self.attempt_store.for_key(self.attempt_key)
         if attempt is None or not attempt.validation_record_path:
-            logger.debug("Publish gate: attempt cache miss for %s", head_sha[:8])
+            logger.debug("%s: attempt cache miss for %s", self.suite, head_sha[:8])
             return None
         record_path = self._resolve_attempt_validation_record_path(
             attempt.validation_record_path
         )
         if not record_path.exists():
             logger.debug(
-                "Publish gate: attempt cache miss for %s; record missing at %s",
+                "%s: attempt cache miss for %s; record missing at %s",
+                self.suite,
                 head_sha[:8],
                 record_path,
             )
@@ -433,7 +499,7 @@ class PublishGate:
             cache_source="attempt",
         ):
             return None
-        logger.debug("Publish gate: attempt cache hit for %s", head_sha[:8])
+        logger.debug("%s: attempt cache hit for %s", self.suite, head_sha[:8])
         return record
 
     def _materialize_cached_record(
@@ -446,7 +512,7 @@ class PublishGate:
         ):
             return
         atomic_write_json(
-            session_output_dir / "validation-record.json",
+            session_output_dir / VALIDATION_RECORD_NAME,
             record.to_dict(),
         )
 
@@ -458,7 +524,7 @@ class PublishGate:
         if session_output_dir is not None and _is_session_run_dir(
             session_output_dir, self.store.worktree
         ):
-            return session_output_dir / "validation-record.json"
+            return session_output_dir / VALIDATION_RECORD_NAME
         return self.store.get_record_path(record.head_sha)
 
     def _store_attempt_validation_record(
@@ -511,13 +577,14 @@ class PublishGate:
             return result
 
         # Gate disabled if no command
-        if not self.command:
-            logger.debug("Publish gate disabled (no command configured)")
+        command = self.command
+        if not command:
+            logger.debug("%s disabled (no command configured)", self.suite)
             cache_lookup = "disabled"
             return finish(
                 PublishGateResult(
                     allowed=True,
-                    reason="Publish gate disabled (no command configured)",
+                    reason=f"{self.suite} disabled (no command configured)",
                 )
             )
 
@@ -539,11 +606,19 @@ class PublishGate:
             cached = self._attempt_cached_record(head_sha)
             cache_hit_prefix = "attempt_"
         else:
-            cached = self.cache.lookup(head_sha, self.command, self.profile)
+            cached = self.cache.lookup(head_sha, command, self.profile)
+            # The store is already contract-scoped, so a record found here was
+            # written under this contract. Re-checking is deliberate: it keeps
+            # one predicate answering "may this record satisfy this request"
+            # for both cache sources, rather than two rules that can drift.
+            if cached is not None and not self._record_matches_request(
+                cached, head_sha=head_sha, cache_source="sha"
+            ):
+                cached = None
             cache_hit_prefix = ""
         if cached is not None and cached.passed:
             cache_lookup = f"{cache_hit_prefix}hit_passed"
-            logger.info("Publish gate: cache hit (passed) for %s", head_sha[:8])
+            logger.info("%s: cache hit (passed) for %s", self.suite, head_sha[:8])
             # Materialize the cached record into the session run dir so
             # downstream consumers (manifest, review-exchange predicate, UI)
             # see the gate's authoritative result. Without this, a stale
@@ -563,7 +638,8 @@ class PublishGate:
             cache_lookup = f"{cache_hit_prefix}hit_failed_rerun"
             # Cached failure - log it but re-run validation
             logger.info(
-                "Publish gate: cached failure for %s, re-running validation",
+                "%s: cached failure for %s, re-running validation",
+                self.suite,
                 head_sha[:8],
             )
         else:
@@ -571,14 +647,15 @@ class PublishGate:
 
         # Run validation
         logger.info(
-            "Publish gate: running validation for %s [profile=%s]",
+            "%s: running validation for %s [profile=%s]",
+            self.suite,
             head_sha[:8],
             self.profile,
         )
         record = self.runner.run(
-            suite=self.SUITE_NAME,
+            suite=self.suite,
             head_sha=head_sha,
-            command=self.command,
+            command=command,
             timeout_seconds=self.timeout_seconds,
             session_output_dir=session_output_dir,
             profile=self.profile,
@@ -621,36 +698,47 @@ class AgentGateResult:
 class AgentGate:
     """Validation gate for agent completion.
 
-    Unlike PublishGate, this runs unconditionally (no cache) and
+    Unlike :class:`ValidationGate` this runs unconditionally (no cache) and
     records the result for informational purposes.
+
+    It runs the profile's *quick* contract and records its own suite label, so
+    a reader can tell an agent-side run from the orchestrator's own quick gate
+    while both remain honestly labelled as the quick contract. Handing it a
+    publish contract is rejected rather than mislabelled (#25).
     """
 
-    SUITE_NAME = "agent_gate"
+    SUITE_NAME = AGENT_GATE_SUITE
 
     def __init__(
         self,
         worktree: Path,
         command_runner: CommandRunner,
         working_copy: WorkingCopy,
-        command: Optional[str] = None,
-        timeout_seconds: int = 1800,
-        profile: str = DEFAULT_VALIDATION_PROFILE,
+        contract: ValidationGateContract,
     ):
         """Initialize agent gate for a worktree.
 
         Args:
             worktree: Path to the git worktree
-            command: Validation command to run (None = gate disabled)
-            timeout_seconds: Timeout for validation command
-            profile: Named validation profile this gate runs (#7059)
+            contract: The profile's quick contract. An unconfigured contract
+                (no ``cmd``) means the gate is disabled.
+
+        Raises:
+            ValueError: when handed a contract other than the quick one.
         """
+        if not contract.is_quick:
+            raise ValueError(
+                "AgentGate runs the quick contract; "
+                f"got {contract.kind.value!r}"
+            )
         self.worktree = worktree
         self.command_runner = command_runner
         self.working_copy = working_copy
-        self.command = command
-        self.timeout_seconds = timeout_seconds
-        self.profile = profile
-        self.store = ValidationRecordStore(worktree)
+        self.contract = contract
+        self.command = contract.cmd
+        self.timeout_seconds = contract.timeout_seconds
+        self.profile = contract.profile
+        self.store = ValidationRecordStore(worktree, contract.kind)
         self.runner = ValidationRunner(self.store, command_runner)
 
     def _get_head_sha(self) -> Optional[str]:
@@ -663,7 +751,7 @@ class AgentGate:
     def run(self, session_output_dir: Path) -> AgentGateResult:
         """Run the agent gate validation.
 
-        Unlike PublishGate.check(), this always runs the validation
+        Unlike ValidationGate.check(), this always runs the validation
         (no cache lookup) because we want to capture the result at
         the specific point in time when the completion command is called.
 

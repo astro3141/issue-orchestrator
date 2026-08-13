@@ -85,6 +85,142 @@ def test_load_validation_failure_summary_extracts_failed_tests_and_excerpts(tmp_
     assert summary.stderr_excerpt[-1] == "error: failed to push some refs"
 
 
+def _seed_publish_gate_refusal(tmp_path: Path) -> Path:
+    """A run whose quick gate passed and whose publish gate then failed.
+
+    The production ordering after #25: ``coding-done`` leaves the quick
+    contract's evidence in the run root, the publication gate writes its own
+    into ``publish-gate/``, and the completion processor attaches *that* set
+    to the manifest.
+    """
+    worktree = tmp_path / "wt"
+    run_dir = worktree / ".issue-orchestrator" / "sessions" / "run-publish"
+    publish_dir = run_dir / "publish-gate"
+    publish_dir.mkdir(parents=True)
+
+    (run_dir / "manifest.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "session_name": "coding-publish",
+                "run_dir": str(run_dir),
+                "worktree": str(worktree),
+                "validation_status": "failed",
+                "validation_reason": "Validation failed for feedface (exit_code=1)",
+                "validation_record_path": str(publish_dir / "validation-record.json"),
+                "validation_stdout": str(publish_dir / "validation-stdout.log"),
+                "validation_stderr": str(publish_dir / "validation-stderr.log"),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    # The quick gate's evidence: still in the run root, still passing.
+    (run_dir / "validation-record.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "suite": "agent_gate",
+                "head_sha": "feedface",
+                "passed": True,
+                "exit_code": 0,
+                "command": "make validate-quick",
+                "started_at": "2026-06-01T09:00:00Z",
+                "ended_at": "2026-06-01T09:02:00Z",
+                "timed_out": False,
+            }
+        ),
+        encoding="utf-8",
+    )
+    (run_dir / "validation-stdout.log").write_text(
+        "============= 300 passed in 60.00s =============\n", encoding="utf-8"
+    )
+    (run_dir / "validation-stderr.log").write_text("", encoding="utf-8")
+
+    # The publish gate's evidence: the run that actually refused publication.
+    (publish_dir / "validation-record.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "suite": "publish_gate",
+                "head_sha": "feedface",
+                "passed": False,
+                "exit_code": 1,
+                "command": "make validate-pr",
+                "started_at": "2026-06-01T09:03:00Z",
+                "ended_at": "2026-06-01T09:20:00Z",
+                "timed_out": False,
+            }
+        ),
+        encoding="utf-8",
+    )
+    (publish_dir / "validation-stdout.log").write_text(
+        "\n".join(
+            [
+                "=================================== FAILURES ===================================",
+                "FAILED tests/integration/test_publish.py::test_publish_path",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    (publish_dir / "validation-stderr.log").write_text(
+        "make: *** [validate-pr] Error 1", encoding="utf-8"
+    )
+    return run_dir
+
+
+def test_a_publish_gate_refusal_renders_the_publish_gates_own_evidence(
+    tmp_path: Path,
+) -> None:
+    """The summary reads what the manifest names, not what the run root holds.
+
+    Re-deriving ``run_dir/validation-*`` here would answer "why was
+    publication refused" with the output of the quick command that *passed*
+    — the manifest is correct after #25; this consumer must honour it.
+    """
+    run_dir = _seed_publish_gate_refusal(tmp_path)
+
+    summary = load_validation_failure_summary(run_dir)
+
+    assert summary is not None
+    assert summary.status == "failed"
+    assert summary.suite == "publish_gate"
+    assert summary.command == "make validate-pr"
+    assert summary.exit_code == 1
+    assert summary.failed_tests == (
+        "tests/integration/test_publish.py::test_publish_path",
+    )
+    assert any("FAILURES" in line for line in summary.stdout_excerpt)
+    assert summary.stderr_excerpt[-1] == "make: *** [validate-pr] Error 1"
+    # Nothing from the quick run leaked in.
+    assert not any("300 passed" in line for line in summary.stdout_excerpt)
+
+
+def test_the_run_root_still_answers_when_the_manifest_names_a_missing_file(
+    tmp_path: Path,
+) -> None:
+    """The fallback survives for runs whose recorded evidence is gone.
+
+    Manifest-first must not turn a pruned or never-written path into an
+    empty summary when the run root still holds readable evidence.
+    """
+    run_dir = _seed_publish_gate_refusal(tmp_path)
+    publish_dir = run_dir / "publish-gate"
+    for name in (
+        "validation-record.json",
+        "validation-stdout.log",
+        "validation-stderr.log",
+    ):
+        (publish_dir / name).unlink()
+
+    summary = load_validation_failure_summary(run_dir)
+
+    assert summary is not None
+    assert summary.status == "failed"
+    assert summary.suite == "agent_gate"
+    assert summary.command == "make validate-quick"
+
+
 def test_load_validation_failure_summary_returns_none_for_passed_runs_by_default(tmp_path: Path) -> None:
     """Default (failure-only) gate preserves existing callers' contracts —
     things like the issue-detail run diagnostic should not flag passed runs.

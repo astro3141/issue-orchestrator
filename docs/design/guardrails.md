@@ -60,7 +60,7 @@ Unsupported AI agents (no hook mechanism) are refused by `issue-orchestrator set
 
 ### 2. Orchestrator quick validation gate
 
-When an agent calls `coding-done completed`, the orchestrator runs the user-defined `validation.quick.cmd` (fast tests, lint, type-check, lightweight policy scans) and writes a validation record keyed by commit SHA to `.issue-orchestrator/validation/<suite>/<HEAD_SHA>.json`. Local coder/reviewer exchange also uses this quick record so reviewers get fast confidence without running the full publish suite on every back-and-forth.
+When an agent calls `coding-done completed`, the orchestrator runs the user-defined `validation.quick.cmd` (fast tests, lint, type-check, lightweight policy scans) and writes a validation record to `.issue-orchestrator/validation/quick/<HEAD_SHA>.json` — one location per validation *contract*, so a quick result can never sit where a publish result belongs. Local coder/reviewer exchange also uses this quick record so reviewers get fast confidence without running the full publish suite on every back-and-forth.
 
 This is the layer that catches obvious regressions while the coding agent can still fix them immediately. Repo-specific cheap policy checks, such as rejecting newly added test skips (`assumeTrue`, `assumeFalse`, `@Disabled`, `@Ignore`), should live inside the configured quick command. See [Validation System](../architecture/validation.md) for the record format and cache model.
 
@@ -70,18 +70,22 @@ Every completed coding session is handed to a reviewer agent before anything is 
 
 The exchange can run via draft PR (`via-draft-pr`), an in-process local loop (`via-local-loop`, default), or MCP (`via-mcp`) — the gating rule is identical in all modes: no approval, no publish. See [Review Workflow](../development/REVIEW_WORKFLOW.md) for exchange mechanisms and cycle-limit details.
 
-### 4. Pre-publish hook gate
+### 4. Publication gate — the orchestrator runs `validation.publish.cmd`
+
+Before publishing a change (a completion that opens a PR), the orchestrator runs the run's frozen `validation.publish.cmd` itself and records the result as `suite=publish_gate` with that exact command. This is the authoritative pre-publication contract; the quick gate above is not a substitute for it, and a quick result never satisfies it (#25).
+
+### 5. Pre-publish hook gate
 
 Before the orchestrator performs the authenticated push, it runs the worktree's effective `.git/hooks/pre-push` wrapper itself. That wrapper chains the project's pre-push hook (`make validate-pr`, `scripts/verify-pr.sh`, etc.) with the orchestrator's pre-push hook (Agent-Status trailer validation and the configured dirty-tree policy). This moves hook failures earlier in the lifecycle while preserving the exact same policy the real push would enforce.
 
-The real push still keeps hooks enabled. The publish validation command is `validation.publish.cmd`, and its cache-bearing record is keyed by commit SHA plus command, so the later hook pass can reuse the same passing token instead of rerunning the expensive validation command on the same commit. Agents still cannot use `--no-verify` themselves; Layer 1 blocks that.
+The real push still keeps hooks enabled. The publish validation command is `validation.publish.cmd`, and its cache-bearing record is keyed by commit SHA, command, profile and contract kind, so the later hook pass can reuse the same passing token instead of rerunning the expensive validation command on the same commit. Agents still cannot use `--no-verify` themselves; Layer 1 blocks that.
 
 For managed target repos, `setup-guardrails` also records the selected config
 filename into `scripts/verify-pr.sh`. If the repo later switches to another
 config file, rerun `setup-guardrails` so the pre-push gate and cache token keep
 using the same validation contract.
 
-### 5. CI and branch protection
+### 6. CI and branch protection
 
 Required status checks in GitHub branch protection re-run the canonical validation gate in a clean environment, mirroring `make validate-pr` across a fast job and an agent-backed job. This is the ultimate backstop: even if every local layer were bypassed, unverified code cannot land on the protected branch. Humans still perform the merge.
 
