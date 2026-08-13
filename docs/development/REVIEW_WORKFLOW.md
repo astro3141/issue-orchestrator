@@ -158,11 +158,13 @@ bound to the same presented commit.
 ```
 
 - **Orchestrator-observed.** Every field is the launcher's own: the label it
-  routed the role by, the provider it resolved to run it (the same
-  `agent_provider` call that spawns the process), and the model it asked that
-  provider for (the same `AgentConfig.resolved_model()` the spawn passes).
-  An agent cannot assert its own identity, and a claim carried in
-  agent-authored output is not evidence.
+  routed the role by, plus the provider and model read off the same
+  `launch_config(agent)` derivation the exchange spawns — so an `ai_system`-only
+  agent is recorded as the provider it actually launched on, with the model
+  that resolution actually passes (`AgentConfig.resolved_model()`). Reading the
+  configured agent instead of the launched one would let the record name a
+  model no process was given. An agent cannot assert its own identity, and a
+  claim carried in agent-authored output is not evidence.
 - **`model` is `null` when the orchestrator pinned none.** An agent with an
   explicit non-Claude provider and no `model:` runs on whatever its CLI
   defaults to — the launcher passes no model, so the record states that rather

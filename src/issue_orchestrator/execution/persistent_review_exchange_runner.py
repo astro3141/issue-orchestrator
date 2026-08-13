@@ -42,6 +42,7 @@ from .persistent_exchange_pair_registry_inmemory import (
 from ..ports.session_output import SessionOutput
 from .persistent_session_exchange import (
     agent_provider,
+    launch_config,
     review_exchange_supervisor_timeout_seconds,
     run_persistent_session_exchange,
 )
@@ -134,28 +135,31 @@ class PersistentReviewExchangeRunner:
     ) -> CandidateExecutionIdentityRecorder:
         """Both roles' identities as the orchestrator configured them.
 
-        Every field is the launcher's own: the label it routed the role by, the
-        provider it resolved to run it (the same :func:`agent_provider` call
-        the exchange uses to spawn the process), and the model it asked that
-        provider for (the same :meth:`~..domain.models.AgentConfig.resolved_model`
-        the spawn passes — ``None`` when the orchestrator pinned none and the
-        CLI chose, which is what an explicit non-Claude provider without a
-        ``model:`` runs as). Nothing here can be reached by an agent's output.
+        Every field is the launcher's own: the label it routed the role by, and
+        the provider/model read off :func:`launch_config` — the *same*
+        derivation ``_derive_bootstrap_agent`` spawns, not the configured agent
+        it is derived from. That distinction is the whole point: an
+        ``ai_system``-only agent's provider resolves at launch, and its model
+        answer follows the resolved provider, so reading the pre-derivation
+        config would record a model the launcher never passed (``sonnet`` for a
+        codex run). Nothing here can be reached by an agent's output.
         """
+        coder_launch = launch_config(coder_agent)
+        reviewer_launch = launch_config(reviewer_agent)
         return CandidateExecutionIdentityRecorder(
             store=self._execution_identity_store,
             issue_key=issue_key,
             actor=AgentExecutionIdentity(
                 role=ExecutionRole.ACTOR,
                 agent_label=coder_label,
-                provider=agent_provider(coder_agent).value,
-                model=coder_agent.resolved_model(),
+                provider=agent_provider(coder_launch).value,
+                model=coder_launch.resolved_model(),
             ),
             reviewer=AgentExecutionIdentity(
                 role=ExecutionRole.REVIEWER,
                 agent_label=reviewer_label,
-                provider=agent_provider(reviewer_agent).value,
-                model=reviewer_agent.resolved_model(),
+                provider=agent_provider(reviewer_launch).value,
+                model=reviewer_launch.resolved_model(),
             ),
         )
 

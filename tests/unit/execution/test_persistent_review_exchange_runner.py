@@ -537,15 +537,18 @@ def test_run_hands_the_inner_runner_orchestrator_observed_identities(
     assert recorder.reviewer.model is None
 
 
-def _agents_from_config_loader(tmp_path: Path) -> dict[str, AgentConfig]:
+def _agents_from_config_loader(
+    tmp_path: Path, *, reviewer_selection: str = "    provider: codex\n"
+) -> dict[str, AgentConfig]:
     """Agents as the real config loader builds them, not as a test builds them.
 
-    The dataclass default for ``model`` is claude's ``"sonnet"``, so an
-    ``AgentConfig`` constructed directly never reaches the state the loader
-    writes for an explicit non-Claude provider with no ``model:``: a blank
-    model, meaning "let that CLI choose". That is a supported and documented
-    configuration, so the seam has to be exercised from the side that produces
-    it.
+    The dataclass defaults hide both configurations that matter here: ``model``
+    defaults to claude's ``"sonnet"``, which the loader replaces with a blank
+    for an explicit non-Claude provider, and an ``ai_system``-only agent
+    reaches the exchange with ``provider=None`` — a shape a directly
+    constructed ``AgentConfig`` only takes if a test remembers to ask for it.
+    Both are supported configurations, so the seam is exercised from the side
+    that produces them.
     """
     repo_root = tmp_path / "loaded-repo"
     prompts = repo_root / ".prompts"
@@ -563,11 +566,30 @@ def _agents_from_config_loader(tmp_path: Path) -> dict[str, AgentConfig]:
         "    provider: claude-code\n"
         "    model: opus\n"
         "  agent:reviewer:\n"
-        "    prompt: .prompts/code-review.md\n"
-        "    provider: codex\n",
+        "    prompt: .prompts/code-review.md\n" + reviewer_selection,
         encoding="utf-8",
     )
     return Config.load(config_path).agents
+
+
+def _recorder_for_loaded_agents(
+    monkeypatch, tmp_path: Path, agents: dict[str, AgentConfig]
+) -> tuple[Any, ReviewExchangeOutcome]:
+    """Run the exchange with the inner runner stubbed; return recorder + outcome."""
+    captured: dict[str, Any] = {}
+
+    def _fake_inner(**kwargs):
+        captured.update(kwargs)
+        return _canned_outcome(kwargs["exchange_run"])
+
+    monkeypatch.setattr(prer, "run_persistent_session_exchange", _fake_inner)
+    outcome = _run(
+        _make_runner(tmp_path),
+        tmp_path,
+        coder_agent=agents["agent:coder"],
+        reviewer_agent=agents["agent:reviewer"],
+    )
+    return captured["execution_identities"], outcome
 
 
 def test_a_reviewer_that_pinned_no_model_is_recorded_not_fatal(
@@ -587,25 +609,45 @@ def test_a_reviewer_that_pinned_no_model_is_recorded_not_fatal(
     assert agents["agent:reviewer"].model == "", (
         "fixture invariant: the loader leaves a non-Claude provider's model blank"
     )
-    captured: dict[str, Any] = {}
 
-    def _fake_inner(**kwargs):
-        captured.update(kwargs)
-        return _canned_outcome(kwargs["exchange_run"])
-
-    monkeypatch.setattr(prer, "run_persistent_session_exchange", _fake_inner)
-
-    outcome = _run(
-        _make_runner(tmp_path),
-        tmp_path,
-        coder_agent=agents["agent:coder"],
-        reviewer_agent=agents["agent:reviewer"],
-    )
+    recorder, outcome = _recorder_for_loaded_agents(monkeypatch, tmp_path, agents)
 
     assert outcome.status == "ok"
-    recorder = captured["execution_identities"]
     assert recorder.reviewer.provider == "codex"
     assert recorder.reviewer.model is None
     assert recorder.actor.model == "opus"
     # Unpinned on one side does not collapse the two identities.
     assert recorder.actor.fingerprint() != recorder.reviewer.fingerprint()
+
+
+def test_an_ai_system_only_reviewer_records_the_model_its_launch_resolves_to(
+    monkeypatch,
+    tmp_path: Path,
+    stub_lifecycle,
+) -> None:
+    """The record must read the derivation the exchange spawns, not the config.
+
+    ``ai_system: codex`` with no ``provider:`` is the shape
+    ``resolve_launch_provider`` exists for — it launched as print-mode claude
+    until that resolution was added. The loader hands it ``provider=None`` and
+    the claude-flavoured ``"sonnet"`` default, and the exchange spawns
+    ``launch_config(agent)``, whose resolved provider is codex and whose model
+    is therefore *not* passed. Reading the raw agent instead would record that
+    codex ran ``sonnet``: a model no process was ever given.
+    """
+    agents = _agents_from_config_loader(
+        tmp_path, reviewer_selection="    ai_system: codex\n"
+    )
+    reviewer = agents["agent:reviewer"]
+    assert (reviewer.provider, reviewer.ai_system, reviewer.model) == (
+        None,
+        "codex",
+        "sonnet",
+    ), "fixture invariant: an ai_system-only agent keeps the claude model default"
+
+    recorder, outcome = _recorder_for_loaded_agents(monkeypatch, tmp_path, agents)
+
+    assert outcome.status == "ok"
+    assert recorder.reviewer.provider == "codex"
+    assert recorder.reviewer.model is None
+    assert recorder.actor.model == "opus"

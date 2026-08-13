@@ -1103,6 +1103,24 @@ class _RoleSessionOwner:
 # ---------------------------------------------------------------------------
 
 
+def launch_config(agent: AgentConfig) -> AgentConfig:
+    """The configured agent as this exchange actually launches it.
+
+    ``resolve_launch_provider`` is what makes an ``ai_system``-only stub launch
+    on the right CLI instead of print-mode claude. Every field whose meaning
+    depends on the provider — the model above all — must therefore be read off
+    *this* shape, not the configured one.
+
+    Shared with the execution-identity record (#34) for the reason
+    :func:`agent_provider` and
+    :meth:`~..domain.models.AgentConfig.resolved_model` are shared: an
+    authority record that reads a pre-derivation config can state something the
+    launcher never passed. Sharing the derivation, rather than re-deriving it,
+    is what keeps "what ran" and "what we recorded" one answer.
+    """
+    return replace(agent, provider=agent.resolve_launch_provider())
+
+
 def _derive_bootstrap_agent(agent: AgentConfig, bootstrap_prompt: str) -> AgentConfig:
     """Derive the launch config for one exchange role from the configured agent.
 
@@ -1112,16 +1130,11 @@ def _derive_bootstrap_agent(agent: AgentConfig, bootstrap_prompt: str) -> AgentC
     is how an opted-in agent launched UNSANDBOXED on the exchange path.
 
     Only two fields are transformed: ``provider`` resolves through
-    ``resolve_launch_provider`` (so an ``ai_system``-only stub launches
-    correctly), and ``initial_prompt`` becomes the role bootstrap. Sharing the
-    ``provider_args`` reference is safe — the command builder copies it before
-    mutating (``AgentConfig._build_provider_command``).
+    :func:`launch_config`, and ``initial_prompt`` becomes the role bootstrap.
+    Sharing the ``provider_args`` reference is safe — the command builder
+    copies it before mutating (``AgentConfig._build_provider_command``).
     """
-    return replace(
-        agent,
-        provider=agent.resolve_launch_provider(),
-        initial_prompt=bootstrap_prompt,
-    )
+    return replace(launch_config(agent), initial_prompt=bootstrap_prompt)
 
 
 def _open_role_session_from_spec(spec: _RoleSessionSpec) -> PersistentSession:
