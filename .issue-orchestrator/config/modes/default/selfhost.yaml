@@ -21,12 +21,13 @@
 #
 # SELF-HOSTING BOUNDARY
 #
-# The trusted pinned runtime at ~/io-runtime-r1/issue-orchestrator (promoted
-# 2026-08-12 at 81c11ae1, the commit that ran the canary) orchestrates this
-# repository as a candidate. The candidate's own (possibly modified) IO source
-# never runs itself. Moving that pin is a separate decision, taken only after a
-# PR passes independent review and the publish gate, and followed by its own
-# canary run. See docs/selfhosting/RUNBOOK.md, "The boundary".
+# A trusted pinned runtime orchestrates this repository as a candidate. The
+# candidate's own (possibly modified) IO source never runs itself. Moving that
+# pin is a separate decision, taken only after a PR passes independent review
+# and the publish gate, and followed by its own canary run.
+#
+# The current pin and the promotion procedure live in issue #18, "The
+# boundary": https://github.com/astro3141/issue-orchestrator/issues/18
 
 repo:
   name: astro3141/issue-orchestrator
