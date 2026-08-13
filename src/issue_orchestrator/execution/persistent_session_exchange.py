@@ -90,6 +90,7 @@ from ..ports.turn_mailbox import TurnMailbox
 from ..domain.review_exchange_run import ReviewExchangeRun, ReviewExchangeRunAssets
 from ..domain.review_exchange_summary import ReviewExchangeReason, ReviewExchangeStatus
 from ..domain.review_verdict_binding import ReviewVerdictOutcome
+from .candidate_execution_identity import CandidateExecutionIdentityRecorder
 from .review_exchange_records import bind_review_verdict, write_exchange_summary
 from .reviewer_worktree import ReviewerCandidatePresentation
 from ..domain.runtime_config import RuntimeConfigReference
@@ -417,6 +418,7 @@ def run_persistent_session_exchange(  # noqa: PLR0913
     turn_mailbox: "TurnMailbox | None" = None,
     response_channels: ReviewExchangeResponseChannels | None = None,
     coder_prompt_addendum: str | None = None,
+    execution_identities: CandidateExecutionIdentityRecorder | None = None,
 ) -> ReviewExchangeOutcome:
     """Run the coder↔reviewer exchange against a registry-owned persistent pair.
 
@@ -430,6 +432,12 @@ def run_persistent_session_exchange(  # noqa: PLR0913
     escalation, orchestrator shutdown) is still the caller's responsibility.
     This function also lets the pair contract release on run-binding changes,
     process/recording contract failure, and exchange exceptions.
+
+    ``execution_identities`` records who executed the reviewed candidate (#34).
+    :class:`~.persistent_review_exchange_runner.PersistentReviewExchangeRunner`
+    requires the underlying store at construction and always supplies a
+    recorder, so ``None`` reaches here only from tests that drive this function
+    directly and do not exercise the binding.
     """
     session_name = exchange_run.session_name
     run_dir = exchange_run.assets.run_dir
@@ -772,9 +780,10 @@ def run_persistent_session_exchange(  # noqa: PLR0913
                 require_validation=require_validation,
                 nit_policy=_coerce_runtime_nit_policy(nit_policy),
                 approval_gate=approval_gate,
-                coder_provider=_agent_provider(coder_agent),
-                reviewer_provider=_agent_provider(reviewer_agent),
+                coder_provider=agent_provider(coder_agent),
+                reviewer_provider=agent_provider(reviewer_agent),
                 reviewer_presentation=reviewer_presentation,
+                execution_identities=execution_identities,
                 emit=_emit,
                 coder_mirror=coder_mirror,
                 reviewer_mirror=reviewer_mirror,
@@ -1261,7 +1270,12 @@ def _build_role_env(
     return build_filtered_env(overrides=overrides)
 
 
-def _agent_provider(agent: AgentConfig) -> AgentProvider:
+def agent_provider(agent: AgentConfig) -> AgentProvider:
+    """The one resolution of which provider actually runs a role.
+
+    Shared with the execution-identity record (#34) so "who executed this"
+    and "which provider the exchange launched" cannot name different things.
+    """
     raw = agent.provider if agent.provider else agent.ai_system
     if not raw:
         raise ArtifactContractViolation(
@@ -1741,6 +1755,7 @@ class _DriveRoundsCommand:
     coder_provider: AgentProvider
     reviewer_provider: AgentProvider
     reviewer_presentation: ReviewerCandidatePresentation
+    execution_identities: CandidateExecutionIdentityRecorder | None
     emit: Callable[[EventName, dict[str, Any]], None]
     coder_mirror: _RoleSliceMirror
     reviewer_mirror: _RoleSliceMirror
@@ -1781,6 +1796,7 @@ def _drive_rounds(command: _DriveRoundsCommand) -> ReviewExchangeOutcome:
     coder_provider = command.coder_provider
     reviewer_provider = command.reviewer_provider
     reviewer_presentation = command.reviewer_presentation
+    execution_identities = command.execution_identities
     emit = command.emit
     coder_mirror = command.coder_mirror
     reviewer_mirror = command.reviewer_mirror
@@ -1971,9 +1987,11 @@ def _drive_rounds(command: _DriveRoundsCommand) -> ReviewExchangeOutcome:
         )
 
         if reviewer.response_type == "ok":
-            return _complete_with_reviewer_ok(
+            return _complete_with_reviewer_decision(
                 run_assets=run_assets,
                 exchange_dir=exchange_dir,
+                status=ReviewExchangeStatus.OK,
+                reason=ReviewExchangeReason.REVIEWER_OK,
                 round_index=round_index,
                 reviewer=reviewer,
                 decision=artifact_pair.decision,
@@ -1984,15 +2002,18 @@ def _drive_rounds(command: _DriveRoundsCommand) -> ReviewExchangeOutcome:
                 session_name=session_name,
                 validation_record_path=validation_record_path,
                 presented_head_sha=presented_head_sha,
+                execution_identities=execution_identities,
             )
         if reviewer.getting_closer is False:
             no_progress_count += 1
         else:
             no_progress_count = 0
         if max_no_progress > 0 and no_progress_count >= max_no_progress:
-            return _stop_for_no_progress(
+            return _complete_with_reviewer_decision(
                 run_assets=run_assets,
                 exchange_dir=exchange_dir,
+                status=ReviewExchangeStatus.STOPPED,
+                reason=ReviewExchangeReason.REVIEWER_REPORTS_NO_PROGRESS,
                 round_index=round_index,
                 reviewer=reviewer,
                 decision=artifact_pair.decision,
@@ -2003,6 +2024,7 @@ def _drive_rounds(command: _DriveRoundsCommand) -> ReviewExchangeOutcome:
                 session_name=session_name,
                 validation_record_path=validation_record_path,
                 presented_head_sha=presented_head_sha,
+                execution_identities=execution_identities,
             )
 
         last_reviewer_text = reviewer.response_text
@@ -2774,10 +2796,12 @@ def _persist_turn_result(
 # ---------------------------------------------------------------------------
 
 
-def _complete_with_reviewer_ok(
+def _complete_with_reviewer_decision(
     *,
     run_assets: ReviewExchangeRunAssets,
     exchange_dir: Path,
+    status: ReviewExchangeStatus,
+    reason: ReviewExchangeReason,
     round_index: int,
     reviewer: ReviewExchangeResponse,
     decision: ReviewDecision,
@@ -2788,11 +2812,20 @@ def _complete_with_reviewer_ok(
     session_name: str,
     validation_record_path: Path,
     presented_head_sha: str | None,
+    execution_identities: CandidateExecutionIdentityRecorder | None,
 ) -> ReviewExchangeOutcome:
+    """Close the exchange at a terminal the reviewer decided.
+
+    The two such terminals — the reviewer's ``ok`` and the no-progress stop —
+    differ only in ``status``/``reason``. They used to be two functions with
+    one body, which is how a durable authority record can end up written at one
+    terminal and not the other; the Foundation records (#15, #34) are bound
+    here so both terminals have one derivation site by construction.
+    """
     summary = write_exchange_summary(
         exchange_dir, round_index,
-        status=ReviewExchangeStatus.OK,
-        reason=ReviewExchangeReason.REVIEWER_OK,
+        status=status,
+        reason=reason,
         reviewer_response=reviewer,
         review_artifacts=review_artifacts,
         validation_record_path=validation_record_path,
@@ -2806,6 +2839,10 @@ def _complete_with_reviewer_ok(
         presented_head_sha=presented_head_sha,
         completed_rounds=round_index,
     )
+    # §4's other half, bound to the same observation and therefore to the same
+    # commit: who executed this candidate, as the orchestrator launched them.
+    if execution_identities is not None:
+        execution_identities.record(presented_head_sha)
     _emit_built_event(emit, make_review_exchange_round_completed_event({
         "issue_number": issue_number,
         "session_name": session_name,
@@ -2822,79 +2859,17 @@ def _complete_with_reviewer_ok(
         "issue_number": issue_number,
         "session_name": session_name,
         "rounds": round_index,
-        "status": ReviewExchangeStatus.OK.value,
-        "reason": ReviewExchangeReason.REVIEWER_OK.value,
+        "status": status.value,
+        "reason": reason.value,
         "review_decision_verdict": decision.verdict,
         "review_nit_policy": decision.nit_policy,
         "review_abstraction_status": decision.abstraction_review.status,
         "artifacts": review_artifacts,
     }))
     return ReviewExchangeOutcome(
-        status=ReviewExchangeStatus.OK,
+        status=status,
         rounds=round_index,
-        reason=ReviewExchangeReason.REVIEWER_OK,
-        run_assets=run_assets,
-        reviewer_response=reviewer,
-        summary=summary,
-    )
-
-
-def _stop_for_no_progress(
-    *,
-    run_assets: ReviewExchangeRunAssets,
-    exchange_dir: Path,
-    round_index: int,
-    reviewer: ReviewExchangeResponse,
-    decision: ReviewDecision,
-    verdict: ReviewVerdictOutcome,
-    review_artifacts: list[dict[str, str]],
-    emit: Callable[[EventName, dict[str, Any]], None],
-    issue_number: int,
-    session_name: str,
-    validation_record_path: Path,
-    presented_head_sha: str | None,
-) -> ReviewExchangeOutcome:
-    summary = write_exchange_summary(
-        exchange_dir, round_index,
-        status=ReviewExchangeStatus.STOPPED,
-        reason=ReviewExchangeReason.REVIEWER_REPORTS_NO_PROGRESS,
-        reviewer_response=reviewer,
-        review_artifacts=review_artifacts,
-        validation_record_path=validation_record_path,
-    )
-    bind_review_verdict(
-        exchange_dir=exchange_dir,
-        verdict=verdict,
-        presented_head_sha=presented_head_sha,
-        completed_rounds=round_index,
-    )
-    _emit_built_event(emit, make_review_exchange_round_completed_event({
-        "issue_number": issue_number,
-        "session_name": session_name,
-        "round_index": round_index,
-        "reviewer_response_type": reviewer.response_type,
-        "reviewer_response_text": reviewer.response_text,
-        "review_decision_verdict": decision.verdict,
-        "review_nit_policy": decision.nit_policy,
-        "review_abstraction_status": decision.abstraction_review.status,
-        "artifacts": review_artifacts,
-        "coder_response_type": None,
-    }))
-    _emit_built_event(emit, make_review_exchange_completed_event({
-        "issue_number": issue_number,
-        "session_name": session_name,
-        "rounds": round_index,
-        "status": ReviewExchangeStatus.STOPPED.value,
-        "reason": ReviewExchangeReason.REVIEWER_REPORTS_NO_PROGRESS.value,
-        "review_decision_verdict": decision.verdict,
-        "review_nit_policy": decision.nit_policy,
-        "review_abstraction_status": decision.abstraction_review.status,
-        "artifacts": review_artifacts,
-    }))
-    return ReviewExchangeOutcome(
-        status=ReviewExchangeStatus.STOPPED,
-        rounds=round_index,
-        reason=ReviewExchangeReason.REVIEWER_REPORTS_NO_PROGRESS,
+        reason=reason,
         run_assets=run_assets,
         reviewer_response=reviewer,
         summary=summary,

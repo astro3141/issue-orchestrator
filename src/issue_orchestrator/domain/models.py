@@ -11,7 +11,7 @@ from typing import Any, Iterable, Literal, Optional, TYPE_CHECKING, TypeAlias
 from unittest.mock import Mock
 
 from .dependency_gates import DependencyGateSnapshot
-from .issue_key import IssueKey, GitHubIssueKey, parse_external_id
+from .issue_key import IssueKey, github_issue_key
 from .session_key import SessionKey, TaskKind  # re-exported for callers
 from .sandbox_scope import (
     SandboxScope,
@@ -761,9 +761,7 @@ class Issue:
         Uses external ID from title prefix (e.g., [M1-011]) if present,
         otherwise falls back to the issue number as a string.
         """
-        parsed = parse_external_id(self.title)
-        external_id = parsed.external_id or str(self.number)
-        return GitHubIssueKey(repo=self.repo, external_id=external_id)
+        return github_issue_key(repo=self.repo, number=self.number, title=self.title)
 
     @property
     def agent_type(self) -> Optional[str]:
@@ -967,7 +965,7 @@ class AgentConfig:
         (``claude-code``, ``codex``).
 
         Exists because session CLASSIFICATION (``provider or ai_system``,
-        see ``persistent_session_exchange._agent_provider``) and command
+        see ``persistent_session_exchange.agent_provider``) and command
         BUILDING (``provider`` only, else the legacy ``claude -p`` template)
         resolved differently: an ``ai_system="codex"`` reviewer with no
         ``provider`` was classified as codex but silently launched as

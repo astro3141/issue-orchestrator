@@ -3,6 +3,14 @@
 An ``Attempt`` is the cache boundary named in issue #6130: all facts here are
 about a specific issue at a specific HEAD SHA. Per-run artifacts remain on the
 session run manifest; cross-run cache facts belong here.
+
+Because its key is exactly ``(issue, commit)``, it is also where Foundation
+admission evidence about one candidate lives (#34). ``validation_record_path``
+already points at §4's validation half; ``execution_identities`` carries the
+actor/reviewer half. Both are about the same ``(issue, A)``, and an attempt
+refuses to hold identities naming a different commit than the key it is filed
+under — so the exact-``A`` binding is the storage key itself, not a field that
+could disagree with it.
 """
 
 from __future__ import annotations
@@ -10,6 +18,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import re
 
+from .execution_identity import CandidateExecutionIdentities
 from .issue_key import GitHubIssueKey, IssueKey, StableIssueId
 
 _FULL_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
@@ -64,10 +73,20 @@ class Attempt:
     validation_record_path: str | None = None
     review_exchange_summary_path: str | None = None
     review_exchange_job_id: str | None = None
+    execution_identities: CandidateExecutionIdentities | None = None
 
     def __post_init__(self) -> None:
         if self.reroute_budget_used < 0:
             raise ValueError("Attempt.reroute_budget_used must be >= 0")
+        if (
+            self.execution_identities is not None
+            and not self.execution_identities.covers(self.key.head_sha)
+        ):
+            raise ValueError(
+                "Attempt.execution_identities must name the attempt's own "
+                f"commit: key={self.key.head_sha} "
+                f"identities={self.execution_identities.candidate_sha}"
+            )
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -80,6 +99,11 @@ class Attempt:
             "validation_record_path": self.validation_record_path,
             "review_exchange_summary_path": self.review_exchange_summary_path,
             "review_exchange_job_id": self.review_exchange_job_id,
+            "execution_identities": (
+                self.execution_identities.to_payload()
+                if self.execution_identities is not None
+                else None
+            ),
         }
 
     @classmethod
@@ -114,6 +138,9 @@ class Attempt:
                 data.get("review_exchange_summary_path")
             ),
             review_exchange_job_id=_optional_str(data.get("review_exchange_job_id")),
+            execution_identities=_optional_execution_identities(
+                data.get("execution_identities")
+            ),
         )
 
 
@@ -145,6 +172,24 @@ def _issue_key_from_dict(
 def _validate_schema_version(value: object) -> None:
     if isinstance(value, bool) or value != _SCHEMA_VERSION:
         raise ValueError(f"Attempt sidecar schema_version must be {_SCHEMA_VERSION}")
+
+
+def _optional_execution_identities(
+    value: object,
+) -> CandidateExecutionIdentities | None:
+    """Parse the admission-evidence half, or ``None`` when none was recorded.
+
+    A malformed record raises rather than reading as absent. Absent means "no
+    exchange has bound identities to this commit yet"; unparseable means the
+    durable evidence is damaged, and a gate must not mistake the second for the
+    first — that is the difference between "not yet reviewed" and "the record
+    of who reviewed it is corrupt".
+    """
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ValueError("Attempt sidecar execution_identities must be an object")
+    return CandidateExecutionIdentities.from_payload(value)
 
 
 def _optional_str(value: object) -> str | None:

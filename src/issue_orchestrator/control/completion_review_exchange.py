@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any, Literal
 
 from ..domain.models import CompletionRecord, RequestedAction
 from ..domain.completion_finalization import ReviewExchangeRunningQuery
+from ..domain.issue_key import github_issue_key
 from ..domain.review_exchange_run import ReviewExchangeRun, ReviewExchangeRunAssets
 from ..domain.review_exchange_resume import ResumeDecision
 from ..domain.review_artifacts import review_artifacts_from_exchange_result
@@ -1319,6 +1320,18 @@ class CompletionReviewExchange:
         return self._review_exchange_runner.run(
             exchange_run=exchange_run,
             coder_worktree=worktree,
+            # Derived here, from the one owner of the rule, so this exchange's
+            # durable records land under the same key every other attempt-scoped
+            # record for this issue uses (#34). An unresolved repo scopes to
+            # ``""`` rather than raising — that is what ``Issue.repo`` already
+            # defaults to, so the key still matches what every other derivation
+            # of it produces, and a deployment that never resolved a repo keeps
+            # behaving exactly as it did.
+            issue_key=github_issue_key(
+                repo=self._config.repo or "",
+                number=issue_number,
+                title=issue_title,
+            ),
             issue_number=issue_number,
             issue_title=issue_title,
             coder_label=coder_label,

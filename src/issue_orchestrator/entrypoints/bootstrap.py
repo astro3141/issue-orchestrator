@@ -125,10 +125,10 @@ from ..ports.run_ledger_store import SingleInstanceRunLedgerStore
 from ..domain.lease_config import LeaseConfig
 
 if TYPE_CHECKING:
+    from ..ports.attempt_store import AttemptStore
     from ..ports.label_set import LabelSet
     from ..control.label_manager import LabelManager
     from ..infra.orchestrator import Orchestrator
-    from ..ports.attempt_store import AttemptStore
     from ..control.pr_scanner import PRScanner
     from ..control.session_restorer import SessionRestorer
     from ..control.completion_processor import CompletionProcessor
@@ -137,7 +137,6 @@ if TYPE_CHECKING:
     from ..adapters.github.fresh_issue_reader import GitHubFreshIssueReader
     from ..ports.fresh_issue_reader import FreshIssueReader
     from ..ports.e2e_issue_tracker import E2EIssueTracker
-    from ..ports.attempt_store import AttemptStore
     from ..ports.tech_lead_authority import TechLeadAuthorityStore
 
 logger = logging.getLogger(__name__)
@@ -344,7 +343,12 @@ def _create_io_adapters(github_auth: GitHubAuth | None = None) -> tuple[
 
 
 def create_attempt_store(config: Config) -> "AttemptStore":
-    """Create the attempt store for this repository."""
+    """Create the attempt store for this repository.
+
+    Rooted at the primary checkout, never an issue worktree: attempt records
+    carry Foundation admission evidence (#34), read after the producing
+    sessions and their worktrees are gone.
+    """
     from ..adapters.sidecar_attempt_store import SidecarAttemptStore
 
     return SidecarAttemptStore(config.repo_root)
@@ -1060,6 +1064,7 @@ def build_orchestrator_for_testing(
     from ..control.completion_processor import CompletionProcessor
     from ..control.pre_publish_gate import PrePublishGate
     from ..control.publication_gate import build_publication_gate
+    from ..execution.attempt_execution_identity_store import AttemptExecutionIdentityStore
     from ..execution.persistent_review_exchange_runner import (
         PersistentReviewExchangeRunner,
     )
@@ -1114,6 +1119,7 @@ def build_orchestrator_for_testing(
         review_exchange_runner=PersistentReviewExchangeRunner(
             session_output,
             pair_registry_for_testing,
+            AttemptExecutionIdentityStore(attempt_store),
             turn_mailbox=turn_mailbox,
             coder_prompt_addendum=coder_prompt_addendum,
         ),

@@ -35,7 +35,12 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from issue_orchestrator.adapters.sidecar_attempt_store import SidecarAttemptStore
+from issue_orchestrator.domain.issue_key import GitHubIssueKey
 from issue_orchestrator.domain.models import AgentConfig
+from issue_orchestrator.execution.attempt_execution_identity_store import (
+    AttemptExecutionIdentityStore,
+)
 from issue_orchestrator.domain.review_exchange import ReviewExchangeOutcome
 from issue_orchestrator.domain.review_exchange_run import (
     ReviewExchangeRun,
@@ -158,6 +163,7 @@ def _run(
     return runner.run(
         exchange_run=exchange_run,
         coder_worktree=tmp_path / "coder",
+        issue_key=GitHubIssueKey(repo="acme/repo", external_id="42"),
         issue_number=42,
         issue_title="t",
         coder_label="agent:coder",
@@ -171,10 +177,16 @@ def _run(
     )
 
 
+def _identity_store(tmp_path: Path) -> AttemptExecutionIdentityStore:
+    """The real durable store, rooted outside any worktree the test creates."""
+    return AttemptExecutionIdentityStore(SidecarAttemptStore(tmp_path / "repo-root"))
+
+
 def _make_runner(tmp_path: Path) -> "prer.PersistentReviewExchangeRunner":
     return prer.PersistentReviewExchangeRunner(
         MagicMock(name="session_output"),
         MagicMock(name="pair_registry"),
+        _identity_store(tmp_path),
     )
 
 
@@ -251,6 +263,7 @@ def test_run_passes_per_agent_response_channels(
     runner = prer.PersistentReviewExchangeRunner(
         MagicMock(name="session_output"),
         MagicMock(name="pair_registry"),
+        _identity_store(tmp_path),
         turn_mailbox=MagicMock(name="turn_mailbox"),
     )
     reviewer = _make_agent(
@@ -341,6 +354,7 @@ def test_run_resolves_coder_addendum_for_coder_worktree_only(
     runner = prer.PersistentReviewExchangeRunner(
         MagicMock(name="session_output"),
         MagicMock(name="pair_registry"),
+        _identity_store(tmp_path),
         coder_prompt_addendum=provider,
     )
 
@@ -477,3 +491,43 @@ def test_run_propagates_inner_exceptions_without_releasing_pair(
     # pair's death.
     assert not runner._pair_registry.release.called  # noqa: SLF001
     assert not runner._pair_registry.shutdown_all.called  # noqa: SLF001
+
+
+def test_run_hands_the_inner_runner_orchestrator_observed_identities(
+    monkeypatch,
+    tmp_path: Path,
+    stub_lifecycle,
+) -> None:
+    """The recorder carries the resolved provider/model, not a repr of them.
+
+    Every field comes from the launcher's own configuration: the label it
+    routed each role by, the provider ``agent_provider`` resolved (falling back
+    to ``ai_system`` when no explicit provider is set, exactly as the spawn
+    does), and the model it asked for. This is the seam #34's admission
+    evidence is built from, so it is asserted on values a later gate can
+    compare — a stringified value object would compare unequal to every real
+    provider name.
+    """
+    captured: dict[str, Any] = {}
+
+    def _fake_inner(**kwargs):
+        captured.update(kwargs)
+        return _canned_outcome(kwargs["exchange_run"])
+
+    monkeypatch.setattr(prer, "run_persistent_session_exchange", _fake_inner)
+    runner = _make_runner(tmp_path)
+
+    _run(
+        runner,
+        tmp_path,
+        reviewer_agent=_make_agent(tmp_path, provider="codex", ai_system="codex"),
+    )
+
+    recorder = captured["execution_identities"]
+    assert recorder.issue_key == GitHubIssueKey(repo="acme/repo", external_id="42")
+    assert recorder.actor.agent_label == "agent:coder"
+    # No explicit provider on the coder: resolved from ai_system, as the spawn does.
+    assert recorder.actor.provider == "claude-code"
+    assert recorder.actor.model == "sonnet"
+    assert recorder.reviewer.agent_label == "agent:reviewer"
+    assert recorder.reviewer.provider == "codex"

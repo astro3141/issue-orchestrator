@@ -19,12 +19,16 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from pathlib import Path
 
+from ..domain.execution_identity import AgentExecutionIdentity, ExecutionRole
+from ..domain.issue_key import IssueKey
 from ..domain.models import AgentConfig
 from ..domain.review_exchange import ReviewExchangeOutcome
 from ..domain.review_exchange_run import ReviewExchangeRun
 from ..domain.runtime_config import RuntimeConfigReference
 from ..events import EventContext
 from ..ports.event_sink import EventSink
+from ..ports.execution_identity_store import CandidateExecutionIdentityStore
+from .candidate_execution_identity import CandidateExecutionIdentityRecorder
 from ..ports.review_exchange_approval_gate import ReviewExchangeApprovalGate
 from ..ports.coder_prompt import (
     CoderPromptAddendumProvider,
@@ -37,6 +41,7 @@ from .persistent_exchange_pair_registry_inmemory import (
 )
 from ..ports.session_output import SessionOutput
 from .persistent_session_exchange import (
+    agent_provider,
     review_exchange_supervisor_timeout_seconds,
     run_persistent_session_exchange,
 )
@@ -102,14 +107,54 @@ class PersistentReviewExchangeRunner:
         self,
         session_output: SessionOutput,
         pair_registry: InMemoryPersistentExchangePairRegistry,
+        execution_identity_store: CandidateExecutionIdentityStore,
         *,
         turn_mailbox: "TurnMailbox | None" = None,
         coder_prompt_addendum: CoderPromptAddendumProvider = NO_CODER_PROMPT_ADDENDUM,
     ) -> None:
         self._session_output = session_output
         self._pair_registry = pair_registry
+        # Required, not optional: this runner is the only place the
+        # orchestrator observes both execution identities and the candidate
+        # they ran against, so a deployment that forgot to wire the store
+        # would produce a review no Foundation gate could ever admit — and it
+        # would do so silently. Fail at construction instead (#34).
+        self._execution_identity_store = execution_identity_store
         self._turn_mailbox = turn_mailbox
         self._coder_prompt_addendum = coder_prompt_addendum
+
+    def _execution_identity_recorder(
+        self,
+        *,
+        issue_key: IssueKey,
+        coder_label: str,
+        coder_agent: AgentConfig,
+        reviewer_label: str,
+        reviewer_agent: AgentConfig,
+    ) -> CandidateExecutionIdentityRecorder:
+        """Both roles' identities as the orchestrator configured them.
+
+        Every field is the launcher's own: the label it routed the role by, the
+        provider it resolved to run it (the same :func:`agent_provider` call
+        the exchange uses to spawn the process), and the model it asked for.
+        Nothing here can be reached by an agent's output.
+        """
+        return CandidateExecutionIdentityRecorder(
+            store=self._execution_identity_store,
+            issue_key=issue_key,
+            actor=AgentExecutionIdentity(
+                role=ExecutionRole.ACTOR,
+                agent_label=coder_label,
+                provider=agent_provider(coder_agent).value,
+                model=coder_agent.model,
+            ),
+            reviewer=AgentExecutionIdentity(
+                role=ExecutionRole.REVIEWER,
+                agent_label=reviewer_label,
+                provider=agent_provider(reviewer_agent).value,
+                model=reviewer_agent.model,
+            ),
+        )
 
     def job_timeout_seconds(
         self,
@@ -133,6 +178,7 @@ class PersistentReviewExchangeRunner:
         *,
         exchange_run: ReviewExchangeRun,
         coder_worktree: Path,
+        issue_key: IssueKey,
         issue_number: int,
         issue_title: str,
         coder_label: str,
@@ -209,4 +255,11 @@ class PersistentReviewExchangeRunner:
             turn_mailbox=self._turn_mailbox,
             response_channels=response_channels,
             coder_prompt_addendum=prepared_coder_prompt.addendum,
+            execution_identities=self._execution_identity_recorder(
+                issue_key=issue_key,
+                coder_label=coder_label,
+                coder_agent=coder_agent,
+                reviewer_label=reviewer_label,
+                reviewer_agent=reviewer_agent,
+            ),
         )

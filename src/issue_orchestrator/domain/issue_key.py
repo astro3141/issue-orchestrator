@@ -191,3 +191,16 @@ def parse_external_id(title: str) -> ParsedTitle:
     external_id = match.group(1)
     raw_title = title[match.end():].strip()
     return ParsedTitle(external_id=external_id, raw_title=raw_title)
+
+
+def github_issue_key(*, repo: str, number: int, title: str) -> GitHubIssueKey:
+    """The one derivation of a GitHub issue's stable key.
+
+    ``Issue.key`` delegates here, and so does any caller that holds only the
+    repo/number/title triple rather than an ``Issue`` — attempt-scoped records
+    are filed under this key, so a second spelling of the rule would file the
+    same commit's evidence under two different keys and neither writer would
+    notice.
+    """
+    parsed = parse_external_id(title)
+    return GitHubIssueKey(repo=repo, external_id=parsed.external_id or str(number))

@@ -175,6 +175,7 @@ def _stub_persistent_review_exchange_setup(monkeypatch, request):
         *,
         exchange_run,
         coder_worktree,
+        issue_key,  # noqa: ARG001
         issue_number,
         issue_title,  # noqa: ARG001
         coder_label,  # noqa: ARG001

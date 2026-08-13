@@ -139,6 +139,52 @@ presented commit, it records **no** binding rather than guessing — an
 unbound verdict is one no later gate can admit, and an unusable observation
 never changes the outcome of the review it describes.
 
+### Candidate execution identities — who ran, bound to what they ran against
+
+`review-verdict.json` answers "was this commit approved". Foundation admission
+(`docs/foundation/VALIDATED_WORK_DISPOSITION.md` §4, I2c) also requires that
+**the reviewer identity is distinct from the actor's**, so the orchestrator
+records the other half at the same moment: both roles' execution identities,
+bound to the same presented commit.
+
+```json
+{
+  "schema_version": 1,
+  "candidate_sha": "<40-hex commit>",
+  "actor":    {"role": "actor",    "agent_label": "agent:backend",  "provider": "claude-code", "model": "opus"},
+  "reviewer": {"role": "reviewer", "agent_label": "agent:reviewer", "provider": "codex",       "model": "gpt-5"},
+  "observed_at": "2026-08-14T00:00:00+00:00"
+}
+```
+
+- **Orchestrator-observed.** Every field is the launcher's own: the label it
+  routed the role by, the provider it resolved to run it (the same
+  `agent_provider` call that spawns the process), and the model it asked for.
+  An agent cannot assert its own identity, and a claim carried in
+  agent-authored output is not evidence.
+- **Bound to the exact candidate.** `candidate_sha` is the commit the
+  orchestrator checked out for the reviewer — the same observation
+  `reviewed_sha` comes from, so the two records cannot describe different
+  commits. A session-start HEAD is deliberately not accepted: it is what the
+  worktree held before the actor committed anything.
+- **Durable past the worktree.** Unlike the exchange directory, this record
+  lives on the attempt record keyed by `(issue, commit)`, under
+  `<repo_root>/.issue-orchestrator/attempts` — the primary checkout. Admission
+  reads it after the sessions that produced it and their worktrees are gone.
+  The same record already holds `validation_record_path`, so one record answers
+  §4 for one candidate.
+- **Distinctness is falsifiable.** The comparison excludes `role` on purpose:
+  including it would make every pair distinct by construction. Configure the
+  actor as the same agent label, provider and model as the reviewer and
+  `satisfies_reviewer_distinctness` goes false.
+
+Both reviewer-decided terminals record it, for the same reason both bind a
+verdict — who executed the candidate is true whatever the verdict was. An
+unobservable presented commit records nothing rather than guessing, and never
+changes the outcome of the review it describes.
+
+This is evidence only. Nothing here holds, approves or publishes anything.
+
 Nits are classified in the same reviewer pass as blockers. They do not get a separate review pass. When `review.nits.default_policy` or a per-agent override is `address`, an approved review with only nits is converted into normal coder rework before PR creation. `surface` records and shows nits without blocking PR creation. `ignore` keeps them only in the persisted artifacts.
 
 ### via-mcp

@@ -857,6 +857,10 @@ class TestReviewExchangeExecution:
         from issue_orchestrator.execution.persistent_review_exchange_runner import (
             PersistentReviewExchangeRunner,
         )
+        from issue_orchestrator.execution.attempt_execution_identity_store import (
+            AttemptExecutionIdentityStore,
+        )
+        from issue_orchestrator.entrypoints.bootstrap import create_attempt_store
 
         session_output = FileSystemSessionOutput()
         return CompletionProcessor(
@@ -868,6 +872,7 @@ class TestReviewExchangeExecution:
             review_exchange_runner=PersistentReviewExchangeRunner(
                 session_output,
                 InMemoryPersistentExchangePairRegistry(),
+                AttemptExecutionIdentityStore(create_attempt_store(config)),
             ),
             event_bus=EventBus(),
             label_config={},
