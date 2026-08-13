@@ -2,7 +2,7 @@
 
 import sys
 from pathlib import Path
-from collections.abc import Iterable, MutableMapping
+from collections.abc import Iterable, Mapping, MutableMapping
 from typing import Any, Optional, cast
 
 import yaml
@@ -560,6 +560,59 @@ def _collect_stage2_tech_lead(
     prompter.print(f"  ✓ Label flow: {code_reviewed_label} → {reviewed_label}")
 
 
+def _collect_internal_reviewer(
+    prompter: Prompter,
+    config: MutableMapping[str, Any],
+) -> None:
+    """Collect the optional fast reviewer loop owned by each coder turn."""
+    review = cast(dict[str, Any], config.setdefault("review", {"enabled": False}))
+    existing_internal = review.get("internal", {}) or {}
+    if not isinstance(existing_internal, Mapping):
+        raise ValueError("review.internal must be a mapping")
+    existing_enabled = existing_internal.get("enabled") is True
+    existing_max_rounds = existing_internal.get("max_rounds", 5)
+    if not isinstance(existing_max_rounds, int):
+        existing_max_rounds = 5
+    existing_instructions = existing_internal.get(
+        "instructions",
+        ".io/internal-review.md",
+    )
+    if not isinstance(existing_instructions, str) or not existing_instructions.strip():
+        existing_instructions = ".io/internal-review.md"
+
+    prompter.print("")
+    enabled = prompter.yes_no(
+        "Enable coder-owned internal reviewer loop?",
+        default=existing_enabled,
+    )
+    if not enabled:
+        review["internal"] = {
+            "enabled": False,
+            "max_rounds": existing_max_rounds,
+            "instructions": existing_instructions.strip(),
+        }
+        return
+    max_rounds = _prompt_int(
+        prompter,
+        "  Maximum internal review rounds",
+        existing_max_rounds,
+        min_value=1,
+        max_value=50,
+    )
+    instructions = prompter.input(
+        "  Internal reviewer instructions file",
+        existing_instructions.strip(),
+    ).strip()
+    review["internal"] = {
+        "enabled": True,
+        "max_rounds": max_rounds,
+        "instructions": instructions,
+    }
+    prompter.print(
+        "  ✓ Each coder must earn internal approval before successful completion"
+    )
+
+
 def wizard_new_project(prompter: Prompter) -> dict[str, Any]:  # noqa: C901, PLR0912 - interactive wizard with branches for each config option
     """Walk through new project setup."""
     config: dict[str, Any] = {"agents": {}}
@@ -837,6 +890,7 @@ def wizard_new_project(prompter: Prompter) -> dict[str, Any]:  # noqa: C901, PLR
                 prompter, config, code_reviewed_label, config["agents"]
             )
 
+    _collect_internal_reviewer(prompter, config)
     return config
 
 
@@ -1169,7 +1223,29 @@ def wizard_existing_project(  # noqa: C901, PLR0912 - interactive wizard with br
                 prompter, config, code_reviewed_label, config["agents"]
             )
 
+    _collect_internal_reviewer(prompter, config)
     return config, updating_existing_path
+
+
+def default_cleanup_config(config: dict) -> dict:
+    """Build safe automatic cleanup defaults for a newly generated config."""
+    review_cfg = config.get("review", {})
+    has_tech_lead = review_cfg.get("tech_lead_review_agent")
+    has_code_review = review_cfg.get("enabled") or review_cfg.get("default")
+    if has_tech_lead:
+        return {
+            "with_tech_lead": {
+                "close_ai_session_tabs": True,
+                "remove_worktrees": True,
+            }
+        }
+    return {
+        "without_tech_lead": {
+            "wait_for_code_review": bool(has_code_review),
+            "close_ai_session_tabs": True,
+            "remove_worktrees": True,
+        }
+    }
 
 
 def run_wizard(  # noqa: C901, PLR0912 - main wizard entry point with prerequisite checks, mode selection, and confirmation flow
@@ -1287,37 +1363,7 @@ def run_wizard(  # noqa: C901, PLR0912 - main wizard entry point with prerequisi
 
     # Add cleanup config with defaults (don't prompt - users can edit later)
     if "cleanup" not in config:
-        review_cfg = config.get("review", {})
-        has_tech_lead = review_cfg.get("tech_lead_review_agent")
-        has_code_review = review_cfg.get("enabled") or review_cfg.get("default")
-
-        # Include section based on their review workflow
-        if has_tech_lead:
-            # Tech Lead workflow - cleanup happens after tech_lead review
-            config["cleanup"] = {
-                "with_tech_lead": {
-                    "close_ai_session_tabs": True,
-                    "remove_worktrees": False,
-                }
-            }
-        elif has_code_review:
-            # Code review only - cleanup after code review
-            config["cleanup"] = {
-                "without_tech_lead": {
-                    "wait_for_code_review": True,
-                    "close_ai_session_tabs": True,
-                    "remove_worktrees": False,
-                }
-            }
-        else:
-            # No review workflow - cleanup on completion
-            config["cleanup"] = {
-                "without_tech_lead": {
-                    "wait_for_code_review": False,
-                    "close_ai_session_tabs": True,
-                    "remove_worktrees": False,
-                }
-            }
+        config["cleanup"] = default_cleanup_config(config)
 
     # Review config
     prompter.print("\n" + "=" * 50)
@@ -1329,9 +1375,7 @@ def run_wizard(  # noqa: C901, PLR0912 - main wizard entry point with prerequisi
     # Use absolute paths to avoid issues with cwd
     from ...infra.config import CONFIG_DIR, DEFAULT_CONFIG_NAME
 
-    default_config_path = (
-        f"{CONFIG_DIR}/{DEFAULT_CONFIG_NAME}"  # .issue-orchestrator/config/default.yaml
-    )
+    default_config_path = f"{CONFIG_DIR}/modes/default/{DEFAULT_CONFIG_NAME}"
 
     if existing_config_path:
         output_path = (
