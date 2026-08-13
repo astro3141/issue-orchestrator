@@ -16,12 +16,11 @@ could disagree with it.
 from __future__ import annotations
 
 from dataclasses import dataclass
-import re
 
+from .commit_sha import normalize_commit_sha
 from .execution_identity import CandidateExecutionIdentities
 from .issue_key import GitHubIssueKey, IssueKey, StableIssueId
 
-_FULL_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 _SCHEMA_VERSION = 1
 
 
@@ -50,10 +49,14 @@ class AttemptKey:
     head_sha: str
 
     def __post_init__(self) -> None:
-        normalized = self.head_sha.strip().lower()
-        if not _FULL_SHA_RE.fullmatch(normalized):
-            raise ValueError("AttemptKey.head_sha must be a full 40-character hex SHA")
-        object.__setattr__(self, "head_sha", normalized)
+        # The same rule the authority records use: this key *is* the binding
+        # between one candidate and the evidence filed under it, so it must
+        # decide "same commit" the way the records it holds do.
+        object.__setattr__(
+            self,
+            "head_sha",
+            normalize_commit_sha(self.head_sha, field_name="AttemptKey.head_sha"),
+        )
 
     @property
     def issue_stable_id(self) -> str:

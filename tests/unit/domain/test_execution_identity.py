@@ -20,8 +20,8 @@ SHA_A = "a" * 40
 SHA_B = "b" * 40
 
 
-def _actor(**overrides: str) -> AgentExecutionIdentity:
-    fields = {
+def _actor(**overrides: str | None) -> AgentExecutionIdentity:
+    fields: dict[str, str | None] = {
         "agent_label": "agent:backend",
         "provider": "claude-code",
         "model": "opus",
@@ -30,8 +30,8 @@ def _actor(**overrides: str) -> AgentExecutionIdentity:
     return AgentExecutionIdentity(role=ExecutionRole.ACTOR, **fields)
 
 
-def _reviewer(**overrides: str) -> AgentExecutionIdentity:
-    fields = {
+def _reviewer(**overrides: str | None) -> AgentExecutionIdentity:
+    fields: dict[str, str | None] = {
         "agent_label": "agent:reviewer",
         "provider": "codex",
         "model": "gpt-5",
@@ -87,10 +87,29 @@ class TestDistinctness:
         ids=["label", "provider", "model"],
     )
     def test_any_single_matching_field_is_not_enough_to_collapse_them(
-        self, differing: dict[str, str]
+        self, differing: dict[str, str | None]
     ) -> None:
         """One shared field does not make two executions one execution."""
         assert _identities(actor=_actor(**differing)).roles_are_distinct() is True
+
+    def test_unpinned_models_keep_the_check_falsifiable_both_ways(self) -> None:
+        """Two roles that both let their CLI choose are still comparable.
+
+        Recording "no model pinned" must not weaken I2c into "everyone on a
+        provider-default model is the same execution", nor into "nobody is":
+        the label and provider still decide, and the collapse still collapses.
+        """
+        distinct = _identities(
+            actor=_actor(provider="codex", model=None),
+            reviewer=_reviewer(model=None),
+        )
+        collapsed = _identities(
+            actor=_actor(agent_label="agent:reviewer", provider="codex", model=None),
+            reviewer=_reviewer(model=None),
+        )
+
+        assert distinct.roles_are_distinct() is True
+        assert collapsed.roles_are_distinct() is False
 
     def test_evidence_about_another_commit_never_satisfies_i2c(self) -> None:
         """Distinct identities bound to a different candidate answer False.
@@ -122,10 +141,24 @@ class TestRecordInvariants:
                 observed_at="2026-08-14T00:00:00+00:00",
             )
 
-    @pytest.mark.parametrize("field_name", ["agent_label", "provider", "model"])
+    @pytest.mark.parametrize("field_name", ["agent_label", "provider"])
     def test_an_identity_field_may_not_be_blank(self, field_name: str) -> None:
         with pytest.raises(ValueError, match=field_name):
             _actor(**{field_name: "   "})
+
+    @pytest.mark.parametrize("unpinned", [None, "", "   "], ids=["none", "empty", "blank"])
+    def test_an_agent_that_pinned_no_model_records_the_absence(
+        self, unpinned: str | None
+    ) -> None:
+        """A supported configuration must be recordable, not fatal.
+
+        An agent with an explicit non-Claude provider and no ``model:`` runs on
+        whatever its CLI defaults to; the config loader spells that as a blank
+        model and the launcher passes no model at all. The record states what
+        the orchestrator did — it pinned none — instead of refusing to describe
+        a run that really happens.
+        """
+        assert _actor(model=unpinned).model is None
 
     def test_observed_at_is_required(self) -> None:
         with pytest.raises(ValueError, match="observed_at"):
@@ -162,6 +195,35 @@ class TestPayloadRoundTrip:
         reloaded = CandidateExecutionIdentities.from_payload(payload)
 
         assert reloaded.satisfies_reviewer_distinctness(SHA_A) is False
+
+    def test_an_unpinned_model_round_trips_as_an_explicit_absence(self) -> None:
+        """Stored as ``null``, reloaded as ``None`` — a stated fact either way."""
+        original = _identities(reviewer=_reviewer(model=None))
+
+        payload = original.to_payload()
+        reviewer_payload = payload["reviewer"]
+        assert isinstance(reviewer_payload, dict)
+        assert reviewer_payload["model"] is None
+
+        reloaded = CandidateExecutionIdentities.from_payload(payload)
+
+        assert reloaded == original
+        assert reloaded.reviewer.model is None
+
+    def test_a_record_that_never_stated_a_model_does_not_parse(self) -> None:
+        """Absent is not the same claim as "no model pinned".
+
+        A payload whose ``model`` key is missing was written by something that
+        never made the statement; reading it as an explicit absence would let a
+        gate compare executions on a field nobody recorded.
+        """
+        payload = _identities().to_payload()
+        actor_payload = payload["actor"]
+        assert isinstance(actor_payload, dict)
+        del actor_payload["model"]
+
+        with pytest.raises(ValueError, match="requires a model"):
+            CandidateExecutionIdentities.from_payload(payload)
 
     @pytest.mark.parametrize("missing", ["actor", "reviewer", "candidate_sha"])
     def test_a_payload_missing_any_half_does_not_parse(self, missing: str) -> None:

@@ -38,6 +38,7 @@ import pytest
 from issue_orchestrator.adapters.sidecar_attempt_store import SidecarAttemptStore
 from issue_orchestrator.domain.issue_key import GitHubIssueKey
 from issue_orchestrator.domain.models import AgentConfig
+from issue_orchestrator.infra.config import Config
 from issue_orchestrator.execution.attempt_execution_identity_store import (
     AttemptExecutionIdentityStore,
 )
@@ -531,3 +532,80 @@ def test_run_hands_the_inner_runner_orchestrator_observed_identities(
     assert recorder.actor.model == "sonnet"
     assert recorder.reviewer.agent_label == "agent:reviewer"
     assert recorder.reviewer.provider == "codex"
+    # The untouched "sonnet" default is claude vocabulary the spawn does not
+    # forward to codex, so the record must not claim codex ran it.
+    assert recorder.reviewer.model is None
+
+
+def _agents_from_config_loader(tmp_path: Path) -> dict[str, AgentConfig]:
+    """Agents as the real config loader builds them, not as a test builds them.
+
+    The dataclass default for ``model`` is claude's ``"sonnet"``, so an
+    ``AgentConfig`` constructed directly never reaches the state the loader
+    writes for an explicit non-Claude provider with no ``model:``: a blank
+    model, meaning "let that CLI choose". That is a supported and documented
+    configuration, so the seam has to be exercised from the side that produces
+    it.
+    """
+    repo_root = tmp_path / "loaded-repo"
+    prompts = repo_root / ".prompts"
+    prompts.mkdir(parents=True)
+    (prompts / "backend.md").write_text("code", encoding="utf-8")
+    (prompts / "code-review.md").write_text("review", encoding="utf-8")
+    config_path = repo_root / ".issue-orchestrator" / "config" / "default.yaml"
+    config_path.parent.mkdir(parents=True)
+    config_path.write_text(
+        "repo:\n"
+        "  name: owner/repo\n"
+        "agents:\n"
+        "  agent:coder:\n"
+        "    prompt: .prompts/backend.md\n"
+        "    provider: claude-code\n"
+        "    model: opus\n"
+        "  agent:reviewer:\n"
+        "    prompt: .prompts/code-review.md\n"
+        "    provider: codex\n",
+        encoding="utf-8",
+    )
+    return Config.load(config_path).agents
+
+
+def test_a_reviewer_that_pinned_no_model_is_recorded_not_fatal(
+    monkeypatch,
+    tmp_path: Path,
+    stub_lifecycle,
+) -> None:
+    """A codex reviewer without ``model:`` must review, and be recorded truly.
+
+    The identity record only *describes* the run, so it may never be the thing
+    that prevents one: a blank model reaching the recorder used to raise before
+    the exchange started, killing every review in that deployment. What the
+    orchestrator observed is that it pinned no model and let the codex CLI
+    choose, and that is what the record now states.
+    """
+    agents = _agents_from_config_loader(tmp_path)
+    assert agents["agent:reviewer"].model == "", (
+        "fixture invariant: the loader leaves a non-Claude provider's model blank"
+    )
+    captured: dict[str, Any] = {}
+
+    def _fake_inner(**kwargs):
+        captured.update(kwargs)
+        return _canned_outcome(kwargs["exchange_run"])
+
+    monkeypatch.setattr(prer, "run_persistent_session_exchange", _fake_inner)
+
+    outcome = _run(
+        _make_runner(tmp_path),
+        tmp_path,
+        coder_agent=agents["agent:coder"],
+        reviewer_agent=agents["agent:reviewer"],
+    )
+
+    assert outcome.status == "ok"
+    recorder = captured["execution_identities"]
+    assert recorder.reviewer.provider == "codex"
+    assert recorder.reviewer.model is None
+    assert recorder.actor.model == "opus"
+    # Unpinned on one side does not collapse the two identities.
+    assert recorder.actor.fingerprint() != recorder.reviewer.fingerprint()

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Protocol, runtime_checkable
 
 from ..domain.attempt import Attempt, AttemptKey
@@ -16,8 +17,24 @@ class AttemptStore(Protocol):
         """Return an attempt record for ``key`` if one exists."""
         ...
 
-    def upsert(self, attempt: Attempt) -> None:
-        """Create or replace the attempt record."""
+    def update(self, key: AttemptKey, mutate: Callable[[Attempt], Attempt]) -> Attempt:
+        """Persist ``mutate`` applied to the attempt at ``key``.
+
+        The only write on this port, and it is a *mutation* rather than a
+        whole-record replacement on purpose. An attempt now carries durable
+        Foundation admission evidence about one ``(issue, commit)`` — the
+        validation record path, and (#34) the execution identities §4's I2c is
+        read from. A writer that builds a fresh ``Attempt`` to set one field
+        erases the rest, and the erasure is silent: the record still parses,
+        it just no longer says who reviewed the candidate. Handing the writer
+        the current record makes preserving the other facts the shape of the
+        call rather than a convention each caller re-implements.
+
+        Creates the record when absent, so no caller distinguishes a first
+        write from a later one. Implementations reject a ``mutate`` that
+        returns an attempt filed under a different key, and return the
+        persisted record.
+        """
         ...
 
     def supersede_issue(self, issue_key: IssueKey) -> int:

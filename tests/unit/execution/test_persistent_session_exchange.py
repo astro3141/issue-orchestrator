@@ -144,6 +144,35 @@ def _make_agent(prompt_path: Path) -> AgentConfig:
     )
 
 
+def _identity_recorder(tmp_path: Path) -> CandidateExecutionIdentityRecorder:
+    """A recorder over a throwaway store, for exchanges that assert nothing on it.
+
+    ``run_persistent_session_exchange`` requires the recorder rather than
+    defaulting it to ``None`` (#34): production always supplies one, and the
+    alternative is an exchange that silently records no execution identities
+    and so produces a review no Foundation gate can admit. Tests that assert on
+    the record build their own recorder with the identities they care about.
+    """
+    return CandidateExecutionIdentityRecorder(
+        store=AttemptExecutionIdentityStore(
+            SidecarAttemptStore(tmp_path / "identity-store")
+        ),
+        issue_key=GitHubIssueKey(repo="acme/repo", external_id="42"),
+        actor=AgentExecutionIdentity(
+            role=ExecutionRole.ACTOR,
+            agent_label="agent:backend",
+            provider="claude-code",
+            model="opus",
+        ),
+        reviewer=AgentExecutionIdentity(
+            role=ExecutionRole.REVIEWER,
+            agent_label="agent:reviewer",
+            provider="codex",
+            model="gpt-5",
+        ),
+    )
+
+
 def _make_codex_agent(prompt_path: Path) -> AgentConfig:
     return AgentConfig(
         prompt_path=prompt_path,
@@ -715,6 +744,7 @@ class TestPersistentSessionExchangeHappyPath:
             require_validation=False,
             events=sink,
             event_context=ctx,
+            execution_identities=_identity_recorder(tmp_path),
         )
 
         assert outcome.status == "ok"
@@ -807,6 +837,7 @@ class TestPersistentSessionExchangeHappyPath:
             require_validation=False,
             turn_mailbox=mailbox,
             response_channels=pse.ReviewExchangeResponseChannels.file_only(),
+            execution_identities=_identity_recorder(tmp_path),
         )
 
         assert outcome.status == "ok"
@@ -898,6 +929,7 @@ class TestPersistentSessionExchangeHappyPath:
             max_rounds=3,
             max_no_progress=2,
             require_validation=False,
+            execution_identities=_identity_recorder(tmp_path),
         )
         assert outcome.status == "ok"
         assert outcome.rounds == 2
@@ -1001,6 +1033,7 @@ class TestPersistentSessionExchangeHappyPath:
             max_no_progress=2,
             require_validation=False,
             approval_gate=gate,
+            execution_identities=_identity_recorder(tmp_path),
         )
 
         assert outcome.status == "ok"
@@ -1097,6 +1130,7 @@ class TestPersistentSessionExchangeHappyPath:
             max_rounds=3,
             max_no_progress=2,
             require_validation=False,
+            execution_identities=_identity_recorder(tmp_path),
         )
 
         assert outcome.status == "ok"
@@ -1178,6 +1212,7 @@ class TestPersistentSessionExchangeHappyPath:
             max_no_progress=2,
             require_validation=False,
             nit_policy="address",
+            execution_identities=_identity_recorder(tmp_path),
         )
 
         assert outcome.status == "ok"
@@ -1596,6 +1631,7 @@ class TestTurnArtifactsPersisted:
             max_rounds=3,
             max_no_progress=2,
             require_validation=False,
+            execution_identities=_identity_recorder(tmp_path),
         )
 
         assert outcome.exchange_dir is not None
@@ -1770,6 +1806,7 @@ class TestTurnArtifactsPersisted:
             max_rounds=3,
             max_no_progress=2,
             require_validation=False,
+            execution_identities=_identity_recorder(tmp_path),
         )
 
         assert outcome.exchange_dir is not None
@@ -1877,6 +1914,7 @@ class TestTurnArtifactsPersisted:
             require_validation=False,
             events=sink,
             event_context=EventContext(),
+            execution_identities=_identity_recorder(tmp_path),
         )
 
         assert outcome.reason == "reviewer_no_completion"
@@ -1999,6 +2037,7 @@ class TestTurnArtifactsPersisted:
             require_validation=False,
             events=sink,
             event_context=EventContext(),
+            execution_identities=_identity_recorder(tmp_path),
         )
 
         # The exchange completed normally at round 2 — it did NOT bail to
@@ -2124,6 +2163,7 @@ class TestTurnArtifactsPersisted:
             max_rounds=3,
             max_no_progress=2,
             require_validation=False,
+            execution_identities=_identity_recorder(tmp_path),
         )
 
         assert outcome.status == "error"
@@ -2204,6 +2244,7 @@ class TestTurnArtifactsPersisted:
             max_rounds=3,
             max_no_progress=2,
             require_validation=False,
+            execution_identities=_identity_recorder(tmp_path),
         )
 
         assert outcome.status == "ok"
@@ -2271,6 +2312,7 @@ class TestTurnArtifactsPersisted:
             max_rounds=3,
             max_no_progress=2,
             require_validation=False,
+            execution_identities=_identity_recorder(tmp_path),
         )
 
         assert outcome.reason == "reviewer_no_completion"
@@ -2347,6 +2389,7 @@ class TestTurnArtifactsPersisted:
             require_validation=False,
             events=sink,
             event_context=EventContext(),
+            execution_identities=_identity_recorder(tmp_path),
         )
 
         assert outcome.status == "ok"
@@ -2417,6 +2460,7 @@ class TestTurnArtifactsPersisted:
             max_rounds=3,
             max_no_progress=2,
             require_validation=False,
+            execution_identities=_identity_recorder(tmp_path),
         )
 
         assert outcome.exchange_dir is not None
@@ -2505,6 +2549,7 @@ class TestTurnArtifactsPersisted:
             max_rounds=3,
             max_no_progress=2,
             require_validation=False,
+            execution_identities=_identity_recorder(tmp_path),
         )
 
         assert outcome.exchange_dir is not None
@@ -2583,6 +2628,7 @@ class TestExchangeTerminationConditions:
             max_rounds=5,
             max_no_progress=2,
             require_validation=False,
+            execution_identities=_identity_recorder(tmp_path),
         )
 
         assert outcome.status == "stopped"
@@ -2663,6 +2709,7 @@ class TestExchangeTerminationConditions:
             max_rounds=2,
             max_no_progress=5,
             require_validation=True,
+            execution_identities=_identity_recorder(tmp_path),
         )
 
         assert outcome.status == "error"
@@ -2720,6 +2767,7 @@ class TestExchangeTerminationConditions:
             require_validation=False,
             events=sink,
             event_context=ctx,
+            execution_identities=_identity_recorder(tmp_path),
         )
         assert outcome.status == "error"
         assert outcome.reason == "reviewer_no_completion"
@@ -2780,6 +2828,7 @@ class TestExchangeTerminationConditions:
                 max_rounds=1,
                 max_no_progress=2,
                 require_validation=False,
+                execution_identities=_identity_recorder(tmp_path),
             )
 
         assert state["registry"].released == [(42, "review-exchange-exception")]
@@ -2848,6 +2897,7 @@ class TestChapterSidecarAndEvents:
             max_rounds=3,
             max_no_progress=2,
             require_validation=False,
+            execution_identities=_identity_recorder(tmp_path),
         )
 
         # Reviewer side: 2 round-prompt chapters + 2 round-feedback chapters
@@ -2925,6 +2975,7 @@ class TestChapterSidecarAndEvents:
             require_validation=False,
             events=sink,
             event_context=ctx,
+            execution_identities=_identity_recorder(tmp_path),
         )
 
         names = [evt.event_type for evt in sink.events]
@@ -3041,6 +3092,7 @@ class TestChapterSidecarAndEvents:
             require_validation=False,
             events=sink,
             event_context=ctx,
+            execution_identities=_identity_recorder(tmp_path),
         )
 
         chapter_events = [
@@ -3131,6 +3183,7 @@ class TestCallerHooks:
             max_no_progress=5,
             require_validation=False,
             before_reviewer_round=lambda i: round_invocations.append(i),
+            execution_identities=_identity_recorder(tmp_path),
         )
         # Called once per reviewer round (rounds 1 and 2).
         assert round_invocations == [1, 2]
@@ -3183,6 +3236,7 @@ class TestCallerHooks:
             max_rounds=1,
             max_no_progress=2,
             require_validation=False,
+            execution_identities=_identity_recorder(tmp_path),
         )
         assert outcome.run_assets == exchange_run.assets
         assert exchange_run.assets.run_dir.exists()
@@ -3245,6 +3299,7 @@ class TestCallerHooks:
             max_no_progress=2,
             require_validation=True,
             initial_validation_record_path=current_record,
+            execution_identities=_identity_recorder(tmp_path),
         )
 
         assert outcome.status == "ok"
@@ -3333,6 +3388,7 @@ class TestCallerHooks:
             max_no_progress=2,
             require_validation=True,
             initial_validation_record_path=current_record,
+            execution_identities=_identity_recorder(tmp_path),
         )
 
         assert outcome.status == "ok"
@@ -3431,6 +3487,7 @@ class TestCoderProtocolGuardrail:
             require_validation=False,
             events=sink,
             event_context=ctx,
+            execution_identities=_identity_recorder(tmp_path),
         )
 
         assert outcome.status == "error"
@@ -3554,6 +3611,7 @@ class TestCoderProtocolGuardrail:
             require_validation=False,
             events=sink,
             event_context=ctx,
+            execution_identities=_identity_recorder(tmp_path),
         )
 
         assert outcome.status == "ok"
@@ -3739,6 +3797,7 @@ class TestCoderProtocolGuardrail:
             max_rounds=3,
             max_no_progress=5,
             require_validation=False,
+            execution_identities=_identity_recorder(tmp_path),
         )
 
         assert outcome.status == "error"
@@ -3805,6 +3864,7 @@ class TestCoderProtocolGuardrail:
             max_rounds=2,
             max_no_progress=5,
             require_validation=False,
+            execution_identities=_identity_recorder(tmp_path),
         )
 
         assert outcome.status == "ok"
@@ -3877,6 +3937,7 @@ class TestTerminalEventsOnError:
             require_validation=False,
             events=sink,
             event_context=ctx,
+            execution_identities=_identity_recorder(tmp_path),
         )
 
         assert outcome.status == "error"
@@ -3951,6 +4012,7 @@ class TestTerminalEventsOnError:
             require_validation=False,
             events=sink,
             event_context=ctx,
+            execution_identities=_identity_recorder(tmp_path),
         )
 
         assert outcome.status == "error"
@@ -4027,6 +4089,7 @@ class TestTerminalEventsOnError:
             max_rounds=1,
             max_no_progress=5,
             require_validation=False,
+            execution_identities=_identity_recorder(tmp_path),
         )
 
         assert outcome.summary is not None
@@ -4094,6 +4157,7 @@ class TestRecordingContractFailLoud:
                 require_validation=False,
                 events=sink,
                 event_context=ctx,
+                execution_identities=_identity_recorder(tmp_path),
             )
         # FAILED event fired before the raise propagated.
         assert any(
@@ -4171,6 +4235,7 @@ class TestAtomicSummaryWrite:
             max_rounds=1,
             max_no_progress=5,
             require_validation=False,
+            execution_identities=_identity_recorder(tmp_path),
         )
 
         # summary.json was written via a tempfile + atomic replace.
@@ -4431,6 +4496,7 @@ class TestResponseFileInsideWorktree:
             max_rounds=1,
             max_no_progress=2,
             require_validation=False,
+            execution_identities=_identity_recorder(tmp_path),
         )
 
         # The agent's env var ISSUE_ORCHESTRATOR_REVIEW_RESPONSE_FILE
@@ -4520,6 +4586,7 @@ class TestResponseFileInsideWorktree:
             max_rounds=1,
             max_no_progress=2,
             require_validation=False,
+            execution_identities=_identity_recorder(tmp_path),
         )
 
         for role, path in captured.items():
@@ -4591,6 +4658,7 @@ class TestPerSessionRecordingMirror:
             max_rounds=3,
             max_no_progress=2,
             require_validation=False,
+            execution_identities=_identity_recorder(tmp_path),
         )
 
         # Find the actual run_dir from the coder worktree's sessions/.
@@ -4721,6 +4789,7 @@ class TestPerSessionRecordingMirror:
             max_rounds=1,
             max_no_progress=2,
             require_validation=False,
+            execution_identities=_identity_recorder(tmp_path),
         )
 
         assert outcome.status == "ok"
@@ -5057,6 +5126,7 @@ class TestPerSessionRecordingMirror:
                 max_rounds=1,
                 max_no_progress=2,
                 require_validation=False,
+                execution_identities=_identity_recorder(tmp_path),
             )
         finally:
             for w in writers.values():
@@ -5196,6 +5266,7 @@ class TestEndToEndTimelineReadback:
                 max_rounds=1,
                 max_no_progress=2,
                 require_validation=False,
+                execution_identities=_identity_recorder(tmp_path),
             )
         finally:
             for w in writers.values():
@@ -5280,6 +5351,7 @@ class TestEndToEndTimelineReadback:
             max_rounds=1,
             max_no_progress=2,
             require_validation=False,
+            execution_identities=_identity_recorder(tmp_path),
         )
 
         run_dir = _find_review_exchange_run_dir(coder_wt)
@@ -5406,6 +5478,7 @@ class TestAgentEnvPathIsolation:
             max_rounds=1,
             max_no_progress=2,
             require_validation=False,
+            execution_identities=_identity_recorder(tmp_path),
         )
 
         for role, env in captured.items():
@@ -5538,6 +5611,7 @@ class TestSliceIsolationAcrossExchanges:
                     max_rounds=1,
                     max_no_progress=2,
                     require_validation=False,
+                    execution_identities=_identity_recorder(tmp_path),
                 )
         finally:
             for w in writers.values():
@@ -5683,6 +5757,7 @@ class TestSliceIsolationAcrossExchanges:
                 max_rounds=3,
                 max_no_progress=2,
                 require_validation=False,
+                execution_identities=_identity_recorder(tmp_path),
             )
         finally:
             for w in writers.values():
@@ -5800,6 +5875,7 @@ class TestSliceIsolationAcrossExchanges:
                     max_rounds=1,
                     max_no_progress=2,
                     require_validation=False,
+                    execution_identities=_identity_recorder(tmp_path),
                 )
         finally:
             for wmap in writers_by_issue.values():
@@ -6429,6 +6505,7 @@ class TestContinuousSliceMirroring:
                 max_rounds=1,
                 max_no_progress=2,
                 require_validation=False,
+                execution_identities=_identity_recorder(tmp_path),
             )
         finally:
             for w in writers.values():
@@ -6564,6 +6641,7 @@ class TestContinuousSliceMirroring:
                 require_validation=False,
                 events=sink,
                 event_context=EventContext(),
+                execution_identities=_identity_recorder(tmp_path),
             )
 
         # The orchestrator must hear about the failure as a
@@ -6637,6 +6715,7 @@ class TestContinuousSliceMirroring:
                 max_rounds=1,
                 max_no_progress=2,
                 require_validation=False,
+                execution_identities=_identity_recorder(tmp_path),
             )
 
     def test_slice_detaches_at_exchange_end_no_leak_to_next_exchange(
@@ -6734,6 +6813,7 @@ class TestContinuousSliceMirroring:
                     max_rounds=1,
                     max_no_progress=2,
                     require_validation=False,
+                    execution_identities=_identity_recorder(tmp_path),
                 )
         finally:
             for w in writers.values():
@@ -7266,6 +7346,7 @@ class TestSessionCleanup:
                 require_validation=False,
                 events=sink,
                 event_context=ctx,
+                execution_identities=_identity_recorder(tmp_path),
             )
 
         assert state["registry"].released == [(42, "review-exchange-exception")]
@@ -7355,6 +7436,7 @@ class TestSpawnPartialConstructionCleanup:
                 max_rounds=1,
                 max_no_progress=2,
                 require_validation=False,
+                execution_identities=_identity_recorder(tmp_path),
             )
 
         # The coder opened, the reviewer raised before opening — and
@@ -7451,7 +7533,7 @@ def _run_binding_exchange(
     max_no_progress: int = 2,
     require_validation: bool = False,
     initial_validation_record_path: Path | None = None,
-    execution_identities: Any = None,
+    execution_identities: CandidateExecutionIdentityRecorder | None = None,
 ) -> Any:
     """Run one exchange over a real coder branch and reviewer worktree.
 
@@ -7498,7 +7580,7 @@ def _run_binding_exchange(
         require_validation=require_validation,
         initial_validation_record_path=initial_validation_record_path,
         before_reviewer_round=before_reviewer_round,
-        execution_identities=execution_identities,
+        execution_identities=execution_identities or _identity_recorder(tmp_path),
     )
 
 

@@ -418,7 +418,7 @@ def run_persistent_session_exchange(  # noqa: PLR0913
     turn_mailbox: "TurnMailbox | None" = None,
     response_channels: ReviewExchangeResponseChannels | None = None,
     coder_prompt_addendum: str | None = None,
-    execution_identities: CandidateExecutionIdentityRecorder | None = None,
+    execution_identities: CandidateExecutionIdentityRecorder,
 ) -> ReviewExchangeOutcome:
     """Run the coder↔reviewer exchange against a registry-owned persistent pair.
 
@@ -433,11 +433,11 @@ def run_persistent_session_exchange(  # noqa: PLR0913
     This function also lets the pair contract release on run-binding changes,
     process/recording contract failure, and exchange exceptions.
 
-    ``execution_identities`` records who executed the reviewed candidate (#34).
-    :class:`~.persistent_review_exchange_runner.PersistentReviewExchangeRunner`
-    requires the underlying store at construction and always supplies a
-    recorder, so ``None`` reaches here only from tests that drive this function
-    directly and do not exercise the binding.
+    ``execution_identities`` records who executed the reviewed candidate (#34)
+    and is required, like the store it writes through: an exchange that
+    silently records no identities produces a review no Foundation gate can
+    admit, and a no-op at the terminal is precisely the silent degradation
+    this repository's fail-fast stance refuses.
     """
     session_name = exchange_run.session_name
     run_dir = exchange_run.assets.run_dir
@@ -1755,7 +1755,7 @@ class _DriveRoundsCommand:
     coder_provider: AgentProvider
     reviewer_provider: AgentProvider
     reviewer_presentation: ReviewerCandidatePresentation
-    execution_identities: CandidateExecutionIdentityRecorder | None
+    execution_identities: CandidateExecutionIdentityRecorder
     emit: Callable[[EventName, dict[str, Any]], None]
     coder_mirror: _RoleSliceMirror
     reviewer_mirror: _RoleSliceMirror
@@ -2812,7 +2812,7 @@ def _complete_with_reviewer_decision(
     session_name: str,
     validation_record_path: Path,
     presented_head_sha: str | None,
-    execution_identities: CandidateExecutionIdentityRecorder | None,
+    execution_identities: CandidateExecutionIdentityRecorder,
 ) -> ReviewExchangeOutcome:
     """Close the exchange at a terminal the reviewer decided.
 
@@ -2841,8 +2841,7 @@ def _complete_with_reviewer_decision(
     )
     # §4's other half, bound to the same observation and therefore to the same
     # commit: who executed this candidate, as the orchestrator launched them.
-    if execution_identities is not None:
-        execution_identities.record(presented_head_sha)
+    execution_identities.record(presented_head_sha)
     _emit_built_event(emit, make_review_exchange_round_completed_event({
         "issue_number": issue_number,
         "session_name": session_name,

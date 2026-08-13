@@ -9,12 +9,13 @@ from __future__ import annotations
 
 import json
 import subprocess
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
 from issue_orchestrator.adapters.sidecar_attempt_store import SidecarAttemptStore
-from issue_orchestrator.domain.attempt import Attempt, AttemptKey
+from issue_orchestrator.domain.attempt import AttemptKey
 from issue_orchestrator.domain.execution_identity import (
     AgentExecutionIdentity,
     CandidateExecutionIdentities,
@@ -34,7 +35,9 @@ def _git(cwd: Path, *args: str) -> str:
     ).stdout.strip()
 
 
-def _identities(candidate_sha: str) -> CandidateExecutionIdentities:
+def _identities(
+    candidate_sha: str, *, reviewer_model: str | None = "gpt-5"
+) -> CandidateExecutionIdentities:
     return CandidateExecutionIdentities(
         candidate_sha=candidate_sha,
         actor=AgentExecutionIdentity(
@@ -47,7 +50,7 @@ def _identities(candidate_sha: str) -> CandidateExecutionIdentities:
             role=ExecutionRole.REVIEWER,
             agent_label="agent:reviewer",
             provider="codex",
-            model="gpt-5",
+            model=reviewer_model,
         ),
         observed_at="2026-08-14T00:00:00+00:00",
     )
@@ -65,6 +68,23 @@ class TestRecordAndRead:
         _store(tmp_path).record(key, _identities("a" * 40))
 
         assert _store(tmp_path).read(key) == _identities("a" * 40)
+
+    def test_an_unpinned_model_survives_the_durable_round_trip(
+        self, tmp_path: Path
+    ) -> None:
+        """A reviewer whose CLI chose its own model is still admissible evidence.
+
+        The record states the absence rather than omitting it, so what comes
+        back is "no model was pinned" — not "this record forgot to say".
+        """
+        key = AttemptKey(ISSUE, "a" * 40)
+        _store(tmp_path).record(key, _identities("a" * 40, reviewer_model=None))
+
+        restored = _store(tmp_path).read(key)
+
+        assert restored is not None
+        assert restored.reviewer.model is None
+        assert restored.roles_are_distinct() is True
 
     def test_an_unrecorded_candidate_reads_as_absent(self, tmp_path: Path) -> None:
         assert _store(tmp_path).read(AttemptKey(ISSUE, "b" * 40)) is None
@@ -84,8 +104,11 @@ class TestRecordAndRead:
         """Validation's half of §4 lives on the same record and must survive."""
         key = AttemptKey(ISSUE, "a" * 40)
         attempts = SidecarAttemptStore(tmp_path)
-        attempts.upsert(
-            Attempt(key, validation_record_path="/runs/1/validation-record.json")
+        attempts.update(
+            key,
+            lambda attempt: replace(
+                attempt, validation_record_path="/runs/1/validation-record.json"
+            ),
         )
 
         AttemptExecutionIdentityStore(attempts).record(key, _identities("a" * 40))

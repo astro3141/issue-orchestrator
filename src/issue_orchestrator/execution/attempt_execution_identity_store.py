@@ -27,7 +27,7 @@ from __future__ import annotations
 import logging
 from dataclasses import replace
 
-from ..domain.attempt import Attempt, AttemptKey
+from ..domain.attempt import AttemptKey
 from ..domain.execution_identity import CandidateExecutionIdentities
 from ..ports.attempt_store import AttemptStore
 
@@ -52,12 +52,15 @@ class AttemptExecutionIdentityStore:
     ) -> None:
         """Persist ``identities`` under ``key``, preserving the attempt's facts.
 
-        The candidate/key agreement is enforced by :class:`Attempt` itself, so
-        it holds for every writer of that record rather than only for this one.
+        Both invariants are the store's rather than this caller's:
+        :meth:`~..ports.attempt_store.AttemptStore.update` hands over the
+        current record so the attempt's other facts survive, and
+        :class:`Attempt` enforces the candidate/key agreement — so both hold
+        for every writer of that record rather than only for this one.
         """
-        existing = self._attempts.for_key(key)
-        attempt = existing if existing is not None else Attempt(key)
-        self._attempts.upsert(replace(attempt, execution_identities=identities))
+        self._attempts.update(
+            key, lambda attempt: replace(attempt, execution_identities=identities)
+        )
         logger.info(
             "[EXECUTION_IDENTITY] recorded actor=%s reviewer=%s for %s@%s",
             identities.actor.agent_label,

@@ -159,9 +159,16 @@ bound to the same presented commit.
 
 - **Orchestrator-observed.** Every field is the launcher's own: the label it
   routed the role by, the provider it resolved to run it (the same
-  `agent_provider` call that spawns the process), and the model it asked for.
+  `agent_provider` call that spawns the process), and the model it asked that
+  provider for (the same `AgentConfig.resolved_model()` the spawn passes).
   An agent cannot assert its own identity, and a claim carried in
   agent-authored output is not evidence.
+- **`model` is `null` when the orchestrator pinned none.** An agent with an
+  explicit non-Claude provider and no `model:` runs on whatever its CLI
+  defaults to — the launcher passes no model, so the record states that rather
+  than inventing one. Recording only what was actually passed is what keeps
+  the record and the spawn from naming different models. Distinctness is
+  unaffected: two such roles still differ by `agent_label` and `provider`.
 - **Bound to the exact candidate.** `candidate_sha` is the commit the
   orchestrator checked out for the reviewer — the same observation
   `reviewed_sha` comes from, so the two records cannot describe different

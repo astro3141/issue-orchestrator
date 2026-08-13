@@ -372,6 +372,41 @@ class TestAgentConfig:
         )
         assert "--model gpt-5-codex" in command
 
+    def test_provider_command_omits_a_blank_model(self, tmp_path):
+        """A blank model is what the config loader writes for a non-Claude
+        provider with no ``model:`` — its CLI keeps its own default."""
+        prompt_file = tmp_path / "prompt.txt"
+        prompt_file.write_text("p")
+        config = AgentConfig(prompt_path=prompt_file, provider="codex", model="")
+
+        assert config.resolved_model() is None
+        command = config.get_command(
+            issue_number=1, issue_title="t", worktree=tmp_path,
+        )
+        assert "--model" not in command
+
+    def test_resolved_model_is_what_the_launcher_passes(self, tmp_path):
+        """The one resolution the execution-identity record (#34) reads too."""
+        prompt_file = tmp_path / "prompt.txt"
+        prompt_file.write_text("p")
+
+        assert (
+            AgentConfig(prompt_path=prompt_file, provider="codex").resolved_model()
+            is None
+        )
+        assert (
+            AgentConfig(
+                prompt_path=prompt_file, provider="codex", model="gpt-5-codex"
+            ).resolved_model()
+            == "gpt-5-codex"
+        )
+        assert (
+            AgentConfig(
+                prompt_path=prompt_file, provider="claude-code"
+            ).resolved_model()
+            == "sonnet"
+        )
+
     def test_provider_command_keeps_default_model_for_claude(self, tmp_path):
         """claude-code owns the "sonnet" default — forwarding it is correct
         and preserves existing behavior."""

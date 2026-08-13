@@ -65,31 +65,62 @@ def _required_text(value: object, *, field_name: str) -> str:
     return stripped
 
 
+def _unpinned_or_text(value: object, *, field_name: str) -> str | None:
+    """A field the orchestrator may legitimately not have pinned.
+
+    ``model`` is the one such field: an agent configured with an explicit
+    non-Claude provider and no ``model:`` runs on whatever its CLI defaults to,
+    and the orchestrator observes exactly that — it passed no model. Recording
+    the absence is the truthful record; refusing to record it would make a
+    supported configuration fatal at the seam that only *describes* the run.
+
+    Blank and ``None`` are one fact and canonicalise to ``None``, so two
+    spellings of "no model pinned" cannot fingerprint as different executions.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise TypeError(f"{field_name} must be str or None")
+    return value.strip() or None
+
+
 @dataclass(frozen=True, slots=True)
 class AgentExecutionIdentity:
-    """One role's executing configuration, as the orchestrator launched it."""
+    """One role's executing configuration, as the orchestrator launched it.
+
+    ``model`` is ``None`` when the orchestrator pinned no model and left the
+    choice to the provider's CLI — see :func:`_unpinned_or_text`. It is the
+    launcher's own :meth:`~..domain.models.AgentConfig.resolved_model`, so the
+    record and the spawn cannot name different models.
+    """
 
     role: ExecutionRole
     agent_label: str
     provider: str
-    model: str
+    model: str | None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "role", ExecutionRole(self.role))
-        for field_name in ("agent_label", "provider", "model"):
+        for field_name in ("agent_label", "provider"):
             object.__setattr__(
                 self,
                 field_name,
                 _required_text(getattr(self, field_name), field_name=field_name),
             )
+        object.__setattr__(
+            self, "model", _unpinned_or_text(self.model, field_name="model")
+        )
 
-    def fingerprint(self) -> tuple[str, str, str]:
+    def fingerprint(self) -> tuple[str, str, str | None]:
         """What makes two executions the same one, ignoring the role played.
 
         Role is excluded on purpose — see the module docstring. Two roles run
         by the same agent label on the same provider and model are one
         execution identity wearing two hats, which is exactly the arrangement
         I2c exists to refuse.
+
+        An unpinned model keeps the check's teeth: two roles that both let
+        their CLI choose still differ by ``agent_label`` and ``provider``.
         """
         return (self.agent_label, self.provider, self.model)
 
@@ -110,11 +141,16 @@ class AgentExecutionIdentity:
                 f"execution identity filed as {expected_role.value} carries "
                 f"role {role.value}"
             )
+        if "model" not in payload:
+            # Present-and-null ("no model pinned") is a statement; absent is a
+            # record that never made one. A gate comparing executions must not
+            # read the second as the first.
+            raise ValueError("execution identity requires a model")
         return cls(
             role=role,
             agent_label=_required_text(payload.get("agent_label"), field_name="agent_label"),
             provider=_required_text(payload.get("provider"), field_name="provider"),
-            model=_required_text(payload.get("model"), field_name="model"),
+            model=_unpinned_or_text(payload["model"], field_name="model"),
         )
 
     def to_payload(self) -> dict[str, Any]:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Callable
 from pathlib import Path
 
 from ..domain.attempt import Attempt, AttemptKey
@@ -30,16 +31,22 @@ class SidecarAttemptStore:
         if not isinstance(payload, dict):
             raise ValueError(f"Attempt sidecar must contain an object: {path}")
         attempt = Attempt.from_dict(payload)
-        if (
-            attempt.key.issue_scope != key.issue_scope
-            or attempt.key.issue_stable_id != key.issue_stable_id
-            or attempt.key.head_sha != key.head_sha
-        ):
+        if not _names_same_attempt(attempt.key, key):
             raise ValueError(f"Attempt sidecar key mismatch: {path}")
         return attempt
 
-    def upsert(self, attempt: Attempt) -> None:
-        atomic_write_json(self._path_for(attempt.key), attempt.to_dict())
+    def update(self, key: AttemptKey, mutate: Callable[[Attempt], Attempt]) -> Attempt:
+        existing = self.for_key(key)
+        updated = mutate(existing if existing is not None else Attempt(key))
+        if not _names_same_attempt(updated.key, key):
+            raise ValueError(
+                "Attempt update must stay under the key it was read from: "
+                f"asked for {key.issue_scope}:{key.issue_stable_id}@{key.head_sha}, "
+                f"got {updated.key.issue_scope}:{updated.key.issue_stable_id}"
+                f"@{updated.key.head_sha}"
+            )
+        atomic_write_json(self._path_for(key), updated.to_dict())
+        return updated
 
     def supersede_issue(self, issue_key: IssueKey) -> int:
         if not self._base_dir.exists():
@@ -57,6 +64,20 @@ class SidecarAttemptStore:
         issue_part = _issue_part(key.issue_key)
         sha_part = key.head_sha
         return self._base_dir / f"{issue_part}--{sha_part}.json"
+
+
+def _names_same_attempt(left: AttemptKey, right: AttemptKey) -> bool:
+    """Whether two keys identify the same ``(issue, commit)`` on disk.
+
+    Compared field-wise rather than by ``==``: the same issue can arrive as a
+    ``GitHubIssueKey`` or a ``StoredIssueKey`` (what a reloaded sidecar
+    rebuilds), and those are unequal dataclasses naming one issue.
+    """
+    return (
+        left.issue_scope == right.issue_scope
+        and left.issue_stable_id == right.issue_stable_id
+        and left.head_sha == right.head_sha
+    )
 
 
 def _issue_part(issue_key: IssueKey) -> str:

@@ -136,8 +136,11 @@ class PersistentReviewExchangeRunner:
 
         Every field is the launcher's own: the label it routed the role by, the
         provider it resolved to run it (the same :func:`agent_provider` call
-        the exchange uses to spawn the process), and the model it asked for.
-        Nothing here can be reached by an agent's output.
+        the exchange uses to spawn the process), and the model it asked that
+        provider for (the same :meth:`~..domain.models.AgentConfig.resolved_model`
+        the spawn passes — ``None`` when the orchestrator pinned none and the
+        CLI chose, which is what an explicit non-Claude provider without a
+        ``model:`` runs as). Nothing here can be reached by an agent's output.
         """
         return CandidateExecutionIdentityRecorder(
             store=self._execution_identity_store,
@@ -146,13 +149,13 @@ class PersistentReviewExchangeRunner:
                 role=ExecutionRole.ACTOR,
                 agent_label=coder_label,
                 provider=agent_provider(coder_agent).value,
-                model=coder_agent.model,
+                model=coder_agent.resolved_model(),
             ),
             reviewer=AgentExecutionIdentity(
                 role=ExecutionRole.REVIEWER,
                 agent_label=reviewer_label,
                 provider=agent_provider(reviewer_agent).value,
-                model=reviewer_agent.model,
+                model=reviewer_agent.resolved_model(),
             ),
         )
 
