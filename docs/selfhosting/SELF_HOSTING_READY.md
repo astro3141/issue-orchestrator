@@ -16,7 +16,8 @@ the end before relying on it.
 
 **The runtime pin is behind product `main`, and that is correct.** `81c11ae1` is
 the build that actually ran the Stage 6 canary. Rebuilding from a newer `main`
-would promote something no canary exercised. See the runbook, "Promotion: ship
+would promote something no canary exercised. See the runbook — now issue #18,
+<https://github.com/astro3141/issue-orchestrator/issues/18> — "Promotion: ship
 the runtime you verified".
 
 R0 stays on disk. Rollback is a path change, not a rebuild.
