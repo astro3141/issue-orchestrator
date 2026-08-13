@@ -6,9 +6,56 @@ Validation is a **local lifecycle gate**, not a CI system.
 
 - Run one quick local command while the coding/review loop is active
 - Run one deeper publish command before push/publish
-- Cache passing results by worktree + commit SHA + command
-- Reuse passing publish records across pre-publish and pre-push hooks
+- Cache passing results by worktree + commit SHA + command + contract
+- Reuse passing publish records across the callers that run the publish command
 - Observe GitHub CI rather than reproducing it locally
+
+### One gate kind, one command, one suite label
+
+A gate is constructed from a **`ValidationGateContract`** — a single value
+carrying the kind (`quick` or `publish`), the profile it came from, the command
+and the timeout. The suite a record claims and the command it ran are two
+projections of that one value, so they cannot disagree.
+
+| Gate | Contract | Suite recorded | Who runs it |
+|------|----------|----------------|-------------|
+| Agent gate | `quick` | `agent_gate` | `coding-done` / `reviewer-done`, in the session |
+| Quick gate | `quick` | `quick_gate` | `SessionController`, after completion |
+| Publication gate | `publish` | `publish_gate` | `CompletionProcessor`, before any publish action |
+| Manual publish gate | `publish` | `publish_gate` | `prepush-check` run directly, or `scripts/verify-pr.sh` |
+
+The orchestrator-installed worktree `pre-push` hook is deliberately absent from
+that table. It invokes `prepush-check --dirty-only`, which enforces the
+configured dirty-tree policy and never reaches a validation command. The only
+callers that execute the `publish` contract from `prepush-check` are the manual
+ones above.
+
+Records live at `.issue-orchestrator/validation/<kind>/<HEAD_SHA>.json`, one
+location per **contract**, never per caller. The agent gate and the quick gate
+run the same contract and share a location, so a result the agent already
+produced is reused. The publish contract has its own location, so a quick run
+cannot overwrite the publish gate's record — the only durable evidence of what
+the publish contract actually did.
+
+Cache reuse requires the same HEAD **and** command **and** profile **and**
+contract. A quick result never satisfies a publish request.
+
+Publication-gate evidence for a run is written to
+`<run_dir>/publish-gate/`, separate from the run directory root, whose
+`validation-record.json`, `validation-stdout.log` and `validation-stderr.log`
+belong to the quick gate that runs later in the same tick.
+
+The gate reports those paths back with its decision (`PublicationGateOutcome.
+evidence`), and that is what the completion processor attaches to the run:
+`validation_record_path`, `validation_stdout` and `validation_stderr` in the
+manifest all name files from the *same* run of the *same* command. Naming
+them at the attach site instead let a failing publish record be attached
+beside the passing quick gate's logs.
+
+This was issue [#25]: the post-completion gate executed `validation.quick.cmd`
+while stamping `suite=publish_gate` onto the record, and the completion
+processor's publish-gate seam was never wired in composition — so
+`validation.publish.cmd` ran nowhere in the orchestrator path.
 
 ## Configuration (YAML)
 
@@ -145,11 +192,15 @@ for the supported format and operator guidance.
 
 ## Record Format
 
-Location: `.issue-orchestrator/validation/<suite>/<HEAD_SHA>.json`
+Location: `.issue-orchestrator/validation/<kind>/<HEAD_SHA>.json`, where
+`<kind>` is `quick` or `publish`
 
 Record fields:
 - `schema_version`
-- `suite`
+- `suite` — names the contract that ran (`quick_gate`, `publish_gate`) or the
+  agent-side caller of the quick contract (`agent_gate`). It is not evidence on
+  its own; `command` is what the run actually executed, and the two are derived
+  from the same contract so they agree by construction.
 - `head_sha`
 - `passed` + `exit_code`
 - `command`

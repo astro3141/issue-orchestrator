@@ -455,6 +455,19 @@ class CompletionRecord:
     validation_record_path: Optional[str] = None  # Path to validation record JSON
     follow_up_issues: Optional[list["ProposedFollowUpIssue"]] = None
 
+    @property
+    def offers_a_change_for_review(self) -> bool:
+        """Whether this completion offers its work as a change to review.
+
+        Selects what the publish contract applies to (#25): that contract is
+        what a *change* must satisfy. A ``blocked`` or ``needs_human``
+        completion pushes its branch to preserve work and opens no PR — it is
+        asking a human a question, not offering a change — so holding it to
+        the publish contract would replace the question with a validation
+        failure. Its push still happens under the orchestrator's authority.
+        """
+        return RequestedAction.CREATE_PR in self.requested_actions
+
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary for JSON serialization."""
         return {

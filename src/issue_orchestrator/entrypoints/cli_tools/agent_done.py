@@ -53,6 +53,8 @@ RUNTIME_COMPLETION_OUTCOME: Any = RuntimeCompletionOutcome
 RUNTIME_PROPOSED_FOLLOW_UP_ISSUE: Any = RuntimeProposedFollowUpIssue
 RUNTIME_REQUESTED_ACTION: Any = RuntimeRequestedAction
 from ...control.validation import AgentGate, AgentGateResult
+from ...domain.validation_profile import ValidationGateKind
+from ...infra.validation_profiles import ValidationGateContract
 from ...domain.artifact_contracts import ValidationFailed, ValidationPassed
 from ...domain.session_run import ValidationArtifactPaths
 from ...execution.run_evidence import RunEvidenceRecorder
@@ -71,6 +73,16 @@ class QuickValidationSelection:
     cmd: Optional[str]
     timeout_seconds: int
     profile: str
+
+    @property
+    def contract(self) -> ValidationGateContract:
+        """The typed quick contract this selection describes (#25)."""
+        return ValidationGateContract(
+            kind=ValidationGateKind.QUICK,
+            profile=self.profile,
+            cmd=self.cmd,
+            timeout_seconds=self.timeout_seconds,
+        )
 
 
 class AgentStatus:
@@ -636,9 +648,7 @@ def run_validation(
         worktree,
         command_runner=LocalCommandRunner(),
         working_copy=GitWorkingCopy(),
-        command=selection.cmd,
-        timeout_seconds=selection.timeout_seconds,
-        profile=selection.profile,
+        contract=selection.contract,
     )
     result = gate.run(session_output_dir=session_output_dir)
 
