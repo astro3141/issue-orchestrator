@@ -30,6 +30,10 @@ from issue_orchestrator.domain.issue_key import FakeIssueKey, IssueKey
 from issue_orchestrator.domain.session_key import SessionKey, TaskKind
 from issue_orchestrator.execution.session_output_adapter import FileSystemSessionOutput
 
+# Codex-home isolation is registered in the repository-root conftest.py, not
+# here: pyproject.toml declares a second testpath (packages/agent_runner/tests)
+# that a conftest under tests/ cannot reach. See tests/codex_home.py.
+
 TEST_ADMIN_TOKEN = "test-admin-token"
 TEST_AGENT_CALLBACK_TOKEN = "test-agent-callback-token"
 

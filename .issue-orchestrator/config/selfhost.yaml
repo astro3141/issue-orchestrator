@@ -100,6 +100,20 @@ validation:
     # tests, and `Verdict` reaches `TestExactShaVerdictBinding`, whose module
     # name carries none of the others.
     #
+    # #22 (Codex home isolation) added `codex_home`. Without it exactly one of
+    # the change's ~30 tests was selected — `profile` happened to match a single
+    # provisioning case — and the integration proof that the guard actually
+    # fails a leaking test was deselected entirely. `codex_home` reaches both
+    # `tests/unit/test_codex_home_isolation.py` and
+    # `tests/integration/test_codex_home_isolation.py`.
+    #
+    # #22 rework also added `packages/agent_runner/tests` to the paths. The
+    # isolation fixtures register in the repository-root `conftest.py` so they
+    # reach both declared testpaths, and the test proving the second root is
+    # guarded has to live in that root — a path list of `tests/…` alone cannot
+    # select it. Naming both roots in one invocation also keeps the repository
+    # the rootdir, which is what makes the root `conftest.py` apply at all.
+    #
     # #25 (the publish gate must execute `validation.publish.cmd`) added
     # `publication`, `publish`, `contract` and `gate`. Its central regression
     # module — `test_publication_gate.py` — and the completion-processor cases
@@ -110,7 +124,14 @@ validation:
     # simulated suite stays out of this profile's paths on purpose (it is slow
     # and rework rounds must stay short) and is covered by publish, which runs
     # `make validate-pr-raw`.
-    cmd: ".venv/bin/python -m pytest tests/unit tests/integration -q --tb=short -p no:cacheprovider -k 'validation or profile or config or prepush or planted or cli_tools or dirty or worktree or review_verdict or review_exchange_records or review_artifacts or Verdict or publication or publish or contract or gate' && make typecheck"
+    #
+    # Merging #22 into post-#25 `main` unions the two selectors rather than
+    # letting either win: the paths take `packages/agent_runner/tests` from #22
+    # on top of #25's two, and the keyword list takes both `codex_home` and
+    # #25's four gate terms. Widen-only — no term either branch relied on was
+    # dropped, and `--collect-only` was used to confirm both changes' tests are
+    # still selected after the merge.
+    cmd: ".venv/bin/python -m pytest tests/unit tests/integration packages/agent_runner/tests -q --tb=short -p no:cacheprovider -k 'validation or profile or config or prepush or planted or cli_tools or dirty or worktree or review_verdict or review_exchange_records or review_artifacts or Verdict or codex_home or publication or publish or contract or gate' && make typecheck"
     timeout_seconds: 1800
   publish:
     # The upstream project's own gate, reproduced rather than invented:

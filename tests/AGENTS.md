@@ -194,6 +194,28 @@ Reference: `tests/js/e2e_run_view_actions.test.js` covers every clickable surfac
 
 ---
 
+## Codex Home Isolation (Automatic)
+
+Codex writes a rollout transcript under `$CODEX_HOME/sessions` for every session it runs, and `~/.codex` is a live directory the operator's desktop app owns. **No test may spawn the real Codex CLI against it.**
+
+You do not have to do anything to get this — `tests/codex_home.py` is registered in the **repository-root `conftest.py`**, above every testpath `pyproject.toml` declares (`tests` and `packages/agent_runner/tests`), so it applies to every collected test:
+
+| Fixture | Scope | What it does |
+|---------|-------|--------------|
+| `codex_home_session` | session, autouse | Points `CODEX_HOME` at a throwaway home seeded with `auth.json` only (never the operator's `config.toml`) |
+| `codex_home_guard` | function, autouse | Wraps `subprocess.Popen` and `pexpect.spawn`; if the command starts `codex`, asserts the env that spawn would hand it is not the operator's home |
+| `isolated_codex_home` | function, opt-in | A pristine per-test home, for tests that must prove Codex ignores operator config |
+
+Rules:
+
+- Do **not** re-point `CODEX_HOME` at `~/.codex`; the guard fails the test at spawn time, naming the command and the leak.
+- Live Codex tests stay live. Isolation is not a reason to mock, skip, or reclassify them.
+- The guard asserts on the *effective environment of the spawn*, not on whether a fixture was listed, so a newly added live test cannot leak by omission.
+- A **new test root** is covered as soon as it is a testpath under the repository root — that is what the root `conftest.py` buys, and `packages/agent_runner/tests/test_codex_home_guard_registration.py` proves it from inside the second root. The boundary is the rootdir: pointing pytest *only* at `packages/agent_runner` lets its own `[tool.pytest.ini_options]` win the rootdir search, which puts the root `conftest.py` above `confcutdir` and leaves that run unguarded. Run both roots in one invocation (`pytest tests/unit packages/agent_runner/tests`, what `make test-unit` does) and the registration holds.
+- The guard is **single-level** and wraps the two spawn primitives this repo uses. A codex run started by an intermediary that owns its own environment (a tmux server), or through a primitive nothing here uses today (`os.posix_spawn`, `pty.fork`, `from subprocess import Popen`, `pexpect.run` — which resolves `spawn` through its own module binding, not the patched `pexpect` attribute), is outside its reach — if you add one, extend `tests/codex_home.py` rather than assuming coverage.
+
+---
+
 ## Subdirectory Guides
 
 - `unit/AGENTS.md` - Unit test patterns, fixtures, mocking
