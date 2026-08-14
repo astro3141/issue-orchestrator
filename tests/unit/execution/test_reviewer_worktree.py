@@ -2,14 +2,21 @@
 
 from __future__ import annotations
 
+import json
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 
 from issue_orchestrator.adapters.worktree.api import (
+    REVIEW_COMMAND_GUARD_SETTINGS,
     WorktreeError,
     read_reviewer_head_ownership,
+    review_command_guard_command,
+)
+from issue_orchestrator.infra.hooks.review_command_guard import (
+    orchestrator_source_root,
 )
 from issue_orchestrator.domain.review_exchange import (
     REVIEWER_WORKTREE_CHECKOUT_FAILURE_MARKER,
@@ -177,6 +184,141 @@ class TestReviewerWorktreeLifecycle:
 
         # Must not raise — orchestrator shutdown paths rely on idempotence.
         remove_reviewer_worktree(reviewer)
+
+
+class TestReviewerWorktreeRefusesGateCommands:
+    """The unprovisioned worktree carries a barrier, not just an instruction.
+
+    A gate command run in this worktree fails on the missing prerequisite and
+    the failure is attributed to the candidate (#48). `docs/architecture/
+    hooks.md` rules that a prompt cannot be what prevents that, so creation
+    installs a `PreToolUse` policy that refuses the command before it runs.
+    """
+
+    def test_creation_registers_a_bash_pre_tool_use_guard(
+        self, tmp_path: Path
+    ) -> None:
+        _, coder, branch = _bootstrap_repo_with_branch(tmp_path)
+
+        reviewer = create_reviewer_worktree(
+            coder_worktree=coder, coder_branch=branch, timestamp="T",
+        )
+
+        settings = json.loads(
+            (reviewer.path / REVIEW_COMMAND_GUARD_SETTINGS).read_text()
+        )
+        matchers = settings["hooks"]["PreToolUse"]
+        assert [m["matcher"] for m in matchers] == ["Bash"]
+        assert _guard_command(reviewer.path) == review_command_guard_command()
+
+    def test_the_guard_runs_the_orchestrators_own_policy_not_the_candidates(
+        self, tmp_path: Path
+    ) -> None:
+        """A worktree that supplied its own policy would be judging itself."""
+        _, coder, branch = _bootstrap_repo_with_branch(tmp_path)
+
+        reviewer = create_reviewer_worktree(
+            coder_worktree=coder, coder_branch=branch, timestamp="T",
+        )
+
+        command = _guard_command(reviewer.path)
+        assert str(orchestrator_source_root()) in command
+        assert sys.executable in command
+        assert str(reviewer.path) not in command
+
+    def test_the_installed_hook_actually_refuses_a_gate_command(
+        self, tmp_path: Path
+    ) -> None:
+        _, coder, branch = _bootstrap_repo_with_branch(tmp_path)
+        reviewer = create_reviewer_worktree(
+            coder_worktree=coder, coder_branch=branch, timestamp="T",
+        )
+
+        refused = _run_guard(reviewer.path, "make validate-pr-raw")
+
+        assert refused.returncode == 2
+        assert "BLOCKED" in refused.stderr
+
+    def test_the_installed_hook_still_lets_the_reviewer_read_the_code(
+        self, tmp_path: Path
+    ) -> None:
+        _, coder, branch = _bootstrap_repo_with_branch(tmp_path)
+        reviewer = create_reviewer_worktree(
+            coder_worktree=coder, coder_branch=branch, timestamp="T",
+        )
+
+        assert _run_guard(reviewer.path, "git log --oneline").returncode == 0
+
+    def test_the_guard_leaves_the_candidate_untouched(self, tmp_path: Path) -> None:
+        """It lands in the never-tracked local layer and is hidden from status."""
+        _, coder, branch = _bootstrap_repo_with_branch(tmp_path)
+
+        reviewer = create_reviewer_worktree(
+            coder_worktree=coder, coder_branch=branch, timestamp="T",
+        )
+
+        tracked = subprocess.run(
+            ["git", "ls-files", str(REVIEW_COMMAND_GUARD_SETTINGS)],
+            cwd=reviewer.path,
+            capture_output=True,
+            text=True,
+        )
+        assert tracked.stdout.strip() == ""
+        assert str(REVIEW_COMMAND_GUARD_SETTINGS) not in _git(
+            reviewer.path, "status", "--short"
+        )
+
+    def test_removal_still_succeeds_with_the_guard_installed(
+        self, tmp_path: Path
+    ) -> None:
+        _, coder, branch = _bootstrap_repo_with_branch(tmp_path)
+        reviewer = create_reviewer_worktree(
+            coder_worktree=coder, coder_branch=branch, timestamp="T",
+        )
+
+        remove_reviewer_worktree(reviewer)
+
+        assert not reviewer.path.exists()
+
+    def test_create_rolls_back_when_the_guard_cannot_be_installed(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """An unguarded reviewer worktree must not exist at all."""
+        repo_root, coder, branch = _bootstrap_repo_with_branch(tmp_path)
+        sibling = coder.parent / f"{coder.name}-review-T"
+
+        def fail_guard_install(_path: Path) -> Path:
+            raise WorktreeError("settings unwritable")
+
+        monkeypatch.setattr(
+            "issue_orchestrator.execution.reviewer_worktree.install_review_command_guard",
+            fail_guard_install,
+        )
+
+        with pytest.raises(ReviewerWorktreeError, match="command guard"):
+            create_reviewer_worktree(
+                coder_worktree=coder, coder_branch=branch, timestamp="T",
+            )
+
+        assert not sibling.exists()
+        assert str(sibling) not in _git(repo_root, "worktree", "list", "--porcelain")
+
+
+def _guard_command(reviewer_path: Path) -> str:
+    settings = json.loads((reviewer_path / REVIEW_COMMAND_GUARD_SETTINGS).read_text())
+    return settings["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+
+
+def _run_guard(reviewer_path: Path, command: str) -> subprocess.CompletedProcess[str]:
+    """Run the registered hook exactly as the agent CLI would."""
+    return subprocess.run(
+        _guard_command(reviewer_path),
+        shell=True,
+        cwd=reviewer_path,
+        input=json.dumps({"tool_input": {"command": command}}),
+        capture_output=True,
+        text=True,
+    )
 
 
 class TestReviewerCandidatePresentation:

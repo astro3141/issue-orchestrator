@@ -120,20 +120,26 @@ class ReviewExchangeOutcome:
 # `.venv` symlink nor anything `worktrees.setup` installs
 # (`execution/reviewer_worktree.py`, `docs/architecture/validation.md`).
 # A gate run there fails on the missing prerequisite, not on the candidate —
-# issue #48's failure mode — so the instruction not to run one is a property of
-# the reviewer's worktree, independent of `review.exchange.loop.
-# require_validation`. That knob only decides whether a validation *record* is
-# required before the reviewer may approve; when it is false the reviewer would
-# otherwise be told nothing and be free to run gates in an unrunnable worktree.
+# issue #48's failure mode.
+#
+# What *enforces* that is the `PreToolUse` guard
+# (`infra/hooks/review_command_guard.py`) installed into the worktree, which
+# refuses the command before it executes. This note is the explanation the
+# reviewer reads so a refusal is expected rather than a mystery, and it is
+# unconditional on purpose: `review.exchange.loop.require_validation` decides
+# only whether a validation *record* is required before the reviewer may
+# approve, so with it false the reviewer would otherwise meet the guard with no
+# idea why.
 REVIEWER_WORKTREE_IS_UNPROVISIONED_NOTE = (
     "This reviewer worktree is not provisioned with the repository's runtime "
     "prerequisites (no virtualenv, no node modules, no browser binaries), so "
     "do NOT run build, test, or validation commands yourself (no ./gradlew, "
     "./scripts/validate*, make, npm/pnpm/yarn test, cargo test, pytest, mvn, "
-    "bazel test, or similar). They would fail on the missing prerequisite "
-    "rather than on the change under review, they waste the round's budget, "
-    "and they can hang on restricted networks where wrapper downloads or "
-    "package fetches fail. Review by reading the code."
+    "bazel test, or similar) — a PreToolUse guard refuses them here. They would "
+    "fail on the missing prerequisite rather than on the change under review, "
+    "they waste the round's budget, and they can hang on restricted networks "
+    "where wrapper downloads or package fetches fail. Review by reading the "
+    "code."
 )
 
 

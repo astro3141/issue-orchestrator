@@ -24,7 +24,12 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
-from ..adapters.worktree.api import WorktreeError, install_worktree_identity
+from ..adapters.worktree.api import (
+    REVIEW_COMMAND_GUARD_SETTINGS,
+    WorktreeError,
+    install_review_command_guard,
+    install_worktree_identity,
+)
 from ..domain.review_exchange import REVIEWER_WORKTREE_CHECKOUT_FAILURE_MARKER
 from ..infra.repo_identity import get_repo_head_sha
 from ..ports.worktree_manager import REVIEWER_OWNED_HEAD_MARKER, WORKTREE_ID_MARKER
@@ -120,14 +125,19 @@ def create_reviewer_worktree(
     installs — it is the one agent worktree ``WorktreeProvisioner`` does not
     own (#48, ``docs/architecture/validation.md``). The reviewer reads code; it
     does not run gates, and paying ``worktrees.setup`` (an ``npm ci`` and a
-    browser install for this repository) per exchange to support a command the
-    reviewer is told not to run is not a trade worth making.
+    browser install for this repository) per exchange to support a command that
+    cannot run here is not a trade worth making.
 
-    What keeps the exemption safe is that the reviewer is told so:
-    ``REVIEWER_WORKTREE_IS_UNPROVISIONED_NOTE`` is in *every* reviewer prompt,
-    including when ``review.exchange.loop.require_validation`` is false and no
-    validation record is demanded. Change that instruction and this worktree
-    has to start going through the provisioner.
+    What keeps the exemption safe is a barrier, not an instruction:
+    :func:`install_review_command_guard` registers a ``PreToolUse`` policy in
+    this worktree that *refuses* build, test and validation commands before they
+    execute, pinned to the orchestrator's own copy of that policy
+    (``docs/architecture/hooks.md`` — prompts are suggestions, hooks are
+    enforcement). ``REVIEWER_WORKTREE_IS_UNPROVISIONED_NOTE`` stays in every
+    reviewer prompt so a refusal is expected rather than surprising, but the
+    invariant no longer rests on the reviewer reading it. Installing the guard
+    is part of taking ownership of the worktree: if it cannot be installed, the
+    worktree is rolled back and creation fails.
     """
     sibling = coder_worktree.parent / f"{coder_worktree.name}-review-{timestamp}"
     if sibling.exists():
@@ -157,6 +167,7 @@ def create_reviewer_worktree(
         ) from exc
     try:
         install_worktree_identity(sibling)
+        install_review_command_guard(sibling)
         _persist_owned_head(sibling, tip_sha)
     except (WorktreeError, ReviewerWorktreeError) as exc:
         try:
@@ -164,7 +175,8 @@ def create_reviewer_worktree(
         except ReviewerWorktreeError:
             logger.exception("Failed to roll back unowned reviewer worktree %s", sibling)
         raise ReviewerWorktreeError(
-            f"Failed to install reviewer ownership in worktree {sibling}: {exc}",
+            f"Failed to install reviewer ownership and command guard in "
+            f"worktree {sibling}: {exc}",
             context={
                 "reviewer_worktree": str(sibling),
                 "coder_branch": coder_branch,
@@ -279,8 +291,15 @@ def remove_reviewer_worktree(
     if not reviewer.path.exists():
         return
     repo_root = _resolve_repo_root(reviewer.path)
+    # Everything the reviewer lifecycle planted here is untracked, and
+    # ``git worktree remove`` refuses a worktree that still holds untracked
+    # files. Each is lifted (and restored below if the removal then fails).
     marker_contents: dict[Path, str] = {}
-    for relative_marker in (WORKTREE_ID_MARKER, REVIEWER_OWNED_HEAD_MARKER):
+    for relative_marker in (
+        WORKTREE_ID_MARKER,
+        REVIEWER_OWNED_HEAD_MARKER,
+        REVIEW_COMMAND_GUARD_SETTINGS,
+    ):
         marker = reviewer.path / relative_marker
         try:
             marker_contents[marker] = marker.read_text(encoding="utf-8")

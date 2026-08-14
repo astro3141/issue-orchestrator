@@ -13,6 +13,11 @@ from ._worktree import (
     next_branch_name,
     find_worktree_for_branch,
 )
+from ._review_command_guard import (
+    REVIEW_COMMAND_GUARD_SETTINGS,
+    install_review_command_guard,
+    review_command_guard_command,
+)
 from ._worktree_errors import WorktreeError
 from ._worktree_hooks import HOOKS_DIR, install_hooks
 from ._worktree_runtime import (
@@ -25,6 +30,7 @@ from ._worktree_runtime_setup import WorktreeRuntimeSetup, WorktreeRuntimeState
 
 
 __all__ = [
+    "REVIEW_COMMAND_GUARD_SETTINGS",
     "WorktreeError",
     "WorktreeRuntimeSetup",
     "WorktreeRuntimeState",
@@ -42,7 +48,9 @@ __all__ = [
     "find_worktree_for_branch",
     "HOOKS_DIR",
     "install_claude_settings",
+    "install_review_command_guard",
     "install_worktree_identity",
     "read_reviewer_head_ownership",
+    "review_command_guard_command",
     "sync_cli_tools",
 ]
