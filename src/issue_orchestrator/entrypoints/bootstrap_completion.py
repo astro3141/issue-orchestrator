@@ -26,6 +26,7 @@ from ..ports.coder_prompt import (
 if TYPE_CHECKING:
     from ..control.needs_human_block import SharedNeedsHumanBlock
     from ..control.open_issue_corpus import OpenIssueCorpusManager
+    from ..control.publication_authority import UnrecordedRefusals
     from ..ports.completion_handler_factory import CompletionHandlerFactory
     from ..ports.repository_host import RepositoryHost
     from ..ports.session_output import SessionOutput
@@ -112,6 +113,11 @@ def create_completion_components(
     # NEEDS_HUMAN completion outcome routes through it, and the label adapter
     # below refuses that label by value, so the two halves cannot disagree.
     needs_human_block: "SharedNeedsHumanBlock",
+    # The orchestrator-wide record of publication-gate refusals whose label
+    # write did not commit (#45). Required, and shared with every reader of
+    # the verdict: a processor holding refusals nobody reads back would fail
+    # open exactly where this record exists to fail closed.
+    unrecorded_refusals: "UnrecordedRefusals",
     coder_prompt_addendum: CoderPromptAddendumProvider = NO_CODER_PROMPT_ADDENDUM,
 ) -> tuple[
     "CompletionProcessor | None",
@@ -217,6 +223,7 @@ def create_completion_components(
         runtime_identity=runtime_identity.resolve_runtime_identity(),
         tech_lead_authority=tech_lead_authority,
         needs_human_block=needs_human_block,
+        unrecorded_refusals=unrecorded_refusals,
     )
 
     session_controller_instance = SessionController(

@@ -917,6 +917,12 @@ def build_test_orchestrator_deps(
     )
     from issue_orchestrator.entrypoints.bootstrap import create_attempt_store
     agent_callback_endpoint = ready_callback_endpoint()
+    # One shared record of publication-gate refusals whose label write did not
+    # commit, wired exactly as bootstrap wires it (#45).
+    from issue_orchestrator.control.publication_authority import (
+        UnrecordedRefusals,
+    )
+    unrecorded_refusals = UnrecordedRefusals()
 
     completion_processor = CompletionProcessor(
         agent_callback_endpoint=agent_callback_endpoint,
@@ -939,6 +945,7 @@ def build_test_orchestrator_deps(
             "in_progress": config.get_label_in_progress(),
         },
         config=config,
+        unrecorded_refusals=unrecorded_refusals,
     )
     _session_controller = session_controller or SessionController(
         completion_processor=completion_processor,
@@ -954,6 +961,7 @@ def build_test_orchestrator_deps(
         config=config,
         repository=repo_host,
         events=events,
+        unrecorded_refusals=unrecorded_refusals,
     )
     fresh_reader = MagicMock()
     fresh_reader.read_issue_labels.return_value = []
@@ -1069,6 +1077,7 @@ def build_test_orchestrator_deps(
         attempt_store=attempt_store,
         tech_lead_authority=tech_lead_authority,
         open_issue_corpus=open_issue_corpus,
+        unrecorded_refusals=unrecorded_refusals,
     )
 
     from issue_orchestrator.execution.json_publish_retry_locator_store import (
@@ -1159,6 +1168,7 @@ def build_test_orchestrator_deps(
             agent_callback_endpoint=agent_callback_endpoint,
             provider_readiness_probe=readiness_probe,
             needs_human_block=needs_human_block,
+            unrecorded_refusals=unrecorded_refusals,
         ),
         # Same shape again for the completion handler (#6999 A4).
         completion_handler_factory=build_completion_handler_factory(

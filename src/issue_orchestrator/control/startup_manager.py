@@ -40,7 +40,6 @@ if TYPE_CHECKING:
     from .worktree_reconciliation import StartupWorktreeReconciler
 from ..domain.models import (
     OrchestratorState,
-    PendingRetrospectiveReview,
     PendingReview,
     PendingValidationRetry,
     SessionHistoryEntry,
@@ -57,9 +56,10 @@ from .stuck_sweep import hydrate_stuck_sweep_state
 from .action_applier import ActionApplier
 from .issue_fetch_resilience import IssueFetchResilience, TransientIssueFetchError
 from .queue_cache import QueueCache, QueueMutationStatus, record_issue_refreshes
+from .publication_authority import UnrecordedRefusals
 from .review_validity import evaluate_review_validity
 from .review_scope import ReviewScopeChecker, extract_issue_number_from_pr
-from .retrospective_review import discover_retrospective_review_issues
+from .retrospective_review import recover_pending_retrospective_reviews
 from .worker_budget import worker_slot_free
 from ..events import EventName
 from ..ports import EventSink, SessionRunner, make_trace_event, RepositoryHost
@@ -100,6 +100,7 @@ class StartupManager:
         label_manager: "LabelManager | None" = None,
         label_store: "LabelStore | None" = None,
         tech_lead_authority: "TechLeadAuthorityStore | None" = None,
+        unrecorded_refusals: "UnrecordedRefusals | None" = None,
     ):
         """Initialize the startup manager.
 
@@ -121,6 +122,11 @@ class StartupManager:
             startup_worktree_reconciler: Owner of crash-safe worktree recovery.
             queue_cache_store: Persistent store for queue cache (enables warm restarts)
             label_manager: Label registry for prefix-aware queries.
+            unrecorded_refusals: The shared record of publication-gate
+                refusals whose label write did not commit (#45). Wired like
+                the other two readers of the verdict so no path can answer it
+                differently, though startup runs before any gate in this
+                process has failed and so reads it empty.
         """
         self.config = config
         self.events = events
@@ -139,6 +145,7 @@ class StartupManager:
             from .label_manager import LabelManager
             label_manager = LabelManager(config)
         self._lm = label_manager
+        self._unrecorded_refusals = unrecorded_refusals or UnrecordedRefusals()
         self._label_store = label_store
         # Gated-proposal ledger (#6778); None (tests) = no op-backed exclusions.
         self._tech_lead_authority = tech_lead_authority
@@ -666,6 +673,7 @@ class StartupManager:
                 config=self.config,
                 label_manager=self._lm,
                 issue=issue,
+                unrecorded_refusals=self._unrecorded_refusals,
                 pr=pr,
                 review_label_confirmed=True,
             )
@@ -718,30 +726,11 @@ class StartupManager:
 
     def _recover_pending_retrospective_reviews(self, state: OrchestratorState) -> None:
         """Recover trigger-labeled existing-work review requests on startup."""
-
-        discovered = discover_retrospective_review_issues(
+        recover_pending_retrospective_reviews(
+            state,
             repository_host=self.repository_host,
             config=self.config,
-            already_issue_numbers=state.retrospective_review_in_flight_issue_numbers(),
         )
-        for review in discovered:
-            state.pending_retrospective_reviews.append(
-                PendingRetrospectiveReview(
-                    issue_key=self.repository_host.create_issue_key(review.issue_number),
-                    issue_number=review.issue_number,
-                    issue_title=review.issue_title,
-                    agent_label=review.agent_label,
-                    trigger_label=review.trigger_label,
-                    prior_pr_number=review.prior_pr_number,
-                    prior_pr_url=review.prior_pr_url,
-                    issue_labels=review.issue_labels,
-                )
-            )
-        if discovered:
-            logger.info(
-                "[startup] Recovered %d retrospective review request(s)",
-                len(discovered),
-            )
 
     def _recover_pending_validation_retries(
         self,

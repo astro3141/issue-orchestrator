@@ -47,6 +47,7 @@ if TYPE_CHECKING:
     from .tech_lead_run_ownership import TechLeadRunOwnership
     from .infra_services import InfraServices
     from .label_manager import LabelManager
+    from .publication_authority import UnrecordedRefusals
     from .planner import Planner
     from .session_manager import SessionManager
     from .label_sync import LabelSync
@@ -170,6 +171,10 @@ class OrchestratorDeps:
     @property
     def label_manager(self) -> "LabelManager":
         return self.services.label_manager
+
+    @property
+    def unrecorded_refusals(self) -> "UnrecordedRefusals":
+        return self.services.unrecorded_refusals
 
     @property
     def label_store(self) -> "LabelStore":

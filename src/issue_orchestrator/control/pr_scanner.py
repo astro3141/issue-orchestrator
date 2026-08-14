@@ -18,6 +18,7 @@ from ..events import EventName
 from ..domain.models import PendingReview, PendingRework
 from ..domain.issue_key import IssueKey
 from ..domain.pr_attempt_scope import scope_prs_to_active_issue_branch
+from .publication_authority import UnrecordedRefusals
 from .review_validity import evaluate_review_validity
 from .review_scope import ReviewScopeChecker, extract_issue_number_from_pr
 from ..ports import EventSink,  make_trace_event
@@ -75,6 +76,7 @@ class PRScanner:
         events: EventSink,
         label_manager: "LabelManager | None" = None,
         issue_branches_fn: Callable[[], dict[int, str]] | None = None,
+        unrecorded_refusals: "UnrecordedRefusals | None" = None,
     ):
         """Initialize the scanner.
 
@@ -83,6 +85,11 @@ class PRScanner:
             repository: Adapter for GitHub operations
             events: EventSink for trace events
             label_manager: Label registry for prefix-aware queries.
+            unrecorded_refusals: The orchestrator's shared record of
+                publication-gate refusals whose label write did not commit
+                (#45). Production passes the one instance the completion
+                processor writes to; an unwired composition gets its own
+                empty one and behaves as the durable marker alone dictates.
         """
         self.config = config
         self.repository = repository
@@ -92,6 +99,7 @@ class PRScanner:
             from .label_manager import LabelManager
             label_manager = LabelManager(config)
         self._lm = label_manager
+        self._unrecorded_refusals = unrecorded_refusals or UnrecordedRefusals()
         self._review_scope = ReviewScopeChecker(config, repository, log_prefix="SCANNER")
 
     def load_issue_branches(self) -> dict[int, str]:
@@ -167,6 +175,7 @@ class PRScanner:
                 config=self.config,
                 label_manager=self._lm,
                 issue=issue,
+                unrecorded_refusals=self._unrecorded_refusals,
                 pr=pr,
                 review_label_confirmed=True,
             )

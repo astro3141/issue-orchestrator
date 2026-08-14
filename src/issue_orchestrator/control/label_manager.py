@@ -596,4 +596,9 @@ class LabelManager:
             "needs_rework": self.needs_rework,
             "code_review": self._resolved["code_review"],
             "in_progress": self.in_progress,
+            # The publication-gate verdict marker (#45). Omitting it left the
+            # completion processor writing the built-in default while every
+            # reader resolved the configured, prefix-aware name — a verdict
+            # nothing downstream could see.
+            "validation_failed": self.validation_failed,
         }

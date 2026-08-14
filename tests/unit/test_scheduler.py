@@ -1461,6 +1461,7 @@ class TestLaunchSessionDependencyCAS:
                 agent_callback_endpoint=ready_callback_endpoint(),
                 provider_readiness_probe=orch.deps.provider_readiness_probe,
                 needs_human_block=NO_OTHER_NEEDS_HUMAN_CAUSES,
+                unrecorded_refusals=orch.deps.unrecorded_refusals,
             )
 
         # Original issue had no dependencies
@@ -1554,6 +1555,7 @@ class TestLaunchSessionDependencyCAS:
                 agent_callback_endpoint=ready_callback_endpoint(),
                 provider_readiness_probe=orch.deps.provider_readiness_probe,
                 needs_human_block=NO_OTHER_NEEDS_HUMAN_CAUSES,
+                unrecorded_refusals=orch.deps.unrecorded_refusals,
             )
 
         issue = Issue(

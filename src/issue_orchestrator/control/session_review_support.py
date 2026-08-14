@@ -19,6 +19,7 @@ from .review_validity import ReviewValidity, evaluate_review_validity
 
 if TYPE_CHECKING:
     from .label_manager import LabelManager
+    from .publication_authority import UnrecordedRefusals
 
 logger = logging.getLogger(__name__)
 
@@ -64,8 +65,13 @@ def review_launch_validity(
     config: Config,
     repository_host: RepositoryHost,
     label_manager: "LabelManager",
+    unrecorded_refusals: "UnrecordedRefusals",
 ) -> ReviewValidity:
-    """Load current review facts and decide whether launch is still valid."""
+    """Load current review facts and decide whether launch is still valid.
+
+    Launch is the last moment the verdict can be re-read, so it re-reads all
+    of it: the live labels, and the refusals that never reached a label (#45).
+    """
     current_issue = repository_host.get_issue(review.issue_number)
     if not isinstance(current_issue, IssueProtocol):
         current_issue = None
@@ -76,6 +82,7 @@ def review_launch_validity(
         config=config,
         label_manager=label_manager,
         issue=current_issue,
+        unrecorded_refusals=unrecorded_refusals,
         pr=current_pr,
     )
 

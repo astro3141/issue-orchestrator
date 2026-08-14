@@ -240,6 +240,43 @@ def discover_retrospective_review_issues(
     return discovered
 
 
+def recover_pending_retrospective_reviews(
+    state: "OrchestratorState",
+    *,
+    repository_host: "RepositoryHost",
+    config: "Config",
+) -> None:
+    """Requeue trigger-labeled existing-work review requests after a restart.
+
+    Hydration lives beside discovery so startup and the per-tick scan queue the
+    same shape from the same facts, rather than each spelling out how a
+    discovered request becomes a pending one.
+    """
+    discovered = discover_retrospective_review_issues(
+        repository_host=repository_host,
+        config=config,
+        already_issue_numbers=state.retrospective_review_in_flight_issue_numbers(),
+    )
+    for review in discovered:
+        state.pending_retrospective_reviews.append(
+            PendingRetrospectiveReview(
+                issue_key=repository_host.create_issue_key(review.issue_number),
+                issue_number=review.issue_number,
+                issue_title=review.issue_title,
+                agent_label=review.agent_label,
+                trigger_label=review.trigger_label,
+                prior_pr_number=review.prior_pr_number,
+                prior_pr_url=review.prior_pr_url,
+                issue_labels=review.issue_labels,
+            )
+        )
+    if discovered:
+        logger.info(
+            "[startup] Recovered %d retrospective review request(s)",
+            len(discovered),
+        )
+
+
 def build_retrospective_review_existing_work(
     review: PendingRetrospectiveReview,
 ) -> str:

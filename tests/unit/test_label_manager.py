@@ -520,6 +520,7 @@ class TestToLabelConfigDict:
         assert set(d.keys()) == {
             "blocked", "needs_human", "code_reviewed",
             "needs_rework", "code_review", "in_progress",
+            "validation_failed",
         }
 
     def test_values_no_prefix(self, lm: LabelManager) -> None:
@@ -532,6 +533,10 @@ class TestToLabelConfigDict:
         assert d["blocked"] == "bot:blocked"
         assert d["in_progress"] == "bot:in-progress"
         assert d["code_reviewed"] == "bot:code-reviewed"
+        # The publication-gate verdict marker must reach the completion
+        # processor prefixed, or the label it writes is not the label the
+        # review-validity seam reads back (#45).
+        assert d["validation_failed"] == "bot:validation-failed"
 
     def test_custom_review_labels(self) -> None:
         """Custom code_review_label and code_reviewed_label are used."""
