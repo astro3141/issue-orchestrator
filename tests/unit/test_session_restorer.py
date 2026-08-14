@@ -700,8 +700,16 @@ class TestStateValidation:
         assert len(restored) == 0
         assert "No repo configured" in caplog.text
 
-    def test_creates_minimal_issue_when_issue_not_found(self, tmp_path):
-        """When issue not found in repo, creates minimal issue object."""
+    def test_declines_restore_when_issue_is_not_found(self, tmp_path, caplog):
+        """An unavailable issue is declined, not restored from tab text (#40).
+
+        Restoration used to build a minimal issue out of the terminal's tab
+        name and key the session by issue number. Neither is authoritative: a
+        tab name is a UI label, and for a title carrying a stable-id prefix the
+        number-only key names a different work item than every other record for
+        that issue. Coherence of the restored identity outranks continuing to
+        track the terminal, so the session is skipped.
+        """
         repo_root = tmp_path / "repo"
         repo_root.mkdir()
         worktree = tmp_path / "repo-123"
@@ -722,13 +730,11 @@ class TestStateValidation:
         discovered = [
             make_discovered_session(123, tab_name="#123 My task", worktree=worktree)
         ]
-        restored = restorer.restore_sessions(discovered, already_tracked=[])
+        with caplog.at_level(logging.WARNING):
+            restored = restorer.restore_sessions(discovered, already_tracked=[])
 
-        # Session still restored with minimal issue
-        assert len(restored) == 1
-        session = restored[0]
-        assert session.issue.number == 123
-        assert session.issue.title == "123 My task"  # Tab name with # stripped
+        assert restored == []
+        assert "canonical identity cannot be proven" in caplog.text
 
     def test_uses_fallback_agent_config_when_issue_has_no_agent_label(self, tmp_path):
         """Uses first available agent config when issue has no agent type label."""
