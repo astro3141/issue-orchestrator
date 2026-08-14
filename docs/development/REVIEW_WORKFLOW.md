@@ -390,6 +390,16 @@ configuring `review.tech_lead_review_agent` enables the workflow.
 
 3. **Labels as source of truth** - Crash-safe: labels persist, orchestrator picks up where it left off
 
+4. **A trigger is not authority** - `needs-code-review` says a review was once
+   wanted; it does not say this candidate earned one. Validation precedes
+   review, so the publication gate's verdict is recorded on the *issue* as
+   `validation-failed` and read back by every path that could start a review —
+   scan-time discovery, startup recovery, and launch-time revalidation. A
+   candidate whose gate failed is not reviewed even though the PR still carries
+   the label an earlier candidate left there. The next candidate that clears
+   every publication precondition clears the verdict with it, so ordinary work
+   needs no human step to get its review back.
+
 ## Review Decision Policy (Strict)
 
 Review decision criteria are maintained in `.claude/skills/review-workflow/SKILL.md` (canonical source).

@@ -2253,6 +2253,43 @@ class TestLaunchReviewSession:
         assert launcher_bundle.create_session_calls == []
         assert "Dropping stale pending review: pr=456 issue=123 reason=issue_blocked" in caplog.text
 
+    def test_drops_queued_review_when_publication_gate_failed_after_queueing(
+        self,
+        launcher_bundle,
+        mock_repo_host,
+        caplog,
+    ):
+        """Launch must re-read the verdict, not trust queue history (#45).
+
+        The review was queued while the issue was clean; the publication gate
+        for the candidate then failed. Launch reads live labels, so the queue
+        entry cannot carry the review past a refused gate.
+        """
+        review = PendingReview(
+            issue_key=GitHubIssueKey(repo="test/repo", external_id="123"),
+            pr_number=456,
+            pr_url="https://github.com/test/repo/pull/456",
+            branch_name="123-feature",
+            _issue_number=123,
+        )
+        mock_repo_host.issues[123] = Issue(
+            number=123,
+            title="Gate failed after queueing",
+            labels=["agent:web", "validation-failed"],
+            repo="test/repo",
+        )
+
+        with caplog.at_level("INFO"):
+            result = launcher_bundle.launcher.launch_review_session(review, active_sessions=[])
+
+        assert result.success is False
+        assert result.reason == "Stale pending review: issue_publication_gate_failed"
+        assert launcher_bundle.create_session_calls == []
+        assert (
+            "Dropping stale pending review: pr=456 issue=123 "
+            "reason=issue_publication_gate_failed"
+        ) in caplog.text
+
     def test_review_existing_work_includes_keep_current_note(
         self, launcher_bundle, mock_repo_host
     ):

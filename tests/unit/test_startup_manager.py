@@ -877,6 +877,56 @@ class TestStartupManagerCodeReviewRecovery:
             in caplog.text
         )
 
+    @pytest.mark.asyncio
+    async def test_does_not_recover_review_when_publication_gate_failed(
+        self,
+        startup_manager,
+        sample_state,
+        mock_repository_host,
+        mock_config,
+        caplog,
+    ):
+        """A restart must not re-authorize a refused candidate (#45).
+
+        Crash recovery rebuilds the review queue from ``needs-code-review``,
+        which an earlier candidate left on the PR. The publication-gate
+        verdict is durable label state precisely so it survives the restart
+        that recreates that trigger.
+        """
+        mock_config.agents = {}
+        mock_config.code_review_agent = "agent:reviewer"
+        mock_config.code_review_label = "needs-code-review"
+
+        from issue_orchestrator.ports import PRInfo
+
+        pr = PRInfo(
+            number=10,
+            url="https://github.com/owner/repo/pull/10",
+            title="Test PR",
+            branch="1-feature",
+            labels=["needs-code-review", "rework-cycle-1"],
+            body=f"Closes #1\n\n{ORCHESTRATOR_PR_MARKER}",
+            state="open",
+        )
+        issue = Issue(
+            number=1,
+            title="Rework candidate whose gate failed",
+            labels=["agent:web", "validation-failed"],
+            repo="owner/repo",
+        )
+        mock_repository_host.get_prs_with_label.return_value = [pr]
+        mock_repository_host.get_issue.return_value = issue
+
+        with caplog.at_level("INFO"):
+            await startup_manager.run_startup(sample_state)
+
+        assert sample_state.pending_reviews == []
+        assert (
+            "Dropping stale pending review recovery: pr=10 issue=1 "
+            "reason=issue_publication_gate_failed"
+            in caplog.text
+        )
+
 
 class TestStartupManagerAwaitingMergeRecovery:
     """Tests for dashboard visibility recovery of pr-pending issues."""

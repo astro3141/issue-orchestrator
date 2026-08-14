@@ -381,7 +381,11 @@ class TestCompletionProcessorLabelActions:
     def test_completed_outcome_does_not_add_labels_directly(
         self, processor, mock_label_adapter, worktree_with_completion
     ):
-        """Completed outcome requests push/PR, no label actions needed."""
+        """Completed outcome requests push/PR, no label actions needed.
+
+        The one label write it does make is the publication-gate verdict:
+        clearing a refusal an earlier candidate may have earned (#45).
+        """
         record = make_record(
             outcome=CompletionOutcome.COMPLETED,
             requested_actions=[
@@ -402,7 +406,9 @@ class TestCompletionProcessorLabelActions:
 
         assert result.success
         mock_label_adapter.add_label.assert_not_called()
-        mock_label_adapter.remove_label.assert_not_called()
+        mock_label_adapter.remove_label.assert_called_once_with(
+            123, "validation-failed"
+        )
 
 
 class _FakeStackGate:
@@ -4057,6 +4063,79 @@ class TestCompletionProcessorPublishGate:
         comment = mock_pr_adapter.add_comment.call_args[0][1]
         assert "Validation Failed" in comment
         assert "Validation failed: tests failed" in comment
+        # The refusal is what withholds review from this candidate, so it must
+        # not be cleared in the same pass that recorded it (#45).
+        mock_label_adapter.remove_label.assert_not_called()
+
+    def test_passing_gate_clears_a_previous_candidates_refusal(
+        self,
+        processor_with_gate,
+        mock_publish_gate,
+        mock_label_adapter,
+        worktree_with_completion,
+    ):
+        """Authority is re-earned per candidate, then released (#45).
+
+        A refusal that outlived the candidate that earned it would hold the
+        next, genuinely validated candidate out of review forever — so a
+        candidate that clears the gate clears the marker too.
+        """
+        mock_publish_gate.check.side_effect = publish_gate_outcome(
+            allowed=True,
+            reason="passed",
+        )
+
+        record = make_record(
+            outcome=CompletionOutcome.COMPLETED,
+            requested_actions=[RequestedAction.PUSH_BRANCH, RequestedAction.CREATE_PR],
+            summary="Reworked",
+        )
+        worktree = worktree_with_completion(record)
+
+        result = processor_with_gate.process(
+            worktree,
+            run_assets=make_session_run_assets(worktree),
+            issue_number=123,
+            issue_title="Test",
+        )
+
+        assert result.success
+        mock_label_adapter.remove_label.assert_called_once_with(
+            123, "validation-failed"
+        )
+
+    def test_completion_offering_no_change_leaves_the_refusal_standing(
+        self,
+        processor_with_gate,
+        mock_publish_gate,
+        mock_label_adapter,
+        worktree_with_completion,
+    ):
+        """Only a candidate offered for review can clear the verdict (#45).
+
+        A ``blocked`` completion pushes to preserve work and opens no PR, so
+        it never runs the publish contract — it has proved nothing, and must
+        not release a refusal an earlier candidate earned.
+        """
+        record = make_record(
+            outcome=CompletionOutcome.BLOCKED,
+            requested_actions=[
+                RequestedAction.PUSH_BRANCH,
+                RequestedAction.ADD_BLOCKED_LABEL,
+            ],
+            summary="Blocked",
+        )
+        worktree = worktree_with_completion(record)
+
+        processor_with_gate.process(
+            worktree,
+            run_assets=make_session_run_assets(worktree),
+            issue_number=123,
+            issue_title="Test",
+        )
+
+        mock_publish_gate.check.assert_not_called()
+        mock_label_adapter.remove_label.assert_not_called()
 
     def test_validation_failure_captured_in_session_output(
         self, processor_with_gate, mock_publish_gate, tmp_path

@@ -71,6 +71,7 @@ from ..ports.review_exchange_runner import (
     ReviewExchangeRunner,
 )
 from ..ports.session_output import SessionOutput, ValidationRecord
+from .publication_authority import PublicationAuthority
 from .publication_gate import PublicationGate, PublicationGateOutcome
 from .validation import GateEvidence
 from .validation_record_cache import contract_record_path
@@ -257,6 +258,12 @@ class CompletionProcessor:
         self._trace_events: EventSink | None = None
         self._event_context: EventContext | None = None
         self.label_config = label_config or {}
+        # The one owner of this issue's publication-gate verdict (#45). Built
+        # here from the injected label adapter so the marker is written and
+        # cleared in exactly one place, under the configured label name.
+        self._publication_authority = PublicationAuthority(
+            label_adapter, self._get_label("validation_failed")
+        )
         self.publication_gate = publication_gate
         self.pre_publish_gate = pre_publish_gate
         self._config = config
@@ -1053,12 +1060,24 @@ class CompletionProcessor:
         if runtime_artifact_error:
             return runtime_artifact_error
 
-        return self._check_publish_gate_if_required(
+        gate_failure = self._check_publish_gate_if_required(
             worktree,
             record,
             issue_number,
             run_assets,
         )
+        if gate_failure is not None:
+            return gate_failure
+
+        # This candidate cleared every publication precondition, so a verdict
+        # recorded against an earlier one no longer describes what is being
+        # offered. Granting here — not at the push or the PR — keeps the
+        # verdict tied to the candidate the gate actually judged: a refusal
+        # with no matching grant would hold a later, genuinely validated
+        # candidate out of review forever (#45).
+        if record.offers_a_change_for_review:
+            self._publication_authority.grant(issue_number)
+        return None
 
     def _read_and_validate_record(
         self,
@@ -1360,21 +1379,11 @@ class CompletionProcessor:
             ValidationFailed(reason=gate_reason or "publish gate failed"),
             ended_at=datetime.now(timezone.utc).isoformat(),
         )
-        # Add validation-failed label so user knows why issue is stuck
-        validation_failed_label = self._get_label("validation_failed")
-        try:
-            self.label_adapter.add_label(issue_number, validation_failed_label)
-            logger.info(
-                "Added '%s' label to issue #%d due to validation failure",
-                validation_failed_label,
-                issue_number,
-            )
-        except Exception as e:
-            logger.warning(
-                "Failed to add validation-failed label to issue #%d: %s",
-                issue_number,
-                e,
-            )
+        # Record the refusal on the issue: it tells the user why the issue is
+        # stuck, and it is what withholds the review step from this candidate
+        # until a later one clears the gate (#45).
+        validation_failed_label = self._publication_authority.label
+        self._publication_authority.revoke(issue_number, reason=gate_reason)
         comment = build_gate_failure_comment(
             gate_reason=gate_reason,
             validation_failed_label=validation_failed_label,

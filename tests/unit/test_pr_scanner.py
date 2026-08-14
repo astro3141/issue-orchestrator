@@ -367,6 +367,45 @@ class TestScanForReviewsFiltering:
         assert result == []
         assert "Skipping stale review PR: pr=100 issue=42 reason=issue_blocked" in caplog.text
 
+    def test_skips_review_pr_when_publication_gate_failed(
+        self,
+        scanner,
+        mock_repository,
+        caplog,
+    ):
+        """A failed publication gate must not authorize the review step (#45).
+
+        The PR still carries ``needs-code-review`` from the candidate that was
+        published before the rework — trigger state left by an earlier
+        candidate, not authority for this one.
+        """
+        mock_repository.issues.append(
+            IssueBuilder()
+            .with_number(42)
+            .with_title("Rework candidate whose gate failed")
+            .with_labels("agent:developer", "validation-failed")
+            .build()
+        )
+        pr = make_pr_info(
+            100,
+            branch="42-feature",
+            body="Closes #42",
+            labels=["needs-code-review", "rework-cycle-1"],
+        )
+        mock_repository.prs["42-feature"] = [pr]
+
+        with caplog.at_level("INFO"):
+            result = scanner.scan_for_reviews(
+                already_queued=[],
+                active_sessions=[],
+            )
+
+        assert result == []
+        assert (
+            "Skipping stale review PR: pr=100 issue=42 "
+            "reason=issue_publication_gate_failed"
+        ) in caplog.text
+
 
 class TestScanForReviewsEvents:
     """Tests for event emission in review scanning."""
