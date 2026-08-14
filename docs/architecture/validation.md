@@ -57,6 +57,44 @@ while stamping `suite=publish_gate` onto the record, and the completion
 processor's publish-gate seam was never wired in composition — so
 `validation.publish.cmd` ran nowhere in the orchestrator path.
 
+## Worktree readiness is a precondition of a meaningful verdict
+
+Every gate above runs *inside a worktree*. A worktree that lacks the
+repository's runtime prerequisites — its virtualenv, its node modules, its
+browser binaries — still runs the command, still fails, and the failure is
+recorded against the candidate commit. An environment gap then reads as
+"this change failed validation".
+
+Two collaborators decide whether a worktree can run anything:
+
+| Step | Owner | What it guarantees |
+|------|-------|--------------------|
+| Create/reuse the worktree | `WorktreeManager` (adapter) | The checkout, its branch, its hooks, and a symlink from the worktree's `.venv` to the repository's |
+| Provision the worktree | `WorktreeProvisioner` (`control/worktree_provisioning.py`) | Everything `worktrees.setup` installs — anything the symlink does not supply, such as `packages/vscode/node_modules` |
+
+The provisioner is the single owner, and **every** launch path goes through it:
+coding, validation retry, rework, review and retrospective review. It used to
+be invoked from the coding and validation-retry paths only, so whether a
+worktree was runnable depended on which path had created it: a rework or review
+worktree — the reused ones — reached the publish gate unprovisioned, and the
+run died on a late, unrelated gate target. That was issue [#48].
+
+Provisioning holds two rules:
+
+- **Fail closed, where the failure is.** A failing or timing-out setup command
+  aborts the launch at provisioning — before the claim is held, before a
+  terminal exists — instead of letting an unprovisioned worktree reach a
+  validation command.
+- **Do not touch the candidate.** Setup commands install tooling. The
+  provisioner checkpoints `HEAD` and the worktree's dirty state before running
+  them and re-reads both afterwards, so a setup command that moves `HEAD` or
+  edits tracked content is a loud failure rather than a silent edit to the
+  change under test. The prerequisites themselves are build output and are
+  git-ignored, so an honest setup run leaves a clean worktree clean.
+
+A repository that declares no `worktrees.setup` commands provisions nothing;
+its worktrees must be runnable from the checkout alone.
+
 ## Configuration (YAML)
 
 ```yaml

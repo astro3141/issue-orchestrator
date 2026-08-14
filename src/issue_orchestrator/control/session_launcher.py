@@ -53,6 +53,7 @@ from ..domain.coder_prompt import (
 )
 from ..domain.session_run import SessionRunAssets
 from .worktree_context import WorktreeContext
+from .worktree_provisioning import WorktreeProvisioner, provision_launch_worktree
 from ..infra.validation_state import DEFAULT_RETRY_TEMPLATE, _truncate_with_tail
 from ..domain.tech_lead_session import TechLeadLaunchScope
 from .tech_lead_session_policy import (
@@ -118,7 +119,6 @@ from .session_worktree_diagnostics import (
     write_worktree_diagnostic,
 )
 from .transition_log import log_transition
-from .isolation import build_runtime_tool_env
 from .launch_dependency_gate import LaunchDependencyGate
 from .publication_authority import UnrecordedRefusals
 from .launch_guards import (
@@ -202,6 +202,13 @@ class SessionLauncher:
         self._worktree_manager = worktree_manager
         self._working_copy = working_copy
         self._command_runner = command_runner
+        # One owner decides whether a worktree is runnable, for every launch
+        # path this launcher has (#48).
+        self._worktree_provisioner = WorktreeProvisioner(
+            config=config,
+            command_runner=command_runner,
+            working_copy=working_copy,
+        )
         self._session_output = session_output
         self._manifest_downloader = manifest_downloader
         self._tech_lead_authority = tech_lead_authority
@@ -1576,13 +1583,10 @@ class SessionLauncher:
         if result := callback_endpoint_not_ready(self._agent_callback_endpoint):
             return result
         # Get the reviewer for this agent (per-agent override or default)
-        agent_label = self.config.get_reviewer_for_agent(review.agent_label) if review.agent_label else self.config.code_review_agent
-        if not agent_label:
-            return LaunchResult(None, False, "No code review agent configured")
-
-        agent_config = self.config.agents.get(agent_label)
-        if not agent_config:
-            return LaunchResult(None, False, f"No agent config for {agent_label}")
+        resolved = self._resolve_reviewer_agent(review.agent_label)
+        if isinstance(resolved, LaunchResult):
+            return resolved
+        agent_label, agent_config = resolved
 
         if result := self._check_provider_ready(agent_config.provider, review.issue_number):
             return result
@@ -1661,6 +1665,16 @@ class SessionLauncher:
         worktree_path = ctx.worktree_path
         worktree_info = ctx.worktree_info
         run = ctx.run
+
+        if failure := provision_launch_worktree(
+            self._worktree_provisioner,
+            worktree_path,
+            events=self.events,
+            kind="review",
+            number=review.issue_number,
+            session_name=session_name,
+        ):
+            return failure
 
         # Durable before anything irreversible (#6999 A2).
         if failure := work_claim.hold_before_spawn(
@@ -1848,6 +1862,27 @@ class SessionLauncher:
 
             return LaunchResult(session, True)
 
+    def _resolve_reviewer_agent(
+        self, source_agent_label: str | None
+    ) -> tuple[str, AgentConfig] | LaunchResult:
+        """Resolve which reviewer runs a review-family launch, and its config.
+
+        Both review launches answer this the same way — the per-agent reviewer
+        override, else the configured default — so they resolve it in one place
+        rather than each re-deriving the reviewer's identity.
+        """
+        agent_label = (
+            self.config.get_reviewer_for_agent(source_agent_label)
+            if source_agent_label
+            else self.config.code_review_agent
+        )
+        if not agent_label:
+            return LaunchResult(None, False, "No code review agent configured")
+        agent_config = self.config.agents.get(agent_label)
+        if not agent_config:
+            return LaunchResult(None, False, f"No agent config for {agent_label}")
+        return agent_label, agent_config
+
     def _check_retrospective_preconditions(
         self,
         review: PendingRetrospectiveReview,
@@ -1874,17 +1909,10 @@ class SessionLauncher:
         """Launch a reviewer session to audit an existing implementation."""
         if result := callback_endpoint_not_ready(self._agent_callback_endpoint):
             return result
-        agent_label = (
-            self.config.get_reviewer_for_agent(review.agent_label)
-            if review.agent_label
-            else self.config.code_review_agent
-        )
-        if not agent_label:
-            return LaunchResult(None, False, "No code review agent configured")
-
-        agent_config = self.config.agents.get(agent_label)
-        if not agent_config:
-            return LaunchResult(None, False, f"No agent config for {agent_label}")
+        resolved = self._resolve_reviewer_agent(review.agent_label)
+        if isinstance(resolved, LaunchResult):
+            return resolved
+        agent_label, agent_config = resolved
 
         if result := self._check_provider_ready(agent_config.provider, review.issue_number):
             return result
@@ -1968,6 +1996,16 @@ class SessionLauncher:
         worktree_path = ctx.worktree_path
         worktree_info = ctx.worktree_info
         run = ctx.run
+
+        if failure := provision_launch_worktree(
+            self._worktree_provisioner,
+            worktree_path,
+            events=self.events,
+            kind="retrospective-review",
+            number=review.issue_number,
+            session_name=session_name,
+        ):
+            return failure
 
         # Durable before anything irreversible (#6999 A2).
         if failure := work_claim.hold_before_spawn(
@@ -2147,6 +2185,7 @@ class SessionLauncher:
             create_session=self._create_session,
             apply_actions=self._apply_actions,
             worktree_reuse_options=self._worktree_reuse_options,
+            worktree_provisioner=self._worktree_provisioner,
             session_identity_launch_metadata=self._session_identity_launch_metadata,
             clear_interrupted_retry_guard_label=self._clear_interrupted_retry_guard_label,
             clear_reset_retry_pending_label=self._clear_reset_retry_pending_label,
@@ -2163,28 +2202,15 @@ class SessionLauncher:
         )
 
     def _run_setup_commands(self, worktree_path: Path) -> None:
-        """Run setup commands in worktree."""
-        step_start = time.time()
-        for cmd in self.config.setup_worktree:
-            logger.debug("Running setup command: %s", cmd)
-            logger.info("[launch] Running setup: %s", cmd)
-            result = self._command_runner.run(
-                cmd,
-                shell=True,
-                cwd=worktree_path,
-                env=build_runtime_tool_env(worktree_path),
-            )
-            if result.timed_out:
-                logger.error("[launch] Setup command timed out: %s", cmd)
-                raise RuntimeError(f"setup command timed out: {cmd}")
-            if result.returncode != 0:
-                stderr = result.stderr.strip() or "no stderr captured"
-                logger.error("Setup command failed: %s\n%s", cmd, stderr)
-                raise RuntimeError(
-                    f"setup command failed: {cmd} (exit_code={result.returncode}): {stderr}"
-                )
-        setup_time = time.time() - step_start
-        logger.info("[launch] Setup completed in %.1fs", setup_time)
+        """Provision a worktree through its single owner (#48).
+
+        The coding and validation-retry paths keep their own handlers rather
+        than calling :func:`provision_launch_worktree`: a failed provisioning
+        there also cleans up the pre-active worktree and releases the claim
+        those paths hold. The decision of *what provisioning is* is the
+        provisioner's either way.
+        """
+        self._worktree_provisioner.provision(worktree_path)
 
     def _persist_session_prompt(self, run_dir: Path, prompt_text: str) -> str:
         """Persist rendered launch prompt into run-scoped artifacts."""

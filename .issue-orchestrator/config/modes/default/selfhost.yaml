@@ -64,6 +64,23 @@ worktrees:
   seed_ref: origin/main
   reuse_push_preflight: true
   worktree_branch_on_recreate: delete
+  # This fork's publish gate is `make validate-pr-raw`, whose last target is
+  # `test-vscode`; its quick gate runs `.venv/bin/python` and `make typecheck`,
+  # and `quality-guardrails` needs `.venv-semgrep`. None of that is created by
+  # creating a worktree — the worktree manager only symlinks the repository
+  # `.venv` — so with no setup declared here, every worktree reached validation
+  # missing prerequisites and the resulting failure was recorded against the
+  # candidate commit (#48). `make worktree-setup` is the target that installs
+  # them, and it is what main.yaml and z-codespaces.yaml already declare.
+  #
+  # It is idempotent by design: `venv-fast` reuses an existing `.venv`, `npm ci`
+  # and `playwright install` are no-ops once satisfied. It syncs the *shared*
+  # repository venv the worktree is symlinked to, so a candidate that changes
+  # `uv.lock` re-syncs that shared venv from its own lock — pinned third-party
+  # dependencies only; the boundary above (the candidate's IO source never runs
+  # itself) is untouched.
+  setup:
+    - make worktree-setup
   remediation:
     pr_collision: new_branch
     push_rebase_retry: true

@@ -46,6 +46,7 @@ from .session_worktree_diagnostics import (
 )
 from .transition_log import log_transition
 from .worktree_context import WorktreeContext
+from .worktree_provisioning import WorktreeProvisioner, provision_launch_worktree
 from .needs_human_block import NeedsHumanCause
 
 if TYPE_CHECKING:
@@ -142,6 +143,7 @@ class ReworkLaunchDependencies:
     create_session: SessionCreatorFn
     apply_actions: ActionApplierFn
     worktree_reuse_options: WorktreeReuseOptionsFactory
+    worktree_provisioner: WorktreeProvisioner
     session_identity_launch_metadata: SessionIdentityMetadataBuilder
     clear_interrupted_retry_guard_label: InterruptedGuardLabelClearer
     clear_reset_retry_pending_label: GuardLabelClearer
@@ -262,6 +264,61 @@ def _rework_launch_identity(
     return agent_config, issue_number, prepared_coder_prompt
 
 
+def _rework_inherited_state(
+    deps: ReworkLaunchDependencies,
+    rework: PendingRework,
+    *,
+    pr_number: int,
+    worktree_path: Path,
+    run: SessionRunAssets,
+    rebase_failed: bool,
+) -> str | None:
+    """Assemble what the rework agent inherits, as one prompt section.
+
+    A conflicted rebase, the feedback queued with the rework, and the
+    reviewer's comments on the PR are three sources of the same thing — the
+    state this cycle starts from — so one step gathers them, persists the
+    combined feedback as this cycle's artifact, and returns the text. ``None``
+    when this cycle inherits nothing the agent has to be told about.
+    """
+    existing_work = build_rework_existing_work(rebase_failed)
+    if existing_work:
+        logger.warning("[launch] Rebase failed for rework - agent will need to resolve merge conflicts")
+
+    copy_review_feedback_to_rework(
+        worktree_path=worktree_path,
+        pr_number=pr_number,
+        rework_run_assets=run,
+    )
+
+    feedback_sections: list[str] = []
+    if rework.feedback:
+        feedback_sections.append(rework.feedback)
+
+    reviewer_feedback = format_reviewer_feedback(
+        pr_number=pr_number,
+        repository_host=deps.repository_host,
+        cache_minutes=deps.config.reviewer_feedback_cache_minutes,
+        run_assets=run,
+        sleep_fn=time.sleep,
+    )
+    if reviewer_feedback:
+        feedback_sections.append(reviewer_feedback)
+
+    if not feedback_sections:
+        return existing_work
+
+    combined_feedback = "\n\n".join(feedback_sections)
+    logger.info("[launch] Including rework feedback in session prompt")
+    deps.session_output.save_review_feedback(
+        worktree_path=worktree_path,
+        cycle=rework.rework_cycle,
+        feedback=combined_feedback,
+        pr_number=pr_number,
+    )
+    return f"{existing_work}\n\n{combined_feedback}" if existing_work else combined_feedback
+
+
 def launch_rework_session(
     rework: PendingRework,
     active_sessions: list[Session],
@@ -371,6 +428,20 @@ def launch_rework_session(
     run = ctx.run
     claude_project_dir = ctx.claude_project_dir
 
+    # A rework worktree runs the same quick and publish gates a fresh one does,
+    # so it needs the same runtime prerequisites. Provision it here, before any
+    # irreversible step, so a gap fails the launch instead of being attributed
+    # to the candidate commit by a late validation target (#48).
+    if failure := provision_launch_worktree(
+        deps.worktree_provisioner,
+        worktree_path,
+        events=deps.events,
+        kind="rework",
+        number=issue_number,
+        session_name=session_name,
+    ):
+        return failure
+
     if failure := work_claim.hold_before_spawn(run, issue_number=issue_number):
         return failure
 
@@ -424,40 +495,14 @@ def launch_rework_session(
             claude_project_dir.exists(),
         )
 
-        existing_work = build_rework_existing_work(worktree_info.rebase_failed)
-        if existing_work:
-            logger.warning("[launch] Rebase failed for rework - agent will need to resolve merge conflicts")
-
-        copy_review_feedback_to_rework(
+        existing_work = _rework_inherited_state(
+            deps,
+            rework,
+            pr_number=pr_number,
             worktree_path=worktree_path,
-            pr_number=pr_number,
-            rework_run_assets=run,
+            run=run,
+            rebase_failed=worktree_info.rebase_failed,
         )
-
-        feedback_sections: list[str] = []
-        if rework.feedback:
-            feedback_sections.append(rework.feedback)
-
-        reviewer_feedback = format_reviewer_feedback(
-            pr_number=pr_number,
-            repository_host=deps.repository_host,
-            cache_minutes=deps.config.reviewer_feedback_cache_minutes,
-            run_assets=run,
-            sleep_fn=time.sleep,
-        )
-        if reviewer_feedback:
-            feedback_sections.append(reviewer_feedback)
-
-        if feedback_sections:
-            combined_feedback = "\n\n".join(feedback_sections)
-            existing_work = f"{existing_work}\n\n{combined_feedback}" if existing_work else combined_feedback
-            logger.info("[launch] Including rework feedback in session prompt")
-            deps.session_output.save_review_feedback(
-                worktree_path=worktree_path,
-                cycle=rework.rework_cycle,
-                feedback=combined_feedback,
-                pr_number=pr_number,
-            )
 
         issue_title = f"Rework PR #{pr_number} (cycle {rework.rework_cycle})"
         rendered_prompt = agent_config.render_initial_prompt(
