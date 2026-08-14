@@ -11,7 +11,6 @@ import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
-from ..domain.issue_key import GitHubIssueKey, IssueKey
 from ..domain.models import (
     PendingRework,
     Session,
@@ -35,6 +34,7 @@ from .completion_dispatcher import (
     CompletionDispatcher,
     SynchronousCompletionDispatcher,
 )
+from .session_completion_decision import completion_decider
 from .session_completion_diagnostics import run_session_analysis, surface_failure_context
 from .session_run_resolution import resolve_session_run_dir
 from .transition_log import log_transition
@@ -42,7 +42,6 @@ from .tech_lead_reaction import record_completed_session_problem
 
 if TYPE_CHECKING:
     from ..domain.models import OrchestratorState
-    from ..observation.observation import SessionObservationResult
     from ..observation.observer import SessionObserver
     from ..ports.claim_manager import ClaimManager
     from .action_applier import ActionApplier
@@ -53,19 +52,6 @@ if TYPE_CHECKING:
     from .tech_lead_reset_retry import RequiredActLevelOutcome
 
 logger = logging.getLogger(__name__)
-
-
-def _validation_issue_key(session: Session, config: Config) -> IssueKey | None:
-    repo = session.issue.repo or config.repo
-    if repo:
-        return GitHubIssueKey(repo=repo, external_id=str(session.issue.number))
-    if config.is_validation_enabled():
-        logger.info(
-            "[COMPLETION] Validation attempt identity unavailable: repo is unset "
-            "for issue %s",
-            session.issue.number,
-        )
-    return None
 
 
 _RUNTIME_TERMINAL_STATUSES = frozenset({
@@ -621,45 +607,12 @@ def process_active_sessions(
             continue
         dispatcher.dispatch(
             session,
-            _completion_decider(session_controller, session, obs, config),
+            completion_decider(session_controller, session, obs, config),
         )
 
     # Apply decisions a synchronous dispatcher just produced this tick (the
     # background dispatcher returns nothing here — its work is still running).
     _apply_completed_decisions(dispatcher.drain(), apply)
-
-
-def _completion_decider(
-    session_controller: "SessionController",
-    session: Session,
-    obs: "SessionObservationResult",
-    config: Config,
-) -> "Callable[[], SessionDecision]":
-    """Bind a no-arg call to decide this session's outcome.
-
-    Cheap per-session inputs (issue key, retry template) are computed now on the
-    tick thread; the returned callable performs the slow git/GitHub/validation
-    work and may run off-thread.
-    """
-    issue_key = _validation_issue_key(session, config)
-    retry_prompt_template = (
-        session.agent_config.retry_prompt_template or config.retry.retry_prompt_template
-    )
-
-    def decide() -> "SessionDecision":
-        return session_controller.decide_outcome(
-            obs, session.worktree_path, session.issue.number,
-            session.issue.title, session.terminal_id, session.completion_path,
-            validation_retry_count=session.validation_retry_count,
-            original_prompt=session.original_prompt,
-            retry_prompt_template=retry_prompt_template,
-            repo_root=config.repo_root,
-            issue_key=issue_key,
-            session_run_assets=session.run_assets,
-            task_kind=session.key.task,
-        )
-
-    return decide
 
 
 def _apply_completed_decisions(
