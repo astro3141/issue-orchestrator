@@ -6,19 +6,26 @@ ordinary Actor → validation → review → PR → human-merge path.
 This is a milestone record, not a claim about everything. Read the boundary at
 the end before relying on it.
 
-## Pins
+## Pins at declaration — 2026-08-12
 
 | | Path | Commit |
 |---|---|---|
-| **Trusted runtime** | `~/io-runtime-r1/issue-orchestrator` | `81c11ae1` |
+| **Trusted runtime at declaration** | `~/io-runtime-r1/issue-orchestrator` | `81c11ae1` |
 | Predecessor (preserved) | `~/io-tools/issue-orchestrator` | `74575869` |
 | Product `main` at declaration | `astro3141/issue-orchestrator` | `7f16c3ed` |
 
-**The runtime pin is behind product `main`, and that is correct.** `81c11ae1` is
-the build that actually ran the Stage 6 canary. Rebuilding from a newer `main`
-would promote something no canary exercised. See the runbook — now issue #18,
-<https://github.com/astro3141/issue-orchestrator/issues/18> — "Promotion: ship
-the runtime you verified".
+**Every value in this table is the 2026-08-12 milestone's, not the current
+state.** `81c11ae1` was the trusted runtime *at that declaration*; the trusted
+pin has moved since, and this record deliberately does not follow it. For the
+current trusted runtime, read issue #18,
+<https://github.com/astro3141/issue-orchestrator/issues/18> — the single source
+of truth for pins. Do not copy a current SHA into this file.
+
+**At that declaration the runtime pin was behind product `main`, and that was
+correct.** `81c11ae1` is the build that actually ran the Stage 6 canary.
+Rebuilding from a newer `main` would have promoted something no canary
+exercised. See the runbook — now issue #18 — "Promotion: ship the runtime you
+verified".
 
 R0 stays on disk. Rollback is a path change, not a rebuild.
 
