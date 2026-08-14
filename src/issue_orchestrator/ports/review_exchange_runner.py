@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any, Protocol, TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from ..domain.issue_key import IssueKey
     from ..domain.models import AgentConfig
     from ..domain.review_exchange import ReviewExchangeOutcome
     from ..domain.review_exchange_run import ReviewExchangeRun
@@ -33,6 +34,12 @@ class ReviewExchangeRunner(Protocol):
     Implementations own the reviewer-worktree lifecycle and the
     round loop. The caller hands over a coder worktree and the
     agent configs; the runner returns the structured outcome.
+
+    ``issue_key`` is the stable work-item identity the run's durable records
+    are filed under. It is the caller's to supply rather than the runner's to
+    reconstruct: identity derivation is a control-layer concern, and a runner
+    inventing its own spelling of it would file a candidate's admission
+    evidence (#34) under a key nothing else uses.
     """
 
     def run(
@@ -40,6 +47,7 @@ class ReviewExchangeRunner(Protocol):
         *,
         exchange_run: "ReviewExchangeRun",
         coder_worktree: Path,
+        issue_key: "IssueKey",
         issue_number: int,
         issue_title: str,
         coder_label: str,

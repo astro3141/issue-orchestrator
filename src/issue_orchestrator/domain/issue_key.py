@@ -191,3 +191,27 @@ def parse_external_id(title: str) -> ParsedTitle:
     external_id = match.group(1)
     raw_title = title[match.end():].strip()
     return ParsedTitle(external_id=external_id, raw_title=raw_title)
+
+
+def github_issue_key(*, repo: str, number: int, title: str) -> GitHubIssueKey:
+    """The one derivation of a GitHub issue's stable key.
+
+    ``Issue.key``, ``GitHubIssue.key`` (the ``IssueProtocol`` production runs
+    on) and ``GitHubAdapter.create_issue_key`` all delegate here, as does any
+    caller that holds only the repo/number/title triple rather than an
+    ``Issue`` — attempt-scoped records are filed under this key, so a second
+    spelling of the rule would file the same commit's evidence under two
+    different keys and neither writer would notice.
+
+    The parse rule is only half of the key; ``repo`` is the other half, and the
+    two halves of an attempt's admission evidence reach it by different routes.
+    ``completion_review_exchange`` passes ``config.repo``; the validation path
+    passes ``issue.repo``, which the GitHub adapter stamps from its own
+    resolved repo. They name the same repository because ``bootstrap``'s
+    ``_resolve_repo`` writes the auto-detected value back into ``config.repo``
+    before the adapter is built, and builds no adapter at all when no repo
+    resolves. That write-back is the remaining assumption holding both halves
+    under one key.
+    """
+    parsed = parse_external_id(title)
+    return GitHubIssueKey(repo=repo, external_id=parsed.external_id or str(number))

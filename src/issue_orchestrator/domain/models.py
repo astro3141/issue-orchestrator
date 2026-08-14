@@ -11,7 +11,7 @@ from typing import Any, Iterable, Literal, Optional, TYPE_CHECKING, TypeAlias
 from unittest.mock import Mock
 
 from .dependency_gates import DependencyGateSnapshot
-from .issue_key import IssueKey, GitHubIssueKey, parse_external_id
+from .issue_key import IssueKey, github_issue_key
 from .session_key import SessionKey, TaskKind  # re-exported for callers
 from .sandbox_scope import (
     SandboxScope,
@@ -761,9 +761,7 @@ class Issue:
         Uses external ID from title prefix (e.g., [M1-011]) if present,
         otherwise falls back to the issue number as a string.
         """
-        parsed = parse_external_id(self.title)
-        external_id = parsed.external_id or str(self.number)
-        return GitHubIssueKey(repo=self.repo, external_id=external_id)
+        return github_issue_key(repo=self.repo, number=self.number, title=self.title)
 
     @property
     def agent_type(self) -> Optional[str]:
@@ -913,6 +911,42 @@ class AgentConfig:
             return mode
         return "default"
 
+    def resolved_model(self) -> Optional[str]:
+        """The model the launcher asks the provider for, or ``None`` for none.
+
+        One resolution shared by the spawn and the execution-identity record
+        (#34), the way ``agent_provider`` is shared for the provider: "which
+        model executed this role" and "which model the launcher passed" must
+        not be able to name different things.
+
+        ``None`` is a fact, not a missing value: the orchestrator pinned no
+        model, so the provider CLI selects its own. Two configurations mean
+        that, and both are reachable from a supported config file:
+
+        * a blank ``model`` — what the config loader writes for an explicit
+          non-Claude provider, so its CLI keeps its own default;
+        * the untouched ``"sonnet"`` field default on a non-Claude provider.
+          That default is claude vocabulary; forwarding it sends e.g.
+          ``codex --model sonnet``, which the codex backend rejects (400) and
+          the TUI then idles for the whole round timeout — caught live by the
+          real-codex exchange smoke test.
+
+        Both conditions are provider-path facts, so the provider-less legacy
+        ``claude -p`` template — which renders ``{model}`` verbatim — keeps
+        whatever it was configured with. This method answers for the branch
+        ``get_command_for_prompt`` actually takes.
+        """
+        model = self.model.strip()
+        if not model:
+            return None
+        if not self.provider:
+            return model
+        if model == type(self).__dataclass_fields__["model"].default and (
+            self.provider != "claude-code"
+        ):
+            return None
+        return model
+
     def _initial_prompt_template(self, task_kind: str) -> str:
         """Initial prompt template for ``task_kind``.
 
@@ -967,7 +1001,7 @@ class AgentConfig:
         (``claude-code``, ``codex``).
 
         Exists because session CLASSIFICATION (``provider or ai_system``,
-        see ``persistent_session_exchange._agent_provider``) and command
+        see ``persistent_session_exchange.agent_provider``) and command
         BUILDING (``provider`` only, else the legacy ``claude -p`` template)
         resolved differently: an ``ai_system="codex"`` reviewer with no
         ``provider`` was classified as codex but silently launched as
@@ -1183,21 +1217,14 @@ class AgentConfig:
             # Other providers (Codex, etc.): prepend completion instructions to prompt
             prompt = f"{completion_with_prompt_ref}\n\n---\n\n{prompt}"
 
-        # Build the command (returns list[str])
-        model: Optional[str] = self.model
-        if (
-            model == type(self).__dataclass_fields__["model"].default
-            and self.provider != "claude-code"
-        ):
-            # The field default ("sonnet") is claude vocabulary. Forwarding
-            # it to another provider sends e.g. ``codex --model sonnet``,
-            # which the codex backend rejects (400) and the TUI then idles
-            # for the whole round timeout — caught live by the real-codex
-            # exchange smoke test. An untouched default is "no explicit
-            # choice": let the provider use its own default model.
-            model = None
+        # Build the command (returns list[str]). ``resolved_model`` is the one
+        # place "which model did the launcher ask for" is decided, so the
+        # execution-identity record cannot disagree with what was spawned.
         cmd_list = provider.build_command(
-            prompt=prompt, model=model, sandbox_scope=sandbox_scope, **kwargs
+            prompt=prompt,
+            model=self.resolved_model(),
+            sandbox_scope=sandbox_scope,
+            **kwargs,
         )
 
         # Convert to shell-safe string

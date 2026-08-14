@@ -20,6 +20,7 @@ import pytest
 from issue_orchestrator.control.completion_review_exchange import (
     CompletionReviewExchange,
 )
+from issue_orchestrator.domain.issue_key import github_issue_key
 from issue_orchestrator.domain.review_exchange import (
     ReviewExchangeOutcome,
     ReviewExchangeResponse,
@@ -336,12 +337,16 @@ def _build(
     outcome_events: list[dict[str, Any]],
     *,
     require_validation: bool = False,
+    repo: str | None = None,
+    review_exchange_runner: Any | None = None,
 ) -> tuple[CompletionReviewExchange, _FakeSessionOutput]:
     from issue_orchestrator.control.background_job_supervisor import (
         BackgroundJobSupervisor,
     )
 
     session_output = _FakeSessionOutput(tmp_path)
+    config = _make_config(tmp_path, require_validation=require_validation)
+    config.repo = repo
 
     def _record_review_started(**kwargs: Any) -> None:
         started_events.append(kwargs)
@@ -355,14 +360,72 @@ def _build(
     # need testing, tests call `supervisor.tick()` themselves.
     review = CompletionReviewExchange(
         agent_callback_endpoint=ready_callback_endpoint(),
-        config=_make_config(tmp_path, require_validation=require_validation),
+        config=config,
         session_output=cast(SessionOutput, session_output),
         emit_review_started=_record_review_started,
         emit_review_outcome=_on_outcome,
-        review_exchange_runner=_FakeReviewExchangeRunner(),
+        review_exchange_runner=review_exchange_runner or _FakeReviewExchangeRunner(),
         job_supervisor=BackgroundJobSupervisor(job_runner),
     )
     return review, session_output
+
+
+class TestExchangeRecordScope:
+    """The repo half of the key the exchange files its #34 records under.
+
+    The validation half of the same attempt's evidence is scoped by
+    ``issue.repo`` — the adapter's resolved ``owner/repo``. If the exchange
+    defaulted an unresolved repo to ``""`` the two halves of one candidate
+    would land under different scopes and nothing would report it.
+    """
+
+    def test_an_unresolved_repo_is_refused_rather_than_defaulted(
+        self, tmp_path: Path
+    ) -> None:
+        review, session_output = _build(tmp_path, _FakeJobRunner(), [], [], repo=None)
+
+        with pytest.raises(ValueError, match="config.repo"):
+            review.run_review_exchange_loop(
+                exchange_run=session_output.cached_review_run(),
+                worktree=tmp_path,
+                issue_number=230,
+                issue_title="Example",
+                session_name="coding-1",
+                agent_label="agent:backend",
+            )
+
+    def test_records_are_scoped_by_the_resolved_repo(self, tmp_path: Path) -> None:
+        keys: list[Any] = []
+
+        class _CapturingRunner(_FakeReviewExchangeRunner):
+            def run(self, **kwargs: Any) -> ReviewExchangeOutcome:
+                keys.append(kwargs["issue_key"])
+                return super().run(**kwargs)
+
+        review, session_output = _build(
+            tmp_path,
+            _FakeJobRunner(),
+            [],
+            [],
+            repo="acme/widgets",
+            review_exchange_runner=_CapturingRunner(),
+        )
+
+        review.run_review_exchange_loop(
+            exchange_run=session_output.cached_review_run(),
+            worktree=tmp_path,
+            issue_number=230,
+            issue_title="[M1-011] Example",
+            session_name="coding-1",
+            agent_label="agent:backend",
+        )
+
+        assert len(keys) == 1
+        # Exactly what ``github_issue_key`` — the one owner of the rule —
+        # derives, so this scope matches ``GitHubIssue.key``'s.
+        assert keys[0] == github_issue_key(
+            repo="acme/widgets", number=230, title="[M1-011] Example"
+        )
 
 
 def test_first_pass_submits_background_job_and_returns_deferred(tmp_path: Path) -> None:

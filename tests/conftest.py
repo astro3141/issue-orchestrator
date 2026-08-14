@@ -912,6 +912,10 @@ def build_test_orchestrator_deps(
     from issue_orchestrator.execution.persistent_review_exchange_runner import (
         PersistentReviewExchangeRunner,
     )
+    from issue_orchestrator.execution.attempt_execution_identity_store import (
+        AttemptExecutionIdentityStore,
+    )
+    from issue_orchestrator.entrypoints.bootstrap import create_attempt_store
     agent_callback_endpoint = ready_callback_endpoint()
 
     completion_processor = CompletionProcessor(
@@ -922,7 +926,9 @@ def build_test_orchestrator_deps(
         event_bus=None,
         session_output=session_output,
         review_exchange_runner=PersistentReviewExchangeRunner(
-            session_output, InMemoryPersistentExchangePairRegistry(),
+            session_output,
+            InMemoryPersistentExchangePairRegistry(),
+            AttemptExecutionIdentityStore(create_attempt_store(config)),
         ),
         label_config={
             "blocked": config.get_label_blocked(),

@@ -19,12 +19,21 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from pathlib import Path
 
+from ..domain.execution_identity import (
+    AgentExecutionIdentity,
+    ExecutionPrincipal,
+    ExecutionProvenance,
+    ExecutionRole,
+)
+from ..domain.issue_key import IssueKey
 from ..domain.models import AgentConfig
 from ..domain.review_exchange import ReviewExchangeOutcome
 from ..domain.review_exchange_run import ReviewExchangeRun
 from ..domain.runtime_config import RuntimeConfigReference
 from ..events import EventContext
 from ..ports.event_sink import EventSink
+from ..ports.execution_identity_store import CandidateExecutionIdentityStore
+from .candidate_execution_identity import CandidateExecutionIdentityRecorder
 from ..ports.review_exchange_approval_gate import ReviewExchangeApprovalGate
 from ..ports.coder_prompt import (
     CoderPromptAddendumProvider,
@@ -37,6 +46,8 @@ from .persistent_exchange_pair_registry_inmemory import (
 )
 from ..ports.session_output import SessionOutput
 from .persistent_session_exchange import (
+    agent_provider,
+    launch_config,
     review_exchange_supervisor_timeout_seconds,
     run_persistent_session_exchange,
 )
@@ -102,14 +113,65 @@ class PersistentReviewExchangeRunner:
         self,
         session_output: SessionOutput,
         pair_registry: InMemoryPersistentExchangePairRegistry,
+        execution_identity_store: CandidateExecutionIdentityStore,
         *,
         turn_mailbox: "TurnMailbox | None" = None,
         coder_prompt_addendum: CoderPromptAddendumProvider = NO_CODER_PROMPT_ADDENDUM,
     ) -> None:
         self._session_output = session_output
         self._pair_registry = pair_registry
+        # Required, not optional: this runner is the only place the
+        # orchestrator observes both execution identities and the candidate
+        # they ran against, so a deployment that forgot to wire the store
+        # would produce a review no Foundation gate could ever admit — and it
+        # would do so silently. Fail at construction instead (#34).
+        self._execution_identity_store = execution_identity_store
         self._turn_mailbox = turn_mailbox
         self._coder_prompt_addendum = coder_prompt_addendum
+
+    def _execution_identity_recorder(
+        self,
+        *,
+        issue_key: IssueKey,
+        coder_label: str,
+        coder_agent: AgentConfig,
+        reviewer_label: str,
+        reviewer_agent: AgentConfig,
+    ) -> CandidateExecutionIdentityRecorder:
+        """Both roles' principals and provenance as the orchestrator observed them.
+
+        The principal is the label the orchestrator routed the role by — the
+        authority half, and the only half I2c compares. The provenance is read
+        off :func:`launch_config` — the *same* derivation
+        ``_derive_bootstrap_agent`` spawns, not the configured agent it is
+        derived from. That distinction is the whole point: an ``ai_system``-only
+        agent's provider resolves at launch, and its model answer follows the
+        resolved provider, so reading the pre-derivation config would record a
+        model the launcher never passed (``sonnet`` for a codex run). Nothing
+        here can be reached by an agent's output.
+        """
+        coder_launch = launch_config(coder_agent)
+        reviewer_launch = launch_config(reviewer_agent)
+        return CandidateExecutionIdentityRecorder(
+            store=self._execution_identity_store,
+            issue_key=issue_key,
+            actor=AgentExecutionIdentity(
+                role=ExecutionRole.ACTOR,
+                principal=ExecutionPrincipal(agent_label=coder_label),
+                provenance=ExecutionProvenance(
+                    provider=agent_provider(coder_launch).value,
+                    model=coder_launch.resolved_model(),
+                ),
+            ),
+            reviewer=AgentExecutionIdentity(
+                role=ExecutionRole.REVIEWER,
+                principal=ExecutionPrincipal(agent_label=reviewer_label),
+                provenance=ExecutionProvenance(
+                    provider=agent_provider(reviewer_launch).value,
+                    model=reviewer_launch.resolved_model(),
+                ),
+            ),
+        )
 
     def job_timeout_seconds(
         self,
@@ -133,6 +195,7 @@ class PersistentReviewExchangeRunner:
         *,
         exchange_run: ReviewExchangeRun,
         coder_worktree: Path,
+        issue_key: IssueKey,
         issue_number: int,
         issue_title: str,
         coder_label: str,
@@ -209,4 +272,11 @@ class PersistentReviewExchangeRunner:
             turn_mailbox=self._turn_mailbox,
             response_channels=response_channels,
             coder_prompt_addendum=prepared_coder_prompt.addendum,
+            execution_identities=self._execution_identity_recorder(
+                issue_key=issue_key,
+                coder_label=coder_label,
+                coder_agent=coder_agent,
+                reviewer_label=reviewer_label,
+                reviewer_agent=reviewer_agent,
+            ),
         )

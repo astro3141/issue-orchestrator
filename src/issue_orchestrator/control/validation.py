@@ -24,7 +24,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from ..domain.attempt import Attempt, AttemptKey
+from ..domain.attempt import AttemptKey
 from ..domain.session_run import (
     VALIDATION_RECORD_NAME,
     VALIDATION_STDERR_NAME,
@@ -535,13 +535,12 @@ class ValidationGate:
         if self.attempt_store is None or self.attempt_key is None:
             return
         record_path = self._attempt_record_path_for(record, session_output_dir)
-        existing = self.attempt_store.for_key(self.attempt_key)
-        attempt = existing if existing is not None else Attempt(self.attempt_key)
-        self.attempt_store.upsert(
-            replace(
+        self.attempt_store.update(
+            self.attempt_key,
+            lambda attempt: replace(
                 attempt,
                 validation_record_path=str(record_path.resolve()),
-            )
+            ),
         )
 
     def check(self, session_output_dir: Optional[Path] = None) -> PublishGateResult:

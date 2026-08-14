@@ -41,6 +41,21 @@ from issue_orchestrator.execution import persistent_session_exchange as pse
 from issue_orchestrator.execution.persistent_role_prompt_policy import (
     role_session_needs_fresh_prompt_process,
 )
+from issue_orchestrator.adapters.sidecar_attempt_store import SidecarAttemptStore
+from issue_orchestrator.domain.attempt import AttemptKey
+from issue_orchestrator.domain.execution_identity import (
+    AgentExecutionIdentity,
+    ExecutionPrincipal,
+    ExecutionProvenance,
+    ExecutionRole,
+)
+from issue_orchestrator.domain.issue_key import GitHubIssueKey
+from issue_orchestrator.execution.attempt_execution_identity_store import (
+    AttemptExecutionIdentityStore,
+)
+from issue_orchestrator.execution.candidate_execution_identity import (
+    CandidateExecutionIdentityRecorder,
+)
 from issue_orchestrator.execution.review_exchange_records import load_review_verdict
 from issue_orchestrator.execution.session_output_adapter import FileSystemSessionOutput
 from issue_orchestrator.ports import TraceEvent
@@ -128,6 +143,33 @@ class _FakeSession:
 def _make_agent(prompt_path: Path) -> AgentConfig:
     return AgentConfig(
         prompt_path=prompt_path, ai_system="claude-code", timeout_minutes=1
+    )
+
+
+def _identity_recorder(tmp_path: Path) -> CandidateExecutionIdentityRecorder:
+    """A recorder over a throwaway store, for exchanges that assert nothing on it.
+
+    ``run_persistent_session_exchange`` requires the recorder rather than
+    defaulting it to ``None`` (#34): production always supplies one, and the
+    alternative is an exchange that silently records no execution identities
+    and so produces a review no Foundation gate can admit. Tests that assert on
+    the record build their own recorder with the identities they care about.
+    """
+    return CandidateExecutionIdentityRecorder(
+        store=AttemptExecutionIdentityStore(
+            SidecarAttemptStore(tmp_path / "identity-store")
+        ),
+        issue_key=GitHubIssueKey(repo="acme/repo", external_id="42"),
+        actor=AgentExecutionIdentity(
+            role=ExecutionRole.ACTOR,
+            principal=ExecutionPrincipal(agent_label="agent:backend"),
+            provenance=ExecutionProvenance(provider="claude-code", model="opus"),
+        ),
+        reviewer=AgentExecutionIdentity(
+            role=ExecutionRole.REVIEWER,
+            principal=ExecutionPrincipal(agent_label="agent:reviewer"),
+            provenance=ExecutionProvenance(provider="codex", model="gpt-5"),
+        ),
     )
 
 
@@ -702,6 +744,7 @@ class TestPersistentSessionExchangeHappyPath:
             require_validation=False,
             events=sink,
             event_context=ctx,
+            execution_identities=_identity_recorder(tmp_path),
         )
 
         assert outcome.status == "ok"
@@ -794,6 +837,7 @@ class TestPersistentSessionExchangeHappyPath:
             require_validation=False,
             turn_mailbox=mailbox,
             response_channels=pse.ReviewExchangeResponseChannels.file_only(),
+            execution_identities=_identity_recorder(tmp_path),
         )
 
         assert outcome.status == "ok"
@@ -885,6 +929,7 @@ class TestPersistentSessionExchangeHappyPath:
             max_rounds=3,
             max_no_progress=2,
             require_validation=False,
+            execution_identities=_identity_recorder(tmp_path),
         )
         assert outcome.status == "ok"
         assert outcome.rounds == 2
@@ -988,6 +1033,7 @@ class TestPersistentSessionExchangeHappyPath:
             max_no_progress=2,
             require_validation=False,
             approval_gate=gate,
+            execution_identities=_identity_recorder(tmp_path),
         )
 
         assert outcome.status == "ok"
@@ -1084,6 +1130,7 @@ class TestPersistentSessionExchangeHappyPath:
             max_rounds=3,
             max_no_progress=2,
             require_validation=False,
+            execution_identities=_identity_recorder(tmp_path),
         )
 
         assert outcome.status == "ok"
@@ -1165,6 +1212,7 @@ class TestPersistentSessionExchangeHappyPath:
             max_no_progress=2,
             require_validation=False,
             nit_policy="address",
+            execution_identities=_identity_recorder(tmp_path),
         )
 
         assert outcome.status == "ok"
@@ -1583,6 +1631,7 @@ class TestTurnArtifactsPersisted:
             max_rounds=3,
             max_no_progress=2,
             require_validation=False,
+            execution_identities=_identity_recorder(tmp_path),
         )
 
         assert outcome.exchange_dir is not None
@@ -1757,6 +1806,7 @@ class TestTurnArtifactsPersisted:
             max_rounds=3,
             max_no_progress=2,
             require_validation=False,
+            execution_identities=_identity_recorder(tmp_path),
         )
 
         assert outcome.exchange_dir is not None
@@ -1864,6 +1914,7 @@ class TestTurnArtifactsPersisted:
             require_validation=False,
             events=sink,
             event_context=EventContext(),
+            execution_identities=_identity_recorder(tmp_path),
         )
 
         assert outcome.reason == "reviewer_no_completion"
@@ -1986,6 +2037,7 @@ class TestTurnArtifactsPersisted:
             require_validation=False,
             events=sink,
             event_context=EventContext(),
+            execution_identities=_identity_recorder(tmp_path),
         )
 
         # The exchange completed normally at round 2 — it did NOT bail to
@@ -2111,6 +2163,7 @@ class TestTurnArtifactsPersisted:
             max_rounds=3,
             max_no_progress=2,
             require_validation=False,
+            execution_identities=_identity_recorder(tmp_path),
         )
 
         assert outcome.status == "error"
@@ -2191,6 +2244,7 @@ class TestTurnArtifactsPersisted:
             max_rounds=3,
             max_no_progress=2,
             require_validation=False,
+            execution_identities=_identity_recorder(tmp_path),
         )
 
         assert outcome.status == "ok"
@@ -2258,6 +2312,7 @@ class TestTurnArtifactsPersisted:
             max_rounds=3,
             max_no_progress=2,
             require_validation=False,
+            execution_identities=_identity_recorder(tmp_path),
         )
 
         assert outcome.reason == "reviewer_no_completion"
@@ -2334,6 +2389,7 @@ class TestTurnArtifactsPersisted:
             require_validation=False,
             events=sink,
             event_context=EventContext(),
+            execution_identities=_identity_recorder(tmp_path),
         )
 
         assert outcome.status == "ok"
@@ -2404,6 +2460,7 @@ class TestTurnArtifactsPersisted:
             max_rounds=3,
             max_no_progress=2,
             require_validation=False,
+            execution_identities=_identity_recorder(tmp_path),
         )
 
         assert outcome.exchange_dir is not None
@@ -2492,6 +2549,7 @@ class TestTurnArtifactsPersisted:
             max_rounds=3,
             max_no_progress=2,
             require_validation=False,
+            execution_identities=_identity_recorder(tmp_path),
         )
 
         assert outcome.exchange_dir is not None
@@ -2570,6 +2628,7 @@ class TestExchangeTerminationConditions:
             max_rounds=5,
             max_no_progress=2,
             require_validation=False,
+            execution_identities=_identity_recorder(tmp_path),
         )
 
         assert outcome.status == "stopped"
@@ -2650,6 +2709,7 @@ class TestExchangeTerminationConditions:
             max_rounds=2,
             max_no_progress=5,
             require_validation=True,
+            execution_identities=_identity_recorder(tmp_path),
         )
 
         assert outcome.status == "error"
@@ -2707,6 +2767,7 @@ class TestExchangeTerminationConditions:
             require_validation=False,
             events=sink,
             event_context=ctx,
+            execution_identities=_identity_recorder(tmp_path),
         )
         assert outcome.status == "error"
         assert outcome.reason == "reviewer_no_completion"
@@ -2767,6 +2828,7 @@ class TestExchangeTerminationConditions:
                 max_rounds=1,
                 max_no_progress=2,
                 require_validation=False,
+                execution_identities=_identity_recorder(tmp_path),
             )
 
         assert state["registry"].released == [(42, "review-exchange-exception")]
@@ -2835,6 +2897,7 @@ class TestChapterSidecarAndEvents:
             max_rounds=3,
             max_no_progress=2,
             require_validation=False,
+            execution_identities=_identity_recorder(tmp_path),
         )
 
         # Reviewer side: 2 round-prompt chapters + 2 round-feedback chapters
@@ -2912,6 +2975,7 @@ class TestChapterSidecarAndEvents:
             require_validation=False,
             events=sink,
             event_context=ctx,
+            execution_identities=_identity_recorder(tmp_path),
         )
 
         names = [evt.event_type for evt in sink.events]
@@ -3028,6 +3092,7 @@ class TestChapterSidecarAndEvents:
             require_validation=False,
             events=sink,
             event_context=ctx,
+            execution_identities=_identity_recorder(tmp_path),
         )
 
         chapter_events = [
@@ -3118,6 +3183,7 @@ class TestCallerHooks:
             max_no_progress=5,
             require_validation=False,
             before_reviewer_round=lambda i: round_invocations.append(i),
+            execution_identities=_identity_recorder(tmp_path),
         )
         # Called once per reviewer round (rounds 1 and 2).
         assert round_invocations == [1, 2]
@@ -3170,6 +3236,7 @@ class TestCallerHooks:
             max_rounds=1,
             max_no_progress=2,
             require_validation=False,
+            execution_identities=_identity_recorder(tmp_path),
         )
         assert outcome.run_assets == exchange_run.assets
         assert exchange_run.assets.run_dir.exists()
@@ -3232,6 +3299,7 @@ class TestCallerHooks:
             max_no_progress=2,
             require_validation=True,
             initial_validation_record_path=current_record,
+            execution_identities=_identity_recorder(tmp_path),
         )
 
         assert outcome.status == "ok"
@@ -3320,6 +3388,7 @@ class TestCallerHooks:
             max_no_progress=2,
             require_validation=True,
             initial_validation_record_path=current_record,
+            execution_identities=_identity_recorder(tmp_path),
         )
 
         assert outcome.status == "ok"
@@ -3418,6 +3487,7 @@ class TestCoderProtocolGuardrail:
             require_validation=False,
             events=sink,
             event_context=ctx,
+            execution_identities=_identity_recorder(tmp_path),
         )
 
         assert outcome.status == "error"
@@ -3541,6 +3611,7 @@ class TestCoderProtocolGuardrail:
             require_validation=False,
             events=sink,
             event_context=ctx,
+            execution_identities=_identity_recorder(tmp_path),
         )
 
         assert outcome.status == "ok"
@@ -3726,6 +3797,7 @@ class TestCoderProtocolGuardrail:
             max_rounds=3,
             max_no_progress=5,
             require_validation=False,
+            execution_identities=_identity_recorder(tmp_path),
         )
 
         assert outcome.status == "error"
@@ -3792,6 +3864,7 @@ class TestCoderProtocolGuardrail:
             max_rounds=2,
             max_no_progress=5,
             require_validation=False,
+            execution_identities=_identity_recorder(tmp_path),
         )
 
         assert outcome.status == "ok"
@@ -3864,6 +3937,7 @@ class TestTerminalEventsOnError:
             require_validation=False,
             events=sink,
             event_context=ctx,
+            execution_identities=_identity_recorder(tmp_path),
         )
 
         assert outcome.status == "error"
@@ -3938,6 +4012,7 @@ class TestTerminalEventsOnError:
             require_validation=False,
             events=sink,
             event_context=ctx,
+            execution_identities=_identity_recorder(tmp_path),
         )
 
         assert outcome.status == "error"
@@ -4014,6 +4089,7 @@ class TestTerminalEventsOnError:
             max_rounds=1,
             max_no_progress=5,
             require_validation=False,
+            execution_identities=_identity_recorder(tmp_path),
         )
 
         assert outcome.summary is not None
@@ -4081,6 +4157,7 @@ class TestRecordingContractFailLoud:
                 require_validation=False,
                 events=sink,
                 event_context=ctx,
+                execution_identities=_identity_recorder(tmp_path),
             )
         # FAILED event fired before the raise propagated.
         assert any(
@@ -4158,6 +4235,7 @@ class TestAtomicSummaryWrite:
             max_rounds=1,
             max_no_progress=5,
             require_validation=False,
+            execution_identities=_identity_recorder(tmp_path),
         )
 
         # summary.json was written via a tempfile + atomic replace.
@@ -4418,6 +4496,7 @@ class TestResponseFileInsideWorktree:
             max_rounds=1,
             max_no_progress=2,
             require_validation=False,
+            execution_identities=_identity_recorder(tmp_path),
         )
 
         # The agent's env var ISSUE_ORCHESTRATOR_REVIEW_RESPONSE_FILE
@@ -4507,6 +4586,7 @@ class TestResponseFileInsideWorktree:
             max_rounds=1,
             max_no_progress=2,
             require_validation=False,
+            execution_identities=_identity_recorder(tmp_path),
         )
 
         for role, path in captured.items():
@@ -4578,6 +4658,7 @@ class TestPerSessionRecordingMirror:
             max_rounds=3,
             max_no_progress=2,
             require_validation=False,
+            execution_identities=_identity_recorder(tmp_path),
         )
 
         # Find the actual run_dir from the coder worktree's sessions/.
@@ -4708,6 +4789,7 @@ class TestPerSessionRecordingMirror:
             max_rounds=1,
             max_no_progress=2,
             require_validation=False,
+            execution_identities=_identity_recorder(tmp_path),
         )
 
         assert outcome.status == "ok"
@@ -5044,6 +5126,7 @@ class TestPerSessionRecordingMirror:
                 max_rounds=1,
                 max_no_progress=2,
                 require_validation=False,
+                execution_identities=_identity_recorder(tmp_path),
             )
         finally:
             for w in writers.values():
@@ -5183,6 +5266,7 @@ class TestEndToEndTimelineReadback:
                 max_rounds=1,
                 max_no_progress=2,
                 require_validation=False,
+                execution_identities=_identity_recorder(tmp_path),
             )
         finally:
             for w in writers.values():
@@ -5267,6 +5351,7 @@ class TestEndToEndTimelineReadback:
             max_rounds=1,
             max_no_progress=2,
             require_validation=False,
+            execution_identities=_identity_recorder(tmp_path),
         )
 
         run_dir = _find_review_exchange_run_dir(coder_wt)
@@ -5393,6 +5478,7 @@ class TestAgentEnvPathIsolation:
             max_rounds=1,
             max_no_progress=2,
             require_validation=False,
+            execution_identities=_identity_recorder(tmp_path),
         )
 
         for role, env in captured.items():
@@ -5525,6 +5611,7 @@ class TestSliceIsolationAcrossExchanges:
                     max_rounds=1,
                     max_no_progress=2,
                     require_validation=False,
+                    execution_identities=_identity_recorder(tmp_path),
                 )
         finally:
             for w in writers.values():
@@ -5670,6 +5757,7 @@ class TestSliceIsolationAcrossExchanges:
                 max_rounds=3,
                 max_no_progress=2,
                 require_validation=False,
+                execution_identities=_identity_recorder(tmp_path),
             )
         finally:
             for w in writers.values():
@@ -5787,6 +5875,7 @@ class TestSliceIsolationAcrossExchanges:
                     max_rounds=1,
                     max_no_progress=2,
                     require_validation=False,
+                    execution_identities=_identity_recorder(tmp_path),
                 )
         finally:
             for wmap in writers_by_issue.values():
@@ -6416,6 +6505,7 @@ class TestContinuousSliceMirroring:
                 max_rounds=1,
                 max_no_progress=2,
                 require_validation=False,
+                execution_identities=_identity_recorder(tmp_path),
             )
         finally:
             for w in writers.values():
@@ -6551,6 +6641,7 @@ class TestContinuousSliceMirroring:
                 require_validation=False,
                 events=sink,
                 event_context=EventContext(),
+                execution_identities=_identity_recorder(tmp_path),
             )
 
         # The orchestrator must hear about the failure as a
@@ -6624,6 +6715,7 @@ class TestContinuousSliceMirroring:
                 max_rounds=1,
                 max_no_progress=2,
                 require_validation=False,
+                execution_identities=_identity_recorder(tmp_path),
             )
 
     def test_slice_detaches_at_exchange_end_no_leak_to_next_exchange(
@@ -6721,6 +6813,7 @@ class TestContinuousSliceMirroring:
                     max_rounds=1,
                     max_no_progress=2,
                     require_validation=False,
+                    execution_identities=_identity_recorder(tmp_path),
                 )
         finally:
             for w in writers.values():
@@ -7253,6 +7346,7 @@ class TestSessionCleanup:
                 require_validation=False,
                 events=sink,
                 event_context=ctx,
+                execution_identities=_identity_recorder(tmp_path),
             )
 
         assert state["registry"].released == [(42, "review-exchange-exception")]
@@ -7342,6 +7436,7 @@ class TestSpawnPartialConstructionCleanup:
                 max_rounds=1,
                 max_no_progress=2,
                 require_validation=False,
+                execution_identities=_identity_recorder(tmp_path),
             )
 
         # The coder opened, the reviewer raised before opening — and
@@ -7438,6 +7533,7 @@ def _run_binding_exchange(
     max_no_progress: int = 2,
     require_validation: bool = False,
     initial_validation_record_path: Path | None = None,
+    execution_identities: CandidateExecutionIdentityRecorder | None = None,
 ) -> Any:
     """Run one exchange over a real coder branch and reviewer worktree.
 
@@ -7484,6 +7580,7 @@ def _run_binding_exchange(
         require_validation=require_validation,
         initial_validation_record_path=initial_validation_record_path,
         before_reviewer_round=before_reviewer_round,
+        execution_identities=execution_identities or _identity_recorder(tmp_path),
     )
 
 
@@ -7829,3 +7926,306 @@ class TestExactShaVerdictBinding:
 
         assert (outcome.status, outcome.reason) == ("ok", "reviewer_ok")
         assert load_review_verdict(outcome.run_assets.exchange_dir) is None
+
+
+class TestCandidateExecutionIdentityBinding:
+    """§4's other half: who executed the candidate, bound to that candidate.
+
+    The verdict binding above answers "was this commit approved". These answer
+    "by whom, and by whom was it produced" — the pair I2c compares. Both come
+    from the same orchestrator observation, so the two records cannot end up
+    describing different commits.
+    """
+
+    @staticmethod
+    def _recorder(
+        tmp_path: Path,
+        *,
+        actor_label: str = "agent:backend",
+        actor_provider: str = "claude-code",
+        actor_model: str = "opus",
+    ) -> CandidateExecutionIdentityRecorder:
+        return CandidateExecutionIdentityRecorder(
+            store=AttemptExecutionIdentityStore(
+                SidecarAttemptStore(tmp_path / "identity-root")
+            ),
+            issue_key=GitHubIssueKey(repo="acme/repo", external_id="42"),
+            actor=AgentExecutionIdentity(
+                role=ExecutionRole.ACTOR,
+                principal=ExecutionPrincipal(agent_label=actor_label),
+                provenance=ExecutionProvenance(
+                    provider=actor_provider, model=actor_model
+                ),
+            ),
+            reviewer=AgentExecutionIdentity(
+                role=ExecutionRole.REVIEWER,
+                principal=ExecutionPrincipal(agent_label="agent:reviewer"),
+                provenance=ExecutionProvenance(provider="codex", model="gpt-5"),
+            ),
+        )
+
+    @staticmethod
+    def _read(
+        recorder: CandidateExecutionIdentityRecorder, candidate_sha: str
+    ) -> Any:
+        return recorder.store.read(AttemptKey(recorder.issue_key, candidate_sha))
+
+    @staticmethod
+    def _approving_reviewer() -> dict[str, list[Any]]:
+        """A fresh script per test: the harness consumes the queued responses."""
+        return {
+            "reviewer": [
+                {
+                    "response_type": "ok",
+                    "response_text": "Looks good",
+                    "getting_closer": True,
+                }
+            ],
+            "coder": [],
+        }
+
+    def test_both_identities_are_recorded_for_the_presented_candidate(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        repo = _BindingRepo(tmp_path)
+        presented = repo.coder_head()
+        recorder = self._recorder(tmp_path)
+
+        outcome = _run_binding_exchange(
+            tmp_path=tmp_path,
+            monkeypatch=monkeypatch,
+            repo=repo,
+            response_script=self._approving_reviewer(),
+            execution_identities=recorder,
+        )
+
+        identities = self._read(recorder, presented)
+        assert identities is not None
+        assert identities.actor.principal.agent_label == "agent:backend"
+        assert identities.reviewer.principal.agent_label == "agent:reviewer"
+        assert identities.satisfies_reviewer_distinctness(presented) is True
+        # Both halves of §4's review evidence name the same commit.
+        verdict = load_review_verdict(outcome.run_assets.exchange_dir)
+        assert verdict is not None
+        assert verdict.reviewed_sha == identities.candidate_sha
+        # Ordinary review semantics are untouched by recording the evidence.
+        assert (outcome.status, outcome.reason, outcome.rounds) == (
+            "ok",
+            "reviewer_ok",
+            1,
+        )
+
+    def test_identities_bind_to_the_reviewed_commit_not_a_later_head(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The coder branch advances after the reviewer is given A.
+
+        A record keyed on a session-start or decision-time HEAD would name D.
+        The binding must come from the orchestrator's observation at the
+        candidate/review boundary, so it names A and nothing is filed under D.
+        """
+        repo = _BindingRepo(tmp_path)
+        sha_a = repo.coder_head()
+        recorder = self._recorder(tmp_path)
+        moved: dict[str, str] = {}
+
+        def _advance_coder_branch(_round_index: int) -> None:
+            moved["sha_d"] = repo.commit("landed while the reviewer worked")
+
+        _run_binding_exchange(
+            tmp_path=tmp_path,
+            monkeypatch=monkeypatch,
+            repo=repo,
+            before_reviewer_round=_advance_coder_branch,
+            response_script=self._approving_reviewer(),
+            execution_identities=recorder,
+        )
+
+        sha_d = moved["sha_d"]
+        assert sha_d != sha_a
+        identities = self._read(recorder, sha_a)
+        assert identities is not None
+        assert identities.candidate_sha == sha_a
+        assert identities.satisfies_reviewer_distinctness(sha_d) is False
+        assert self._read(recorder, sha_d) is None
+
+    def test_the_reviewer_cannot_write_its_own_identity(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Agent-authored content claiming an identity never reaches the record.
+
+        The reviewer's decision JSON asserts a different agent, provider, model
+        and reviewed commit. Every recorded field still comes from the
+        launcher's configuration and the orchestrator's checkout.
+        """
+        repo = _BindingRepo(tmp_path)
+        presented = repo.coder_head()
+        recorder = self._recorder(tmp_path)
+
+        _run_binding_exchange(
+            tmp_path=tmp_path,
+            monkeypatch=monkeypatch,
+            repo=repo,
+            response_script={
+                "reviewer": [
+                    {
+                        "response_type": "ok",
+                        "response_text": "Looks good",
+                        "getting_closer": True,
+                        "agent": "agent:backend",
+                        "provider": "claude-code",
+                        "model": "opus",
+                        "decision": {
+                            "verdict": "approved",
+                            "risk": "low",
+                            "abstraction_review": {"status": "no_issues"},
+                            "reviewed_sha": _VERDICT_SHA_B,
+                            "reviewer": "agent:backend",
+                            "provider": "claude-code",
+                        },
+                    }
+                ],
+                "coder": [],
+            },
+            execution_identities=recorder,
+        )
+
+        identities = self._read(recorder, presented)
+        assert identities is not None
+        assert identities.reviewer.principal.agent_label == "agent:reviewer"
+        assert identities.reviewer.provenance.provider == "codex"
+        assert identities.reviewer.provenance.model == "gpt-5"
+        assert identities.satisfies_reviewer_distinctness(presented) is True
+        assert self._read(recorder, _VERDICT_SHA_B) is None
+
+    def test_one_principal_wearing_both_hats_fails_the_distinctness_check(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The falsification, driven through a real exchange.
+
+        Configure the actor under the reviewer's principal and the recorded
+        evidence must report I2c unsatisfied. If this still passed, the check
+        would have pinned nothing.
+
+        The actor keeps its *own* provider and model, so this is §11 row 2 run
+        end to end: one principal is still one principal however far its
+        provenance differs. Folding provenance back into the comparison would
+        make this exchange admissible.
+        """
+        repo = _BindingRepo(tmp_path)
+        presented = repo.coder_head()
+        recorder = self._recorder(tmp_path, actor_label="agent:reviewer")
+
+        _run_binding_exchange(
+            tmp_path=tmp_path,
+            monkeypatch=monkeypatch,
+            repo=repo,
+            response_script=self._approving_reviewer(),
+            execution_identities=recorder,
+        )
+
+        identities = self._read(recorder, presented)
+        assert identities is not None
+        assert identities.actor.provenance != identities.reviewer.provenance
+        assert identities.principals_are_distinct() is False
+        assert identities.satisfies_reviewer_distinctness(presented) is False
+
+    def test_two_principals_on_one_configuration_still_satisfy_i2c(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """§11 row 3, run end to end: matching configuration does not collapse.
+
+        Both roles launched on the same provider and model — how this fork is
+        actually operated. A comparison that read that as one identity would
+        make independent review unrepresentable, refusing every admission this
+        deployment can produce.
+        """
+        repo = _BindingRepo(tmp_path)
+        presented = repo.coder_head()
+        recorder = self._recorder(
+            tmp_path, actor_provider="codex", actor_model="gpt-5"
+        )
+
+        _run_binding_exchange(
+            tmp_path=tmp_path,
+            monkeypatch=monkeypatch,
+            repo=repo,
+            response_script=self._approving_reviewer(),
+            execution_identities=recorder,
+        )
+
+        identities = self._read(recorder, presented)
+        assert identities is not None
+        assert identities.actor.provenance == identities.reviewer.provenance
+        assert identities.principals_are_distinct() is True
+        assert identities.satisfies_reviewer_distinctness(presented) is True
+
+    def test_a_reviewer_decided_rework_terminal_also_records_identities(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Both reviewer-decided terminals bind, not only the approval.
+
+        The evidence is about who executed the candidate, which is true
+        whatever the verdict was; recording it at one terminal only is how the
+        two Foundation records drift apart.
+        """
+        repo = _BindingRepo(tmp_path)
+        presented = repo.coder_head()
+        recorder = self._recorder(tmp_path)
+        stale_record = tmp_path / "stale-validation-record.json"
+        stale_record.write_text(
+            json.dumps({"passed": True, "head_sha": _VERDICT_SHA_B}),
+            encoding="utf-8",
+        )
+
+        outcome = _run_binding_exchange(
+            tmp_path=tmp_path,
+            monkeypatch=monkeypatch,
+            repo=repo,
+            response_script=self._approving_reviewer(),
+            max_rounds=2,
+            max_no_progress=1,
+            require_validation=True,
+            initial_validation_record_path=stale_record,
+            execution_identities=recorder,
+        )
+
+        assert outcome.reason == "reviewer_reports_no_progress"
+        identities = self._read(recorder, presented)
+        assert identities is not None
+        assert identities.candidate_sha == presented
+
+    def test_an_unobservable_candidate_records_nothing_and_passes_the_review(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """No usable observation means no evidence, never a guessed binding.
+
+        An unbound candidate is one no gate can admit — the safe direction —
+        and recording evidence about a review never changes that review.
+        """
+        recorder = self._recorder(tmp_path)
+
+        outcome = _run_binding_exchange(
+            tmp_path=tmp_path,
+            monkeypatch=monkeypatch,
+            unobservable_head=True,
+            response_script=self._approving_reviewer(),
+            execution_identities=recorder,
+        )
+
+        assert (outcome.status, outcome.reason) == ("ok", "reviewer_ok")
+        assert not (tmp_path / "identity-root" / ".issue-orchestrator").exists()

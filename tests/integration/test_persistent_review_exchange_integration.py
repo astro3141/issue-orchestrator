@@ -40,7 +40,11 @@ from tests.callback_endpoint_helpers import (
 from issue_orchestrator.control.completion_review_exchange import (
     CompletionReviewExchange,
 )
+from issue_orchestrator.adapters.sidecar_attempt_store import SidecarAttemptStore
 from issue_orchestrator.events import EventName
+from issue_orchestrator.execution.attempt_execution_identity_store import (
+    AttemptExecutionIdentityStore,
+)
 from issue_orchestrator.execution.manifest_accessor import ManifestAccessor, RunIdentity
 from issue_orchestrator.execution.persistent_exchange_pair_registry_inmemory import (
     InMemoryPersistentExchangePairRegistry,
@@ -169,9 +173,15 @@ def _bootstrap_git_worktree(tmp_path: Path) -> tuple[Path, str]:
     return repo, branch
 
 
+def _identity_store(root: Path) -> AttemptExecutionIdentityStore:
+    """The real durable identity store, rooted outside any test worktree."""
+    return AttemptExecutionIdentityStore(SidecarAttemptStore(root))
+
+
 def _make_review_exchange_runner(
     session_output: FileSystemSessionOutput,
     *,
+    identity_root: Path,
     pair_registry: InMemoryPersistentExchangePairRegistry | None = None,
 ) -> PersistentReviewExchangeRunner:
     """Centralized constructor for the integration tests' review-exchange runner.
@@ -191,6 +201,7 @@ def _make_review_exchange_runner(
     return PersistentReviewExchangeRunner(
         session_output,
         pair_registry or InMemoryPersistentExchangePairRegistry(),
+        _identity_store(identity_root),
     )
 
 
@@ -418,6 +429,7 @@ def test_persistent_review_exchange_end_to_end_through_completion_owner(
         emit_review_outcome=lambda **_: None,
         review_exchange_runner=_make_review_exchange_runner(
             session_output,
+            identity_root=tmp_path / "identity-root",
             pair_registry=pair_registry,
         ),
     )
@@ -560,6 +572,7 @@ def test_persistent_review_exchange_multi_round_changes_then_ok(
         emit_review_outcome=lambda **_: None,
         review_exchange_runner=_make_review_exchange_runner(
             _session_output_for_test,
+            identity_root=tmp_path / "identity-root",
         ),
     )
 
@@ -648,7 +661,9 @@ def test_codex_shaped_interactive_agent_receives_argv_bootstrap_then_pty_rounds(
         session_output=session_output,
         emit_review_started=lambda **_: None,
         emit_review_outcome=lambda **_: None,
-        review_exchange_runner=_make_review_exchange_runner(session_output),
+        review_exchange_runner=_make_review_exchange_runner(
+            session_output, identity_root=tmp_path / "identity-root",
+        ),
     )
 
     from issue_orchestrator.events import EventContext
@@ -796,7 +811,9 @@ def test_synthetic_raw_tui_review_exchange_suppresses_bootstrap_response(
         session_output=session_output,
         emit_review_started=lambda **_: None,
         emit_review_outcome=lambda **_: None,
-        review_exchange_runner=_make_review_exchange_runner(session_output),
+        review_exchange_runner=_make_review_exchange_runner(
+            session_output, identity_root=tmp_path / "identity-root",
+        ),
     )
 
     from issue_orchestrator.events import EventContext
@@ -917,6 +934,7 @@ def test_real_interactive_codex_reviewer_round_trips_through_exchange(
             review_exchange_runner=PersistentReviewExchangeRunner(
                 session_output,
                 InMemoryPersistentExchangePairRegistry(),
+                _identity_store(tmp_path / "identity-root"),
                 turn_mailbox=mailbox,
             ),
         )
@@ -1015,6 +1033,7 @@ def test_one_shot_reviewer_respawns_after_addressable_nits(
         emit_review_outcome=lambda **_: None,
         review_exchange_runner=_make_review_exchange_runner(
             session_output,
+            identity_root=tmp_path / "identity-root",
             pair_registry=pair_registry,
         ),
     )
@@ -1118,6 +1137,7 @@ def test_one_shot_coder_respawns_for_later_rework_turn(
         emit_review_outcome=lambda **_: None,
         review_exchange_runner=_make_review_exchange_runner(
             session_output,
+            identity_root=tmp_path / "identity-root",
             pair_registry=pair_registry,
         ),
     )
@@ -1196,6 +1216,7 @@ def test_persistent_review_exchange_max_rounds_exhausted(
         emit_review_outcome=lambda **_: None,
         review_exchange_runner=_make_review_exchange_runner(
             _session_output_for_test,
+            identity_root=tmp_path / "identity-root",
         ),
     )
 
@@ -1297,6 +1318,7 @@ def test_two_rework_rounds_render_distinguishably_in_projected_timeline(
         emit_review_outcome=lambda **_: None,
         review_exchange_runner=_make_review_exchange_runner(
             _session_output_for_test,
+            identity_root=tmp_path / "identity-root",
         ),
     )
 
@@ -1404,6 +1426,7 @@ def test_persistent_pair_respawns_for_second_exchange_run(
         emit_review_outcome=lambda **_: None,
         review_exchange_runner=_make_review_exchange_runner(
             session_output,
+            identity_root=tmp_path / "identity-root",
             pair_registry=pair_registry,
         ),
     )
@@ -1573,6 +1596,7 @@ def test_persistent_pair_response_and_completion_paths_stable_across_exchanges(
         emit_review_outcome=lambda **_: None,
         review_exchange_runner=_make_review_exchange_runner(
             session_output,
+            identity_root=tmp_path / "identity-root",
             pair_registry=pair_registry,
         ),
     )
@@ -1743,6 +1767,7 @@ def test_persistent_review_exchange_end_to_end_through_mailbox(
         runner = PersistentReviewExchangeRunner(
             session_output,
             InMemoryPersistentExchangePairRegistry(),
+            _identity_store(tmp_path / "identity-root"),
             turn_mailbox=mailbox,
         )
         cre = CompletionReviewExchange(

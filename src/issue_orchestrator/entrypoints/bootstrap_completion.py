@@ -94,7 +94,6 @@ def create_completion_components(
     label_manager: "LabelManager | None" = None,
     background_job_supervisor: "BackgroundJobSupervisor | None" = None,
     pair_registry: "InMemoryPersistentExchangePairRegistry | None" = None,
-    attempt_store: "AttemptStore | None" = None,
     turn_mailbox: "TurnMailbox | None" = None,
     tech_lead_authority: "TechLeadAuthorityStore | None" = None,
     open_issue_corpus: "OpenIssueCorpusManager | None" = None,
@@ -105,6 +104,10 @@ def create_completion_components(
     *,
     # Required: the composition root owns the single shared endpoint.
     agent_callback_endpoint: "AgentCallbackEndpoint",
+    # Required: the review exchange records Foundation admission evidence on
+    # the attempt record (#34), so there is no configuration in which the
+    # completion pipeline may run without a durable attempt store.
+    attempt_store: "AttemptStore",
     # The one owner of the shared needs-human block. The agent-requested
     # NEEDS_HUMAN completion outcome routes through it, and the label adapter
     # below refuses that label by value, so the two halves cannot disagree.
@@ -129,6 +132,9 @@ def create_completion_components(
     from ..execution.run_evidence import RunEvidenceRecorder
     from ..execution.persistent_exchange_pair_registry_inmemory import (
         InMemoryPersistentExchangePairRegistry,
+    )
+    from ..execution.attempt_execution_identity_store import (
+        AttemptExecutionIdentityStore,
     )
     from ..execution.persistent_review_exchange_runner import (
         PersistentReviewExchangeRunner,
@@ -193,6 +199,9 @@ def create_completion_components(
         review_exchange_runner=PersistentReviewExchangeRunner(
             session_output,
             pair_registry,
+            # Foundation admission evidence: both roles' execution
+            # identities, bound to the candidate the reviewer was shown (#34).
+            AttemptExecutionIdentityStore(attempt_store),
             turn_mailbox=turn_mailbox,
             coder_prompt_addendum=coder_prompt_addendum,
         ),

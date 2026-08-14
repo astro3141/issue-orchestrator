@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any, Literal
 
 from ..domain.models import CompletionRecord, RequestedAction
 from ..domain.completion_finalization import ReviewExchangeRunningQuery
+from ..domain.issue_key import github_issue_key
 from ..domain.review_exchange_run import ReviewExchangeRun, ReviewExchangeRunAssets
 from ..domain.review_exchange_resume import ResumeDecision
 from ..domain.review_artifacts import review_artifacts_from_exchange_result
@@ -1303,6 +1304,16 @@ class CompletionReviewExchange:
             raise ValueError("Review exchange requires config")
         if not agent_label:
             raise ValueError("Review exchange requires agent_label")
+        if not self._config.repo:
+            # The repo scopes this exchange's durable records, and the
+            # validation half of the same evidence is scoped by ``issue.repo``
+            # — the adapter's resolved ``owner/repo``, never ``""``. Defaulting
+            # here would file the two halves of one candidate under different
+            # scopes silently, so refuse instead. Unreachable in production:
+            # ``bootstrap`` builds no GitHub adapter when the repo cannot be
+            # resolved, and ``_resolve_repo`` writes the auto-detected value
+            # back into ``config.repo`` before this pipeline exists.
+            raise ValueError("Review exchange requires config.repo")
         coder_label = agent_label
         reviewer_label = self.resolve_reviewer_label(agent_label)
         coder_agent = self._config.agents[coder_label]
@@ -1319,6 +1330,16 @@ class CompletionReviewExchange:
         return self._review_exchange_runner.run(
             exchange_run=exchange_run,
             coder_worktree=worktree,
+            # Derived here, from the one owner of the rule, so this exchange's
+            # durable records land under the same key every other attempt-scoped
+            # record for this issue uses (#34). ``config.repo`` is checked above
+            # rather than defaulted, so this scope is the same ``owner/repo``
+            # the adapter puts on ``issue.repo``.
+            issue_key=github_issue_key(
+                repo=self._config.repo,
+                number=issue_number,
+                title=issue_title,
+            ),
             issue_number=issue_number,
             issue_title=issue_title,
             coder_label=coder_label,

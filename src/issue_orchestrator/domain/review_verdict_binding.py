@@ -34,11 +34,10 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any
 
+from .commit_sha import normalize_commit_sha
+
 REVIEW_VERDICT_BINDING_FILENAME = "review-verdict.json"
 REVIEW_VERDICT_BINDING_SCHEMA_VERSION = 1
-
-_SHA_LENGTH = 40
-_HEX_DIGITS = frozenset("0123456789abcdef")
 
 
 class ReviewVerdictOutcome(StrEnum):
@@ -58,18 +57,13 @@ class ReviewVerdictOutcome(StrEnum):
 def normalize_reviewed_sha(value: object, *, field_name: str = "reviewed_sha") -> str:
     """Return ``value`` as a canonical full commit SHA, or raise.
 
-    Abbreviated, uppercase, or non-hex values are rejected rather than
-    normalised into something that would compare unequal to a real HEAD later.
+    Review's spelling of :func:`~.commit_sha.normalize_commit_sha`. The rule
+    itself lives there because §4 is an equality *between* records: the actor
+    and reviewer execution identities bound to a candidate
+    (:mod:`~.execution_identity`) must decide "same commit" exactly as this
+    binding does, and two copies of the rule are two chances to drift.
     """
-    if not isinstance(value, str):
-        raise TypeError(f"{field_name} must be str")
-    normalized = value.strip().lower()
-    if len(normalized) != _SHA_LENGTH or not set(normalized) <= _HEX_DIGITS:
-        raise ValueError(
-            f"{field_name} must be a full {_SHA_LENGTH}-character hex SHA, "
-            f"got {value!r}"
-        )
-    return normalized
+    return normalize_commit_sha(value, field_name=field_name)
 
 
 @dataclass(frozen=True, slots=True)

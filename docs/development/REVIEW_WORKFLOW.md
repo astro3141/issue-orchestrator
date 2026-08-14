@@ -139,6 +139,83 @@ presented commit, it records **no** binding rather than guessing — an
 unbound verdict is one no later gate can admit, and an unusable observation
 never changes the outcome of the review it describes.
 
+### Candidate execution identities — who ran, bound to what they ran against
+
+`review-verdict.json` answers "was this commit approved". Foundation admission
+(`docs/foundation/VALIDATED_WORK_DISPOSITION.md` §4, I2c) also requires that
+**the reviewer execution principal is distinct from the actor's**, so the
+orchestrator records the other half at the same moment: both roles' execution
+identities, bound to the same presented commit.
+
+```json
+{
+  "schema_version": 1,
+  "candidate_sha": "<40-hex commit>",
+  "actor": {
+    "role": "actor",
+    "principal":  {"agent_label": "agent:backend"},
+    "provenance": {"provider": "claude-code", "model": "opus"}
+  },
+  "reviewer": {
+    "role": "reviewer",
+    "principal":  {"agent_label": "agent:reviewer"},
+    "provenance": {"provider": "codex", "model": "gpt-5"}
+  },
+  "observed_at": "2026-08-14T00:00:00+00:00"
+}
+```
+
+- **Principal is authority; provenance is detail (contract rev 4).** I2c
+  compares `principal` and nothing else. `provenance` is retained because
+  "which execution actually happened" is worth auditing, but comparing it
+  fails both ways: fold provider or model into identity and two separately
+  configured reviewing principals collapse into one whenever they run the same
+  model — the arrangement this fork operates under — while one principal whose
+  model changed between runs reads as two. The contract does not name what
+  plays the part of a principal; IO's answer is the agent label, and that
+  choice lives in `ExecutionPrincipal`.
+- **Orchestrator-observed.** Every field is the launcher's own: the label it
+  routed the role by, plus the provider and model read off the same
+  `launch_config(agent)` derivation the exchange spawns — so an `ai_system`-only
+  agent is recorded as the provider it actually launched on, with the model
+  that resolution actually passes (`AgentConfig.resolved_model()`). Reading the
+  configured agent instead of the launched one would let the record name a
+  model no process was given. An agent cannot assert its own identity, and a
+  claim carried in agent-authored output is not evidence.
+- **`model` is `null` when the orchestrator pinned none.** An agent with an
+  explicit non-Claude provider and no `model:` runs on whatever its CLI
+  defaults to — the launcher passes no model, so the record states that rather
+  than inventing one. Recording only what was actually passed is what keeps
+  the record and the spawn from naming different models. Distinctness is
+  unaffected, because no model was ever compared.
+- **Bound to the exact candidate.** `candidate_sha` is the commit the
+  orchestrator checked out for the reviewer — the same observation
+  `reviewed_sha` comes from, so the two records cannot describe different
+  commits. A session-start HEAD is deliberately not accepted: it is what the
+  worktree held before the actor committed anything.
+- **Durable past the worktree.** Unlike the exchange directory, this record
+  lives on the attempt record keyed by `(issue, commit)`, under
+  `<repo_root>/.issue-orchestrator/attempts` — the primary checkout. Admission
+  reads the identity evidence after the sessions that produced it and their
+  worktrees are gone. The same record *references* §4's other halves via
+  `validation_record_path` — but that path points inside the session directory
+  that produced it, which dies with the worktree, so this record does not by
+  itself answer §4 after cleanup. How the whole admitted evidence set survives
+  cleanup is a separate decision and a prerequisite for #33.
+- **Distinctness is falsifiable in both directions.** The comparison excludes
+  `role` on purpose: including it would make every pair distinct by
+  construction. Excluding provenance is what makes the other direction
+  breakable. §11's three rows: one principal in both roles is refused; one
+  principal is still one principal however far its provenance differs; two
+  principals stay distinct on identical provider/model configuration.
+
+Both reviewer-decided terminals record it, for the same reason both bind a
+verdict — who executed the candidate is true whatever the verdict was. An
+unobservable presented commit records nothing rather than guessing, and never
+changes the outcome of the review it describes.
+
+This is evidence only. Nothing here holds, approves or publishes anything.
+
 Nits are classified in the same reviewer pass as blockers. They do not get a separate review pass. When `review.nits.default_policy` or a per-agent override is `address`, an approved review with only nits is converted into normal coder rework before PR creation. `surface` records and shows nits without blocking PR creation. `ignore` keeps them only in the persisted artifacts.
 
 ### via-mcp

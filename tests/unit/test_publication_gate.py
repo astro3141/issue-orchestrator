@@ -492,6 +492,7 @@ class TestCompositionActuallyBuildsTheGate:
 
         import yaml
 
+        from issue_orchestrator.entrypoints.bootstrap import create_attempt_store
         from issue_orchestrator.entrypoints.bootstrap_completion import (
             create_completion_components,
         )
@@ -532,6 +533,7 @@ class TestCompositionActuallyBuildsTheGate:
             FileSystemSessionOutput(),
             LocalCommandRunner(),
             agent_callback_endpoint=MagicMock(),
+            attempt_store=create_attempt_store(Config.load(config_path)),
             needs_human_block=MagicMock(),
         )
         return processor
