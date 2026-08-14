@@ -1,0 +1,19 @@
+Accidental commit — not intended work.
+
+Created a single-line `DUMMY` file while attempting to edit GitHub issue #46's
+body with the wrong tool. Reverted immediately by c5bcd635.
+
+The three create/revert pairs on main are:
+  24c9bbfc -> d58c8c23
+  9fa74611 -> af1c430b
+  06bae7ca -> c5bcd635
+
+The tree at c5bcd635 is byte-identical to b71827bb, the last commit before the
+incident (both 8e941031da4c), so no content was gained or lost.
+
+History was deliberately NOT rewritten. These commits are already on the remote,
+and this project treats the commit DAG as evidence (#21 §10): rewriting main to
+hide an operator mistake would use that principle backwards, and a rewrite
+reduces exposure without recalling anything (#21 §12). The incident is recorded
+in #21 instead. This note exists because the commit subject 'x' explains nothing
+to a later reader — it is supplementary, not the canonical record.
