@@ -333,8 +333,16 @@ class SessionRestorer:
 
         So when the host cannot produce the issue, this declines the
         restoration rather than completing it under a downgraded identity.
-        Nothing durable records the canonical key for a live terminal, so
-        there is no already-proven key to fall back to.
+
+        A durable canonical key does exist on some restored paths: a review,
+        rework or retrospective-review session holds a ``PendingWorkClaim``
+        whose ledger row in ``.issue-orchestrator/state/`` carries the
+        ``issue_key`` itself, and a validation-retry or tech-lead claim
+        carries the number and title that derivation takes. A plain issue
+        session has no claim row, and this path does not consult that ledger.
+        So no durable canonical key is proven for every restored session path,
+        and rather than guessing one, this path declines when the
+        authoritative issue metadata is unavailable.
         """
         issue = self.repository_host.get_issue(issue_number)
         if issue is None:
