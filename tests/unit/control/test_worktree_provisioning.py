@@ -250,3 +250,105 @@ class TestProvisioningLeavesTheCandidateAlone:
         provisioner.provision(tmp_path)
 
         assert working_copy.dirty_reads == 2
+
+    def test_a_command_that_alters_the_candidate_and_then_fails_reports_both(
+        self, tmp_path
+    ):
+        """The failure of one fact must not suppress the report of the other.
+
+        A setup command that edits the candidate and exits nonzero aborts the
+        launch either way — but without the post-check on the failure path the
+        alteration is left in the worktree and never named.
+        """
+        provisioner, _, _ = _provisioner(
+            commands=["make worktree-setup"],
+            runner=RecordingCommandRunner(
+                [
+                    CommandResult(
+                        returncode=1,
+                        stdout="",
+                        stderr="patched then died",
+                        timed_out=False,
+                    )
+                ]
+            ),
+            working_copy=StubWorkingCopy(dirty=[False, True]),
+        )
+
+        with pytest.raises(WorktreeProvisioningError) as excinfo:
+            provisioner.provision(tmp_path)
+
+        message = str(excinfo.value)
+        assert "exit_code=1" in message
+        assert "patched then died" in message
+        assert "uncommitted changes" in message
+
+    def test_the_candidate_is_re_read_even_when_a_command_fails(self, tmp_path):
+        provisioner, _, working_copy = _provisioner(
+            commands=["make worktree-setup"],
+            runner=RecordingCommandRunner(
+                [CommandResult(returncode=1, stdout="", stderr="boom", timed_out=False)]
+            ),
+        )
+
+        with pytest.raises(WorktreeProvisioningError):
+            provisioner.provision(tmp_path)
+
+        assert working_copy.head_sha_reads == 2
+        assert working_copy.dirty_reads == 2
+
+    def test_a_command_that_fails_without_altering_the_candidate_reports_only_that(
+        self, tmp_path
+    ):
+        provisioner, _, _ = _provisioner(
+            commands=["make worktree-setup"],
+            runner=RecordingCommandRunner(
+                [CommandResult(returncode=1, stdout="", stderr="boom", timed_out=False)]
+            ),
+        )
+
+        with pytest.raises(WorktreeProvisioningError) as excinfo:
+            provisioner.provision(tmp_path)
+
+        assert "uncommitted changes" not in str(excinfo.value)
+        assert "moved HEAD" not in str(excinfo.value)
+
+
+class TestProvisioningRecipeIsPinned:
+    """What runs is the operator's configuration, not the worktree's own."""
+
+    def test_configuration_outside_the_worktree_provisions_normally(self, tmp_path):
+        config = Config()
+        config.setup_worktree = ["make worktree-setup"]
+        config.config_path = tmp_path / "config" / "selfhost.yaml"
+        runner = RecordingCommandRunner()
+        provisioner = WorktreeProvisioner(
+            config=config,
+            command_runner=runner,
+            working_copy=StubWorkingCopy(),
+        )
+        worktree = tmp_path / "worktree"
+        worktree.mkdir()
+
+        provisioner.provision(worktree)
+
+        assert len(runner.calls) == 1
+
+    def test_configuration_inside_the_provisioned_worktree_is_refused(self, tmp_path):
+        config = Config()
+        config.setup_worktree = ["make worktree-setup"]
+        worktree = tmp_path / "worktree"
+        worktree.mkdir()
+        config.config_path = worktree / ".issue-orchestrator" / "config.yaml"
+        runner = RecordingCommandRunner()
+        provisioner = WorktreeProvisioner(
+            config=config,
+            command_runner=runner,
+            working_copy=StubWorkingCopy(),
+        )
+
+        with pytest.raises(WorktreeProvisioningError) as excinfo:
+            provisioner.provision(worktree)
+
+        assert "outside the worktree" in str(excinfo.value)
+        assert runner.calls == []

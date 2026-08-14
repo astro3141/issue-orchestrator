@@ -13,15 +13,36 @@ invoked from two of the five launch paths, so whether a worktree was runnable
 depended on which path happened to create it — a rework or review worktree
 reached the publish gate unprovisioned.
 
-Two invariants ride along with running the commands:
+Three invariants ride along with running the commands:
 
 * **Fail closed, at the point of failure.** A provisioning failure aborts the
   launch where provisioning happened, rather than letting the session start and
   surface hours later as an unrelated gate target dying.
 * **Provisioning must not alter the candidate.** Setup commands install tooling;
   they must not move ``HEAD`` or leave the candidate's tracked content modified.
-  A checkpoint taken before the commands is re-read afterwards, so a setup
-  command that edits the candidate is a loud failure instead of a silent one.
+  A checkpoint taken before the commands is re-read afterwards, and it is read
+  whether or not the commands succeeded: a failing command and an altered
+  candidate are two separate facts, and the first must not suppress the second.
+* **The recipe is pinned to the operator's configuration.** Which commands run
+  is read from ``Config.setup_worktree``, whose source is the configuration file
+  the orchestrator was started with. That file must live outside the worktree
+  being provisioned, so the worktree under test never supplies the list of
+  commands run on it.
+
+Authority
+---------
+
+Provisioning runs the configured commands at orchestrator host authority in the
+worktree, and those commands resolve to the repository's own build files. That
+is the same authority, in the same worktree, under which the configured
+validation gate already runs the repository's build and test code
+(``docs/architecture/validation.md``), and it holds under ADR-0034's
+trusted-repository contract: the operator selects and onboards the repository
+the orchestrator works on. Extending provisioning to the rework and review
+launch paths therefore adds no class of code and no authority that the gate in
+those same worktrees did not already carry — it makes the gate's verdict mean
+what the record says it means. Anything stronger (a bounded execution
+substrate) is the separate untrusted-repository track, not this owner.
 """
 
 from __future__ import annotations
@@ -88,19 +109,61 @@ class WorktreeProvisioner:
     def provision(self, worktree_path: Path) -> None:
         """Run the configured setup commands in ``worktree_path``.
 
+        The candidate check runs on both outcomes. A setup command that alters
+        the candidate and *then* fails would otherwise abort the launch with the
+        alteration left in the worktree and never reported, so the two facts are
+        gathered separately and both are named in the failure.
+
         Raises:
-            WorktreeProvisioningError: a command failed or timed out, or
-                provisioning changed the candidate's committed state.
+            WorktreeProvisioningError: the recipe is not pinned outside the
+                worktree, a command failed or timed out, or provisioning
+                changed the candidate's committed state.
         """
         commands = list(self._config.setup_worktree)
         if not commands:
             return
+        self._require_pinned_recipe(worktree_path)
         checkpoint = self._checkpoint(worktree_path)
         step_start = time.time()
-        for cmd in commands:
-            self._run_command(cmd, worktree_path)
-        logger.info("[launch] Setup completed in %.1fs", time.time() - step_start)
-        self._verify_candidate_unchanged(worktree_path, checkpoint)
+        setup_failure: WorktreeProvisioningError | None = None
+        try:
+            for cmd in commands:
+                self._run_command(cmd, worktree_path)
+        except WorktreeProvisioningError as exc:
+            setup_failure = exc
+        else:
+            logger.info("[launch] Setup completed in %.1fs", time.time() - step_start)
+        candidate_change = self._describe_candidate_change(worktree_path, checkpoint)
+        if candidate_change is not None:
+            logger.error("Provisioning altered the candidate: %s", candidate_change)
+        if setup_failure is not None and candidate_change is not None:
+            raise WorktreeProvisioningError(
+                f"{setup_failure}; the candidate was also altered: {candidate_change}"
+            ) from setup_failure
+        if setup_failure is not None:
+            raise setup_failure
+        if candidate_change is not None:
+            raise WorktreeProvisioningError(candidate_change)
+
+    def _require_pinned_recipe(self, worktree_path: Path) -> None:
+        """Refuse a recipe the provisioned worktree could itself supply.
+
+        ``Config.setup_worktree`` is only as trustworthy as the file it was read
+        from. A configuration file resolved *inside* the worktree being
+        provisioned would let the worktree under test choose what runs on it, so
+        that arrangement is refused rather than executed. A ``Config`` built
+        in-process carries no file and is trivially not worktree-sourced.
+        """
+        config_path = self._config.config_path
+        if config_path is None:
+            return
+        resolved = Path(config_path).resolve()
+        worktree = Path(worktree_path).resolve()
+        if resolved.is_relative_to(worktree):
+            raise WorktreeProvisioningError(
+                "provisioning commands must come from configuration outside the "
+                f"worktree they provision: {resolved} is inside {worktree}"
+            )
 
     def _run_command(self, cmd: str, worktree_path: Path) -> None:
         logger.debug("Running setup command: %s", cmd)
@@ -127,10 +190,13 @@ class WorktreeProvisioner:
             dirty=self._working_copy.has_uncommitted_changes(worktree_path),
         )
 
-    def _verify_candidate_unchanged(
+    def _describe_candidate_change(
         self, worktree_path: Path, before: _CandidateCheckpoint
-    ) -> None:
-        """Fail loudly when provisioning changed what is under test.
+    ) -> str | None:
+        """Name what provisioning changed about the candidate, or ``None``.
+
+        Returns rather than raises so the caller can report it alongside a setup
+        command that failed after making the change.
 
         A worktree that was already dirty stays a question this check cannot
         answer, so only a clean-to-dirty transition is treated as provisioning's
@@ -138,14 +204,13 @@ class WorktreeProvisioner:
         """
         after = self._checkpoint(worktree_path)
         if after.head_sha != before.head_sha:
-            raise WorktreeProvisioningError(
+            return (
                 f"provisioning moved HEAD in {worktree_path}: "
                 f"{before.head_sha} -> {after.head_sha}"
             )
         if after.dirty and not before.dirty:
-            raise WorktreeProvisioningError(
-                f"provisioning left uncommitted changes in {worktree_path}"
-            )
+            return f"provisioning left uncommitted changes in {worktree_path}"
+        return None
 
 
 def provision_launch_worktree(
