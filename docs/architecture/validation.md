@@ -72,12 +72,13 @@ Two collaborators decide whether a worktree can run anything:
 | Create/reuse the worktree | `WorktreeManager` (adapter) | The checkout, its branch, its hooks, and a symlink from the worktree's `.venv` to the repository's |
 | Provision the worktree | `WorktreeProvisioner` (`control/worktree_provisioning.py`) | Everything `worktrees.setup` installs — anything the symlink does not supply, such as `packages/vscode/node_modules` |
 
-The provisioner is the single owner, and **every** launch path goes through it:
-coding, validation retry, rework, review and retrospective review. It used to
-be invoked from the coding and validation-retry paths only, so whether a
-worktree was runnable depended on which path had created it: a rework or review
-worktree — the reused ones — reached the publish gate unprovisioned, and the
-run died on a late, unrelated gate target. That was issue [#48].
+The provisioner is the single owner of provisioning, and **every session launch
+path** goes through it: coding, validation retry, rework, review and
+retrospective review. It used to be invoked from the coding and validation-retry
+paths only, so whether a worktree was runnable depended on which path had
+created it: a rework or review worktree — the reused ones — reached the publish
+gate unprovisioned, and the run died on a late, unrelated gate target. That was
+issue [#48].
 
 Provisioning holds two rules:
 
@@ -94,6 +95,31 @@ Provisioning holds two rules:
 
 A repository that declares no `worktrees.setup` commands provisions nothing;
 its worktrees must be runnable from the checkout alone.
+
+### The one worktree that is exempt
+
+Not every worktree an agent sits in is created by a session launch. The
+persistent review-exchange reviewer worktree
+(`execution/reviewer_worktree.py`, `<coder-worktree>-review-<timestamp>`) is
+created with a raw `git worktree add --detach`, outside `WorktreeManager`. It
+therefore gets neither guarantee in the table above: no `.venv` symlink, and
+nothing `worktrees.setup` installs.
+
+That is deliberate, and it is the only such exemption. The reviewer reads the
+candidate's code; it does not run gates, and provisioning it would pay
+`worktrees.setup` — for this repository an `npm ci` and a browser install — per
+exchange to support a command the reviewer is told not to run.
+
+Being told is what makes the exemption safe rather than a repeat of #48. Every
+reviewer prompt carries `REVIEWER_WORKTREE_IS_UNPROVISIONED_NOTE`
+(`domain/review_exchange.py`), naming the worktree as unprovisioned and ruling
+out build/test/validation commands. That note is unconditional on purpose:
+`review.exchange.loop.require_validation` decides only whether a validation
+*record* is required before the reviewer may approve, so when it is false the
+reviewer would otherwise hear nothing about gates and be free to run one in a
+worktree that cannot run it — recording an environment gap against the
+candidate, which is exactly what #48 is about. A change that lets the reviewer
+run gates must first route this worktree through `WorktreeProvisioner`.
 
 ## Configuration (YAML)
 

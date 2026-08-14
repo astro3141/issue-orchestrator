@@ -113,6 +113,21 @@ def create_reviewer_worktree(
     The sibling lives at ``<coder_worktree>-review-<timestamp>``. Detached
     HEAD is required because the coder's branch is already checked out in
     the coder worktree; git refuses to check out the same branch twice.
+
+    **This worktree is deliberately unprovisioned.** It is created here with a
+    raw ``git worktree add`` rather than through ``WorktreeManager``, so it gets
+    neither the repository ``.venv`` symlink nor anything ``worktrees.setup``
+    installs — it is the one agent worktree ``WorktreeProvisioner`` does not
+    own (#48, ``docs/architecture/validation.md``). The reviewer reads code; it
+    does not run gates, and paying ``worktrees.setup`` (an ``npm ci`` and a
+    browser install for this repository) per exchange to support a command the
+    reviewer is told not to run is not a trade worth making.
+
+    What keeps the exemption safe is that the reviewer is told so:
+    ``REVIEWER_WORKTREE_IS_UNPROVISIONED_NOTE`` is in *every* reviewer prompt,
+    including when ``review.exchange.loop.require_validation`` is false and no
+    validation record is demanded. Change that instruction and this worktree
+    has to start going through the provisioner.
     """
     sibling = coder_worktree.parent / f"{coder_worktree.name}-review-{timestamp}"
     if sibling.exists():

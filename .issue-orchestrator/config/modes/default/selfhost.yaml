@@ -73,8 +73,11 @@ worktrees:
   # candidate commit (#48). `make worktree-setup` is the target that installs
   # them, and it is what main.yaml and z-codespaces.yaml already declare.
   #
-  # It is idempotent by design: `venv-fast` reuses an existing `.venv`, `npm ci`
-  # and `playwright install` are no-ops once satisfied. It syncs the *shared*
+  # It is idempotent in *result*, not free: `venv-fast` reuses an existing
+  # `.venv` and `playwright install` skips satisfied browsers, but `npm ci`
+  # deletes `packages/vscode/node_modules` and reinstalls from the lockfile on
+  # every invocation by design. That fixed cost is now paid on all five session
+  # launch paths, not just coding and validation retry. It syncs the *shared*
   # repository venv the worktree is symlinked to, so a candidate that changes
   # `uv.lock` re-syncs that shared venv from its own lock — pinned third-party
   # dependencies only; the boundary above (the candidate's IO source never runs
