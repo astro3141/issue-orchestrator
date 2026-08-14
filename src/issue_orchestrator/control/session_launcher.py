@@ -942,7 +942,7 @@ class SessionLauncher:
             )
 
             # Run setup commands
-            if self.config.setup_worktree:
+            if self._worktree_provisioner.has_commands:
                 try:
                     self._worktree_provisioner.provision(worktree_path)
                 except Exception as e:
@@ -1435,7 +1435,7 @@ class SessionLauncher:
         Validation retries intentionally keep the existing worktree, so
         configured setup commands must be idempotent and non-destructive.
         """
-        if not self.config.setup_worktree:
+        if not self._worktree_provisioner.has_commands:
             return None
         try:
             self._worktree_provisioner.provision(worktree_path)
