@@ -526,15 +526,15 @@ def test_run_hands_the_inner_runner_orchestrator_observed_identities(
 
     recorder = captured["execution_identities"]
     assert recorder.issue_key == GitHubIssueKey(repo="acme/repo", external_id="42")
-    assert recorder.actor.agent_label == "agent:coder"
+    assert recorder.actor.principal.agent_label == "agent:coder"
     # No explicit provider on the coder: resolved from ai_system, as the spawn does.
-    assert recorder.actor.provider == "claude-code"
-    assert recorder.actor.model == "sonnet"
-    assert recorder.reviewer.agent_label == "agent:reviewer"
-    assert recorder.reviewer.provider == "codex"
+    assert recorder.actor.provenance.provider == "claude-code"
+    assert recorder.actor.provenance.model == "sonnet"
+    assert recorder.reviewer.principal.agent_label == "agent:reviewer"
+    assert recorder.reviewer.provenance.provider == "codex"
     # The untouched "sonnet" default is claude vocabulary the spawn does not
     # forward to codex, so the record must not claim codex ran it.
-    assert recorder.reviewer.model is None
+    assert recorder.reviewer.provenance.model is None
 
 
 def _agents_from_config_loader(
@@ -613,11 +613,12 @@ def test_a_reviewer_that_pinned_no_model_is_recorded_not_fatal(
     recorder, outcome = _recorder_for_loaded_agents(monkeypatch, tmp_path, agents)
 
     assert outcome.status == "ok"
-    assert recorder.reviewer.provider == "codex"
-    assert recorder.reviewer.model is None
-    assert recorder.actor.model == "opus"
-    # Unpinned on one side does not collapse the two identities.
-    assert recorder.actor.fingerprint() != recorder.reviewer.fingerprint()
+    assert recorder.reviewer.provenance.provider == "codex"
+    assert recorder.reviewer.provenance.model is None
+    assert recorder.actor.provenance.model == "opus"
+    # The two principals are what I2c compares; an unpinned model is
+    # provenance and cannot collapse them either way.
+    assert recorder.actor.principal != recorder.reviewer.principal
 
 
 def test_an_ai_system_only_reviewer_records_the_model_its_launch_resolves_to(
@@ -648,6 +649,6 @@ def test_an_ai_system_only_reviewer_records_the_model_its_launch_resolves_to(
     recorder, outcome = _recorder_for_loaded_agents(monkeypatch, tmp_path, agents)
 
     assert outcome.status == "ok"
-    assert recorder.reviewer.provider == "codex"
-    assert recorder.reviewer.model is None
-    assert recorder.actor.model == "opus"
+    assert recorder.reviewer.provenance.provider == "codex"
+    assert recorder.reviewer.provenance.model is None
+    assert recorder.actor.provenance.model == "opus"

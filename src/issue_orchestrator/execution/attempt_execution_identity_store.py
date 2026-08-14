@@ -1,14 +1,21 @@
 """Candidate execution-identity evidence, carried by the attempt record.
 
-Why this store and not a new one. §4's admission evidence is two records about
-**one** ``(issue, A)``: validation's, and review's. ``Attempt`` is already the
-durable owner keyed by exactly ``(issue, commit)`` and already holds
-``validation_record_path``, so putting the execution identities beside it makes
-one record answer §4 for one candidate. Its production sidecar directory is
-``<repo_root>/.issue-orchestrator/attempts`` — the primary checkout, not an
-issue worktree — so the evidence survives both an orchestrator restart and
-``git worktree remove``, which is what admission needs and what the exchange
-directory's own artifacts cannot offer.
+Why this store and not a new one. §4's admission evidence is about **one**
+``(issue, A)``, and ``Attempt`` is already the durable owner keyed by exactly
+``(issue, commit)``, already holding ``validation_record_path``. Putting the
+execution identities beside it means one record carries the identity evidence
+and *references* §4's other halves, keyed by the same candidate. Its production
+sidecar directory is ``<repo_root>/.issue-orchestrator/attempts`` — the primary
+checkout, not an issue worktree — so the identity evidence survives both an
+orchestrator restart and ``git worktree remove``, which is what admission needs
+and what the exchange directory's own artifacts cannot offer.
+
+That claim is deliberately narrow: **this record does not by itself answer §4
+after cleanup.** ``validation_record_path`` points into the session directory
+that produced it, and that directory dies with the coder worktree — so what
+survives here is the identity evidence plus a reference whose target may not.
+How the *whole* admitted evidence set survives cleanup is a separate decision
+and a prerequisite for #33, whose admission reads all of it.
 
 The alternatives were measured, not assumed. The exchange directory
 (``execution/review_exchange_records.py``) lives inside the coder worktree and
@@ -63,8 +70,8 @@ class AttemptExecutionIdentityStore:
         )
         logger.info(
             "[EXECUTION_IDENTITY] recorded actor=%s reviewer=%s for %s@%s",
-            identities.actor.agent_label,
-            identities.reviewer.agent_label,
+            identities.actor.principal.agent_label,
+            identities.reviewer.principal.agent_label,
             key.issue_key,
             identities.candidate_sha[:12],
         )

@@ -2,9 +2,26 @@
 
 Foundation admission (``docs/foundation/VALIDATED_WORK_DISPOSITION.md`` §4)
 admits work only when I2c holds: the review outcome is an approval **and the
-reviewer identity is distinct from the actor's**. :mod:`.review_verdict_binding`
-supplies the approval half. This module supplies the other one — the two
-execution identities, paired with the exact candidate they executed against.
+reviewer execution principal is distinct from the actor's**.
+:mod:`.review_verdict_binding` supplies the approval half. This module supplies
+the other one — the two execution identities, paired with the exact candidate
+they executed against.
+
+**Principal and provenance are separate things (contract rev 4).** An identity
+here is one :class:`ExecutionPrincipal` — the orchestrator-assigned logical
+agent identity under whose authority the role ran — plus the
+:class:`ExecutionProvenance` describing how that principal's execution
+happened. I2c compares principals and nothing else. Provenance is retained
+because "which execution actually happened" is worth auditing, but it must not
+decide admission: fold provider or model into identity and two roles that are
+separately configured reviewing principals collapse into one whenever they run
+the same model (the arrangement this fork actually operates under), while one
+principal whose model changed between runs reads as two and admits work that
+reviewed itself.
+
+The contract deliberately does not name what plays the part of a principal.
+IO's answer is the agent label the launcher routed the role by; that choice
+lives in :class:`ExecutionPrincipal` here rather than in the contract.
 
 Three properties make these records evidence rather than description.
 
@@ -20,12 +37,15 @@ Three properties make these records evidence rather than description.
   a full SHA and :meth:`CandidateExecutionIdentities.covers` re-derives the
   match whenever it matters, so a moved candidate is detectably stale rather
   than quietly reusable.
-* **Distinctness is falsifiable.** :meth:`AgentExecutionIdentity.fingerprint`
-  deliberately excludes ``role``. Including it would make every pair distinct
-  by construction — a check that no mutation can break, which is a check that
-  has pinned nothing (#21 §9). What remains is the executing configuration:
-  make the actor's equal the reviewer's and
-  :meth:`CandidateExecutionIdentities.roles_are_distinct` goes false.
+* **Distinctness is falsifiable in both directions.**
+  :meth:`CandidateExecutionIdentities.principals_are_distinct` compares
+  principals and excludes ``role``: including the role would make every pair
+  distinct by construction — a check no mutation can break, which is a check
+  that has pinned nothing (#21 §9). Excluding provenance is what makes the
+  *other* direction breakable: give the two roles one principal and the check
+  must go false however far their provider, model or run apart; give them two
+  principals and it must stay true however identical their configuration.
+  §11's three rows drive exactly those mutations.
 
 The record is evidence only. Nothing here admits, holds, approves or publishes
 anything; #33 owns the gate that reads it.
@@ -85,8 +105,48 @@ def _unpinned_or_text(value: object, *, field_name: str) -> str | None:
 
 
 @dataclass(frozen=True, slots=True)
-class AgentExecutionIdentity:
-    """One role's executing configuration, as the orchestrator launched it.
+class ExecutionPrincipal:
+    """The logical agent identity a role executed under. What I2c compares.
+
+    The contract states the concept without naming an implementation, so the
+    choice of what fills it is made here and only here: IO's principal is the
+    agent label the launcher routed the role by. Recording that decision as its
+    own type is what stops provenance drifting back into identity — a later
+    reader can see the whole of what I2c compares by reading one class.
+
+    Frozen and hashable on purpose. Rev 4 §2 puts both principals inside the
+    evidence set §5 digests, so a principal must stay structurally hashable
+    alongside the rest of §4's evidence.
+    """
+
+    agent_label: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "agent_label",
+            _required_text(self.agent_label, field_name="agent_label"),
+        )
+
+    @classmethod
+    def from_payload(cls, payload: Mapping[str, object]) -> "ExecutionPrincipal":
+        return cls(
+            agent_label=_required_text(
+                payload.get("agent_label"), field_name="agent_label"
+            )
+        )
+
+    def to_payload(self) -> dict[str, Any]:
+        return {"agent_label": self.agent_label}
+
+
+@dataclass(frozen=True, slots=True)
+class ExecutionProvenance:
+    """How a principal's execution happened. Retained for audit, never compared.
+
+    Provider and model are attributes of a run, not of the authority the run
+    carried, so nothing here participates in I2c — see the module docstring for
+    why comparing them fails in both directions.
 
     ``model`` is ``None`` when the orchestrator pinned no model and left the
     choice to the provider's CLI — see :func:`_unpinned_or_text`. It is the
@@ -94,35 +154,48 @@ class AgentExecutionIdentity:
     record and the spawn cannot name different models.
     """
 
-    role: ExecutionRole
-    agent_label: str
     provider: str
     model: str | None
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "role", ExecutionRole(self.role))
-        for field_name in ("agent_label", "provider"):
-            object.__setattr__(
-                self,
-                field_name,
-                _required_text(getattr(self, field_name), field_name=field_name),
-            )
+        object.__setattr__(
+            self, "provider", _required_text(self.provider, field_name="provider")
+        )
         object.__setattr__(
             self, "model", _unpinned_or_text(self.model, field_name="model")
         )
 
-    def fingerprint(self) -> tuple[str, str, str | None]:
-        """What makes two executions the same one, ignoring the role played.
+    @classmethod
+    def from_payload(cls, payload: Mapping[str, object]) -> "ExecutionProvenance":
+        if "model" not in payload:
+            # Present-and-null ("no model pinned") is a statement; absent is a
+            # record that never made one. An audit trail must not read the
+            # second as the first, and rev 4 digests what the record states.
+            raise ValueError("execution provenance requires a model")
+        return cls(
+            provider=_required_text(payload.get("provider"), field_name="provider"),
+            model=_unpinned_or_text(payload["model"], field_name="model"),
+        )
 
-        Role is excluded on purpose — see the module docstring. Two roles run
-        by the same agent label on the same provider and model are one
-        execution identity wearing two hats, which is exactly the arrangement
-        I2c exists to refuse.
+    def to_payload(self) -> dict[str, Any]:
+        return {"provider": self.provider, "model": self.model}
 
-        An unpinned model keeps the check's teeth: two roles that both let
-        their CLI choose still differ by ``agent_label`` and ``provider``.
-        """
-        return (self.agent_label, self.provider, self.model)
+
+@dataclass(frozen=True, slots=True)
+class AgentExecutionIdentity:
+    """One role's principal, plus the provenance of the run that carried it.
+
+    The split is the point: ``principal`` is the authority I2c compares and
+    ``provenance`` is audit detail it must ignore. Nothing on this class
+    compares the two together.
+    """
+
+    role: ExecutionRole
+    principal: ExecutionPrincipal
+    provenance: ExecutionProvenance
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "role", ExecutionRole(self.role))
 
     @classmethod
     def from_payload(
@@ -141,24 +214,23 @@ class AgentExecutionIdentity:
                 f"execution identity filed as {expected_role.value} carries "
                 f"role {role.value}"
             )
-        if "model" not in payload:
-            # Present-and-null ("no model pinned") is a statement; absent is a
-            # record that never made one. A gate comparing executions must not
-            # read the second as the first.
-            raise ValueError("execution identity requires a model")
+        principal_raw = payload.get("principal")
+        if not isinstance(principal_raw, Mapping):
+            raise ValueError("execution identity requires a principal")
+        provenance_raw = payload.get("provenance")
+        if not isinstance(provenance_raw, Mapping):
+            raise ValueError("execution identity requires provenance")
         return cls(
             role=role,
-            agent_label=_required_text(payload.get("agent_label"), field_name="agent_label"),
-            provider=_required_text(payload.get("provider"), field_name="provider"),
-            model=_unpinned_or_text(payload["model"], field_name="model"),
+            principal=ExecutionPrincipal.from_payload(principal_raw),
+            provenance=ExecutionProvenance.from_payload(provenance_raw),
         )
 
     def to_payload(self) -> dict[str, Any]:
         return {
             "role": self.role.value,
-            "agent_label": self.agent_label,
-            "provider": self.provider,
-            "model": self.model,
+            "principal": self.principal.to_payload(),
+            "provenance": self.provenance.to_payload(),
         }
 
 
@@ -213,9 +285,15 @@ class CandidateExecutionIdentities:
             == self.candidate_sha
         )
 
-    def roles_are_distinct(self) -> bool:
-        """Whether the reviewer's execution differs from the actor's."""
-        return self.actor.fingerprint() != self.reviewer.fingerprint()
+    def principals_are_distinct(self) -> bool:
+        """Whether the reviewer ran under a different principal from the actor.
+
+        Principals only, per rev 4's I2c: "two executions of the same principal
+        are the same principal however much their provenance differs, and two
+        distinct principals stay distinct however identical their provenance
+        is." Both halves of that sentence are mutations §11 requires to fail.
+        """
+        return self.actor.principal != self.reviewer.principal
 
     def satisfies_reviewer_distinctness(self, head_sha: str) -> bool:
         """The only question I2c asks of this record, for ``head_sha`` itself.
@@ -224,7 +302,7 @@ class CandidateExecutionIdentities:
         even when its two identities differ, because it is evidence about other
         work. Mirrors :meth:`~.review_verdict_binding.BoundReviewVerdict.approves`.
         """
-        return self.covers(head_sha) and self.roles_are_distinct()
+        return self.covers(head_sha) and self.principals_are_distinct()
 
     @classmethod
     def from_payload(

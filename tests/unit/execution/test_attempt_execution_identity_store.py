@@ -19,6 +19,8 @@ from issue_orchestrator.domain.attempt import AttemptKey
 from issue_orchestrator.domain.execution_identity import (
     AgentExecutionIdentity,
     CandidateExecutionIdentities,
+    ExecutionPrincipal,
+    ExecutionProvenance,
     ExecutionRole,
 )
 from issue_orchestrator.domain.issue_key import GitHubIssueKey
@@ -42,15 +44,15 @@ def _identities(
         candidate_sha=candidate_sha,
         actor=AgentExecutionIdentity(
             role=ExecutionRole.ACTOR,
-            agent_label="agent:backend",
-            provider="claude-code",
-            model="opus",
+            principal=ExecutionPrincipal(agent_label="agent:backend"),
+            provenance=ExecutionProvenance(provider="claude-code", model="opus"),
         ),
         reviewer=AgentExecutionIdentity(
             role=ExecutionRole.REVIEWER,
-            agent_label="agent:reviewer",
-            provider="codex",
-            model=reviewer_model,
+            principal=ExecutionPrincipal(agent_label="agent:reviewer"),
+            provenance=ExecutionProvenance(
+                provider="codex", model=reviewer_model
+            ),
         ),
         observed_at="2026-08-14T00:00:00+00:00",
     )
@@ -83,8 +85,8 @@ class TestRecordAndRead:
         restored = _store(tmp_path).read(key)
 
         assert restored is not None
-        assert restored.reviewer.model is None
-        assert restored.roles_are_distinct() is True
+        assert restored.reviewer.provenance.model is None
+        assert restored.principals_are_distinct() is True
 
     def test_an_unrecorded_candidate_reads_as_absent(self, tmp_path: Path) -> None:
         assert _store(tmp_path).read(AttemptKey(ISSUE, "b" * 40)) is None

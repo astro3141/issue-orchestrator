@@ -1,8 +1,12 @@
 """The actor/reviewer execution identities §4's I2c is stated over.
 
 These tests pin the record's meaning, not its plumbing: what makes two
-executions "the same one", what a stored payload must contain to parse at all,
-and — the one that matters most — that the distinctness check is falsifiable.
+executions "the same principal", what a stored payload must contain to parse at
+all, and — the one that matters most — that the distinctness check is
+falsifiable in *both* directions. Rev 4 of the contract separates the principal
+(what I2c compares) from the provenance of the run that carried it (retained
+for audit, never compared), and §11 states the three mutations that must hold
+that separation in place.
 """
 
 from __future__ import annotations
@@ -13,6 +17,8 @@ from issue_orchestrator.domain.execution_identity import (
     EXECUTION_IDENTITY_SCHEMA_VERSION,
     AgentExecutionIdentity,
     CandidateExecutionIdentities,
+    ExecutionPrincipal,
+    ExecutionProvenance,
     ExecutionRole,
 )
 
@@ -20,24 +26,57 @@ SHA_A = "a" * 40
 SHA_B = "b" * 40
 
 
-def _actor(**overrides: str | None) -> AgentExecutionIdentity:
-    fields: dict[str, str | None] = {
-        "agent_label": "agent:backend",
-        "provider": "claude-code",
-        "model": "opus",
-    }
-    fields.update(overrides)
-    return AgentExecutionIdentity(role=ExecutionRole.ACTOR, **fields)
+def _identity(
+    role: ExecutionRole,
+    *,
+    agent_label: str,
+    provider: str,
+    model: str | None,
+) -> AgentExecutionIdentity:
+    return AgentExecutionIdentity(
+        role=role,
+        principal=ExecutionPrincipal(agent_label=agent_label),
+        provenance=ExecutionProvenance(provider=provider, model=model),
+    )
 
 
-def _reviewer(**overrides: str | None) -> AgentExecutionIdentity:
-    fields: dict[str, str | None] = {
-        "agent_label": "agent:reviewer",
-        "provider": "codex",
-        "model": "gpt-5",
-    }
-    fields.update(overrides)
-    return AgentExecutionIdentity(role=ExecutionRole.REVIEWER, **fields)
+def _actor(
+    *,
+    agent_label: str = "agent:backend",
+    provider: str = "claude-code",
+    model: str | None = "opus",
+) -> AgentExecutionIdentity:
+    return _identity(
+        ExecutionRole.ACTOR,
+        agent_label=agent_label,
+        provider=provider,
+        model=model,
+    )
+
+
+def _reviewer(
+    *,
+    agent_label: str = "agent:reviewer",
+    provider: str = "codex",
+    model: str | None = "gpt-5",
+) -> AgentExecutionIdentity:
+    return _identity(
+        ExecutionRole.REVIEWER,
+        agent_label=agent_label,
+        provider=provider,
+        model=model,
+    )
+
+
+def _provenance_payload(
+    payload: dict[str, object], role: str
+) -> dict[str, object]:
+    """The stored provenance sub-object, without asserting its way there."""
+    identity = payload[role]
+    assert isinstance(identity, dict)
+    provenance = identity["provenance"]
+    assert isinstance(provenance, dict)
+    return provenance
 
 
 def _identities(
@@ -55,15 +94,21 @@ def _identities(
 
 
 class TestDistinctness:
-    """I2c: the reviewer identity must be distinct from the actor's."""
+    """I2c: the reviewer *principal* must be distinct from the actor's.
 
-    def test_distinct_configurations_satisfy_i2c_for_their_own_candidate(self) -> None:
+    The three §11 rows below are the whole definition of "same identity". Each
+    is a mutation that must fail, and between them they pin the boundary from
+    both sides: fold provenance into the comparison and the second row dies;
+    drop the principal from it and the first or third does.
+    """
+
+    def test_distinct_principals_satisfy_i2c_for_their_own_candidate(self) -> None:
         assert _identities().satisfies_reviewer_distinctness(SHA_A) is True
 
-    def test_making_the_actor_equal_the_reviewer_is_fatal(self) -> None:
-        """The falsification the issue requires: the mutation must break it.
+    def test_one_principal_in_both_roles_is_refused(self) -> None:
+        """§11 row 1: actor principal == reviewer principal -> refused.
 
-        A check that survives "set the actor's identity to the reviewer's" has
+        A check that survives "set the actor's principal to the reviewer's" has
         pinned nothing. Role is deliberately excluded from the comparison, so
         the two records below differ *only* in the hat each wears — and that is
         exactly the arrangement I2c exists to refuse.
@@ -74,52 +119,82 @@ class TestDistinctness:
             ),
         )
 
-        assert impostor.roles_are_distinct() is False
+        assert impostor.principals_are_distinct() is False
         assert impostor.satisfies_reviewer_distinctness(SHA_A) is False
 
     @pytest.mark.parametrize(
-        "differing",
+        ("actor_provider", "actor_model"),
         [
-            {"agent_label": "agent:reviewer"},
-            {"provider": "codex"},
-            {"model": "gpt-5"},
+            ("claude-code", "gpt-5"),
+            ("codex", "opus"),
+            ("claude-code", "opus"),
+            ("codex", None),
         ],
-        ids=["label", "provider", "model"],
+        ids=["provider", "model", "both", "unpinned-model"],
     )
-    def test_any_single_matching_field_is_not_enough_to_collapse_them(
-        self, differing: dict[str, str | None]
+    def test_one_principal_stays_one_however_far_its_provenance_differs(
+        self, actor_provider: str, actor_model: str | None
     ) -> None:
-        """One shared field does not make two executions one execution."""
-        assert _identities(actor=_actor(**differing)).roles_are_distinct() is True
+        """§11 row 2: same principal, differing provenance -> still refused.
 
-    def test_unpinned_models_keep_the_check_falsifiable_both_ways(self) -> None:
-        """Two roles that both let their CLI choose are still comparable.
-
-        Recording "no model pinned" must not weaken I2c into "everyone on a
-        provider-default model is the same execution", nor into "nobody is":
-        the label and provider still decide, and the collapse still collapses.
+        Provenance does not create a second principal. This is the row that
+        pins *which* field is identity: fold ``provider`` or ``model`` back
+        into the comparison and every case here starts passing I2c, admitting
+        work whose actor reviewed itself under a changed configuration.
         """
-        distinct = _identities(
-            actor=_actor(provider="codex", model=None),
-            reviewer=_reviewer(model=None),
-        )
         collapsed = _identities(
-            actor=_actor(agent_label="agent:reviewer", provider="codex", model=None),
-            reviewer=_reviewer(model=None),
+            actor=_actor(
+                agent_label="agent:reviewer",
+                provider=actor_provider,
+                model=actor_model,
+            ),
         )
 
-        assert distinct.roles_are_distinct() is True
-        assert collapsed.roles_are_distinct() is False
+        assert collapsed.principals_are_distinct() is False
+        assert collapsed.satisfies_reviewer_distinctness(SHA_A) is False
+
+    @pytest.mark.parametrize(
+        "shared_model", ["opus", None], ids=["pinned", "unpinned"]
+    )
+    def test_two_principals_stay_distinct_on_identical_configuration(
+        self, shared_model: str | None
+    ) -> None:
+        """§11 row 3: distinct principals, same provider/model -> admitted.
+
+        This is how this fork is actually operated — both roles on the same
+        provider and model — so a comparison that collapsed them would make
+        independent review unrepresentable. Drop the principal from the
+        comparison and this row dies.
+        """
+        matching_configuration = _identities(
+            actor=_actor(provider="claude-code", model=shared_model),
+            reviewer=_reviewer(provider="claude-code", model=shared_model),
+        )
+
+        assert matching_configuration.principals_are_distinct() is True
+        assert matching_configuration.satisfies_reviewer_distinctness(SHA_A) is True
+
+    def test_a_principal_stays_hashable_for_the_evidence_digest(self) -> None:
+        """Rev 4 §2 puts both principals inside the set §5 digests.
+
+        Nothing here computes a digest — #33 owns that. What this pins is that
+        the principal is not structurally unhashable, so the digest obligation
+        stays open rather than being foreclosed by this record's shape.
+        """
+        principal = ExecutionPrincipal(agent_label="agent:reviewer")
+
+        assert hash(principal) == hash(ExecutionPrincipal(agent_label="agent:reviewer"))
+        assert len({principal, _actor().principal}) == 2
 
     def test_evidence_about_another_commit_never_satisfies_i2c(self) -> None:
-        """Distinct identities bound to a different candidate answer False.
+        """Distinct principals bound to a different candidate answer False.
 
         Both halves are required. Evidence about other work is not evidence
         about this candidate no matter how distinct its two roles were.
         """
         identities = _identities(candidate_sha=SHA_A)
 
-        assert identities.roles_are_distinct() is True
+        assert identities.principals_are_distinct() is True
         assert identities.covers(SHA_B) is False
         assert identities.satisfies_reviewer_distinctness(SHA_B) is False
 
@@ -141,10 +216,13 @@ class TestRecordInvariants:
                 observed_at="2026-08-14T00:00:00+00:00",
             )
 
-    @pytest.mark.parametrize("field_name", ["agent_label", "provider"])
-    def test_an_identity_field_may_not_be_blank(self, field_name: str) -> None:
-        with pytest.raises(ValueError, match=field_name):
-            _actor(**{field_name: "   "})
+    def test_a_principal_may_not_be_blank(self) -> None:
+        with pytest.raises(ValueError, match="agent_label"):
+            ExecutionPrincipal(agent_label="   ")
+
+    def test_a_provenance_provider_may_not_be_blank(self) -> None:
+        with pytest.raises(ValueError, match="provider"):
+            ExecutionProvenance(provider="   ", model="opus")
 
     @pytest.mark.parametrize("unpinned", [None, "", "   "], ids=["none", "empty", "blank"])
     def test_an_agent_that_pinned_no_model_records_the_absence(
@@ -158,7 +236,7 @@ class TestRecordInvariants:
         the orchestrator did — it pinned none — instead of refusing to describe
         a run that really happens.
         """
-        assert _actor(model=unpinned).model is None
+        assert _actor(model=unpinned).provenance.model is None
 
     def test_observed_at_is_required(self) -> None:
         with pytest.raises(ValueError, match="observed_at"):
@@ -201,28 +279,39 @@ class TestPayloadRoundTrip:
         original = _identities(reviewer=_reviewer(model=None))
 
         payload = original.to_payload()
-        reviewer_payload = payload["reviewer"]
-        assert isinstance(reviewer_payload, dict)
-        assert reviewer_payload["model"] is None
+        assert _provenance_payload(payload, "reviewer")["model"] is None
 
         reloaded = CandidateExecutionIdentities.from_payload(payload)
 
         assert reloaded == original
-        assert reloaded.reviewer.model is None
+        assert reloaded.reviewer.provenance.model is None
 
     def test_a_record_that_never_stated_a_model_does_not_parse(self) -> None:
         """Absent is not the same claim as "no model pinned".
 
         A payload whose ``model`` key is missing was written by something that
-        never made the statement; reading it as an explicit absence would let a
-        gate compare executions on a field nobody recorded.
+        never made the statement; reading it as an explicit absence would put a
+        claim in the audit trail that nobody recorded.
+        """
+        payload = _identities().to_payload()
+        del _provenance_payload(payload, "actor")["model"]
+
+        with pytest.raises(ValueError, match="requires a model"):
+            CandidateExecutionIdentities.from_payload(payload)
+
+    @pytest.mark.parametrize("half", ["principal", "provenance"])
+    def test_an_identity_missing_either_half_does_not_parse(self, half: str) -> None:
+        """Principal and provenance are both required, and neither substitutes.
+
+        A record with no principal cannot answer I2c, and one with no
+        provenance is not the audit statement this record claims to be.
         """
         payload = _identities().to_payload()
         actor_payload = payload["actor"]
         assert isinstance(actor_payload, dict)
-        del actor_payload["model"]
+        del actor_payload[half]
 
-        with pytest.raises(ValueError, match="requires a model"):
+        with pytest.raises(ValueError, match=half):
             CandidateExecutionIdentities.from_payload(payload)
 
     @pytest.mark.parametrize("missing", ["actor", "reviewer", "candidate_sha"])

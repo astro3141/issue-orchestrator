@@ -45,6 +45,8 @@ from issue_orchestrator.adapters.sidecar_attempt_store import SidecarAttemptStor
 from issue_orchestrator.domain.attempt import AttemptKey
 from issue_orchestrator.domain.execution_identity import (
     AgentExecutionIdentity,
+    ExecutionPrincipal,
+    ExecutionProvenance,
     ExecutionRole,
 )
 from issue_orchestrator.domain.issue_key import GitHubIssueKey
@@ -160,15 +162,13 @@ def _identity_recorder(tmp_path: Path) -> CandidateExecutionIdentityRecorder:
         issue_key=GitHubIssueKey(repo="acme/repo", external_id="42"),
         actor=AgentExecutionIdentity(
             role=ExecutionRole.ACTOR,
-            agent_label="agent:backend",
-            provider="claude-code",
-            model="opus",
+            principal=ExecutionPrincipal(agent_label="agent:backend"),
+            provenance=ExecutionProvenance(provider="claude-code", model="opus"),
         ),
         reviewer=AgentExecutionIdentity(
             role=ExecutionRole.REVIEWER,
-            agent_label="agent:reviewer",
-            provider="codex",
-            model="gpt-5",
+            principal=ExecutionPrincipal(agent_label="agent:reviewer"),
+            provenance=ExecutionProvenance(provider="codex", model="gpt-5"),
         ),
     )
 
@@ -7952,15 +7952,15 @@ class TestCandidateExecutionIdentityBinding:
             issue_key=GitHubIssueKey(repo="acme/repo", external_id="42"),
             actor=AgentExecutionIdentity(
                 role=ExecutionRole.ACTOR,
-                agent_label=actor_label,
-                provider=actor_provider,
-                model=actor_model,
+                principal=ExecutionPrincipal(agent_label=actor_label),
+                provenance=ExecutionProvenance(
+                    provider=actor_provider, model=actor_model
+                ),
             ),
             reviewer=AgentExecutionIdentity(
                 role=ExecutionRole.REVIEWER,
-                agent_label="agent:reviewer",
-                provider="codex",
-                model="gpt-5",
+                principal=ExecutionPrincipal(agent_label="agent:reviewer"),
+                provenance=ExecutionProvenance(provider="codex", model="gpt-5"),
             ),
         )
 
@@ -8003,8 +8003,8 @@ class TestCandidateExecutionIdentityBinding:
 
         identities = self._read(recorder, presented)
         assert identities is not None
-        assert identities.actor.agent_label == "agent:backend"
-        assert identities.reviewer.agent_label == "agent:reviewer"
+        assert identities.actor.principal.agent_label == "agent:backend"
+        assert identities.reviewer.principal.agent_label == "agent:reviewer"
         assert identities.satisfies_reviewer_distinctness(presented) is True
         # Both halves of §4's review evidence name the same commit.
         verdict = load_review_verdict(outcome.run_assets.exchange_dir)
@@ -8098,30 +8098,62 @@ class TestCandidateExecutionIdentityBinding:
 
         identities = self._read(recorder, presented)
         assert identities is not None
-        assert identities.reviewer.agent_label == "agent:reviewer"
-        assert identities.reviewer.provider == "codex"
-        assert identities.reviewer.model == "gpt-5"
+        assert identities.reviewer.principal.agent_label == "agent:reviewer"
+        assert identities.reviewer.provenance.provider == "codex"
+        assert identities.reviewer.provenance.model == "gpt-5"
         assert identities.satisfies_reviewer_distinctness(presented) is True
         assert self._read(recorder, _VERDICT_SHA_B) is None
 
-    def test_one_agent_wearing_both_hats_fails_the_distinctness_check(
+    def test_one_principal_wearing_both_hats_fails_the_distinctness_check(
         self,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """The falsification, driven through a real exchange.
 
-        Configure the actor as the same agent/provider/model as the reviewer
-        and the recorded evidence must report I2c unsatisfied. If this still
-        passed, the check would have pinned nothing.
+        Configure the actor under the reviewer's principal and the recorded
+        evidence must report I2c unsatisfied. If this still passed, the check
+        would have pinned nothing.
+
+        The actor keeps its *own* provider and model, so this is §11 row 2 run
+        end to end: one principal is still one principal however far its
+        provenance differs. Folding provenance back into the comparison would
+        make this exchange admissible.
+        """
+        repo = _BindingRepo(tmp_path)
+        presented = repo.coder_head()
+        recorder = self._recorder(tmp_path, actor_label="agent:reviewer")
+
+        _run_binding_exchange(
+            tmp_path=tmp_path,
+            monkeypatch=monkeypatch,
+            repo=repo,
+            response_script=self._approving_reviewer(),
+            execution_identities=recorder,
+        )
+
+        identities = self._read(recorder, presented)
+        assert identities is not None
+        assert identities.actor.provenance != identities.reviewer.provenance
+        assert identities.principals_are_distinct() is False
+        assert identities.satisfies_reviewer_distinctness(presented) is False
+
+    def test_two_principals_on_one_configuration_still_satisfy_i2c(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """§11 row 3, run end to end: matching configuration does not collapse.
+
+        Both roles launched on the same provider and model — how this fork is
+        actually operated. A comparison that read that as one identity would
+        make independent review unrepresentable, refusing every admission this
+        deployment can produce.
         """
         repo = _BindingRepo(tmp_path)
         presented = repo.coder_head()
         recorder = self._recorder(
-            tmp_path,
-            actor_label="agent:reviewer",
-            actor_provider="codex",
-            actor_model="gpt-5",
+            tmp_path, actor_provider="codex", actor_model="gpt-5"
         )
 
         _run_binding_exchange(
@@ -8134,8 +8166,9 @@ class TestCandidateExecutionIdentityBinding:
 
         identities = self._read(recorder, presented)
         assert identities is not None
-        assert identities.roles_are_distinct() is False
-        assert identities.satisfies_reviewer_distinctness(presented) is False
+        assert identities.actor.provenance == identities.reviewer.provenance
+        assert identities.principals_are_distinct() is True
+        assert identities.satisfies_reviewer_distinctness(presented) is True
 
     def test_a_reviewer_decided_rework_terminal_also_records_identities(
         self,

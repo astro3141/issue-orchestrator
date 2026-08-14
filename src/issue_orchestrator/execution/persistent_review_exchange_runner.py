@@ -19,7 +19,12 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from pathlib import Path
 
-from ..domain.execution_identity import AgentExecutionIdentity, ExecutionRole
+from ..domain.execution_identity import (
+    AgentExecutionIdentity,
+    ExecutionPrincipal,
+    ExecutionProvenance,
+    ExecutionRole,
+)
 from ..domain.issue_key import IssueKey
 from ..domain.models import AgentConfig
 from ..domain.review_exchange import ReviewExchangeOutcome
@@ -133,16 +138,17 @@ class PersistentReviewExchangeRunner:
         reviewer_label: str,
         reviewer_agent: AgentConfig,
     ) -> CandidateExecutionIdentityRecorder:
-        """Both roles' identities as the orchestrator configured them.
+        """Both roles' principals and provenance as the orchestrator observed them.
 
-        Every field is the launcher's own: the label it routed the role by, and
-        the provider/model read off :func:`launch_config` — the *same*
-        derivation ``_derive_bootstrap_agent`` spawns, not the configured agent
-        it is derived from. That distinction is the whole point: an
-        ``ai_system``-only agent's provider resolves at launch, and its model
-        answer follows the resolved provider, so reading the pre-derivation
-        config would record a model the launcher never passed (``sonnet`` for a
-        codex run). Nothing here can be reached by an agent's output.
+        The principal is the label the orchestrator routed the role by — the
+        authority half, and the only half I2c compares. The provenance is read
+        off :func:`launch_config` — the *same* derivation
+        ``_derive_bootstrap_agent`` spawns, not the configured agent it is
+        derived from. That distinction is the whole point: an ``ai_system``-only
+        agent's provider resolves at launch, and its model answer follows the
+        resolved provider, so reading the pre-derivation config would record a
+        model the launcher never passed (``sonnet`` for a codex run). Nothing
+        here can be reached by an agent's output.
         """
         coder_launch = launch_config(coder_agent)
         reviewer_launch = launch_config(reviewer_agent)
@@ -151,15 +157,19 @@ class PersistentReviewExchangeRunner:
             issue_key=issue_key,
             actor=AgentExecutionIdentity(
                 role=ExecutionRole.ACTOR,
-                agent_label=coder_label,
-                provider=agent_provider(coder_launch).value,
-                model=coder_launch.resolved_model(),
+                principal=ExecutionPrincipal(agent_label=coder_label),
+                provenance=ExecutionProvenance(
+                    provider=agent_provider(coder_launch).value,
+                    model=coder_launch.resolved_model(),
+                ),
             ),
             reviewer=AgentExecutionIdentity(
                 role=ExecutionRole.REVIEWER,
-                agent_label=reviewer_label,
-                provider=agent_provider(reviewer_launch).value,
-                model=reviewer_launch.resolved_model(),
+                principal=ExecutionPrincipal(agent_label=reviewer_label),
+                provenance=ExecutionProvenance(
+                    provider=agent_provider(reviewer_launch).value,
+                    model=reviewer_launch.resolved_model(),
+                ),
             ),
         )
 
