@@ -13,7 +13,7 @@ import time
 import traceback
 from typing import TYPE_CHECKING
 
-from .issue_scope import issue_scope_skip_detail
+from .issue_scope import evaluate_issue_scope, issue_scope_skip_detail
 
 if TYPE_CHECKING:
     from ..infra.config import Config
@@ -165,6 +165,38 @@ class QueueCache:
             return QueueMutationStatus.REJECTED_OUT_OF_SCOPE
 
         return QueueMutationStatus.ACCEPTED
+
+    def reconciliation_only_issues(self) -> list["Issue"]:
+        """In-scope issues the duplicate-launch guard keeps out of the queue (#46).
+
+        Scheduling eligibility and reconciliation visibility are different
+        questions asked of the same cache. :meth:`evaluate_issue` answers the
+        first, and ``REJECTED_EXCLUDED`` is the ONE branch that means "in scope,
+        but not launchable again this run" — a completed session, a running one,
+        or the awaiting-merge presentation record startup rehydrates into
+        ``session_history``. Reconciliation must still see those issues, or state
+        recorded against them (a provider block, say) can never be retired by its
+        owner once the queue drops them.
+
+        Deliberately NOT the whole in-scope set: everything
+        ``REJECTED_OUT_OF_SCOPE`` covers stays excluded here exactly as it is
+        from the queue. The engine's single-issue scope is re-asked through
+        :func:`evaluate_issue_scope` because :meth:`evaluate_issue` reports the
+        duplicate-launch guard FIRST, so an issue in ``session_history`` never
+        reaches its ``--issue`` check — an operator-narrowed run would otherwise
+        widen back out here. Disjoint from the queue by construction, so callers
+        can concatenate the two without deduplicating.
+        """
+        queued = {issue.number for issue in self._state.cached_queue_issues}
+        return [
+            issue
+            for issue in self._state.cached_scope_issues
+            if issue.number not in queued
+            and self.evaluate_issue(issue) is QueueMutationStatus.REJECTED_EXCLUDED
+            and evaluate_issue_scope(
+                self._config, issue, include_issue_number_filter=True
+            ).in_scope
+        ]
 
     def prune_refresh_timestamps(self) -> None:
         """Prune refresh timestamp map to currently tracked issue IDs."""

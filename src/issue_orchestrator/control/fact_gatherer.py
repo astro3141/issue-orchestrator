@@ -200,18 +200,23 @@ class FactGatherer:
         stale_in_progress_issues: list["Issue"] | None = None,
         stale_claim_issues: list["Issue"] | None = None,
         provider_launch: ProviderLaunchReadiness | None = None,
+        reconcile_only_issues: list["Issue"] | None = None,
     ) -> "OrchestratorSnapshot":
         """Create an immutable snapshot for planning.
 
         Args:
             state: Current orchestrator state
-            issues: Current list of issues from GitHub
+            issues: Current list of issues from GitHub — the SCHEDULING set
             stale_in_progress_issues: Issues with in-progress label but no running session
             stale_claim_issues: Issues with io:claimed label but expired/invalid claim
             provider_launch: Provider launch eligibility the tick sampled before
                 planning (#6999 A3). Passed in rather than sampled here because
                 sampling probes a CLI and writes circuit state, which this
                 read-only gatherer must not do.
+            reconcile_only_issues: In-scope issues the duplicate-launch guard
+                excluded from ``issues`` but that reconciliation must still see
+                (#46). Passed in rather than derived here because queue
+                eligibility is ``QueueCache``'s policy, not this gatherer's.
 
         Returns:
             Immutable snapshot of orchestrator state for Planner
@@ -271,6 +276,7 @@ class FactGatherer:
             e2e_occupies_slot=e2e_occupies_slot,
             e2e_due=e2e_due,
             provider_launch=provider_launch or ProviderLaunchReadiness.empty(),
+            reconcile_only_issues=tuple(reconcile_only_issues or []),
         )
 
     def _read_e2e_slot_facts(self) -> tuple[bool, bool]:

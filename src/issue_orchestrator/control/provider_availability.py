@@ -111,9 +111,18 @@ class ProviderAvailabilityPolicy:
         return self.provider_for_agent_label(issue.agent_type)
 
     def providers_for_snapshot(self, snapshot: OrchestratorSnapshot) -> dict[int, set[str]]:
+        """Which providers each in-scope issue depends on.
+
+        Keyed off ``reconciliation_subjects`` rather than the scheduling set, so
+        an issue the duplicate-launch guard excluded still has its coding
+        provider resolved (#46). Whether that issue may be *blocked* is decided
+        in :meth:`plan_provider_impact`, not here — this map only says which
+        circuits are relevant to it.
+        """
         providers_by_issue: dict[int, set[str]] = {}
 
-        for issue in snapshot.issues:
+        for subject in snapshot.reconciliation_subjects:
+            issue = subject.issue
             provider = self.provider_for_issue(issue)
             if provider:
                 providers_by_issue.setdefault(issue.number, set()).add(provider)
@@ -348,12 +357,27 @@ class ProviderAvailabilityPolicy:
 
         ``now`` fixes the instant every circuit in this pass is read at, so a
         single planning cycle cannot mix reads from different moments.
+
+        The subject set is ``snapshot.reconciliation_subjects``, NOT the
+        scheduling set: an issue the duplicate-launch guard excluded (a session
+        completed for it this run, one is running now, or startup rehydrated its
+        awaiting-merge record) still carries a provider block that only this
+        owner may retire. Reading the scheduling projection instead made that
+        block permanent — the exclusion is recreated on every restart, so no
+        restart could clear it either (#46).
+
+        Widening visibility is not widening authority: a ``reconcile_only``
+        subject can be CLEARED but never newly BLOCKED. Nothing refused work on
+        its behalf this tick, so a block would describe an event that did not
+        happen — and blocking issues that ordinary scheduling is not even
+        considering is exactly the outage behaviour this change must leave alone.
         """
         actions: list[Action] = []
         label = self.blocked_label()
         assessed_at = now or _now()
         providers_by_issue = self.providers_for_snapshot(snapshot)
-        for issue in snapshot.issues:
+        for subject in snapshot.reconciliation_subjects:
+            issue = subject.issue
             providers = providers_by_issue.get(issue.number, set())
             if not providers:
                 continue
@@ -361,7 +385,7 @@ class ProviderAvailabilityPolicy:
             issue_labels = plan_context.issue_labels(issue.number)
             planned_labels = plan_context.planned_adds(issue.number)
             issue_key = issue.key.stable_id()
-            if assessment.blocked and self.should_add_blocked_label(
+            if assessment.blocked and subject.may_originate_block and self.should_add_blocked_label(
                 issue_labels, planned_labels
             ):
                 actions.append(

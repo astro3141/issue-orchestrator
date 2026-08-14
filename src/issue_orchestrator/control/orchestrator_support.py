@@ -633,8 +633,12 @@ def run_planning_cycle(
     # (#6999 A3). Planning then reads the result as a snapshot fact.
     provider_launch = provider_launch_sampler.sample() if provider_launch_sampler else None
 
-    # Create snapshot and plan
-    snapshot = fact_gatherer.create_snapshot(state, state.cached_queue_issues, stale_in_progress_issues=stale_issues, stale_claim_issues=stale_claim_issues, provider_launch=provider_launch)
+    # Create snapshot and plan. The queue is the scheduling set; the queue-cache
+    # owner also names the in-scope issues its duplicate-launch guard excluded,
+    # so reconciliation keeps seeing them (#46) without any of them becoming
+    # launchable.
+    reconcile_only_issues = QueueCache(config, state, queue_cache_store).reconciliation_only_issues()
+    snapshot = fact_gatherer.create_snapshot(state, state.cached_queue_issues, stale_in_progress_issues=stale_issues, stale_claim_issues=stale_claim_issues, provider_launch=provider_launch, reconcile_only_issues=reconcile_only_issues)
     _emit_facts_gathered(events, event_context, state, stale_issues)
 
     plan = planner.plan(snapshot)
