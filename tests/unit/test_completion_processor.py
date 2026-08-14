@@ -839,6 +839,9 @@ class TestReviewExchangeExecution:
         config.review_enabled = True
         config.review_exchange_mode = "via-mcp"
         config.code_review_agent = "agent:reviewer"
+        # The exchange refuses an unresolved repo — it scopes the attempt
+        # records it files (#34), so it must name the same repo the issue does.
+        config.repo = "acme/widgets"
         config.config_path = _write_test_config(tmp_path)
         config.agents = {
             "agent:coder": AgentConfig(
@@ -2714,6 +2717,9 @@ class TestTechLeadCompletionEffects:
             config.code_review_agent = "agent:reviewer"
             config.config_path = _write_test_config(tmp_path)
             config.agents["agent:reviewer"] = AgentConfig(prompt_path=prompt)
+            # The exchange refuses an unresolved repo — it scopes the attempt
+            # records it files (#34).
+            config.repo = "acme/widgets"
         mock_git_adapter.default_branch.return_value = "main"
         from issue_orchestrator.infra.tech_lead_authority_store import (
             SqliteTechLeadAuthorityStore,

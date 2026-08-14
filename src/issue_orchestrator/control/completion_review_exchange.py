@@ -1304,6 +1304,16 @@ class CompletionReviewExchange:
             raise ValueError("Review exchange requires config")
         if not agent_label:
             raise ValueError("Review exchange requires agent_label")
+        if not self._config.repo:
+            # The repo scopes this exchange's durable records, and the
+            # validation half of the same evidence is scoped by ``issue.repo``
+            # — the adapter's resolved ``owner/repo``, never ``""``. Defaulting
+            # here would file the two halves of one candidate under different
+            # scopes silently, so refuse instead. Unreachable in production:
+            # ``bootstrap`` builds no GitHub adapter when the repo cannot be
+            # resolved, and ``_resolve_repo`` writes the auto-detected value
+            # back into ``config.repo`` before this pipeline exists.
+            raise ValueError("Review exchange requires config.repo")
         coder_label = agent_label
         reviewer_label = self.resolve_reviewer_label(agent_label)
         coder_agent = self._config.agents[coder_label]
@@ -1322,13 +1332,11 @@ class CompletionReviewExchange:
             coder_worktree=worktree,
             # Derived here, from the one owner of the rule, so this exchange's
             # durable records land under the same key every other attempt-scoped
-            # record for this issue uses (#34). An unresolved repo scopes to
-            # ``""`` rather than raising — that is what ``Issue.repo`` already
-            # defaults to, so the key still matches what every other derivation
-            # of it produces, and a deployment that never resolved a repo keeps
-            # behaving exactly as it did.
+            # record for this issue uses (#34). ``config.repo`` is checked above
+            # rather than defaulted, so this scope is the same ``owner/repo``
+            # the adapter puts on ``issue.repo``.
             issue_key=github_issue_key(
-                repo=self._config.repo or "",
+                repo=self._config.repo,
                 number=issue_number,
                 title=issue_title,
             ),

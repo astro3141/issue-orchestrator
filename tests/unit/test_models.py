@@ -407,6 +407,25 @@ class TestAgentConfig:
             == "sonnet"
         )
 
+    def test_resolved_model_states_what_the_legacy_template_renders(self, tmp_path):
+        """A provider-less agent keeps its configured model.
+
+        The legacy ``claude -p`` template renders ``{model}`` verbatim, so the
+        default-``sonnet`` demotion the provider path applies must not reach
+        here — otherwise the execution-identity record (#34) would name a model
+        the launcher never passed.
+        """
+        prompt_file = tmp_path / "prompt.txt"
+        prompt_file.write_text("p")
+        config = AgentConfig(prompt_path=prompt_file)
+
+        assert config.provider is None
+        assert config.resolved_model() == "sonnet"
+        command = config.get_command(
+            issue_number=1, issue_title="t", worktree=tmp_path,
+        )
+        assert "--model sonnet" in command
+
     def test_provider_command_keeps_default_model_for_claude(self, tmp_path):
         """claude-code owns the "sonnet" default — forwarding it is correct
         and preserves existing behavior."""

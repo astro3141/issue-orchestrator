@@ -34,6 +34,14 @@ class AttemptStore(Protocol):
         write from a later one. Implementations reject a ``mutate`` that
         returns an attempt filed under a different key, and return the
         persisted record.
+
+        What this removes is the *caller-side* erasure — a writer that never
+        saw the other fields. It is not a concurrency primitive: the
+        read-modify-write is not required to be atomic, so two writers racing
+        on one ``(issue, commit)`` can still lose the earlier write. Today's
+        writers do not race — validation completes and files its record path
+        before the review exchange that files the identities starts — and this
+        port relies on that ordering rather than on locking.
         """
         ...
 

@@ -9,7 +9,7 @@ This is an immutable snapshot of a GitHub issue. Key design:
 
 from dataclasses import dataclass
 
-from ...domain.issue_key import IssueKey, GitHubIssueKey, parse_external_id
+from ...domain.issue_key import IssueKey, github_issue_key
 from ...domain.models import _base_of, _is_blocking_label
 
 
@@ -57,12 +57,17 @@ class GitHubIssue:
     def key(self) -> IssueKey:
         """Stable identity for this issue.
 
-        Uses external ID from title prefix (e.g., [M1-011]) if present,
-        otherwise falls back to the issue number as a string.
+        Delegates to ``github_issue_key`` rather than spelling the rule out
+        again: this is the ``IssueProtocol`` implementation production runs on,
+        and ``session.issue.key`` is what scopes the *validation* half of an
+        attempt's admission evidence while the execution-identity half is keyed
+        from the same helper (#34). A second spelling here would let the two
+        halves of one candidate land under two keys with neither writer
+        noticing.
         """
-        parsed = parse_external_id(self.title)
-        external_id = parsed.external_id or str(self.number)
-        return GitHubIssueKey(repo=self.repo, external_id=external_id)
+        return github_issue_key(
+            repo=self.repo, number=self.number, title=self.title
+        )
 
     def __eq__(self, other: object) -> bool:
         """Equality based on key only (entity semantics)."""
