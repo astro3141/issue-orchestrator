@@ -80,21 +80,53 @@ created it: a rework or review worktree — the reused ones — reached the publ
 gate unprovisioned, and the run died on a late, unrelated gate target. That was
 issue [#48].
 
-Provisioning holds two rules:
+Provisioning holds three rules:
 
 - **Fail closed, where the failure is.** A failing or timing-out setup command
-  aborts the launch at provisioning — before the claim is held, before a
-  terminal exists — instead of letting an unprovisioned worktree reach a
-  validation command.
+  aborts the launch at provisioning — before a terminal exists — instead of
+  letting an unprovisioned worktree reach a validation command. Where the claim
+  sits relative to provisioning differs by path: the rework, review and
+  retrospective-review paths provision before the claim is held, while the
+  fresh coding and validation-retry paths hold the claim first and release it
+  when provisioning fails.
 - **Do not touch the candidate.** Setup commands install tooling. The
   provisioner checkpoints `HEAD` and the worktree's dirty state before running
-  them and re-reads both afterwards, so a setup command that moves `HEAD` or
-  edits tracked content is a loud failure rather than a silent edit to the
-  change under test. The prerequisites themselves are build output and are
-  git-ignored, so an honest setup run leaves a clean worktree clean.
+  them and re-reads both afterwards — **whether or not the commands succeeded**,
+  because a failing command and an altered candidate are separate facts and a
+  command that edits the candidate and then dies must not go unreported. A
+  moved `HEAD` or a clean-to-dirty transition is a loud failure rather than a
+  silent edit to the change under test. The prerequisites themselves are build
+  output and are git-ignored, so an honest setup run leaves a clean worktree
+  clean.
+- **The recipe is pinned to operator configuration.** Which commands run comes
+  from `worktrees.setup` in the configuration file the orchestrator was started
+  with. That file must resolve outside the worktree being provisioned;
+  otherwise provisioning refuses, so the worktree under test never supplies the
+  list of commands run on it.
 
 A repository that declares no `worktrees.setup` commands provisions nothing;
 its worktrees must be runnable from the checkout alone.
+
+### What authority provisioning runs at
+
+Provisioning executes the configured commands at orchestrator host authority,
+with the worktree as the working directory, and those commands resolve to the
+repository's own build files. That is stated here rather than left implicit,
+because it is the same authority, in the same worktree, under which the
+configured validation gate already runs the repository's build and test code —
+`validation.quick.cmd` and `validation.publish.cmd` are shell commands run in
+the worktree too. It holds under ADR-0034's trusted-repository contract: the
+operator selects and onboards the repository the orchestrator works on, so its
+checked-in build configuration is a trusted input.
+
+Routing the rework, review and retrospective-review launches through the
+provisioner therefore adds no class of executed code and no authority that the
+gate in those same worktrees did not already carry; it makes that gate's
+verdict mean what the record says it means. The two bounds above — a recipe
+pinned outside the worktree, and a candidate the run may not alter — are what
+keep it from widening further. A stronger boundary (running repository code
+under a bounded execution substrate) is the separate untrusted-repository
+track, not this owner's job.
 
 ### The one worktree that is exempt
 
@@ -108,18 +140,32 @@ nothing `worktrees.setup` installs.
 That is deliberate, and it is the only such exemption. The reviewer reads the
 candidate's code; it does not run gates, and provisioning it would pay
 `worktrees.setup` — for this repository an `npm ci` and a browser install — per
-exchange to support a command the reviewer is told not to run.
+exchange to support a command that cannot produce a verdict there anyway.
 
-Being told is what makes the exemption safe rather than a repeat of #48. Every
-reviewer prompt carries `REVIEWER_WORKTREE_IS_UNPROVISIONED_NOTE`
-(`domain/review_exchange.py`), naming the worktree as unprovisioned and ruling
-out build/test/validation commands. That note is unconditional on purpose:
-`review.exchange.loop.require_validation` decides only whether a validation
-*record* is required before the reviewer may approve, so when it is false the
-reviewer would otherwise hear nothing about gates and be free to run one in a
-worktree that cannot run it — recording an environment gap against the
-candidate, which is exactly what #48 is about. A change that lets the reviewer
-run gates must first route this worktree through `WorktreeProvisioner`.
+**A barrier, not an instruction, is what makes the exemption safe.**
+`docs/architecture/hooks.md` is explicit that policy documents and prompts are
+suggestions while hooks are enforcement, so the exemption cannot rest on the
+reviewer choosing to comply. Creating the worktree installs a `PreToolUse`
+Bash guard into it (`adapters/worktree/_review_command_guard.py`), and that
+guard **refuses** build, test and validation commands before they execute
+(`infra/hooks/review_command_guard.py`). Two properties make it trustworthy:
+
+- **Pinned.** The registered command names the running orchestrator's own
+  interpreter and `src` root, so the policy that decides is the orchestrator's,
+  never a copy the guarded worktree contains.
+- **Outside the candidate.** It is written to `.claude/settings.local.json`,
+  the never-tracked local settings layer, and hidden from the worktree's `git
+  status`. Nothing the candidate commit tracks is modified. A guard that cannot
+  be installed rolls the worktree back: an unguarded reviewer worktree does not
+  exist.
+
+Every reviewer prompt still carries `REVIEWER_WORKTREE_IS_UNPROVISIONED_NOTE`
+(`domain/review_exchange.py`), unconditionally — `review.exchange.loop.
+require_validation` decides only whether a validation *record* gates approval,
+so with it false the reviewer would meet a refusal with no idea why. The note
+is the explanation; the guard is the invariant. A change that lets the reviewer
+run gates must remove the guard *and* route this worktree through
+`WorktreeProvisioner`.
 
 ## Configuration (YAML)
 
