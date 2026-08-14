@@ -15,6 +15,7 @@ from ..ports.provider_readiness import (
     NO_PROVIDER_READINESS_PROBE,
     ProviderReadinessProbe,
 )
+from .publication_authority import UnrecordedRefusals
 
 if TYPE_CHECKING:
     from ..ports.label_store import LabelStore
@@ -77,5 +78,13 @@ class InfraServices:
     pair_registry: "PersistentExchangePairRegistry | None" = None
     turn_mailbox: "TurnMailbox | None" = None
     background_job_supervisor: "BackgroundJobSupervisor | None" = None
+    # The orchestrator-wide record of publication-gate refusals whose label
+    # write did not commit (#45). One instance per orchestrator: the
+    # completion processor holds refusals here, and the scanner, startup
+    # recovery and the launcher read them back, so a refusal that never
+    # reached the issue still withholds review from the candidate it refused.
+    unrecorded_refusals: UnrecordedRefusals = field(
+        default_factory=UnrecordedRefusals
+    )
     instance_id: str = ""
     state_health_check: Callable[[], None] = field(default=_noop_health_check)

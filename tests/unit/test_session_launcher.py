@@ -23,6 +23,7 @@ from unittest.mock import MagicMock, patch
 from issue_orchestrator.domain.tech_lead_session import TechLeadCreationOrigin
 from issue_orchestrator.domain.claim import ClaimResult
 from issue_orchestrator.control.provider_resilience import ProviderResilienceManager
+from issue_orchestrator.control.publication_authority import UnrecordedRefusals
 from issue_orchestrator.control.launch_transaction import PendingWorkLaunchClaim
 from issue_orchestrator.domain.repository_launch_selection import (
     RepositoryLaunchSelection,
@@ -566,6 +567,7 @@ def _build_launcher_bundle(
     claim_manager: MagicMock | None = None,
     provider_resilience: ProviderResilienceManager | None = None,
     provider_readiness_probe: ProviderReadinessProbe | None = None,
+    unrecorded_refusals: UnrecordedRefusals | None = None,
 ) -> LauncherTestBundle:
     """Create a SessionLauncher with mock dependencies and tracking.
 
@@ -623,6 +625,8 @@ def _build_launcher_bundle(
         launcher_kwargs["provider_resilience"] = provider_resilience
     if provider_readiness_probe is not None:
         launcher_kwargs["provider_readiness_probe"] = provider_readiness_probe
+    if unrecorded_refusals is not None:
+        launcher_kwargs["unrecorded_refusals"] = unrecorded_refusals
     launcher = SessionLauncher(
         config=sample_config,
         events=mock_events,
@@ -2289,6 +2293,55 @@ class TestLaunchReviewSession:
             "Dropping stale pending review: pr=456 issue=123 "
             "reason=issue_publication_gate_failed"
         ) in caplog.text
+
+    def test_drops_queued_review_when_the_refusals_label_write_failed(
+        self,
+        sample_config,
+        mock_events,
+        mock_repo_host,
+        mock_worktree_manager,
+        mock_working_copy,
+        mock_command_runner,
+        caplog,
+    ):
+        """Launch fails closed on a refusal that never reached the issue (#45).
+
+        Same shape as the test above, minus the marker: the gate refused this
+        candidate and the label write did not commit, so live labels look
+        clean. Launch is the last boundary that can withhold the review, and
+        the unrecorded half of the verdict is all it has left to read.
+        """
+        unrecorded = UnrecordedRefusals()
+        unrecorded.hold(123)
+        launcher_bundle = _build_launcher_bundle(
+            sample_config,
+            mock_events,
+            mock_repo_host,
+            mock_worktree_manager,
+            mock_working_copy,
+            mock_command_runner,
+            unrecorded_refusals=unrecorded,
+        )
+        review = PendingReview(
+            issue_key=GitHubIssueKey(repo="test/repo", external_id="123"),
+            pr_number=456,
+            pr_url="https://github.com/test/repo/pull/456",
+            branch_name="123-feature",
+            _issue_number=123,
+        )
+        mock_repo_host.issues[123] = Issue(
+            number=123,
+            title="Gate failed, refusal unwritten",
+            labels=["agent:web"],
+            repo="test/repo",
+        )
+
+        with caplog.at_level("INFO"):
+            result = launcher_bundle.launcher.launch_review_session(review, active_sessions=[])
+
+        assert result.success is False
+        assert result.reason == "Stale pending review: issue_publication_gate_failed"
+        assert launcher_bundle.create_session_calls == []
 
     def test_review_existing_work_includes_keep_current_note(
         self, launcher_bundle, mock_repo_host

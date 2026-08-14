@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 
 from issue_orchestrator.control.label_manager import LabelManager
+from issue_orchestrator.control.publication_authority import UnrecordedRefusals
 from issue_orchestrator.control.review_validity import evaluate_review_validity
 from issue_orchestrator.infra.config import Config
 from issue_orchestrator.ports.pull_request_tracker import PRInfo
@@ -13,6 +14,7 @@ def test_query_filtered_pr_does_not_require_embedded_review_label() -> None:
         config=config,
         label_manager=LabelManager(config),
         issue=None,
+        unrecorded_refusals=UnrecordedRefusals(),
         pr=PRInfo(
             number=1,
             title="PR",
@@ -35,7 +37,8 @@ def test_direct_pr_snapshot_requires_review_label_when_missing() -> None:
     validity = evaluate_review_validity(
         config=config,
         label_manager=LabelManager(config),
-        issue=SimpleNamespace(labels=["agent:web"]),
+        issue=SimpleNamespace(number=1, labels=["agent:web"]),
+        unrecorded_refusals=UnrecordedRefusals(),
         pr=PRInfo(
             number=1,
             title="PR",
@@ -78,7 +81,8 @@ def test_failed_publication_gate_revokes_review_eligibility() -> None:
     validity = evaluate_review_validity(
         config=config,
         label_manager=LabelManager(config),
-        issue=SimpleNamespace(labels=["agent:backend", "validation-failed"]),
+        issue=SimpleNamespace(number=40, labels=["agent:backend", "validation-failed"]),
+        unrecorded_refusals=UnrecordedRefusals(),
         pr=_open_pr(["needs-code-review", "rework-cycle-1"]),
         review_label_confirmed=True,
     )
@@ -97,13 +101,59 @@ def test_failed_publication_gate_is_recognized_under_a_label_prefix() -> None:
     validity = evaluate_review_validity(
         config=config,
         label_manager=LabelManager(config),
-        issue=SimpleNamespace(labels=["agent:backend", "bot:validation-failed"]),
+        issue=SimpleNamespace(number=40, labels=["agent:backend", "bot:validation-failed"]),
+        unrecorded_refusals=UnrecordedRefusals(),
         pr=_open_pr(["needs-code-review"]),
         review_label_confirmed=True,
     )
 
     assert validity.valid is False
     assert validity.reason == "issue_publication_gate_failed"
+
+
+def test_refusal_that_never_reached_the_issue_still_withholds_review() -> None:
+    """A refusal is a refusal whether or not its label write committed (#45).
+
+    The issue carries no marker — the label write is exactly what failed — and
+    an earlier candidate's ``needs-code-review`` is still on the PR. Without
+    the unrecorded half of the verdict this reads as an ordinary, review-
+    eligible PR, which is the fail-open state a single failed write reached.
+    """
+    config = Config()
+    config.code_review_label = "needs-code-review"
+    unrecorded = UnrecordedRefusals()
+    unrecorded.hold(40)
+
+    validity = evaluate_review_validity(
+        config=config,
+        label_manager=LabelManager(config),
+        issue=SimpleNamespace(number=40, labels=["agent:backend"]),
+        unrecorded_refusals=unrecorded,
+        pr=_open_pr(["needs-code-review"]),
+        review_label_confirmed=True,
+    )
+
+    assert validity.valid is False
+    assert validity.reason == "issue_publication_gate_failed"
+
+
+def test_unrecorded_refusal_is_scoped_to_its_own_issue() -> None:
+    """Another issue's lost write must not withhold review from this one."""
+    config = Config()
+    config.code_review_label = "needs-code-review"
+    unrecorded = UnrecordedRefusals()
+    unrecorded.hold(99)
+
+    validity = evaluate_review_validity(
+        config=config,
+        label_manager=LabelManager(config),
+        issue=SimpleNamespace(number=40, labels=["agent:backend"]),
+        unrecorded_refusals=unrecorded,
+        pr=_open_pr(["needs-code-review"]),
+        review_label_confirmed=True,
+    )
+
+    assert validity.valid is True
 
 
 def test_validated_candidate_still_reaches_review() -> None:
@@ -114,7 +164,8 @@ def test_validated_candidate_still_reaches_review() -> None:
     validity = evaluate_review_validity(
         config=config,
         label_manager=LabelManager(config),
-        issue=SimpleNamespace(labels=["agent:backend", "in-progress"]),
+        issue=SimpleNamespace(number=40, labels=["agent:backend", "in-progress"]),
+        unrecorded_refusals=UnrecordedRefusals(),
         pr=_open_pr(["needs-code-review"]),
         review_label_confirmed=True,
     )

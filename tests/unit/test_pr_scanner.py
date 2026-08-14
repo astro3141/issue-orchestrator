@@ -11,6 +11,7 @@ import pytest
 from unittest.mock import MagicMock
 
 from issue_orchestrator.control.pr_scanner import PRScanner, ScanResult
+from issue_orchestrator.control.publication_authority import UnrecordedRefusals
 from issue_orchestrator.infra.config import Config
 from issue_orchestrator.domain.models import PendingReview, PendingRework
 from issue_orchestrator.domain.issue_key import FakeIssueKey
@@ -393,6 +394,57 @@ class TestScanForReviewsFiltering:
             labels=["needs-code-review", "rework-cycle-1"],
         )
         mock_repository.prs["42-feature"] = [pr]
+
+        with caplog.at_level("INFO"):
+            result = scanner.scan_for_reviews(
+                already_queued=[],
+                active_sessions=[],
+            )
+
+        assert result == []
+        assert (
+            "Skipping stale review PR: pr=100 issue=42 "
+            "reason=issue_publication_gate_failed"
+        ) in caplog.text
+
+    def test_skips_review_pr_when_the_refusals_label_write_failed(
+        self,
+        mock_config,
+        mock_repository,
+        mock_events,
+        caplog,
+    ):
+        """A refusal the gate could not write is still a refusal (#45).
+
+        The issue carries NO marker here — writing it is what failed — so the
+        scanner sees an ordinary issue and a PR the previous candidate left
+        ``needs-code-review`` on. Reading the shared record of unrecorded
+        refusals is the only thing standing between that and a review of a
+        candidate the gate rejected.
+        """
+        unrecorded = UnrecordedRefusals()
+        unrecorded.hold(42)
+        scanner = PRScanner(
+            config=mock_config,
+            repository=mock_repository,
+            events=mock_events,
+            unrecorded_refusals=unrecorded,
+        )
+        mock_repository.issues.append(
+            IssueBuilder()
+            .with_number(42)
+            .with_title("Rework candidate whose gate failed")
+            .with_labels("agent:developer")
+            .build()
+        )
+        mock_repository.prs["42-feature"] = [
+            make_pr_info(
+                100,
+                branch="42-feature",
+                body="Closes #42",
+                labels=["needs-code-review", "rework-cycle-1"],
+            )
+        ]
 
         with caplog.at_level("INFO"):
             result = scanner.scan_for_reviews(

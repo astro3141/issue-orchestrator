@@ -56,6 +56,7 @@ from ..ports.timeline_reader import NullTimelineReader
 from ..ports.timeline_store import NullTimelineStore, TimelineStore
 from ..ports.timeline_writer import NullTimelineWriter
 from ..control.orchestrator_deps import OrchestratorDeps
+from ..control.publication_authority import UnrecordedRefusals
 from ..control.provider_resilience import ProviderResilienceManager
 from ..execution import (
     create_plugin_manager,
@@ -565,6 +566,10 @@ def build_orchestrator(
     # Create label manager (shared instance for all control-layer components)
     from ..control.label_manager import LabelManager as _LabelManager
     label_manager = _LabelManager(config)
+    # ONE record of publication-gate refusals whose label write did not commit
+    # (#45), shared by the processor that holds them and every reader of the
+    # verdict. Beside the label registry: it is the same verdict, unwritten.
+    unrecorded_refusals = UnrecordedRefusals()
 
     # Create claim management components
     claim_gate, lease_renewer, _lease_config, claim_manager, run_ownership = _create_claim_components(
@@ -644,6 +649,7 @@ def build_orchestrator(
             repository=github,
             events=events,
             issue_branches_fn=lambda: extract_issue_branches(working_copy, config.repo_root),
+            unrecorded_refusals=unrecorded_refusals,
         )
         if github
         else None
@@ -711,6 +717,7 @@ def build_orchestrator(
         open_issue_corpus=tech_lead.open_issue_corpus,
         repository_host=github,
         needs_human_block=pending_work.needs_human_block,
+        unrecorded_refusals=unrecorded_refusals,
         coder_prompt_addendum=coder_prompt_addendum,
     )
     _wire_stack_publish_gate(
@@ -792,6 +799,7 @@ def build_orchestrator(
         pair_registry=pair_registry,
         turn_mailbox=turn_mailbox,
         background_job_supervisor=background_job_supervisor,
+        unrecorded_refusals=unrecorded_refusals,
         instance_id=instance_id,
         state_health_check=timeline_store.check_health,
     )
@@ -818,6 +826,7 @@ def build_orchestrator(
         agent_callback_endpoint=agent_callback_endpoint,
         provider_readiness_probe=provider_readiness_probe,
         needs_human_block=pending_work.needs_human_block,
+        unrecorded_refusals=unrecorded_refusals,
         coder_prompt_addendum=coder_prompt_addendum,
     )
     deps = OrchestratorDeps(
@@ -956,6 +965,7 @@ def build_orchestrator_for_testing(
     # Create label manager (shared instance for all control-layer components)
     from ..control.label_manager import LabelManager as _LabelManager
     label_manager = _LabelManager(config)
+    unrecorded_refusals = UnrecordedRefusals()  # one per orchestrator (#45)
 
     default_label_sync = None
     # Only bound when this root builds the planner; a caller-injected planner
@@ -1045,6 +1055,7 @@ def build_orchestrator_for_testing(
         repository=github,
         events=events,
         issue_branches_fn=lambda: extract_issue_branches(working_copy, config.repo_root),
+        unrecorded_refusals=unrecorded_refusals,
     )
 
     # Create SessionRestorer for testing
@@ -1140,6 +1151,7 @@ def build_orchestrator_for_testing(
         runtime_identity=runtime_identity.resolve_runtime_identity(),
         tech_lead_authority=tech_lead_authority_for_testing,
         needs_human_block=pending_work.needs_human_block,
+        unrecorded_refusals=unrecorded_refusals,
     )
     _wire_stack_publish_gate(
         completion_processor, _dependency_evaluator, github, command_runner, config,
@@ -1230,6 +1242,7 @@ def build_orchestrator_for_testing(
         pair_registry=pair_registry_for_testing,
         turn_mailbox=turn_mailbox,
         background_job_supervisor=background_job_supervisor,
+        unrecorded_refusals=unrecorded_refusals,
     )
 
     # Bundle all dependencies into OrchestratorDeps (no nulls, no optionals)
@@ -1254,6 +1267,7 @@ def build_orchestrator_for_testing(
         agent_callback_endpoint=agent_callback_endpoint,
         provider_readiness_probe=provider_readiness_probe,
         needs_human_block=pending_work.needs_human_block,
+        unrecorded_refusals=unrecorded_refusals,
         coder_prompt_addendum=coder_prompt_addendum,
     )
     completion_handler_factory = build_completion_handler_factory(

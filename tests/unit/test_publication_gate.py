@@ -498,6 +498,9 @@ class TestCompositionActuallyBuildsTheGate:
         )
         from issue_orchestrator.execution.command_runner import LocalCommandRunner
         from issue_orchestrator.execution.git_working_copy import GitWorkingCopy
+        from issue_orchestrator.control.publication_authority import (
+            UnrecordedRefusals,
+        )
         from issue_orchestrator.infra.config import Config
         from issue_orchestrator.ports import NullEventSink
 
@@ -535,6 +538,7 @@ class TestCompositionActuallyBuildsTheGate:
             agent_callback_endpoint=MagicMock(),
             attempt_store=create_attempt_store(Config.load(config_path)),
             needs_human_block=MagicMock(),
+            unrecorded_refusals=UnrecordedRefusals(),
         )
         return processor
 

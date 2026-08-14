@@ -120,6 +120,7 @@ from .session_worktree_diagnostics import (
 from .transition_log import log_transition
 from .isolation import build_runtime_tool_env
 from .launch_dependency_gate import LaunchDependencyGate
+from .publication_authority import UnrecordedRefusals
 from .launch_guards import (
     callback_endpoint_not_ready,
     retrospective_session_conflict,
@@ -188,6 +189,10 @@ class SessionLauncher:
         # Every OTHER durable cause of the shared needs-human label (#6999 F4).
         needs_human_block: SharedNeedsHumanBlock = NO_OTHER_NEEDS_HUMAN_CAUSES,
         coder_prompt_addendum: CoderPromptAddendumProvider = NO_CODER_PROMPT_ADDENDUM,
+        # The orchestrator's shared record of publication-gate refusals whose
+        # label write did not commit (#45). Launch is the last chance to
+        # re-read the verdict, so it reads this half too.
+        unrecorded_refusals: "UnrecordedRefusals | None" = None,
     ):
         self.config = config
         self.events = events
@@ -234,6 +239,7 @@ class SessionLauncher:
             from .label_manager import LabelManager
             label_manager = LabelManager(config)
         self._lm = label_manager
+        self._unrecorded_refusals = unrecorded_refusals or UnrecordedRefusals()
         self._tech_lead_needs_human = TechLeadNeedsHumanLifecycle(
             labels=label_manager,
             events=events,
@@ -1517,6 +1523,7 @@ class SessionLauncher:
             config=self.config,
             repository_host=self.repository_host,
             label_manager=self._lm,
+            unrecorded_refusals=self._unrecorded_refusals,
         )
         if not validity.valid:
             log_transition(

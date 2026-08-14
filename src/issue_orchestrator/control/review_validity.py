@@ -12,7 +12,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Sequence
 
-from .publication_authority import publication_gate_failed
+from .publication_authority import UnrecordedRefusals, publication_gate_failed
 
 if TYPE_CHECKING:
     from ..infra.config import Config
@@ -84,6 +84,7 @@ def _issue_refusal(
     *,
     label_manager: "LabelManager",
     issue: "Issue",
+    unrecorded_refusals: UnrecordedRefusals,
 ) -> _Refusal | None:
     """Why the linked issue withholds authority for a review, if it does.
 
@@ -91,6 +92,8 @@ def _issue_refusal(
     precedes review, so a candidate whose publication gate did not pass has no
     authority to advance, however the review was triggered. The trigger state
     an earlier candidate left on the PR is not authority for this one (#45).
+    A refusal the gate could not write to the issue counts here too: it is the
+    same verdict, and only its record is missing.
     """
     return _first(
         (
@@ -99,7 +102,12 @@ def _issue_refusal(
             ),
             _refuse_if(
                 "issue_publication_gate_failed",
-                publication_gate_failed(label_manager, issue.labels),
+                publication_gate_failed(
+                    label_manager,
+                    issue.labels,
+                    issue_number=issue.number,
+                    unrecorded=unrecorded_refusals,
+                ),
             ),
             _refuse_if(
                 "issue_needs_rework", label_manager.needs_rework in issue.labels
@@ -113,10 +121,17 @@ def evaluate_review_validity(
     config: "Config",
     label_manager: "LabelManager",
     issue: "Issue | None",
+    unrecorded_refusals: UnrecordedRefusals,
     pr: "PRInfo | None" = None,
     review_label_confirmed: bool = False,
 ) -> ReviewValidity:
-    """Return whether a review is still valid for queue/launch processing."""
+    """Return whether a review is still valid for queue/launch processing.
+
+    ``unrecorded_refusals`` is required rather than defaulted: it is half of
+    the publication verdict, and a call site that silently supplied an empty
+    one would answer this question differently from the others — the drift
+    this single seam exists to make impossible (#45).
+    """
     issue_labels = tuple(issue.labels) if issue is not None else ()
     pr_labels = tuple(pr.labels) if pr is not None else ()
 
@@ -131,7 +146,11 @@ def evaluate_review_validity(
         else None
     )
     if refusal is None and issue is not None:
-        refusal = _issue_refusal(label_manager=label_manager, issue=issue)
+        refusal = _issue_refusal(
+            label_manager=label_manager,
+            issue=issue,
+            unrecorded_refusals=unrecorded_refusals,
+        )
 
     if refusal is None:
         return ReviewValidity(

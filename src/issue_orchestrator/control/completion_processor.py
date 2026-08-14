@@ -71,7 +71,7 @@ from ..ports.review_exchange_runner import (
     ReviewExchangeRunner,
 )
 from ..ports.session_output import SessionOutput, ValidationRecord
-from .publication_authority import PublicationAuthority
+from .publication_authority import PublicationAuthority, UnrecordedRefusals
 from .publication_gate import PublicationGate, PublicationGateOutcome
 from .validation import GateEvidence
 from .validation_record_cache import contract_record_path
@@ -220,6 +220,9 @@ class CompletionProcessor:
         # An explicit null object rather than an optional: it governs no label,
         # so a composition path without one behaves as it always did.
         needs_human_block: "SharedNeedsHumanBlock" = NO_OTHER_NEEDS_HUMAN_CAUSES,
+        # Publication-gate refusals whose label write did not commit (#45),
+        # shared with every reader of the verdict.
+        unrecorded_refusals: UnrecordedRefusals | None = None,
     ):
         """Initialize the processor with required adapters.
 
@@ -262,7 +265,9 @@ class CompletionProcessor:
         # here from the injected label adapter so the marker is written and
         # cleared in exactly one place, under the configured label name.
         self._publication_authority = PublicationAuthority(
-            label_adapter, self._get_label("validation_failed")
+            label_adapter,
+            self._get_label("validation_failed"),
+            unrecorded_refusals or UnrecordedRefusals(),
         )
         self.publication_gate = publication_gate
         self.pre_publish_gate = pre_publish_gate

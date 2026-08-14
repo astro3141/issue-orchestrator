@@ -400,6 +400,16 @@ configuring `review.tech_lead_review_agent` enables the workflow.
    every publication precondition clears the verdict with it, so ordinary work
    needs no human step to get its review back.
 
+   A refusal whose label write does not commit is still a refusal. Recording
+   it and enforcing it are two obligations: the gate failure is still reported
+   through the completion result and the issue comment, *and* the refusal is
+   held in the orchestrator's shared record of unrecorded refusals, which the
+   same three paths read alongside the label. Without that, one failed label
+   write left a rejected candidate fully review-eligible. The in-process half
+   is bounded by the process — a refusal lost to a failed write and then to a
+   restart is unrecoverable, because nothing durable ever recorded it — and it
+   only ever withholds review, never grants it.
+
 ## Review Decision Policy (Strict)
 
 Review decision criteria are maintained in `.claude/skills/review-workflow/SKILL.md` (canonical source).

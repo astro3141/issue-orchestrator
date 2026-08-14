@@ -4067,6 +4067,95 @@ class TestCompletionProcessorPublishGate:
         # not be cleared in the same pass that recorded it (#45).
         mock_label_adapter.remove_label.assert_not_called()
 
+    def test_refusal_whose_label_write_failed_still_withholds_review(
+        self,
+        mock_label_adapter,
+        mock_pr_adapter,
+        mock_git_adapter,
+        mock_publish_gate,
+        worktree_with_completion,
+    ):
+        """Fail-closed on a lost refusal write, end to end (#45).
+
+        The refusal is recorded as a label, so a single failed label write used
+        to leave a candidate the gate had just rejected fully review-eligible —
+        the exact state this issue exists to prevent. The processor and the
+        review-validity seam share one record of refusals that could not be
+        written, so the verdict survives the lost write.
+
+        Both obligations are asserted together: the gate's reason must still
+        reach the result and the issue comment (nothing is swallowed), AND
+        review must be withheld.
+        """
+        from issue_orchestrator.control.label_manager import LabelManager
+        from issue_orchestrator.control.publication_authority import (
+            UnrecordedRefusals,
+        )
+        from issue_orchestrator.control.review_validity import (
+            evaluate_review_validity,
+        )
+
+        unrecorded = UnrecordedRefusals()
+        mock_label_adapter.add_label.side_effect = RuntimeError("GitHub said no")
+        mock_publish_gate.check.side_effect = publish_gate_outcome(
+            allowed=False,
+            reason="Validation failed: tests failed",
+        )
+        processor = CompletionProcessor(
+            agent_callback_endpoint=ready_callback_endpoint(),
+            label_adapter=mock_label_adapter,
+            pr_adapter=mock_pr_adapter,
+            git_adapter=mock_git_adapter,
+            publication_gate=mock_publish_gate,
+            session_output=FileSystemSessionOutput(),
+            unrecorded_refusals=unrecorded,
+        )
+
+        record = make_record(
+            outcome=CompletionOutcome.COMPLETED,
+            requested_actions=[RequestedAction.PUSH_BRANCH, RequestedAction.CREATE_PR],
+            summary="Done",
+        )
+        worktree = worktree_with_completion(record)
+
+        result = processor.process(
+            worktree,
+            run_assets=make_session_run_assets(worktree),
+            issue_number=123,
+            issue_title="Test",
+        )
+
+        # The refusal is still reported, in full.
+        assert not result.success
+        assert "Validation failed: tests failed" in result.message
+        assert "Validation failed: tests failed" in (
+            mock_pr_adapter.add_comment.call_args[0][1]
+        )
+
+        # ...and it is still enforced. The issue carries no marker — the write
+        # is what failed — and an earlier candidate's review trigger is still
+        # on the PR, which is exactly how review used to proceed anyway.
+        config = Config()
+        config.code_review_label = "needs-code-review"
+        validity = evaluate_review_validity(
+            config=config,
+            label_manager=LabelManager(config),
+            issue=SimpleNamespace(number=123, labels=["agent:backend"]),
+            unrecorded_refusals=unrecorded,
+            pr=PRInfo(
+                number=41,
+                title="PR",
+                url="https://example.test/pull/41",
+                branch="123-feature",
+                body="Closes #123",
+                state="open",
+                labels=["needs-code-review"],
+            ),
+            review_label_confirmed=True,
+        )
+        assert validity.valid is False
+        assert validity.reason == "issue_publication_gate_failed"
+
     def test_passing_gate_clears_a_previous_candidates_refusal(
         self,
         processor_with_gate,
