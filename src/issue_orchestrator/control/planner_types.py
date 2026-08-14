@@ -54,6 +54,33 @@ if TYPE_CHECKING:
 
 
 @dataclass(frozen=True)
+class ReconciliationSubject:
+    """One issue reconciliation may act on, and how far that authority reaches.
+
+    Scheduling eligibility and reconciliation visibility are different sets
+    (#46). ``OrchestratorSnapshot.issues`` answers "what may be launched" and is
+    deliberately narrowed by the duplicate-launch guard; an issue that guard
+    excludes — because a session completed for it this run, because a session is
+    running right now, or because startup rehydrated an awaiting-merge
+    presentation record for it — must still be *visible* to reconciliation, or
+    state recorded against it can never be retired by its owner.
+
+    ``reconcile_only`` marks exactly that case. Such a subject may have stale
+    state cleared, but it never originates NEW blocking state: an issue ordinary
+    scheduling is not considering did not have work refused on its behalf, so
+    nothing happened to it that a block would describe.
+    """
+
+    issue: Issue
+    reconcile_only: bool
+
+    @property
+    def may_originate_block(self) -> bool:
+        """Whether planning may record NEW blocking state for this subject."""
+        return not self.reconcile_only
+
+
+@dataclass(frozen=True)
 class OrchestratorSnapshot:
     """Immutable snapshot of orchestrator state for planning.
 
@@ -61,6 +88,7 @@ class OrchestratorSnapshot:
     relevant state needed to make planning decisions.
     """
 
+    # The scheduling set: every issue ordinary planning may launch work for.
     issues: tuple[Issue, ...]
     active_sessions: tuple[Session, ...]
     pending_reviews: tuple[PendingReview, ...]
@@ -124,6 +152,28 @@ class OrchestratorSnapshot:
     provider_launch: ProviderLaunchReadiness = field(
         default_factory=ProviderLaunchReadiness.empty
     )
+    # In-scope issues the duplicate-launch guard excluded from ``issues``
+    # (#46): they completed a session this run, have one running now, or carry
+    # the startup awaiting-merge presentation record. Disjoint from ``issues``
+    # by construction (``QueueCache.reconciliation_only_issues``). Reconciliation
+    # sees them; scheduling never does — no launch path reads this field.
+    reconcile_only_issues: tuple[Issue, ...] = field(default_factory=tuple)
+
+    @property
+    def reconciliation_subjects(self) -> tuple[ReconciliationSubject, ...]:
+        """Every in-scope issue reconciliation may act on, with its authority.
+
+        The scheduling set first (full authority), then the issues ordinary
+        scheduling excludes (clear-only). Callers that must not widen
+        reconciliation into scheduling read ``may_originate_block``.
+        """
+        return (
+            *(ReconciliationSubject(issue, reconcile_only=False) for issue in self.issues),
+            *(
+                ReconciliationSubject(issue, reconcile_only=True)
+                for issue in self.reconcile_only_issues
+            ),
+        )
 
     @property
     def active_count(self) -> int:

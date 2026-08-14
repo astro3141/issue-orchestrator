@@ -230,8 +230,14 @@ class Planner:
             self._tech_lead_launch_log.retain(snapshot.pending_tech_lead)
             return Plan.empty()
 
+        # Label knowledge covers every issue planning may LABEL, which is wider
+        # than the scheduling set: provider-impact reconciliation also acts on
+        # in-scope issues the duplicate-launch guard excluded (#46), and an
+        # unknown issue reads as "has no labels" — which would silently make its
+        # stale provider block unremovable.
         plan_context = PlanContext(issue_labels_by_number={
-            issue.number: tuple(issue.labels) for issue in snapshot.issues
+            subject.issue.number: tuple(subject.issue.labels)
+            for subject in snapshot.reconciliation_subjects
         })
 
         # === PHASE 1: Queue population actions (don't consume capacity) ===
