@@ -14,7 +14,9 @@ from ._worktree import (
     find_worktree_for_branch,
 )
 from ._review_command_guard import (
+    GUARDABLE_PROVIDERS,
     REVIEW_COMMAND_GUARD_SETTINGS,
+    ReviewCommandGuardOutcome,
     install_review_command_guard,
     review_command_guard_command,
 )
@@ -30,7 +32,9 @@ from ._worktree_runtime_setup import WorktreeRuntimeSetup, WorktreeRuntimeState
 
 
 __all__ = [
+    "GUARDABLE_PROVIDERS",
     "REVIEW_COMMAND_GUARD_SETTINGS",
+    "ReviewCommandGuardOutcome",
     "WorktreeError",
     "WorktreeRuntimeSetup",
     "WorktreeRuntimeState",

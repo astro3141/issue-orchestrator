@@ -43,6 +43,12 @@ def extract_command_from_input(raw: str) -> str:
         data = json.loads(raw)
     except (json.JSONDecodeError, TypeError):
         return ""
+    if not isinstance(data, dict):
+        # Valid JSON that is not an envelope (``[]``, ``"x"``, ``null``) reads
+        # exactly like unparseable input: no command can be extracted. Without
+        # this, the ``.get`` below raises, the hook exits non-2, and an agent
+        # CLI reads that as "not blocked" — a decision made by a crash.
+        return ""
 
     cmd = ""
 

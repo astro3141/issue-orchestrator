@@ -155,17 +155,44 @@ guard **refuses** build, test and validation commands before they execute
   never a copy the guarded worktree contains.
 - **Outside the candidate.** It is written to `.claude/settings.local.json`,
   the never-tracked local settings layer, and hidden from the worktree's `git
-  status`. Nothing the candidate commit tracks is modified. A guard that cannot
-  be installed rolls the worktree back: an unguarded reviewer worktree does not
-  exist.
+  status`. Nothing the candidate commit tracks is modified. A guard that
+  should have been installable but could not be written rolls the worktree
+  back, so an I/O failure cannot quietly produce a worktree that was meant to
+  be guarded and is not.
+- **Installed for the provider that will actually run there, or not at all.**
+  The guard is registered through one provider's hook mechanism, and
+  `create_reviewer_worktree` is given the provider the exchange launches
+  (`launch_config`, the same derivation the execution-identity record reads).
+  For a provider outside `GUARDABLE_PROVIDERS` — today, anything but
+  `claude-code` — **nothing is written**: a `.claude/settings.local.json` in a
+  worktree whose agent never reads it is a claim of enforcement, and this
+  worktree has had enough of those. The installer reports `guarded=False` and
+  logs it at WARNING.
+
+**Known gap: a Codex reviewer is unguarded.** `main.yaml`, the default mode,
+configures `agent:reviewer` on `codex`, and no guard mechanism is implemented
+for it, so in that configuration `REVIEWER_WORKTREE_IS_UNPROVISIONED_NOTE` is
+still the only thing between the reviewer and a gate command — the
+prompt-only arrangement `docs/architecture/hooks.md` rules out. It is named
+here rather than papered over. Codex does have project-local exec policies
+(`adapters/hooks/codex.py`, `prefix_rule`/`execpolicy`), but the CLI disables
+project-local config, hooks and exec policies until the project is *trusted*,
+and a reviewer worktree is a directory nothing has trusted — so planting a
+rules file there would produce another decorative guard. The two real closures
+are (a) making the reviewer worktree trusted at creation so a Codex exec policy
+loads, or (b) dropping the exemption for unguardable providers and routing the
+worktree through `WorktreeProvisioner`, which costs `worktrees.setup` per
+exchange. Both are product decisions larger than the installer, and neither is
+made here.
 
 Every reviewer prompt still carries `REVIEWER_WORKTREE_IS_UNPROVISIONED_NOTE`
 (`domain/review_exchange.py`), unconditionally — `review.exchange.loop.
 require_validation` decides only whether a validation *record* gates approval,
-so with it false the reviewer would meet a refusal with no idea why. The note
-is the explanation; the guard is the invariant. A change that lets the reviewer
-run gates must remove the guard *and* route this worktree through
-`WorktreeProvisioner`.
+so with it false the reviewer would meet a refusal with no idea why. Where the
+guard is installed the note is the explanation and the guard is the invariant;
+where it is not (see the gap above) the note is all there is. A change that
+lets the reviewer run gates must remove the guard *and* route this worktree
+through `WorktreeProvisioner`.
 
 ## Configuration (YAML)
 

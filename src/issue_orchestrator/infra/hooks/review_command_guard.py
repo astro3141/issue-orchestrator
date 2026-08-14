@@ -17,6 +17,17 @@ The policy is deliberately a command-name allowlist inversion: it matches the
 entry points that start a build/test/validation run at a command position and
 leaves reading the code — ``git``, ``rg``, ``cat``, ``ls``, ``find`` — and the
 reviewer's own completion command untouched.
+
+**Threat model: forgetfulness, not evasion.** The reviewer is a cooperating
+agent that has been told in its prompt why gates cannot run here; the guard
+exists so the instruction cannot be quietly ignored, not so a determined
+process cannot get around it. It matches at command position and unwraps the
+prefixes a reviewer would plausibly type by habit (env assignments,
+``sudo``/``exec``, a path prefix, a pipeline, a nested ``sh -c``). Indirection
+that only an agent trying to evade would reach for — ``env make test``,
+``xargs make``, ``find . -exec make {} \\;`` — is out of scope by design. Read
+this list as "the ways a gate command gets run by accident", and do not build
+anything on it that would need it to be exhaustive.
 """
 
 from __future__ import annotations

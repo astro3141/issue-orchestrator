@@ -1387,6 +1387,17 @@ class TestParseHookInput:
         raw = json.dumps({"tool_input": {"command": 42}})
         assert self.extract_command(raw) == ""
 
+    @pytest.mark.parametrize("raw", ["[]", '["git push"]', '"git push"', "null", "7"])
+    def test_valid_json_that_is_not_an_envelope_returns_empty(self, raw):
+        """A non-object document must read as "no command", not raise.
+
+        A raise here is not a refusal: the hook exits non-2 and the agent CLI
+        reads that as "not blocked". Callers that must fail closed (the
+        reviewer worktree's command guard) can only do so if this reports the
+        absence of a command instead of crashing.
+        """
+        assert self.extract_command(raw) == ""
+
 
 class TestCopilotParseHookInput:
     """Tests for Copilot's parse_hook_input.py (nested toolArgs JSON format).

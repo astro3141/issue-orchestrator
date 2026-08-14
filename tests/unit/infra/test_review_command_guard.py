@@ -118,6 +118,18 @@ class TestHookEnvelope:
     def test_no_input_at_all_allows(self) -> None:
         assert evaluate_raw_input("").allowed is True
 
+    @pytest.mark.parametrize("raw", ["[]", '["make test"]', "null"])
+    def test_valid_json_that_is_not_an_envelope_is_refused(self, raw: str) -> None:
+        """Parseable but envelope-shaped-wrong input is still unreadable input.
+
+        It must take the same refusal as unparseable input rather than raising
+        — a raise exits non-2, which the agent CLI reads as "not blocked".
+        """
+        decision = evaluate_raw_input(raw)
+
+        assert decision.allowed is False
+        assert "unable to extract command" in decision.reason
+
     def test_claude_mode_exits_two_and_explains_on_stderr(
         self, monkeypatch, capsys
     ) -> None:

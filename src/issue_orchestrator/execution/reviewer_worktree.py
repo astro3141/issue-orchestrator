@@ -30,6 +30,7 @@ from ..adapters.worktree.api import (
     install_review_command_guard,
     install_worktree_identity,
 )
+from ..domain.artifact_contracts import AgentProvider
 from ..domain.review_exchange import REVIEWER_WORKTREE_CHECKOUT_FAILURE_MARKER
 from ..infra.repo_identity import get_repo_head_sha
 from ..ports.worktree_manager import REVIEWER_OWNED_HEAD_MARKER, WORKTREE_ID_MARKER
@@ -112,6 +113,7 @@ def create_reviewer_worktree(
     coder_worktree: Path,
     coder_branch: str,
     timestamp: str,
+    reviewer_provider: AgentProvider,
 ) -> ReviewerWorktree:
     """Create a sibling reviewer worktree in detached HEAD on the coder's branch tip.
 
@@ -138,6 +140,24 @@ def create_reviewer_worktree(
     invariant no longer rests on the reviewer reading it. Installing the guard
     is part of taking ownership of the worktree: if it cannot be installed, the
     worktree is rolled back and creation fails.
+
+    ``reviewer_provider`` is what stops that from being a claim rather than a
+    fact. The guard is registered through one provider's hook mechanism, so a
+    reviewer launched on a provider that mechanism does not reach would get a
+    worktree that *looks* guarded and is not. Passing the provider the exchange
+    actually launches lets the installer write nothing in that case and say so
+    (``ReviewCommandGuardOutcome.guarded``), which is logged here at WARNING.
+
+    **The gap that leaves.** ``claude-code`` is the only guardable provider
+    today, and this repository's default mode configures a Codex reviewer, so
+    for that configuration the note in the reviewer's prompt is still the only
+    thing between the reviewer and a gate command
+    (``docs/architecture/validation.md`` — "the one worktree that is exempt").
+    Closing it needs either a Codex-loadable guard (its project-local exec
+    policies are disabled until the project is trusted, and this worktree is
+    brand new) or provisioning the worktree instead of exempting it. Both are
+    larger than a guard installer, so neither is decided here; what *is*
+    decided here is that no configuration gets a decorative one.
     """
     sibling = coder_worktree.parent / f"{coder_worktree.name}-review-{timestamp}"
     if sibling.exists():
@@ -167,7 +187,7 @@ def create_reviewer_worktree(
         ) from exc
     try:
         install_worktree_identity(sibling)
-        install_review_command_guard(sibling)
+        guard = install_review_command_guard(sibling, provider=reviewer_provider)
         _persist_owned_head(sibling, tip_sha)
     except (WorktreeError, ReviewerWorktreeError) as exc:
         try:
@@ -184,10 +204,13 @@ def create_reviewer_worktree(
             },
         ) from exc
     logger.info(
-        "Created reviewer worktree path=%s coder_branch=%s tip=%s",
+        "Created reviewer worktree path=%s coder_branch=%s tip=%s provider=%s "
+        "guarded=%s",
         sibling,
         coder_branch,
         tip_sha,
+        reviewer_provider.value,
+        guard.guarded,
     )
     return ReviewerWorktree(path=sibling, coder_branch=coder_branch)
 

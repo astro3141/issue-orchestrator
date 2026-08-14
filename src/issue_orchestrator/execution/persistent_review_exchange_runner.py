@@ -228,10 +228,17 @@ class PersistentReviewExchangeRunner:
             # closure. Subsequent exchanges reuse the cached pair's
             # ``reviewer_worktree_path`` and the inner round-loop
             # fast-forwards it before each reviewer round.
+            #
+            # The provider is read off ``launch_config`` — the derivation the
+            # exchange actually spawns, not the configured agent it comes
+            # from — for the same reason the execution-identity record is:
+            # the worktree's command guard must be installed for the provider
+            # that will really sit in it, or it is not a guard.
             wt = create_reviewer_worktree(
                 coder_worktree=coder_worktree,
                 coder_branch=coder_branch,
                 timestamp=timestamp,
+                reviewer_provider=agent_provider(launch_config(reviewer_agent)),
             )
             return wt.path
 

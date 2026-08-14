@@ -36,6 +36,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from issue_orchestrator.adapters.sidecar_attempt_store import SidecarAttemptStore
+from issue_orchestrator.domain.artifact_contracts import AgentProvider
 from issue_orchestrator.domain.issue_key import GitHubIssueKey
 from issue_orchestrator.domain.models import AgentConfig
 from issue_orchestrator.infra.config import Config
@@ -75,12 +76,13 @@ def stub_lifecycle(monkeypatch, tmp_path):
         calls["resolve_branch"].append(wt)
         return "feature/test"
 
-    def _create(*, coder_worktree, coder_branch, timestamp):
+    def _create(*, coder_worktree, coder_branch, timestamp, reviewer_provider):
         calls["create"].append(
             {
                 "coder_worktree": coder_worktree,
                 "coder_branch": coder_branch,
                 "timestamp": timestamp,
+                "reviewer_provider": reviewer_provider,
             }
         )
         return SimpleNamespace(
@@ -437,6 +439,39 @@ def test_run_passes_reviewer_worktree_factory_invoked_lazily(
     assert len(stub_lifecycle["create"]) == 1
     assert stub_lifecycle["create"][0]["coder_worktree"] == tmp_path / "coder"
     assert stub_lifecycle["create"][0]["coder_branch"] == "feature/test"
+
+
+def test_reviewer_worktree_is_created_for_the_reviewers_launch_provider(
+    monkeypatch,
+    tmp_path: Path,
+    stub_lifecycle,
+):
+    """The worktree's command guard is per-provider, so creation must be too.
+
+    It has to be the *reviewer's* provider (the coder's would name the wrong
+    agent's hook mechanism) and the *launch-resolved* one: an ``ai_system``-only
+    agent launches on that CLI, so reading the pre-derivation config would name
+    a provider that never runs in this worktree — and so a guard the reviewer
+    sitting there never loads.
+    """
+    captured: dict[str, Any] = {}
+
+    def _fake_inner(**kwargs):
+        captured.update(kwargs)
+        return _canned_outcome(kwargs["exchange_run"])
+
+    monkeypatch.setattr(prer, "run_persistent_session_exchange", _fake_inner)
+    runner = _make_runner(tmp_path)
+
+    _run(
+        runner,
+        tmp_path,
+        coder_agent=_make_agent(tmp_path, ai_system="claude-code"),
+        reviewer_agent=_make_agent(tmp_path, ai_system="codex"),
+    )
+    captured["reviewer_worktree_factory"]()
+
+    assert stub_lifecycle["create"][0]["reviewer_provider"] == AgentProvider("codex")
 
 
 def test_run_threads_coder_branch_for_inner_fast_forward(
