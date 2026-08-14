@@ -40,7 +40,6 @@ if TYPE_CHECKING:
     from .worktree_reconciliation import StartupWorktreeReconciler
 from ..domain.models import (
     OrchestratorState,
-    PendingRetrospectiveReview,
     PendingReview,
     PendingValidationRetry,
     SessionHistoryEntry,
@@ -60,7 +59,7 @@ from .queue_cache import QueueCache, QueueMutationStatus, record_issue_refreshes
 from .publication_authority import UnrecordedRefusals
 from .review_validity import evaluate_review_validity
 from .review_scope import ReviewScopeChecker, extract_issue_number_from_pr
-from .retrospective_review import discover_retrospective_review_issues
+from .retrospective_review import recover_pending_retrospective_reviews
 from .worker_budget import worker_slot_free
 from ..events import EventName
 from ..ports import EventSink, SessionRunner, make_trace_event, RepositoryHost
@@ -727,30 +726,11 @@ class StartupManager:
 
     def _recover_pending_retrospective_reviews(self, state: OrchestratorState) -> None:
         """Recover trigger-labeled existing-work review requests on startup."""
-
-        discovered = discover_retrospective_review_issues(
+        recover_pending_retrospective_reviews(
+            state,
             repository_host=self.repository_host,
             config=self.config,
-            already_issue_numbers=state.retrospective_review_in_flight_issue_numbers(),
         )
-        for review in discovered:
-            state.pending_retrospective_reviews.append(
-                PendingRetrospectiveReview(
-                    issue_key=self.repository_host.create_issue_key(review.issue_number),
-                    issue_number=review.issue_number,
-                    issue_title=review.issue_title,
-                    agent_label=review.agent_label,
-                    trigger_label=review.trigger_label,
-                    prior_pr_number=review.prior_pr_number,
-                    prior_pr_url=review.prior_pr_url,
-                    issue_labels=review.issue_labels,
-                )
-            )
-        if discovered:
-            logger.info(
-                "[startup] Recovered %d retrospective review request(s)",
-                len(discovered),
-            )
 
     def _recover_pending_validation_retries(
         self,

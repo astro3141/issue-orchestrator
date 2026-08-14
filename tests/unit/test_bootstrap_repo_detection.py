@@ -6,11 +6,13 @@ import os
 import pytest
 
 from issue_orchestrator.adapters.github.repo import get_repo_from_git, GitRepoError
+from issue_orchestrator.entrypoints.bootstrap_github_scopes import (
+    check_github_token_scopes,
+)
 from issue_orchestrator.entrypoints.bootstrap import (
     Dependencies,
     build_orchestrator,
     build_orchestrator_for_testing,
-    _check_github_token_scopes,
     _create_planner,
     _validation_attempt_key_factory,
 )
@@ -206,7 +208,7 @@ class TestDependencies:
 
 
 class TestCheckGithubTokenScopes:
-    """Tests for _check_github_token_scopes function."""
+    """Tests for check_github_token_scopes function."""
 
     def test_check_scopes_success_with_required_scopes(self) -> None:
         """Success when token has all required scopes."""
@@ -218,7 +220,7 @@ class TestCheckGithubTokenScopes:
         github_adapter.get_token_scopes.return_value = ["repo", "workflow", "read:user"]
 
         # Should not raise
-        _check_github_token_scopes(config, github_adapter)
+        check_github_token_scopes(config, github_adapter)
 
     def test_check_scopes_failure_missing_required(self) -> None:
         """Raises ValueError when required scopes are missing."""
@@ -230,7 +232,7 @@ class TestCheckGithubTokenScopes:
         github_adapter.get_token_scopes.return_value = ["repo"]  # Missing workflow
 
         with pytest.raises(ValueError, match="missing required scopes"):
-            _check_github_token_scopes(config, github_adapter)
+            check_github_token_scopes(config, github_adapter)
 
     def test_check_scopes_failure_extra_disallowed(self) -> None:
         """Raises ValueError when token has disallowed scopes."""
@@ -242,7 +244,7 @@ class TestCheckGithubTokenScopes:
         github_adapter.get_token_scopes.return_value = ["repo", "read:user", "workflow"]
 
         with pytest.raises(ValueError, match="disallowed scopes"):
-            _check_github_token_scopes(config, github_adapter)
+            check_github_token_scopes(config, github_adapter)
 
     def test_check_scopes_with_empty_required_list(self) -> None:
         """Empty or whitespace-only scopes are ignored."""
@@ -254,7 +256,7 @@ class TestCheckGithubTokenScopes:
         github_adapter.get_token_scopes.return_value = ["repo"]
 
         # Should not raise - only non-empty scopes are checked
-        _check_github_token_scopes(config, github_adapter)
+        check_github_token_scopes(config, github_adapter)
 
     def test_check_scopes_logs_warning_on_exception(self) -> None:
         """Logs warning and returns if get_token_scopes fails."""
@@ -265,9 +267,9 @@ class TestCheckGithubTokenScopes:
         github_adapter = MagicMock()
         github_adapter.get_token_scopes.side_effect = Exception("API error")
 
-        with patch("issue_orchestrator.entrypoints.bootstrap.logger") as mock_logger:
+        with patch("issue_orchestrator.entrypoints.bootstrap_github_scopes.logger") as mock_logger:
             # Should not raise, just log warning
-            _check_github_token_scopes(config, github_adapter)
+            check_github_token_scopes(config, github_adapter)
             mock_logger.warning.assert_called()
 
     def test_check_scopes_logs_token_info_when_available(self) -> None:
@@ -279,8 +281,8 @@ class TestCheckGithubTokenScopes:
         github_adapter = MagicMock()
         github_adapter.get_token_scopes.return_value = ["repo", "workflow"]
 
-        with patch("issue_orchestrator.entrypoints.bootstrap.logger") as mock_logger:
-            _check_github_token_scopes(config, github_adapter)
+        with patch("issue_orchestrator.entrypoints.bootstrap_github_scopes.logger") as mock_logger:
+            check_github_token_scopes(config, github_adapter)
             mock_logger.info.assert_called()
             assert "token scopes" in mock_logger.info.call_args[0][0].lower()
 
@@ -293,8 +295,8 @@ class TestCheckGithubTokenScopes:
         github_adapter = MagicMock()
         github_adapter.get_token_scopes.return_value = []
 
-        with patch("issue_orchestrator.entrypoints.bootstrap.logger") as mock_logger:
-            _check_github_token_scopes(config, github_adapter)
+        with patch("issue_orchestrator.entrypoints.bootstrap_github_scopes.logger") as mock_logger:
+            check_github_token_scopes(config, github_adapter)
             mock_logger.info.assert_called()
             assert "unavailable" in mock_logger.info.call_args[0][0].lower()
 
@@ -306,8 +308,8 @@ class TestCheckGithubTokenScopes:
         github_adapter = MagicMock()
         github_adapter.auth_kind = "github_app"
 
-        with patch("issue_orchestrator.entrypoints.bootstrap.logger") as mock_logger:
-            _check_github_token_scopes(config, github_adapter)
+        with patch("issue_orchestrator.entrypoints.bootstrap_github_scopes.logger") as mock_logger:
+            check_github_token_scopes(config, github_adapter)
 
         github_adapter.get_token_scopes.assert_not_called()
         mock_logger.info.assert_called()

@@ -220,8 +220,7 @@ class CompletionProcessor:
         # An explicit null object rather than an optional: it governs no label,
         # so a composition path without one behaves as it always did.
         needs_human_block: "SharedNeedsHumanBlock" = NO_OTHER_NEEDS_HUMAN_CAUSES,
-        # Publication-gate refusals whose label write did not commit (#45),
-        # shared with every reader of the verdict.
+        # Refusals whose label write did not commit, shared with the readers (#45).
         unrecorded_refusals: UnrecordedRefusals | None = None,
     ):
         """Initialize the processor with required adapters.
@@ -261,9 +260,9 @@ class CompletionProcessor:
         self._trace_events: EventSink | None = None
         self._event_context: EventContext | None = None
         self.label_config = label_config or {}
-        # The one owner of this issue's publication-gate verdict (#45). Built
-        # here from the injected label adapter so the marker is written and
-        # cleared in exactly one place, under the configured label name.
+        # The one owner of this issue's publication-gate verdict (#45), built
+        # from the injected label adapter so the marker is written and cleared
+        # in exactly one place, under the configured label name.
         self._publication_authority = PublicationAuthority(
             label_adapter,
             self._get_label("validation_failed"),
@@ -1074,12 +1073,11 @@ class CompletionProcessor:
         if gate_failure is not None:
             return gate_failure
 
-        # This candidate cleared every publication precondition, so a verdict
-        # recorded against an earlier one no longer describes what is being
-        # offered. Granting here — not at the push or the PR — keeps the
-        # verdict tied to the candidate the gate actually judged: a refusal
-        # with no matching grant would hold a later, genuinely validated
-        # candidate out of review forever (#45).
+        # This candidate cleared every publication precondition, so a refusal
+        # recorded against an earlier one no longer describes what is offered.
+        # Granting here — not at the push or the PR — ties the verdict to the
+        # candidate the gate actually judged; a refusal with no matching grant
+        # would hold a later, genuinely validated candidate out forever (#45).
         if record.offers_a_change_for_review:
             self._publication_authority.grant(issue_number)
         return None
@@ -1384,9 +1382,8 @@ class CompletionProcessor:
             ValidationFailed(reason=gate_reason or "publish gate failed"),
             ended_at=datetime.now(timezone.utc).isoformat(),
         )
-        # Record the refusal on the issue: it tells the user why the issue is
-        # stuck, and it is what withholds the review step from this candidate
-        # until a later one clears the gate (#45).
+        # Record the refusal: it tells the user why the issue is stuck, and it
+        # withholds review from this candidate until a later one clears (#45).
         validation_failed_label = self._publication_authority.label
         self._publication_authority.revoke(issue_number, reason=gate_reason)
         comment = build_gate_failure_comment(
