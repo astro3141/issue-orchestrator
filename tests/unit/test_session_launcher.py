@@ -3144,7 +3144,7 @@ class TestLaunchReworkSession:
         assert copied_data["review_issues"] == "Copied feedback content"
 
 
-# Note: TestRunSetupCommands class deleted - tested private _run_setup_commands method.
+# Note: TestRunSetupCommands class deleted - tested a private setup-command method.
 # Setup command behavior is already tested through test_runs_setup_commands in TestLaunchIssueSession.
 
 

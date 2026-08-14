@@ -203,7 +203,10 @@ class SessionLauncher:
         self._working_copy = working_copy
         self._command_runner = command_runner
         # One owner decides whether a worktree is runnable, for every launch
-        # path this launcher has (#48).
+        # path this launcher has (#48). The coding and validation-retry paths
+        # below keep their own failure handling rather than calling
+        # provision_launch_worktree, because a failure there must also clean up
+        # the pre-active worktree and release the claim those paths hold.
         self._worktree_provisioner = WorktreeProvisioner(
             config=config,
             command_runner=command_runner,
@@ -941,7 +944,7 @@ class SessionLauncher:
             # Run setup commands
             if self.config.setup_worktree:
                 try:
-                    self._run_setup_commands(worktree_path)
+                    self._worktree_provisioner.provision(worktree_path)
                 except Exception as e:
                     log_transition("issue", issue.number, "LAUNCHING", "FAILED", "setup commands failed")
                     logger.error(issue_log(issue.number, "FAILED: setup commands failed: %s"), e)
@@ -1435,7 +1438,7 @@ class SessionLauncher:
         if not self.config.setup_worktree:
             return None
         try:
-            self._run_setup_commands(worktree_path)
+            self._worktree_provisioner.provision(worktree_path)
         except Exception as e:
             log_transition("issue", issue.number, "LAUNCHING", "FAILED", "setup commands failed")
             logger.error(issue_log(issue.number, "FAILED: setup commands failed: %s"), e)
@@ -2200,17 +2203,6 @@ class SessionLauncher:
         return launch_rework_flow(
             rework, active_sessions, deps, work_claim=work_claim
         )
-
-    def _run_setup_commands(self, worktree_path: Path) -> None:
-        """Provision a worktree through its single owner (#48).
-
-        The coding and validation-retry paths keep their own handlers rather
-        than calling :func:`provision_launch_worktree`: a failed provisioning
-        there also cleans up the pre-active worktree and releases the claim
-        those paths hold. The decision of *what provisioning is* is the
-        provisioner's either way.
-        """
-        self._worktree_provisioner.provision(worktree_path)
 
     def _persist_session_prompt(self, run_dir: Path, prompt_text: str) -> str:
         """Persist rendered launch prompt into run-scoped artifacts."""
