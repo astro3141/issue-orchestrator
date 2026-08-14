@@ -1,6 +1,7 @@
-# Foundation validated-work disposition — minimal domain contract (rev 3)
+# Foundation validated-work disposition — minimal domain contract (rev 4)
 
-**Status: FROZEN, 2026-08-12.** This file is the authority for the contract.
+**Status: FROZEN, 2026-08-12; amended 2026-08-14 (rev 4, §2/§4/§11 — execution
+principal).** This file is the authority for the contract.
 Contract only — no implementation, none proposed. Persistence, labels and UI are
 decided only where the contract cannot be stated without them.
 
@@ -72,7 +73,40 @@ actually needs answered: *was my approval invalidated, or did execution fail?*
 - **base** — the published tip A was built on.
 - **B** — the finalization commit. Content is a function of `(A, base)`.
 - **target_ref** — the remote ref publication writes.
-- **evidence set** — validation record and review record, each naming a SHA.
+- **evidence set** — the complete admitted evidence whose content establishes
+  I2a–I2c: validation evidence and review evidence, **including the actor and
+  reviewer execution principals**. Commit-scoped evidence names or is bound to
+  A. Execution provenance not used by §4 is not required to be part of this set.
+
+*Restated rev 4.* This was previously "validation record and review record, each
+naming a SHA" — an enumeration of two artifacts. Once I2c compares principals,
+that enumeration leaves the principals outside §5's `evidence_digest`, so an
+approval could survive replacing the actor/reviewer principals with a different
+still-distinct pair: I2c would still pass, the digest would be unchanged, and
+the human would remain bound to an approval whose authority basis had moved.
+Defining the set by *what it establishes* rather than by which files carry it
+closes that, and keeps the contract free of any particular artifact layout.
+- **execution principal** — the orchestrator-assigned logical agent identity
+  under whose authority a role executes. This is what I2c compares.
+- **execution provenance** — attributes describing how a principal's execution
+  happened, such as provider, model, process, session and run identifiers.
+  Recorded provenance is retained for audit; provenance does not define
+  principal identity and is not compared for I2c.
+
+*Added rev 4.* I2c previously said "reviewer identity is distinct from the
+actor" without saying what makes two identities the same, and an implementation
+supplied the answer by accident: a fingerprint over `(agent label, provider,
+model)`. That is provenance mixed into identity, and it fails in both
+directions. Two roles configured as separate reviewing principals but running
+the same provider and model would read as one identity — which is precisely the
+arrangement this fork operates under, so independent review would be
+unrepresentable. Conversely one principal whose model changed between the two
+runs would read as two, admitting work that reviewed itself.
+
+The distinction is deliberately stated without naming any implementation
+concept: what plays the part of a principal is an implementation question, and
+the contract does not care, so long as the thing compared is authority and not
+execution detail.
 
 ---
 
@@ -111,7 +145,12 @@ A disposition may enter `HELD_FOR_APPROVAL` only if **all** hold:
 `validation.profile` equals the profile frozen for the role at run start.
 
 **I2c — review validity.** The review outcome is approval with no blocking
-findings, and the reviewer identity is distinct from the actor.
+findings, and the **reviewer execution principal is distinct from the actor
+execution principal**.
+
+Distinctness is a comparison of principals only. Two executions of the same
+principal are the same principal however much their provenance differs, and two
+distinct principals stay distinct however identical their provenance is.
 
 Coherence alone admits a `passed=false` record whose SHA happens to match. Three
 matching SHAs are not evidence that anything succeeded.
@@ -393,7 +432,10 @@ One per invariant. Each decidable without a live model.
 | I0b/I0c | Finalize where `(A, base)` yields no content change. | B exists with `parent(B) == A`; the only observed ref transition is `base → B`. `target_ref` is never observed pointing at A. |
 | I2a | Admit with `validation.head_sha != review.reviewed_sha`. | Refused, naming the mismatch. |
 | I2b | Admit with `passed=false` but matching SHAs; separately, with a profile other than the frozen one. | Both refused. |
-| I2c | Admit with reviewer identity == actor identity; separately with a blocking finding present. | Both refused. |
+| I2c | Admit with reviewer principal == actor principal; separately with a blocking finding present. | Both refused. |
+| I2c | Admit with reviewer principal == actor principal while provenance differs (different provider, model, session or run). | Refused — provenance does not create a second principal. |
+| I2c | Admit with distinct reviewer and actor principals sharing the same provider/model configuration. | Admitted — matching execution configuration does not collapse two principals. |
+| §5 | After approval, replace the actor/reviewer principal evidence with a different still-distinct pair while A and the verdict are unchanged. | Approval invalid — the evidence digest changed. |
 | I4 | Actor role attempts publication while `APPROVED`. | Refused on authority, not on ordering. |
 | I5 | Run the finalizer twice on identical `(A, base)` in isolated trees. | **Identical B SHA**, not merely identical tree. |
 | I6 | Finalizer produces a B touching a path outside the declared surface. | Refused. |
