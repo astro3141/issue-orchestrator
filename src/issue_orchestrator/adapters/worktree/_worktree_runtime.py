@@ -31,6 +31,7 @@ from ...ports.worktree_manager import (
 )
 from ._worktree_errors import WorktreeError
 from ._worktree_git import _git_run
+from ._worktree_venv import VENV_DIR_NAME
 
 logger = logging.getLogger(__name__)
 
@@ -55,7 +56,7 @@ CLAUDE_SETTINGS_FOR_AGENTS: dict[str, Any] = {
 ALLOW_NO_VERIFY_DRY_RUN_PATH = Path(".issue-orchestrator") / "allow-no-verify-dry-run"
 WORKTREE_LOCAL_EXCLUDE_PATHS: tuple[Path, ...] = (
     Path(".agent-done-marker"),
-    Path(".venv"),
+    Path(VENV_DIR_NAME),
     Path(".claude/settings.json"),
     Path(".claude/scheduled_tasks.lock"),
     WORKTREE_ID_MARKER,
@@ -93,7 +94,6 @@ __all__ = [
     "_hide_runtime_artifacts_from_git_status",
     "install_worktree_identity",
     "read_reviewer_head_ownership",
-    "isolate_worktree_venv",
     "install_claude_settings",
     "repo_owns_cli_tools",
     "sync_cli_tools",
@@ -121,67 +121,6 @@ def _configure_no_verify_dry_run(worktree_path: Path, allow: bool) -> None:
         raise WorktreeError(
             f"Failed to {action} no-verify dry-run flag at {flag_path}: {exc}"
         ) from exc
-
-
-def isolate_worktree_venv(worktree_path: Path) -> None:
-    """Guarantee a worktree's ``.venv`` is its own, or absent — never shared.
-
-    **Agent worktrees get their own runtime environment.** They used to share
-    one: setup planted a ``.venv`` symlink to the repository's, so a single
-    environment served the primary checkout and every worktree at once. That
-    sharing is the whole of #53. ``worktrees.setup`` runs the repository's own
-    setup recipe *in the worktree*, and any recipe that populates ``.venv`` —
-    ``uv sync``, ``pip install -e .``, ``python -m venv`` — writes through the
-    symlink into the shared environment. ``uv sync`` in particular rewrites the
-    editable install's source path to the syncing worktree on every run,
-    whether or not the lockfile changed; when that worktree is later removed,
-    the shared environment imports nothing and the primary checkout can no
-    longer even run its pre-push gate.
-
-    So the link is removed here rather than created, and nothing is installed
-    in its place. Building the worktree's environment is ``worktrees.setup``'s
-    job — the same division #48 settled, where the manager supplies the
-    checkout and the provisioner supplies what makes it runnable. A repository
-    that declares no setup commands gets a worktree with no virtualenv, which
-    is what ``docs/architecture/validation.md`` already says such a repository
-    gets.
-
-    Removing the sharing is what makes concurrent provisioning safe too: there
-    is no longer one environment for two runs to race over, so no lock has to
-    be trusted to hold.
-
-    A ``.venv`` that resolves *inside* the worktree is left alone. A write to
-    it cannot escape the worktree, which is the only property this step is
-    about; whether it is a directory or a worktree-local link is not this
-    step's business.
-
-    Raises:
-        WorktreeError: If the shared link cannot be removed. Handing
-            provisioning a worktree still pointing at another checkout's
-            environment is the defect, so setup fails instead.
-    """
-    target_venv = worktree_path / ".venv"
-    if not target_venv.is_symlink():
-        return
-
-    # `resolve()` is non-strict, so a dangling link — the state the incident
-    # left behind — still yields the path it names and is judged like any other.
-    linked_target = target_venv.resolve()
-    if linked_target.is_relative_to(Path(worktree_path).resolve()):
-        return
-
-    try:
-        target_venv.unlink()
-    except OSError as exc:
-        raise WorktreeError(
-            f"Failed to remove shared venv link {target_venv} -> {linked_target}: {exc}"
-        ) from exc
-    logger.warning(
-        "Removed shared venv link %s -> %s; this worktree's environment is "
-        "worktrees.setup's to build (#53)",
-        target_venv,
-        linked_target,
-    )
 
 
 def _git_or_fail(

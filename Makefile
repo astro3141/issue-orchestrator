@@ -110,11 +110,28 @@ venv: ensure-uv
 	@echo ""
 	@echo "Done! Activate with: source .venv/bin/activate"
 
-# Fast, reliable venv setup: reuse if present, otherwise create
+# Fast, reliable venv setup: reuse a usable .venv, otherwise rebuild it
+#
+# The reuse test used to be `[ -d .venv ]`, and a shell of a virtualenv — a
+# directory holding a `bin/python` and nothing else — satisfies that. Creation
+# was then skipped and `uv sync` was handed an environment it could not use: it
+# found the project "installed, but mismatched" against an install record that
+# lived in ANOTHER checkout, and reconciled by reinstalling editable there,
+# which moved that checkout's `.pth` and left it unable to import its own
+# package (#53/#61). So reuse now requires the two things that make a directory
+# an environment, and anything else is replaced rather than synced into.
+#
+# Structure is all this recipe can check. Whether the environment belongs to
+# THIS checkout is provenance, and the caller answers that: orchestrator
+# worktree setup removes any `.venv` it cannot prove is the worktree's own
+# before this recipe runs (`adapters/worktree/_worktree_venv.py`). Both halves
+# are needed — the recipe alone cannot tell one checkout from another, and the
+# orchestrator is not the only caller.
 venv-fast: ensure-uv
 	@mkdir -p $$(dirname $(SETUP_LOG))
-	@if [ ! -d .venv ]; then \
+	@if [ ! -f .venv/pyvenv.cfg ] || [ ! -x .venv/bin/python ]; then \
 		echo "Creating venv with $(SYSTEM_PYTHON) and installing dependencies..."; \
+		rm -rf .venv; \
 		t0=$$(date +%s); \
 		$(UV) venv .venv --python $(SYSTEM_PYTHON); \
 		t1=$$(date +%s); \
