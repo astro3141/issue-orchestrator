@@ -268,7 +268,10 @@ install_mode() {
   fi
 }
 
-sync_deps() {
+# The install itself, with no marker handling of its own: deps_marker_guard
+# brackets it. One command per branch (`&&`, not `;`), because guard judges this
+# by its single exit status.
+run_dependency_sync() {
   local uv_bin
   local mode
   uv_bin="$(uv_bin_path || true)"
@@ -285,14 +288,20 @@ sync_deps() {
     )
   else
     echo "Syncing Python dependencies from ${ROOT_DIR} with pip..."
-    ensure_pip
-    (cd "${ROOT_DIR}" && "${VENV_PATH}/bin/python" -m pip install -e ".[dev]")
+    ensure_pip \
+      && (cd "${ROOT_DIR}" && "${VENV_PATH}/bin/python" -m pip install -e ".[dev]")
   fi
-  # The marker goes first: it is the statement that this environment is usable,
-  # and it refuses to be written when the sync above left one that is not. The
-  # fingerprint only records what that sync was for, so it must not outlive a
-  # refusal.
-  record_deps_synced "${VENV_PATH}" "${ROOT_DIR}"
+}
+
+sync_deps() {
+  # The bracket belongs to the marker's owner, so this path cannot withdraw the
+  # claim and forget to re-establish it — or, as it did, re-establish without
+  # withdrawing, leaving an earlier run's marker standing over a sync that
+  # failed (#60).
+  deps_marker_guard "${VENV_PATH}" "${ROOT_DIR}" -- run_dependency_sync
+  # Reached only when the marker was written: the fingerprint records what that
+  # sync was for, so it must not outlive a refusal. `set -e` stops us here
+  # otherwise.
   record_deps_fingerprint
 }
 

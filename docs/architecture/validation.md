@@ -231,6 +231,24 @@ writer goes through it:
 | the sync itself | `set -e` in the recipe block | A failed `uv sync` fails the recipe instead of being swallowed by the `;` separator |
 | `record` after the sync | Verifies, then writes | `python -I -c "import issue_orchestrator"` must resolve inside this checkout. Isolated mode is required: agent sessions export a `PYTHONPATH` pointing at the Control Centre snapshot, which would otherwise answer for a different checkout |
 
+**The ordering is the rule, so the owner owns the ordering too.** A writer that
+`record`s without having `clear`ed is not obviously wrong to read, and it is
+exactly the half-bracket that leaves a failed sync standing behind an earlier
+run's marker. `deps_marker.sh guard <venv> <root> -- <cmd…>` performs the whole
+bracket — withdraw, run, re-establish — and passes the command's exit status
+through, so a writer that can express its sync as one command cannot do half of
+it. `install`, `upgrade-deps`, `deps-batch`, `sync-deps` and the Control Centre
+launcher each make one `guard` call. Only the `venv*` recipes, which interleave
+venv creation and timing logs, still bracket by hand. The `semgrep-venv` step
+several of these targets run afterwards now sits outside the bracket: the marker
+speaks for the main environment, so a Semgrep failure should not withdraw a
+claim the main sync earned.
+
+`guard` judges the command by its own exit status, and capturing that status
+suppresses `errexit` inside it — so what is handed over must be one command or
+an `&&` chain. A `;`-separated sequence would report only its last statement,
+which is the original defect wearing a different hat.
+
 The Semgrep tool environment carries a marker of the same name
 (`.venv-semgrep/.deps-synced`) and is deliberately outside this rule: it is
 synced with `--no-install-project`, so there is no project install in it to
@@ -240,10 +258,18 @@ test asks for an executable `bin/semgrep`.
 The Control Centre launcher has asked that same question of its own environment
 since before the marker did (`verify_project_install`), and now sources the
 shared rule rather than keeping a second copy of it — one marker, one meaning,
-one owner. `tests/unit/test_deps_synced_marker.py` holds the failure-direction
-proof: a `uv sync` that fails, one that installs nothing, and one that installs
-another checkout each leave `venv-fast` non-zero with no marker, including when
-an earlier healthy run had left one behind.
+one owner. That matters because the marker it writes is not private: its
+`install_mode` selects the uv path only when its venv *is* `<root>/.venv`, so it
+writes the same file `sync-deps` reads.
+
+`tests/unit/test_deps_synced_marker.py` holds the failure-direction proof: a
+`uv sync` that fails, one that installs nothing, and one that installs another
+checkout each leave the recipe non-zero with no marker — for `venv-fast` and
+`install` alike, and including when an earlier healthy run had left a marker
+behind. It also pins the rule statically: no `touch` of the marker under any of
+its spellings in either writer file, and no `record` in a Makefile target that
+did not `clear` first. `tests/unit/test_start_control_center_script.py` covers
+the launcher's side of the same failure.
 
 ### What authority provisioning runs at
 
