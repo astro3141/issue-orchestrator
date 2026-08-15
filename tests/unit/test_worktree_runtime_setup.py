@@ -55,6 +55,31 @@ def _break_read_of(
     monkeypatch.setattr(Path, "read_text", guarded)
 
 
+def _install_environment(
+    checkout: Path, *, editable_source: Path | None = None
+) -> Path:
+    """Build a ``.venv`` in ``checkout`` that is genuinely an environment.
+
+    The marker file and the interpreter are what separate an environment from a
+    directory named ``.venv``, and ``editable_source`` is the record that says
+    which source tree the environment resolves imports from — the record uv
+    writes, and the one the incident found naming another checkout (#53/#61).
+    """
+    venv = checkout / ".venv"
+    site_packages = venv / "lib" / "python3.14" / "site-packages"
+    site_packages.mkdir(parents=True, exist_ok=True)
+    (venv / "pyvenv.cfg").write_text(
+        "home = /usr/bin\nimplementation = CPython\nversion_info = 3.14.0\n"
+    )
+    (venv / "bin").mkdir(parents=True, exist_ok=True)
+    (venv / "bin" / "python").write_text("#!/bin/sh\n")
+    if editable_source is not None:
+        (site_packages / "_editable_impl_project.pth").write_text(
+            f"{editable_source}\n"
+        )
+    return venv
+
+
 @pytest.fixture
 def git_worktree(tmp_path: Path) -> GitWorktree:
     """A real repository plus one linked worktree, and a repository venv.
@@ -64,11 +89,12 @@ def git_worktree(tmp_path: Path) -> GitWorktree:
     fabricated ``.git`` directory has no answer to give — which the owner
     treats as a failure rather than a licence to guess.
 
-    The repository venv exists so the tests below can prove setup does *not*
-    reach for it (#53); nothing here shares it.
+    The repository venv exists, and is a real working one recording its own
+    checkout, so the tests below can prove setup neither reaches for it nor
+    reaches *into* it (#53).
     """
     worktree = make_git_worktree(tmp_path, name="repo-123")
-    (worktree.main_repo / ".venv" / "bin").mkdir(parents=True)
+    _install_environment(worktree.main_repo, editable_source=worktree.main_repo)
     return worktree
 
 
@@ -195,27 +221,51 @@ class TestWorktreeRuntimeEnvironmentIsNotShared:
         assert not (worktree_path / ".venv").is_symlink()
 
     def test_a_worktree_local_venv_is_left_alone(self, worktree_path):
-        # The state `worktrees.setup` leaves behind. Deleting it would make
-        # every reused worktree pay a full install it does not need.
-        venv = worktree_path / ".venv"
-        (venv / "bin").mkdir(parents=True)
-        (venv / "bin" / "python").write_text("#!/bin/sh\n")
+        # The state `worktrees.setup` leaves behind: this worktree's own
+        # environment, recording this worktree as its source. Deleting it would
+        # make every reused worktree pay a full install it does not need.
+        venv = _install_environment(worktree_path, editable_source=worktree_path)
 
         _setup().apply(worktree_path)
 
         assert (venv / "bin" / "python").exists()
+        assert (venv / "pyvenv.cfg").exists()
 
     def test_a_link_that_stays_inside_the_worktree_is_left_alone(self, worktree_path):
-        # A write through it cannot reach another checkout, which is the only
-        # property this step is about.
+        # A write through it cannot reach another checkout, and what it points
+        # at is this worktree's own working environment.
         (worktree_path / "runtime").mkdir()
+        _install_environment(worktree_path / "runtime", editable_source=worktree_path)
         (worktree_path / ".venv").symlink_to(
-            worktree_path / "runtime", target_is_directory=True
+            worktree_path / "runtime" / ".venv", target_is_directory=True
         )
 
         _setup().apply(worktree_path)
 
         assert (worktree_path / ".venv").is_symlink()
+
+    def test_removal_never_reaches_into_the_environment_it_unlinks(
+        self, repo_root, worktree_path
+    ):
+        # Emptying the link instead of unlinking it would delete the contents of
+        # the environment another checkout is using: the same defect with a
+        # bigger blast radius, not a fix for it.
+        (worktree_path / ".venv").symlink_to(
+            repo_root / ".venv", target_is_directory=True
+        )
+
+        _setup().apply(worktree_path)
+
+        assert (repo_root / ".venv" / "pyvenv.cfg").is_file()
+        assert (repo_root / ".venv" / "bin" / "python").is_file()
+        assert (
+            repo_root
+            / ".venv"
+            / "lib"
+            / "python3.14"
+            / "site-packages"
+            / "_editable_impl_project.pth"
+        ).read_text().strip() == str(repo_root)
 
     def test_an_unremovable_shared_link_fails_setup(
         self, repo_root, worktree_path, monkeypatch
@@ -238,6 +288,121 @@ class TestWorktreeRuntimeEnvironmentIsNotShared:
             _setup().apply(worktree_path)
 
         assert (worktree_path / ".venv").is_symlink()
+
+
+class TestAVenvDirectoryMustProveItIsThisWorktreesOwn:
+    """A ``.venv`` directory is reused only when it proves it is ours (#61).
+
+    The link cases above were the half of #53 that got fixed first. The other
+    half is that a ``.venv`` which is a *real directory* was trusted for being a
+    directory — no check that it belonged to this worktree, none that it was
+    usable — so a worktree carrying what a previous failed run left behind
+    passed setup untouched, and the recipe's own ``[ -d .venv ]`` test kept it.
+    ``uv sync`` was then handed an environment it could not use, found the
+    project installed-but-mismatched against a record naming another checkout,
+    and reconciled by rewriting that checkout's environment.
+
+    So provenance and health are both established here, and anything that fails
+    either is removed rather than reused.
+    """
+
+    def test_a_directory_that_is_not_an_environment_is_removed(self, worktree_path):
+        # The shape the incident left behind: an interpreter under `bin`, a
+        # stray `.pth`, no `pyvenv.cfg` — and enough of a directory to satisfy
+        # `[ -d .venv ]`, which is what kept it.
+        venv = worktree_path / ".venv"
+        (venv / "bin").mkdir(parents=True)
+        (venv / "bin" / "python").write_text("#!/bin/sh\n")
+        (venv / "_virtualenv.pth").write_text("import _virtualenv\n")
+
+        _setup().apply(worktree_path)
+
+        assert not venv.exists()
+
+    def test_an_environment_recording_another_checkout_is_removed(
+        self, repo_root, worktree_path
+    ):
+        # Structurally a perfectly good environment — marker, interpreter, a
+        # populated `site-packages`. It is only the recorded source path that
+        # says it is not this worktree's, and that is the whole defect.
+        venv = _install_environment(worktree_path, editable_source=repo_root)
+
+        _setup().apply(worktree_path)
+
+        assert not venv.exists()
+        assert (repo_root / ".venv" / "pyvenv.cfg").is_file()
+
+    def test_an_environment_whose_direct_url_names_another_checkout_is_removed(
+        self, repo_root, worktree_path
+    ):
+        # The installer's other way of writing down where a distribution came
+        # from. One record type checked and the other not would be a gap the
+        # next installer release could walk through.
+        venv = _install_environment(worktree_path)
+        dist_info = venv / "lib" / "python3.14" / "site-packages" / "project.dist-info"
+        dist_info.mkdir()
+        (dist_info / "direct_url.json").write_text(
+            json.dumps({"url": repo_root.as_uri(), "dir_info": {"editable": True}})
+        )
+
+        _setup().apply(worktree_path)
+
+        assert not venv.exists()
+
+    def test_an_environment_recording_this_worktree_is_reused(self, worktree_path):
+        # The ordinary reused worktree. Rebuilding this one would introduce the
+        # per-session full install the fix is explicitly not allowed to add.
+        venv = _install_environment(worktree_path, editable_source=worktree_path)
+        marker = venv / "lib" / "python3.14" / "site-packages" / "installed-package"
+        marker.write_text("kept\n")
+
+        _setup().apply(worktree_path)
+        _setup().apply(worktree_path)
+
+        assert marker.read_text() == "kept\n"
+
+    def test_an_environment_whose_interpreter_is_gone_is_removed(self, worktree_path):
+        # A base interpreter that has been upgraded out from under the venv.
+        # It satisfies every structural test except the one that matters.
+        venv = _install_environment(worktree_path, editable_source=worktree_path)
+        (venv / "bin" / "python").unlink()
+        (venv / "bin" / "python").symlink_to(worktree_path / "no-such-interpreter")
+
+        _setup().apply(worktree_path)
+
+        assert not venv.exists()
+
+    def test_an_unreadable_install_record_is_not_trusted(
+        self, worktree_path, monkeypatch
+    ):
+        # Unreadable is not evidence of provenance. Passing it would trust an
+        # environment on the strength of a question that was never answered.
+        venv = _install_environment(worktree_path, editable_source=worktree_path)
+        record = (
+            venv / "lib" / "python3.14" / "site-packages" / "_editable_impl_project.pth"
+        )
+        _break_read_of(monkeypatch, record, OSError("simulated read failure"))
+
+        _setup().apply(worktree_path)
+
+        assert not venv.exists()
+
+    def test_an_unremovable_untrusted_environment_fails_setup(
+        self, repo_root, worktree_path, monkeypatch
+    ):
+        # Same reasoning as the unremovable link: continuing would hand
+        # provisioning the environment that was just found untrustworthy.
+        venv = _install_environment(worktree_path, editable_source=repo_root)
+
+        def guarded(path, *args: Any, **kwargs: Any) -> None:
+            raise PermissionError("simulated rmtree failure")
+
+        monkeypatch.setattr("shutil.rmtree", guarded)
+
+        with pytest.raises(WorktreeError, match="names .*, which is outside"):
+            _setup().apply(worktree_path)
+
+        assert venv.is_dir()
 
 
 class TestEnforcedHooksAreAnInvariantNotARequest:

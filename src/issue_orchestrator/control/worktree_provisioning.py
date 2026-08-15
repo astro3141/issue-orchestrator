@@ -30,14 +30,19 @@ Three invariants ride along with running the commands:
   commands run on it.
 * **What it builds belongs to the worktree alone.** The recipe runs with the
   worktree as its working directory, so what it writes must stay there. It did
-  not: worktree creation used to plant a ``.venv`` symlink to the repository's,
-  and every run of a recipe that populates ``.venv`` wrote through it into the
-  environment every other checkout used — repointing that shared environment's
-  editable install at the worktree being provisioned, and leaving it broken when
-  the worktree was removed (#53). Worktree setup now guarantees the ``.venv`` is
-  the worktree's own (``adapters/worktree/_worktree_runtime.isolate_worktree_venv``),
-  which is also why concurrent provisioning needs no lock here: there is no
-  shared environment left to race over.
+  not, in two ways. Worktree creation used to plant a ``.venv`` symlink to the
+  repository's, and every run of a recipe that populates ``.venv`` wrote through
+  it into the environment every other checkout used (#53); and a ``.venv`` that
+  was a real directory was trusted for being a directory, so a worktree carrying
+  a stale environment handed the recipe an install record naming another
+  checkout, which the installer then "reconciled" by rewriting that checkout's
+  environment (#61). Either way the shared environment ended up repointed at the
+  worktree being provisioned, and broken when that worktree was removed. Worktree
+  setup now hands over a ``.venv`` that is this worktree's own healthy
+  environment or none at all
+  (``adapters/worktree/_worktree_venv.ensure_worktree_owns_its_venv``), which is
+  also why concurrent provisioning needs no lock here: there is no shared
+  environment left to race over.
 
 Authority
 ---------

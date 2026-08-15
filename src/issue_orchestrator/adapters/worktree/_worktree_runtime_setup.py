@@ -20,11 +20,11 @@ from ._worktree_runtime import (
     _configure_no_verify_dry_run,
     _hide_runtime_artifacts_from_git_status,
     install_worktree_identity,
-    isolate_worktree_venv,
     install_claude_settings,
     sync_cli_tools,
     unhide_repo_owned_cli_tools,
 )
+from ._worktree_venv import ensure_worktree_owns_its_venv
 
 logger = logging.getLogger(__name__)
 
@@ -126,7 +126,8 @@ class WorktreeRuntimeSetup:
 
         Raises:
             WorktreeError: If any step the session depends on cannot complete —
-                hook install, Claude settings, the no-verify flag, worktree
+                hook install, Claude settings, the no-verify flag, removing a
+                ``.venv`` this worktree cannot claim as its own, worktree
                 identity, or artifact hiding. A half-set-up worktree is a worse
                 outcome than a failed create the lifecycle can retry or
                 recreate from.
@@ -162,7 +163,7 @@ class WorktreeRuntimeSetup:
         _configure_no_verify_dry_run(
             worktree_path, self.allow_no_verify_dry_run_preflight
         )
-        isolate_worktree_venv(worktree_path)
+        ensure_worktree_owns_its_venv(worktree_path)
         synced_cli_tool_paths = list(sync_cli_tools(worktree_path))
         worktree_id = install_worktree_identity(worktree_path)
         _hide_runtime_artifacts_from_git_status(worktree_path, synced_cli_tool_paths)

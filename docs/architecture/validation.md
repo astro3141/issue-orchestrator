@@ -161,9 +161,52 @@ it, and already shared before this change; a run reads from them and adds to
 them rather than repointing them at itself. That is the property the `.venv`
 symlink did not have.
 
+#### A directory is not evidence that the environment is this worktree's
+
+Removing the link was not sufficient, because a `.venv` that was a **real
+directory** was trusted for being a directory — no check that it belonged to
+this worktree, none that it was usable. A worktree carrying what a previous
+failed run left behind therefore passed setup untouched, and the recipe's own
+reuse test was `[ -d .venv ]`, which a shell of a virtualenv satisfies. `uv
+sync` was handed an environment it could not use, found the project *installed,
+but mismatched* against an install record that lived in another checkout, and
+reconciled it by reinstalling editable there — moving that checkout's `.pth`.
+Same damage as the symlink, with no symlink involved. That was issue [#61].
+
+The rule is therefore stated as an invariant of the worktree rather than as a
+question about links: **a worktree's `.venv` is either this worktree's own
+healthy environment, or absent.** `adapters/worktree/_worktree_venv.py` owns it
+and asks two things of a `.venv` before it may be reused:
+
+| | What is checked | Why |
+|---|---|---|
+| Provenance | Every install record inside it (`.pth`, `.egg-link`, `direct_url.json`) names a path inside this worktree | A record naming another checkout is the incident's own evidence. The base interpreter is exempt: every virtualenv points at one, it is outside every worktree by construction, and it is read rather than rewritten |
+| Health | `pyvenv.cfg` is present and an interpreter resolves | The absence of `pyvenv.cfg` is *why* the interpreter resolved into a different environment. This is the shape the incident left behind: a `bin/python` and nothing else |
+
+Anything failing either is removed, and `worktrees.setup` rebuilds it. Removal
+never follows a link out of the worktree — a symlinked `.venv` is unlinked,
+never emptied — because deleting the contents of another checkout's environment
+would be the same defect with a larger blast radius.
+
+**The recipe's reuse test is sound because both halves hold.** `make venv-fast`
+no longer reuses on `[ -d .venv ]` alone: it requires `pyvenv.cfg` and a usable
+`bin/python`, and replaces the directory otherwise. That is all a recipe can
+check, since it cannot tell one checkout from another; provenance is the
+caller's guarantee, and worktree setup makes it before the recipe runs. Both
+are needed — the orchestrator is not `venv-fast`'s only caller.
+
+An environment that records paths outside its own checkout on purpose — a
+sibling package installed editable from a monorepo — is rebuilt every session
+under this rule. That is a decided trade-off: it is the one legitimate shape the
+rule rejects, and the alternative is trusting the shape the incident produced.
+
 `tests/integration/test_worktree_runtime_isolation.py` holds the
 failure-direction proof: a worktree provisions, is removed, and the primary
-checkout still resolves the package from its own source.
+checkout still resolves the package from its own source. It holds the same
+proof for the reuse shape — a worktree carrying a real-directory `.venv` whose
+install record names the primary checkout provisions without touching that
+checkout — and a reused worktree's *own* environment is proved to survive
+provisioning, so isolation is not being bought with a full install per session.
 
 ### What authority provisioning runs at
 
