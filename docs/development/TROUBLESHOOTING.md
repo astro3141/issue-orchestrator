@@ -102,6 +102,38 @@ cat $WORKTREE/.issue-orchestrator/sessions/index.json | jq '.runs'
 **Fix:** Run `make upgrade-deps` to re-resolve and sync, then commit `uv.lock` alongside
 the `pyproject.toml` change.
 
+### A Checkout's venv Imports Nothing (`ModuleNotFoundError: issue_orchestrator`)
+
+**Symptom:** A checkout that worked yesterday cannot import `issue_orchestrator`,
+so `prepush-check` cannot run and no push is possible from it. The editable
+install is still there — `_editable_impl_issue_orchestrator.pth` and
+`issue_orchestrator-*.dist-info` are both present — but the `.pth` names a
+worktree directory that no longer exists.
+
+**Cause:** Worktrees used to be given a `.venv` symlink to the repository's, so
+one environment served every checkout. A provisioning run in any worktree then
+repointed that shared environment's editable install at the worktree it was
+provisioning, and removing the worktree left the path dangling. That was
+[#53]; worktrees no longer share an environment
+(see [validation.md](../architecture/validation.md)), so this cannot recur —
+but an environment already in this state does not repair itself.
+
+**Fix (operator step, run once per affected checkout):**
+
+```bash
+cd <the affected checkout>
+make install                       # the canonical dependency sync
+.venv/bin/python -c "import issue_orchestrator as m; print(m.__file__)"
+```
+
+The printed path must be under *that checkout's* `src/`. This is deliberately
+a human's step: a session repairing the environment it is running in would be
+writing to the very thing under repair.
+
+A worktree left holding the old symlink needs nothing — the next session's
+worktree setup removes it and `worktrees.setup` builds the worktree its own
+environment.
+
 ### Sessions Failing Without Completion
 
 **Symptom:** Sessions end with "without completion markers", marked as FAILED.
