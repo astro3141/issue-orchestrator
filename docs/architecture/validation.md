@@ -115,18 +115,23 @@ repository's own build files. That is stated here rather than left implicit,
 because it is the same authority, in the same worktree, under which the
 configured validation gate already runs the repository's build and test code —
 `validation.quick.cmd` and `validation.publish.cmd` are shell commands run in
-the worktree too. It holds under ADR-0034's trusted-repository contract: the
-operator selects and onboards the repository the orchestrator works on, so its
-checked-in build configuration is a trusted input.
+the worktree too.
 
 Routing the rework, review and retrospective-review launches through the
 provisioner therefore adds no class of executed code and no authority that the
 gate in those same worktrees did not already carry; it makes that gate's
 verdict mean what the record says it means. The two bounds above — a recipe
-pinned outside the worktree, and a candidate the run may not alter — are what
-keep it from widening further. A stronger boundary (running repository code
-under a bounded execution substrate) is the separate untrusted-repository
-track, not this owner's job.
+pinned outside the worktree, and a candidate the run may not alter — are the
+bounds that are actually enforced, and both are checkable in
+`control/worktree_provisioning.py`.
+
+What is *not* written down is the permission itself: no document in this
+repository states under what contract repository-controlled build code may
+execute at orchestrator host authority, or what bounds that permission beyond
+the two above. That is recorded as a CONTRACT GAP in #55 and is not decided
+here. ADR-0034 (`ADR/0034-sandbox-scope.md`) is **Proposed** and defines
+SandboxScope; it defines no trusted-repository contract, so it cannot be cited
+as one.
 
 ### The one worktree that is exempt
 

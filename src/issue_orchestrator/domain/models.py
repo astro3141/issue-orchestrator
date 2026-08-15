@@ -855,10 +855,13 @@ class AgentConfig:
     # Provider-specific arguments (e.g., permission_mode for claude-code, approval_mode for codex)
     # Claude permission modes: default, acceptEdits, bypassPermissions, plan, dontAsk
     provider_args: dict[str, Any] = field(default_factory=dict)
-    # Opt-in (default OFF) to the orchestrator-computed OS sandbox (ADR-0034),
-    # under a TRUSTED-repository contract: the operator onboards the target repo,
-    # so its Claude config + the operator's user/managed settings are trusted, and
-    # the sandbox constrains the AGENT. When True, a claude-code launch replaces
+    # Opt-in (default OFF) to the orchestrator-computed OS sandbox (ADR-0034,
+    # which defines SandboxScope and is Proposed). The target repo's Claude
+    # config + the operator's user/managed settings are loaded as Claude Code
+    # normally loads a workspace's settings, and the sandbox constrains the
+    # AGENT. No canonical document states what makes repository-controlled
+    # configuration an acceptable input at this authority; that gap is recorded
+    # as a CONTRACT GAP in #55. When True, a claude-code launch replaces
     # yolo ``bypassPermissions`` with ``dontAsk`` + a bounded ``--settings``:
     # Bash and native file-tool WRITES are worktree-scoped, known secrets and
     # restricted egress are denied, and the agent cannot modify its own policy

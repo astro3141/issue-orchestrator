@@ -202,12 +202,17 @@ class ClaudeCodeProvider(CLIProvider):
     def apply_scope(self, scope: "SandboxScope") -> list[str]:
         """Translate a :class:`SandboxScope` into claude-code sandbox argv.
 
-        Under the trusted-repository contract (ADR-0034) the target repo's
-        configuration is trusted policy, so no settings-source guard is needed:
-        we translate the scope directly into Claude's native OS sandbox
-        (``--permission-mode dontAsk`` + inline ``--settings``). The boundary the
-        adapter still enforces is against the *agent* — worktree-scoped writes,
-        denied secrets/egress, and denied self-modification of the policy files.
+        The adapter applies no settings-source guard: the target repo's
+        checked-in Claude configuration is loaded as Claude Code normally loads
+        a workspace's settings, and the scope is translated directly into
+        Claude's native OS sandbox (``--permission-mode dontAsk`` + inline
+        ``--settings``). What this adapter constrains is the *agent* —
+        worktree-scoped writes, denied secrets/egress, and denied
+        self-modification of the policy files.
+
+        No canonical document states what makes repository-controlled
+        configuration an acceptable input at this authority; that gap is
+        recorded in **#55** and is not decided here.
         """
         from .sandbox import ClaudeSandboxAdapter
 

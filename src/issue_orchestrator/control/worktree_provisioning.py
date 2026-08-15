@@ -36,13 +36,18 @@ Provisioning runs the configured commands at orchestrator host authority in the
 worktree, and those commands resolve to the repository's own build files. That
 is the same authority, in the same worktree, under which the configured
 validation gate already runs the repository's build and test code
-(``docs/architecture/validation.md``), and it holds under ADR-0034's
-trusted-repository contract: the operator selects and onboards the repository
-the orchestrator works on. Extending provisioning to the rework and review
-launch paths therefore adds no class of code and no authority that the gate in
-those same worktrees did not already carry — it makes the gate's verdict mean
-what the record says it means. Anything stronger (a bounded execution
-substrate) is the separate untrusted-repository track, not this owner.
+(``docs/architecture/validation.md``). Extending provisioning to the rework and
+review launch paths therefore adds no class of executed code and no authority
+that the gate in those same worktrees did not already carry — it makes the
+gate's verdict mean what the record says it means.
+
+One bound on that permission is enforced here and is checkable:
+:meth:`WorktreeProvisioner._require_pinned_recipe` refuses to provision when the
+recipe's source resolves inside the worktree being provisioned, so a candidate
+cannot choose *which* commands run on it. What bounds the permission itself —
+under what contract repository-controlled build code may execute at orchestrator
+host authority at all — is not stated by any canonical document in this
+repository. It is recorded as a CONTRACT GAP in **#55** and is not decided here.
 """
 
 from __future__ import annotations
