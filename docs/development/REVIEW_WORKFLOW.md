@@ -405,10 +405,17 @@ configuring `review.tech_lead_review_agent` enables the workflow.
    through the completion result and the issue comment, *and* the refusal is
    held in the orchestrator's shared record of unrecorded refusals, which the
    same three paths read alongside the label. Without that, one failed label
-   write left a rejected candidate fully review-eligible. The in-process half
-   is bounded by the process — a refusal lost to a failed write and then to a
-   restart is unrecoverable, because nothing durable ever recorded it — and it
-   only ever withholds review, never grants it.
+   write left a rejected candidate fully review-eligible.
+
+   That record is durable. It latches into the orchestrator-owned ledger in
+   `.issue-orchestrator/state/pending_work_claims.sqlite` and rebuilds itself
+   from it at startup, so a refusal the gate could not record remotely keeps
+   withholding review across a restart rather than dying with the process.
+   The latch is strictly negative: it only ever *adds* a refusal, never grants
+   one, and it is not a second source of truth — the label remains the primary
+   record, and the next candidate that clears the gate releases the latch with
+   it. Which candidate holds review authority is a separate question the latch
+   deliberately does not answer.
 
 ## Review Decision Policy (Strict)
 

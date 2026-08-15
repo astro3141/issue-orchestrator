@@ -84,7 +84,7 @@ class InfraServices:
     # recovery and the launcher read them back, so a refusal that never
     # reached the issue still withholds review from the candidate it refused.
     unrecorded_refusals: UnrecordedRefusals = field(
-        default_factory=UnrecordedRefusals
+        default_factory=UnrecordedRefusals.process_local
     )
     instance_id: str = ""
     state_health_check: Callable[[], None] = field(default=_noop_health_check)

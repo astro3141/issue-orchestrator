@@ -918,11 +918,14 @@ def build_test_orchestrator_deps(
     from issue_orchestrator.entrypoints.bootstrap import create_attempt_store
     agent_callback_endpoint = ready_callback_endpoint()
     # One shared record of publication-gate refusals whose label write did not
-    # commit, wired exactly as bootstrap wires it (#45).
+    # commit, shared by the processor and the scanner as bootstrap shares it
+    # (#45). Process-local: this rig assembles components by hand and has no
+    # ledger to latch into, so restart durability (#51) is proved against the
+    # composition root instead.
     from issue_orchestrator.control.publication_authority import (
         UnrecordedRefusals,
     )
-    unrecorded_refusals = UnrecordedRefusals()
+    unrecorded_refusals = UnrecordedRefusals.process_local()
 
     completion_processor = CompletionProcessor(
         agent_callback_endpoint=agent_callback_endpoint,

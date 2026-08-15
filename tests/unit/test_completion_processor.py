@@ -4095,7 +4095,7 @@ class TestCompletionProcessorPublishGate:
             evaluate_review_validity,
         )
 
-        unrecorded = UnrecordedRefusals()
+        unrecorded = UnrecordedRefusals.process_local()
         mock_label_adapter.add_label.side_effect = RuntimeError("GitHub said no")
         mock_publish_gate.check.side_effect = publish_gate_outcome(
             allowed=False,

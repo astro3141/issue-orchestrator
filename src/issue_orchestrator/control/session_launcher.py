@@ -249,7 +249,7 @@ class SessionLauncher:
             from .label_manager import LabelManager
             label_manager = LabelManager(config)
         self._lm = label_manager
-        self._unrecorded_refusals = unrecorded_refusals or UnrecordedRefusals()
+        self._unrecorded_refusals = unrecorded_refusals or UnrecordedRefusals.process_local()
         self._tech_lead_needs_human = TechLeadNeedsHumanLifecycle(
             labels=label_manager,
             events=events,
