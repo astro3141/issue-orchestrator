@@ -50,19 +50,23 @@ rules is harmful):
   sandboxed Bash. ``sandbox.credentials.envVars`` (secret env-var unset) IS still
   emitted — that has no filesystem-path equivalent to duplicate.
 
-TRUST BOUNDARY (ADR-0034 trusted-repository contract). The orchestrator's
-operator selects and onboards the target repository, so its checked-in Claude
-configuration (project/local ``.claude/settings.json``) plus the operator's own
-user/managed settings are TRUSTED inputs — accepting workspace trust is
-authorization to load them, exactly as Claude Code normally treats a trusted
-workspace. ``sandbox: true`` therefore provides a provider-native, per-session
-boundary *under that trusted configuration*; it is NOT an "open an arbitrary
-hostile repository safely" mode (that is the separate untrusted-repository track,
-optional hardening in #6861 via an external isolation substrate). This adapter
-does not try to out-parse Claude's settings model; it translates the scope into
-Claude's native sandbox and constrains the AGENT.
+SETTINGS PROVENANCE — WHAT IS OBSERVABLE, AND WHAT IS UNDECIDED. The target
+repository's checked-in Claude configuration (project/local
+``.claude/settings.json``) is loaded alongside the operator's own user/managed
+settings, exactly as Claude Code loads the settings of a workspace it is pointed
+at; this adapter does not try to out-parse Claude's settings model. So
+``sandbox: true`` is a provider-native, per-session policy applied *on top of*
+whatever that configuration already says — it is not a mode for opening an
+arbitrary repository safely.
 
-WHAT THE ADAPTER CONSTRAINS (against the agent, not the trusted repo):
+No canonical document in this repository states what makes a repository's
+checked-in configuration an acceptable input here. ADR-0034
+(``docs/architecture/ADR/0034-sandbox-scope.md``) is **Proposed** and defines
+SandboxScope; it defines no trusted-repository contract. The missing contract is
+recorded as a CONTRACT GAP in **#55**. What *is* checkable is the list below:
+what this adapter constrains against the AGENT.
+
+WHAT THE ADAPTER CONSTRAINS (against the agent, not the repo):
 - **Writes** — Bash and native ``Edit`` (which governs Edit/Write/MultiEdit) are
   allowed only within the worktree write roots; outside is denied.
 - **Secrets** — one ``permissions.deny Read(path)`` per secret, which (because
@@ -447,8 +451,9 @@ def build_claude_sandbox_argv(
     Emits ``--permission-mode dontAsk`` (non-yolo, unattended, deny-by-default)
     and the sandbox settings as an inline ``--settings`` JSON string, serialized
     with sorted keys and compact separators for deterministic, testable output.
-    The trusted target-repo configuration is loaded normally (ADR-0034 trusted-
-    repository contract); the policy this adds constrains the agent, not the repo.
+    The target repo's own configuration is loaded normally (see SETTINGS
+    PROVENANCE in the module docstring); the policy this adds constrains the
+    agent, not the repo.
     """
     settings_json = json.dumps(
         build_claude_sandbox_settings(scope, git_access=git_access),
