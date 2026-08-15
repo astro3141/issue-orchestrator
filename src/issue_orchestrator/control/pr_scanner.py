@@ -99,7 +99,7 @@ class PRScanner:
             from .label_manager import LabelManager
             label_manager = LabelManager(config)
         self._lm = label_manager
-        self._unrecorded_refusals = unrecorded_refusals or UnrecordedRefusals()
+        self._unrecorded_refusals = unrecorded_refusals or UnrecordedRefusals.process_local()
         self._review_scope = ReviewScopeChecker(config, repository, log_prefix="SCANNER")
 
     def load_issue_branches(self) -> dict[int, str]:

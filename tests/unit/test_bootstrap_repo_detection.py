@@ -357,6 +357,31 @@ class TestBuildOrchestratorForTesting:
         github.get_issue_labels.return_value = []
         return github
 
+    def test_publication_refusals_survive_a_restart(
+        self, minimal_config: Config, mock_github: MagicMock
+    ) -> None:
+        """The composition root wires a DURABLE refusal record (#51).
+
+        A refusal whose label write did not commit is held nowhere else, so a
+        root that wired the process-local record would lose it to the next
+        restart and let review proceed for a candidate the gate refused. Two
+        builds over one repository state directory is that restart.
+        """
+        with patch("issue_orchestrator.entrypoints.bootstrap.install_gh_guard"):
+            before = build_orchestrator_for_testing(
+                config=minimal_config, github=mock_github
+            )
+            before.deps.services.unrecorded_refusals.hold(41)
+
+            after = build_orchestrator_for_testing(
+                config=minimal_config, github=mock_github
+            )
+
+        assert after.deps.services.unrecorded_refusals.holds(41), (
+            "a publication-gate refusal that could not be recorded remotely "
+            "must keep withholding review after a restart"
+        )
+
     def test_build_orchestrator_for_testing_with_all_defaults(
         self, minimal_config: Config, mock_github: MagicMock
     ) -> None:

@@ -538,7 +538,7 @@ class TestCompositionActuallyBuildsTheGate:
             agent_callback_endpoint=MagicMock(),
             attempt_store=create_attempt_store(Config.load(config_path)),
             needs_human_block=MagicMock(),
-            unrecorded_refusals=UnrecordedRefusals(),
+            unrecorded_refusals=UnrecordedRefusals.process_local(),
         )
         return processor
 

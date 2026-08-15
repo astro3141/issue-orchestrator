@@ -33,6 +33,13 @@ a refused candidate review-eligible, which is exactly the state this module
 exists to prevent, reachable through one failed write. A refusal that cannot be
 proved recorded is therefore held here instead, and read back beside the label,
 so "not provably recorded" withholds review rather than silently allowing it.
+
+That hold is itself durable (#51). Held only in process, it was lost to a
+restart, and review became eligible again for a candidate the gate had refused
+— the same hole one step further out. It is now latched in the
+orchestrator-owned ledger behind ``PublicationRefusalLatch``, and rebuilt from
+it at construction, so the fact that a refusal could not be recorded remotely
+outlives the process that observed it.
 """
 
 from __future__ import annotations
@@ -40,6 +47,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Sequence
 
+from ..ports.publication_refusal_latch import PublicationRefusalLatch
 from .completion_ports import LabelAdapter
 
 if TYPE_CHECKING:
@@ -48,38 +56,110 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-class UnrecordedRefusals:
-    """Publication-gate refusals whose durable write did not commit (#45).
+class _ProcessLocalLatch:
+    """A latch that remembers nothing across a restart.
 
-    One instance per orchestrator, shared by the writer
-    (:class:`PublicationAuthority`) and by every reader of the verdict, so a
-    refusal the label write lost still withholds review from the candidate it
-    refused. Held in process rather than on the issue precisely because the
-    issue is what could not be written; the durable marker remains the primary
-    record and this only ever *adds* refusals, never removes one the label
-    already proves.
-
-    The cover is therefore bounded by the process: a refusal lost to a failed
-    write and then lost again to a restart cannot be recovered from anywhere,
-    because nothing durable ever recorded it. That is a smaller hole than the
-    one it closes, and it fails in the same direction as the rest of the
-    verdict — a refusal is only ever forgotten when a later candidate is proved
-    to have cleared the gate.
-
-    Completions run off the tick thread, so the holder and the readers are
-    different threads. No lock: every operation is one atomic set operation,
-    and there is no read-modify-write to tear.
+    The pre-#51 behaviour, kept as an explicitly named null object for
+    compositions that genuinely have no ledger to write to (unit tests, and
+    control-layer defaults for collaborators a composition root always injects).
+    Production wires the durable latch; this one is never a silent substitute
+    for it, because a caller has to ask for it by name.
     """
 
     def __init__(self) -> None:
         self._issue_numbers: set[int] = set()
 
-    def hold(self, issue_number: int) -> None:
-        """Withhold review from this issue: its refusal is not recorded."""
+    def latch_publication_refusal(self, issue_number: int) -> None:
         self._issue_numbers.add(issue_number)
 
+    def release_publication_refusal(self, issue_number: int) -> None:
+        self._issue_numbers.discard(issue_number)
+
+    def latched_publication_refusals(self) -> frozenset[int]:
+        return frozenset(self._issue_numbers)
+
+
+class UnrecordedRefusals:
+    """Publication-gate refusals whose durable write did not commit (#45, #51).
+
+    One instance per orchestrator, shared by the writer
+    (:class:`PublicationAuthority`) and by every reader of the verdict, so a
+    refusal the label write lost still withholds review from the candidate it
+    refused. Held here rather than on the issue precisely because the issue is
+    what could not be written; the label remains the primary record and this
+    only ever *adds* refusals, never removes one the label already proves.
+
+    A hold survives a restart because it is latched in the orchestrator-owned
+    ledger and re-read here at construction (#51). The in-memory set is a
+    mirror, not a second source of truth: it exists so a read can never fail
+    open, and it is only ever narrower than the latch when a release commits.
+    It fails in the same direction as the rest of the verdict — a refusal is
+    only ever forgotten when a later candidate is proved to have cleared the
+    gate.
+
+    Completions run off the tick thread, so the holder and the readers are
+    different threads. No lock: every in-memory operation is one atomic set
+    operation with no read-modify-write to tear, and the latch owns its own
+    concurrency.
+    """
+
+    def __init__(self, latch: PublicationRefusalLatch) -> None:
+        self._latch = latch
+        # Rebuilt, not started empty: this is the whole of #51. Anything the
+        # previous process could not record remotely is still refused.
+        self._issue_numbers: set[int] = set(latch.latched_publication_refusals())
+
+    @classmethod
+    def process_local(cls) -> "UnrecordedRefusals":
+        """An instance with no durable latch: holds die with the process.
+
+        For compositions that have no ledger. A composition root that means to
+        survive a restart passes the real latch instead.
+        """
+        return cls(_ProcessLocalLatch())
+
+    def hold(self, issue_number: int) -> None:
+        """Withhold review from this issue: its refusal is not recorded.
+
+        The in-memory hold is taken FIRST so no reader can observe the issue as
+        unrefused while the latch is being written, and a latch write that
+        fails is logged rather than raised: it degrades to the process-bounded
+        cover, which is still strictly better than leaving the candidate
+        review-eligible, and raising here would destroy the caller's ability to
+        report the gate failure at all.
+        """
+        self._issue_numbers.add(issue_number)
+        try:
+            self._latch.latch_publication_refusal(issue_number)
+        except Exception as exc:
+            logger.error(
+                "Could not latch the unrecorded publication-gate refusal for "
+                "issue #%d durably; review stays withheld in this process, but "
+                "a restart before a later candidate clears the gate will lose "
+                "it: %s",
+                issue_number,
+                exc,
+            )
+
     def release(self, issue_number: int) -> None:
-        """Drop the hold, because the verdict is now settled elsewhere."""
+        """Drop the hold, because the verdict is now settled elsewhere.
+
+        The durable release commits first, and the in-memory hold is only
+        dropped once it has. A release that did not commit has settled nothing,
+        so keeping both fails closed: review stays withheld until the next
+        settlement succeeds, exactly as an uncommitted label removal does.
+        """
+        try:
+            self._latch.release_publication_refusal(issue_number)
+        except Exception as exc:
+            logger.warning(
+                "Could not release the durable publication-refusal latch for "
+                "issue #%d; review stays withheld until a later candidate "
+                "clears the gate: %s",
+                issue_number,
+                exc,
+            )
+            return
         self._issue_numbers.discard(issue_number)
 
     def holds(self, issue_number: int) -> bool:

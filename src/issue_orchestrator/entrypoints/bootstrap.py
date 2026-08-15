@@ -567,10 +567,6 @@ def build_orchestrator(
     # Create label manager (shared instance for all control-layer components)
     from ..control.label_manager import LabelManager as _LabelManager
     label_manager = _LabelManager(config)
-    # ONE record of publication-gate refusals whose label write did not commit
-    # (#45), shared by the processor that holds them and every reader of the
-    # verdict. Beside the label registry: it is the same verdict, unwritten.
-    unrecorded_refusals = UnrecordedRefusals()
 
     # Create claim management components
     claim_gate, lease_renewer, _lease_config, claim_manager, run_ownership = _create_claim_components(
@@ -643,18 +639,6 @@ def build_orchestrator(
     tech_lead_board_publisher = tech_lead.board_publisher
     fact_gatherer = tech_lead.fact_gatherer
 
-    # Create PR scanner and session restorer
-    pr_scanner = (
-        PRScanner(
-            config=config,
-            repository=github,
-            events=events,
-            issue_branches_fn=lambda: extract_issue_branches(working_copy, config.repo_root),
-            unrecorded_refusals=unrecorded_refusals,
-        )
-        if github
-        else None
-    )
     session_restorer = SessionRestorer(
         config=config,
         repository_host=github,
@@ -705,6 +689,27 @@ def build_orchestrator(
         action_applier=cast("ActionApplier", action_applier),
         label_writer=repository_host,
         label_manager=label_manager, events=events)
+
+    # ONE record of publication-gate refusals whose label write did not commit
+    # (#45), shared by the processor that holds them and every reader of the
+    # verdict. Built here, after the ledger, because the record is durable
+    # (#51): it latches into the orchestrator-owned claim store and rebuilds
+    # itself from it, so a refusal nothing could write to the issue still
+    # withholds review after a restart.
+    unrecorded_refusals = UnrecordedRefusals(pending_work.claims)
+
+    # Create PR scanner (after the refusals record it reads)
+    pr_scanner = (
+        PRScanner(
+            config=config,
+            repository=github,
+            events=events,
+            issue_branches_fn=lambda: extract_issue_branches(working_copy, config.repo_root),
+            unrecorded_refusals=unrecorded_refusals,
+        )
+        if github
+        else None
+    )
 
     completion_processor, session_controller_instance, completion_handler_factory = create_completion_components(
         config, github, events, working_copy, session_output, command_runner, provider_resilience,
@@ -940,7 +945,6 @@ def build_orchestrator_for_testing(
     # Create label manager (shared instance for all control-layer components)
     from ..control.label_manager import LabelManager as _LabelManager
     label_manager = _LabelManager(config)
-    unrecorded_refusals = UnrecordedRefusals()  # one per orchestrator (#45)
 
     default_label_sync = None
     # Only bound when this root builds the planner; a caller-injected planner
@@ -1023,16 +1027,6 @@ def build_orchestrator_for_testing(
         rate_limit_threshold=100,
     )
 
-    # Create PRScanner for testing
-    from ..control.pr_scanner import PRScanner
-    pr_scanner = PRScanner(
-        config=config,
-        repository=github,
-        events=events,
-        issue_branches_fn=lambda: extract_issue_branches(working_copy, config.repo_root),
-        unrecorded_refusals=unrecorded_refusals,
-    )
-
     # Create SessionRestorer for testing
     from ..control.session_restorer import SessionRestorer
     session_restorer = SessionRestorer(
@@ -1094,6 +1088,21 @@ def build_orchestrator_for_testing(
         repo_root=config.repo_root, repository_host=github,
         action_applier=action_applier, label_writer=github,
         label_manager=label_manager, events=events)
+
+    # One per orchestrator (#45), durably latched in the ledger above and
+    # rebuilt from it, so a test composition exercises the same restart
+    # behaviour production gets (#51).
+    unrecorded_refusals = UnrecordedRefusals(pending_work.claims)
+
+    # Create PRScanner for testing (after the refusals record it reads)
+    from ..control.pr_scanner import PRScanner
+    pr_scanner = PRScanner(
+        config=config,
+        repository=github,
+        events=events,
+        issue_branches_fn=lambda: extract_issue_branches(working_copy, config.repo_root),
+        unrecorded_refusals=unrecorded_refusals,
+    )
 
     completion_processor = CompletionProcessor(
         label_adapter=GovernedLabelSet(

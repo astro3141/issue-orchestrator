@@ -24,7 +24,25 @@ Two things follow from that boundary and are easy to get wrong:
 
 The quarantine table shares this database because it shares its trust boundary
 and its lifetime, but not its lifecycle: a quarantine outlives the claim it
-could not read and is cleared by a human, never by a session outcome.
+could not read and is cleared by a human, never by a session outcome. The
+shared-needs-human causes and the publication-refusal latch (#51) are here on
+the same terms — same boundary, same lifetime, their own lifecycles.
+
+The latch was measured against the other durable owners before landing here,
+and each was ruled out on what it is allowed to hold rather than on
+convenience: ``label_store.sqlite`` is a write-through GitHub mirror that
+startup reconciliation prunes back to GitHub truth, so it would erase a latch
+whose whole premise is that GitHub does NOT carry the label; ``timeline.sqlite``
+is a per-issue ring buffer with a ``delete(issue)``, and a gate cannot rely on
+evidence a trimming policy may drop; ``queue_cache.sqlite`` replaces and clears
+wholesale; ``state.json`` persists best-effort with save errors swallowed; the
+attempt sidecar is keyed by ``(issue, commit)``, which is candidate identity and
+therefore #50's question, not this one; ``publish_retry_locators.json`` is
+issue-keyed and durable but holds one typed record answering "how do I re-run
+publish for this failed issue", which is a different gate and a different
+meaning. What was needed was an issue-keyed, additive, never-trimmed,
+never-reconciled row in orchestrator-owned storage, which is exactly what this
+database already is.
 """
 
 from __future__ import annotations
@@ -109,6 +127,17 @@ CREATE TABLE IF NOT EXISTS needs_human_cause (
     reason TEXT NOT NULL,
     PRIMARY KEY (issue_number, cause)
 );
+-- Publication-gate refusals whose label write did not commit (#51). The label
+-- is the primary record of the verdict, so a row here means only "the gate
+-- refused this issue and could not say so remotely" - a fact nothing else
+-- durably holds, and one that must outlive the process that observed it or
+-- review becomes eligible again for a candidate the gate refused.
+-- Latching only ever WITHHOLDS review, so the worst a stale row can do is
+-- hold an issue until the next candidate clears the gate and releases it.
+-- NOTE: no semicolons in this comment - the schema is split on them.
+CREATE TABLE IF NOT EXISTS publication_refusal_latch (
+    issue_number INTEGER PRIMARY KEY
+);
 """
 
 # Additive columns the quarantine table gained after it shipped. ``CREATE TABLE
@@ -175,7 +204,12 @@ def _issue_number_of(claim: PendingWorkClaim) -> int:
 
 
 class SqlitePendingWorkClaimStore:
-    """Orchestrator-owned claim ledger and quarantine record for one repository."""
+    """Orchestrator-owned durable state for one repository.
+
+    The claim ledger and its quarantine record, plus the two additive latches
+    that only ever withhold: the shared-needs-human causes and the
+    publication-refusal latch (#51).
+    """
 
     def __init__(self, db_path: Path) -> None:
         self._db_path = db_path
@@ -575,6 +609,31 @@ class SqlitePendingWorkClaimStore:
                 "DELETE FROM needs_human_cause WHERE issue_number = ?",
                 (issue_number,),
             )
+
+    # -- publication-refusal latch (#51) -----------------------------------
+
+    def latch_publication_refusal(self, issue_number: int) -> None:
+        with self._write_lock, self._transaction() as conn:
+            conn.execute(
+                "INSERT INTO publication_refusal_latch (issue_number) VALUES (?) "
+                "ON CONFLICT(issue_number) DO NOTHING",
+                (issue_number,),
+            )
+
+    def release_publication_refusal(self, issue_number: int) -> None:
+        with self._write_lock, self._transaction() as conn:
+            conn.execute(
+                "DELETE FROM publication_refusal_latch WHERE issue_number = ?",
+                (issue_number,),
+            )
+
+    def latched_publication_refusals(self) -> frozenset[int]:
+        return frozenset(
+            int(row["issue_number"])
+            for row in self._get_connection().execute(
+                "SELECT issue_number FROM publication_refusal_latch"
+            )
+        )
 
     # -- quarantine --------------------------------------------------------
 

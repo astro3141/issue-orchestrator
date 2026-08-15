@@ -2319,7 +2319,7 @@ class TestLaunchReviewSession:
         clean. Launch is the last boundary that can withhold the review, and
         the unrecorded half of the verdict is all it has left to read.
         """
-        unrecorded = UnrecordedRefusals()
+        unrecorded = UnrecordedRefusals.process_local()
         unrecorded.hold(123)
         launcher_bundle = _build_launcher_bundle(
             sample_config,

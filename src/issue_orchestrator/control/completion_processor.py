@@ -266,7 +266,7 @@ class CompletionProcessor:
         self._publication_authority = PublicationAuthority(
             label_adapter,
             self._get_label("validation_failed"),
-            unrecorded_refusals or UnrecordedRefusals(),
+            unrecorded_refusals or UnrecordedRefusals.process_local(),
         )
         self.publication_gate = publication_gate
         self.pre_publish_gate = pre_publish_gate

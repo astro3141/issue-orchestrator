@@ -422,7 +422,7 @@ class TestScanForReviewsFiltering:
         refusals is the only thing standing between that and a review of a
         candidate the gate rejected.
         """
-        unrecorded = UnrecordedRefusals()
+        unrecorded = UnrecordedRefusals.process_local()
         unrecorded.hold(42)
         scanner = PRScanner(
             config=mock_config,

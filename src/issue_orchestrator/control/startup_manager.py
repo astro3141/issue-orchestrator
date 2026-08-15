@@ -145,7 +145,7 @@ class StartupManager:
             from .label_manager import LabelManager
             label_manager = LabelManager(config)
         self._lm = label_manager
-        self._unrecorded_refusals = unrecorded_refusals or UnrecordedRefusals()
+        self._unrecorded_refusals = unrecorded_refusals or UnrecordedRefusals.process_local()
         self._label_store = label_store
         # Gated-proposal ledger (#6778); None (tests) = no op-backed exclusions.
         self._tech_lead_authority = tech_lead_authority
