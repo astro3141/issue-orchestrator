@@ -1,4 +1,4 @@
-# Foundation validated-work disposition — minimal domain contract (rev 4)
+# Foundation validated-work disposition — minimal domain contract (rev 5)
 
 **Status: FROZEN, 2026-08-12; amended 2026-08-14 (rev 4, §2/§4/§11 — execution
 principal).** This file is the authority for the contract.
@@ -148,6 +148,14 @@ A disposition may enter `HELD_FOR_APPROVAL` only if **all** hold:
 findings, and the **reviewer execution principal is distinct from the actor
 execution principal**.
 
+**Review authority is the admitted review evidence bound to the exact candidate
+A.** It is not a label. A scheduler-facing label such as `code-reviewed` is a
+*projection* of that evidence for scheduling, and carries no commit identity; it
+cannot establish I2c on its own, and its presence on a work item whose candidate
+has since changed says nothing about the current candidate. Where a projection
+and the bound evidence disagree, the evidence is authoritative and the
+projection is stale.
+
 Distinctness is a comparison of principals only. Two executions of the same
 principal are the same principal however much their provenance differs, and two
 distinct principals stay distinct however identical their provenance is.
@@ -212,6 +220,14 @@ nor inherited:
 (issue 42, A2) → HELD_FOR_APPROVAL → approval Y
 ```
 
+**The same identity rule governs review authority.** A review bound to A is not
+revoked, deleted, or rewritten when the candidate becomes `A'`. It remains
+attributed to A as history, and it does not apply to `A'`. `A'` earns review
+authority only through its own admitted evidence. Removing a past review to
+"clear the way" for a successor destroys history to change a scheduling
+condition, which the projection rule above already covers: the projection may be
+recomputed, the evidence may not.
+
 **Corollary.** Any rework after approval invalidates it. There is no
 "approved, then adjusted" path — that property is what makes Gate 2 mean
 anything.
@@ -243,6 +259,34 @@ semantic source and the result would still satisfy it. The allowed surface is
 declared per project; this contract requires only that one exist and be checked.
 
 ---
+
+## 6a. Publication-side mutation and offer-for-review
+
+**Every remote branch push is a publication-side mutation.** Pushing changes
+state other parties observe; nothing about the pusher's intent makes it local.
+
+**Offering a candidate for review is a separate act.** The two are not the same
+event and must not be inferred from each other.
+
+A completion that ends `blocked` or `needs_human` pushes to preserve work and
+asks a human a question. That push is permitted **without** a publish-gate PASS:
+holding a question to the publish contract would replace the question with a
+validation failure. So for such a push:
+
+| | |
+|---|---|
+| publication-side mutation | **yes** |
+| offer-for-review | **no** |
+
+**A candidate arriving this way holds zero positive review authority.** The
+resulting head has no admitted review evidence bound to it, and a projection
+left by an earlier candidate is not evidence for it (§4). It becomes
+review-eligible only when a **fresh publication-gate PASS exists for that exact
+SHA**. The absence of a recorded refusal is not a grant.
+
+This holds regardless of whether a pull request was already open when the push
+landed. "Opens no PR" describes the pusher's request, not the state of the
+branch it wrote to.
 
 ## 7. Publication and crash recovery
 
@@ -394,14 +438,16 @@ Source-checked against the trusted runtime (`81c11ae1`).
 | **Conditional remote write (I7)** | Publication pushes use `--force-with-lease` **with no expected value** (`adapters/git/git_cli.py:193`, `execution/git_push_operations.py:150`). Bare `--force-with-lease` compares against the local remote-tracking ref — whatever the last fetch happened to record — not against the `expected_remote_head` the approval named. `ref_claim_adapter` does implement ref CAS, but for **claim refs**, and it is not a publication port | **GAP** |
 | Durable state across restart (I12) | run/task state stores, validation records keyed by SHA | **satisfied in mechanism** |
 | Blocking-class human signal (§9) | existing blocking-class labels | **satisfied** |
-| **Durable exact-SHA verdict binding (I2a, I2c)** | `reviewer-done` accepts `--summary --issues --risk --checks --pr-labels`; **no argument naming the reviewed commit**, and no durable record pairing a verdict with a SHA | **GAP** |
+| Exact-SHA verdict binding (I2a, I2c) | closed after the freeze by `613c66d8` (#15 / PR #16): `execution/review_exchange_records.py` writes `review-verdict.json` pairing the verdict with `reviewed_sha`, observed live. The orchestrator, not the reviewer's own JSON, names the SHA | **satisfied in mechanism** |
+| **Whole-evidence durability (I12)** | the verdict binding and the validation record are written inside the session worktree and do not survive its cleanup; the attempt record in the primary checkout survives and carries `candidate_sha`. Evidence that cannot be read back cannot be admitted | **GAP — #33 prerequisite 1** |
 | **Held-before-publish disposition state** | `awaiting-merge` exists but begins *after* publication (`post_publish_*`, reconciler) | **GAP** |
 | **Approval bound to exact A** | no approval record of any kind | **GAP** |
 | **Deterministic finalizer** | no post-approval deterministic step; `merge_queue` orders merges, it does not construct commits | **GAP** |
 
 ### Two findings worth stating precisely
 
-**The review gap is the absence of a durable exact-SHA verdict binding.** Not
+**The review gap is no longer the absence of an exact-SHA verdict binding; it is
+that the binding does not outlive the worktree that wrote it.** Not
 "review is PR-bound" — that framing describes an association IO happens to
 maintain and invites the wrong fix (decouple from PRs). The contract's
 requirement is narrower and harder: a verdict must be durably paired with the
@@ -471,3 +517,19 @@ One per invariant. Each decidable without a live model.
 - Gate 1 policy — who may approve scope, on what evidence.
 - What a given project's B contains.
 - Upstream submission. Upstream #7024 covers the general capability; track separately.
+
+---
+
+## Revision history
+
+**rev 5** — review authority is the admitted evidence bound to exact candidate
+A; scheduler-facing labels are projections and cannot establish I2c alone (§4).
+The §5 identity rule is extended to review authority: a review bound to A is
+retained as history and never applies to `A'`. New §6a separates
+publication-side mutation from offer-for-review, permits the `blocked` /
+`needs_human` preservation push without a publish-gate PASS, and states that the
+head it produces holds zero positive review authority until a fresh
+publication-gate PASS exists for that exact SHA. §10's exact-SHA verdict-binding
+row is corrected — that gap was closed by `613c66d8` after the freeze — and the
+remaining review-side gap is restated as whole-evidence durability (#33
+prerequisite 1). Decided in #50.
