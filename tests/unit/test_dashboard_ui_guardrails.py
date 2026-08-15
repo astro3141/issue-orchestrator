@@ -1821,12 +1821,41 @@ def test_dashboard_live_stream_has_one_owner_and_a_beacon_watchdog() -> None:
     js = _read_dashboard_js_bundle()
 
     assert "createLiveEventStream" in js
-    assert "applyLiveStreamStatus" in js
+    assert "createLiveStreamIndicator" in js
     assert "MISSED_BEACON_TOLERANCE" in js
     assert "checkWatchdog" in js
     # The reachability poll must not own the liveness banner again.
     assert "Engine restarting... waiting for service to recover." not in js
     assert "Engine reachable. Reconnecting event stream" not in js
+
+
+def test_live_stream_indicator_announces_state_not_the_ticking_detail() -> None:
+    """The polite region is the empty span, not the sentence that ticks (#44).
+
+    Structural backstop for an accessibility rule that only shows up in a
+    screen reader: the visible sentence carries a tick age and a reconnect
+    countdown and is rewritten about once a second, so if it were the live
+    region a healthy dashboard would announce itself forever. Behaviour —
+    "ten beacons produce one announcement" — is pinned in
+    ``tests/js/live_event_stream.test.js``.
+    """
+    tmpl = _read(DASHBOARD_TEMPLATE)
+    css = _read_dashboard_css_bundle()
+
+    status_open = tmpl[tmpl.index('id="liveStreamStatus"'):]
+    container = status_open[: status_open.index(">")]
+    assert 'aria-live' not in container, (
+        "the container holds the ticking detail; it must not be the live region"
+    )
+    assert 'role="status"' not in container
+
+    assert 'class="live-stream-status__announcement visually-hidden"' in tmpl
+    assert 'role="status" aria-live="polite"></span>' in tmpl, (
+        "the polite region must ship empty and already in the DOM, or the "
+        "first state change has no region to be announced in"
+    )
+    # The region is hidden by a utility the dashboard bundle actually defines.
+    assert ".visually-hidden {" in css
 
 
 def test_settings_page_uses_shared_embedded_nav_helper() -> None:

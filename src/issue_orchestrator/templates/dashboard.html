@@ -49,12 +49,22 @@
              "connecting" state so it occupies its space from first paint (no
              layout shift when JS takes over) and so the page can never be
              *silently* non-live: this region always states whether the view is
-             live, and says so in text plus a glyph, never colour alone. -->
+             live, and says so in text plus a glyph, never colour alone.
+
+             The visible text carries volatile detail (tick id, age, reconnect
+             countdown) and updates about once a second, so it is deliberately
+             NOT the live region — announcing it would re-read the status
+             continuously on a perfectly healthy dashboard. The polite region
+             is the empty span below, which is written only when the state
+             itself changes. It is rendered here, empty, rather than created by
+             JS, because a live region has to exist before its content changes
+             for the change to be announced at all. -->
         <div id="liveStreamStatus" class="live-stream-status live-stream-status--connecting"
-             data-live-state="connecting" data-connection="connecting" data-engine="unknown"
-             role="status" aria-live="polite">
+             data-live-state="connecting" data-connection="connecting" data-engine="unknown">
             <span class="live-stream-status__icon" aria-hidden="true">&#x25CC;</span>
             <span class="live-stream-status__text">Connecting to the live event stream&hellip;</span>
+            <span class="live-stream-status__announcement visually-hidden"
+                  role="status" aria-live="polite"></span>
         </div>
         {% if not validation_configured %}
         <div class="validation-warning-banner" id="validationWarningBanner" role="alert">

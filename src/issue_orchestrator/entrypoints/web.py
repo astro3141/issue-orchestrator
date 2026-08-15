@@ -12,7 +12,7 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
-from fastapi import FastAPI, Request
+from fastapi import Depends, FastAPI, Request
 from fastapi.responses import JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from sse_starlette.sse import EventSourceResponse
@@ -381,7 +381,7 @@ async def favicon():
 
 
 @app.get("/api/events")
-async def events(request: Request):
+async def events(request: Request, orchestrator=Depends(get_orchestrator)):
     """Server-Sent Events endpoint for real-time updates.
 
     The dashboard connects to this endpoint to receive instant notifications
@@ -390,13 +390,18 @@ async def events(request: Request):
     lets a consumer detect a dead stream — belong to
     :mod:`issue_orchestrator.entrypoints.web_event_stream`; this route only
     binds them to this module's subscriber registry and orchestrator.
+
+    The orchestrator arrives through ``Depends`` like every other route's, so
+    ``app.dependency_overrides`` reaches this stream too; closing over
+    ``get_orchestrator()`` directly would have made this the one route that
+    silently ignored the override.
     """
     return EventSourceResponse(
         stream_events(
             request,
             add_subscriber=add_event_subscriber,
             remove_subscriber=remove_event_subscriber,
-            read_liveness=lambda: read_engine_liveness(get_orchestrator()),
+            read_liveness=lambda: read_engine_liveness(orchestrator),
         )
     )
 

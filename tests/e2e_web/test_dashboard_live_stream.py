@@ -22,6 +22,7 @@ the status wording are pinned far more cheaply in
 
 from __future__ import annotations
 
+import re
 from urllib.parse import urlparse
 
 import pytest
@@ -125,9 +126,13 @@ def test_live_status_is_reachable_to_assistive_tech(
     authed_web_server: dict[str, object],
     cc_admin_token: str,
 ) -> None:
-    """The indicator is a polite live region, and never colour-only.
+    """The indicator carries a polite live region, and is never colour-only.
 
-    A status an operator cannot perceive is not an observability fix.
+    A status an operator cannot perceive is not an observability fix — and one
+    that re-reads itself every ten seconds is not either, so the live region is
+    the dedicated span rather than the sentence that ticks. That split is
+    pinned here in a real browser; the announcement *cadence* is pinned much
+    more cheaply in ``tests/js/live_event_stream.test.js``.
     """
     base_url = authed_web_server["url"]
     assert isinstance(base_url, str)
@@ -138,8 +143,6 @@ def test_live_status_is_reachable_to_assistive_tech(
     )
 
     status = page.locator("#liveStreamStatus")
-    expect(status).to_have_attribute("role", "status")
-    expect(status).to_have_attribute("aria-live", "polite")
     expect(status).to_be_visible()
     # The glyph is decorative; the state must survive in text alone.
     expect(status.locator(".live-stream-status__icon")).to_have_attribute(
@@ -147,3 +150,19 @@ def test_live_status_is_reachable_to_assistive_tech(
     )
     text = status.locator(".live-stream-status__text").inner_text().strip()
     assert text, "the live-stream status must never render as empty text"
+
+    announcement = status.locator(".live-stream-status__announcement")
+    expect(announcement).to_have_attribute("role", "status")
+    expect(announcement).to_have_attribute("aria-live", "polite")
+    expect(announcement).to_have_count(1)
+    # Hidden from sight, present for assistive tech: a real clip rect, not
+    # ``display: none`` (which would remove it from the accessibility tree and
+    # silence every announcement).
+    assert page.evaluate(
+        "() => getComputedStyle("
+        "document.querySelector('.live-stream-status__announcement')"
+        ").display"
+    ) != "none"
+    # It must actually carry the state once the stream reports one — an empty
+    # live region announces nothing at all.
+    expect(announcement).to_have_text(re.compile(r"\S"))

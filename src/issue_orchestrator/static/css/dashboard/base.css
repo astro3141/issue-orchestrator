@@ -103,6 +103,23 @@ html[data-embedded="true"] body > .container > header {
     padding: 18px 20px 28px;
 }
 
+/* Shared utility: content for assistive technology only. Lives in the base
+   chunk because it is a page-wide utility — it was previously declared in
+   ``issue_detail.css``, which made every other user of it depend on an
+   unrelated chunk staying loaded. Absolutely positioned, so it takes no part
+   in a flex parent's layout or gap. */
+.visually-hidden {
+    position: absolute !important;
+    width: 1px !important;
+    height: 1px !important;
+    padding: 0 !important;
+    margin: -1px !important;
+    overflow: hidden !important;
+    clip: rect(0, 0, 0, 0) !important;
+    white-space: nowrap !important;
+    border: 0 !important;
+}
+
 /* Live-stream liveness indicator (issue #44). Always present — it states
    whether the board is live rather than only warning when it is not, because
    "no banner" used to be indistinguishable from "the stream died an hour ago".

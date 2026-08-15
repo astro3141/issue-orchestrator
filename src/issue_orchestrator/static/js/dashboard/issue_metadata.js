@@ -301,6 +301,21 @@ async function toggleExcluded() {
         return;
     }
 
+    if (!statusElement) {
+        // ``createLiveStreamIndicator`` throws on a missing element, and it
+        // should — but this is module top-level, so letting it propagate would
+        // take unrelated dashboard code down with it. Report it and leave the
+        // subscription unstarted: a live stream nobody can see the state of is
+        // exactly what #44 was.
+        console.error('[SSE] #liveStreamStatus is missing; no live subscription');
+        return;
+    }
+
+    // The indicator is created once and owns its own nodes from then on, so
+    // the polite live region keeps its identity across every render — see
+    // ``createLiveStreamIndicator``.
+    const indicator = liveStream.createLiveStreamIndicator(statusElement, document);
+
     const stream = liveStream.createLiveEventStream({
         target: window,
         openStream: async () => {
@@ -322,7 +337,7 @@ async function toggleExcluded() {
             refreshViewModel({ reloadOnListChange: false });
         },
         onStatus: (status) => {
-            liveStream.applyLiveStreamStatus(statusElement, status, document);
+            indicator.render(status);
         },
     });
 

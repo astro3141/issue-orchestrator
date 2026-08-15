@@ -189,6 +189,109 @@ test('any event frame feeds the watchdog, not only the beacon', async () => {
 // Reconnection — always through openStream, which mints a fresh token
 // ---------------------------------------------------------------------------
 
+test('a connect attempt that never produces a frame is retried', async () => {
+    // The same silence, moved from an established stream to the connect
+    // attempt: the socket is accepted and then says nothing — no 'open', no
+    // 'error'. Before the connect deadline existed, the page parked on
+    // "Reconnecting in 1s" forever because nothing was timing the attempt.
+    const { clock, sources, stream } = await startedStream();
+    sources[0].emit('open');
+    sources[0].emit('engine.liveness', beacon());
+
+    clock.advance(30000);
+    assert.equal(stream.getStatus().connection, 'lost');
+
+    clock.advance(2000);
+    await flush();
+    assert.equal(sources.length, 2, 'reconnect must open a new stream');
+
+    // sources[1] is deliberately left silent — it never emits 'open' and
+    // never emits 'error'.
+    clock.advance(30000);
+    await flush();
+
+    assert.ok(sources.length >= 3,
+        `a silent connect attempt must be retried, got ${sources.length} attempts`);
+    assert.equal(sources[1].closed, true, 'the silent attempt must be closed');
+});
+
+test('a hung openStream does not park the page on a countdown forever', async () => {
+    // `fetch('/api/sse-token')` has no default timeout, so the token request
+    // itself can hang on exactly the network condition this module exists for.
+    // Nothing else can notice that: `openStream` simply never settles.
+    let calls = 0;
+    const clock = fakeClock();
+    const stream = liveStream.createLiveEventStream({
+        target: globalThis,
+        timers: clock.timers,
+        openStream: () => {
+            calls += 1;
+            return new Promise(() => {});
+        },
+    });
+    stream.start();
+    await flush();
+    assert.equal(calls, 1);
+
+    clock.advance(30000);
+    await flush();
+
+    assert.ok(calls >= 2, `a hung connect must be abandoned and retried, got ${calls}`);
+    assert.equal(stream.getStatus().connection, 'lost');
+});
+
+test('the first connect is under the same deadline as every later one', async () => {
+    // The initial attempt had a second hole: `lastFrameAt` was null, so the
+    // watchdog returned early and the page sat at "Connecting…" indefinitely.
+    let calls = 0;
+    const clock = fakeClock();
+    const stream = liveStream.createLiveEventStream({
+        target: globalThis,
+        timers: clock.timers,
+        openStream: async () => {
+            calls += 1;
+            return fakeEventSource();  // never emits anything
+        },
+    });
+    stream.start();
+    await flush();
+    assert.equal(stream.getStatus().connection, 'connecting');
+
+    clock.advance(30000);
+    await flush();
+
+    assert.ok(calls >= 2, `the first attempt must be timed too, got ${calls}`);
+});
+
+test('an abandoned attempt cannot install its source when it finally settles', async () => {
+    // The race the attempt token closes: the watchdog gives up at 25s, a new
+    // attempt is already running, and *then* the old promise resolves. Without
+    // the token that stale source becomes `source` and gets wired up, leaving
+    // two live subscriptions and a spent token replaying.
+    const resolvers = [];
+    const clock = fakeClock();
+    const stream = liveStream.createLiveEventStream({
+        target: globalThis,
+        timers: clock.timers,
+        openStream: () => new Promise((resolve) => resolvers.push(resolve)),
+    });
+    stream.start();
+    await flush();
+    assert.equal(resolvers.length, 1);
+
+    clock.advance(30000);
+    await flush();
+    assert.equal(resolvers.length, 2, 'the hung attempt must have been replaced');
+
+    const stale = fakeEventSource();
+    resolvers[0](stale);
+    await flush();
+
+    assert.equal(stale.closed, true, 'the abandoned source must be closed');
+    assert.equal(stale.has('engine.liveness'), false,
+        'an abandoned attempt must not be wired up as the live subscription');
+});
+
 test('a lost stream reconnects through openStream and returns to live', async () => {
     const { clock, sources, stream } = await startedStream();
     sources[0].emit('open');
@@ -330,36 +433,152 @@ test('a stalled engine is reported with its age and phase', () => {
     assert.match(described.text, /phase: planning/);
 });
 
-test('applyLiveStreamStatus writes a glyph node, a text node and a state hook', () => {
-    const created = [];
-    const element = {
-        className: '',
+// A node that remembers every write to `textContent`, because the thing under
+// test is not only *what* the indicator says but *how often it says it*: an
+// `aria-live` region that is rewritten on every beacon announces itself to a
+// screen reader every ten seconds, forever, on a perfectly healthy dashboard.
+function stubNode(className) {
+    return {
+        className,
         attributes: {},
         children: [],
-        textContent: '',
+        writes: [],
+        _text: '',
+        get textContent() { return this._text; },
+        set textContent(value) { this._text = value; this.writes.push(value); },
         setAttribute(name, value) { this.attributes[name] = value; },
         appendChild(child) { this.children.push(child); },
-    };
-    const doc = {
-        createElement: () => {
-            const node = { className: '', textContent: '', attributes: {},
-                setAttribute(n, v) { this.attributes[n] = v; } };
-            created.push(node);
-            return node;
+        querySelector(selector) {
+            const wanted = selector.replace(/^\./, '');
+            return this.children.find(
+                (child) => String(child.className).split(/\s+/).indexOf(wanted) !== -1,
+            ) || null;
         },
     };
+}
 
-    liveStream.applyLiveStreamStatus(element, {
-        connection: 'lost', engine: 'unknown', reconnectInSeconds: 5,
-    }, doc);
+function stubIndicator() {
+    const element = stubNode('live-stream-status');
+    const doc = { createElement: () => stubNode('') };
+    const indicator = liveStream.createLiveStreamIndicator(element, doc);
+    return {
+        element,
+        indicator,
+        icon: () => element.querySelector('.live-stream-status__icon'),
+        text: () => element.querySelector('.live-stream-status__text'),
+        announcement: () => element.querySelector('.live-stream-status__announcement'),
+    };
+}
+
+test('the indicator writes a glyph node, a text node and the state hooks', () => {
+    const { element, indicator, icon, text } = stubIndicator();
+
+    indicator.render({ connection: 'lost', engine: 'unknown', reconnectInSeconds: 5 });
 
     assert.equal(element.attributes['data-live-state'], 'lost');
     assert.equal(element.attributes['data-connection'], 'lost');
     assert.equal(element.attributes['data-engine'], 'unknown');
     assert.match(element.className, /live-stream-status--lost/);
-    assert.equal(element.children.length, 2);
-    assert.equal(element.children[0].attributes['aria-hidden'], 'true');
-    assert.match(element.children[1].textContent, /cached snapshot/);
+    assert.equal(icon().attributes['aria-hidden'], 'true');
+    assert.match(text().textContent, /cached snapshot/);
+});
+
+test('a healthy stream announces once, however many beacons arrive', () => {
+    const { indicator, text, announcement } = stubIndicator();
+
+    for (let i = 0; i < 10; i += 1) {
+        indicator.render({
+            connection: 'live', engine: 'advancing', tickId: 480 + i, secondsSinceTick: i,
+        });
+    }
+
+    assert.equal(announcement().writes.length, 1,
+        'ten beacons in one state must produce exactly one announcement');
+    assert.equal(text().writes.length, 10,
+        'the visible text must still track the detail on every beacon');
+    assert.match(text().textContent, /engine tick 489/);
+});
+
+test('the reconnect countdown is visible but never announced second by second', () => {
+    const { indicator, text, announcement } = stubIndicator();
+    indicator.render({ connection: 'live', engine: 'advancing', tickId: 12 });
+
+    for (let seconds = 8; seconds > 0; seconds -= 1) {
+        indicator.render({ connection: 'lost', engine: 'unknown', reconnectInSeconds: seconds });
+    }
+
+    assert.equal(announcement().writes.length, 2,
+        'the whole backoff window is one announcement, not one per second');
+    assert.match(announcement().textContent, /cached snapshot, not live/);
+    assert.match(text().textContent, /Reconnecting in 1s/);
+});
+
+test('every state transition is announced exactly once', () => {
+    const { indicator, announcement } = stubIndicator();
+
+    indicator.render({ connection: 'connecting', engine: 'unknown' });
+    indicator.render({ connection: 'live', engine: 'advancing', tickId: 1, secondsSinceTick: 1 });
+    indicator.render({ connection: 'live', engine: 'advancing', tickId: 2, secondsSinceTick: 1 });
+    indicator.render({ connection: 'live', engine: 'stalled', secondsSinceTick: 600 });
+    indicator.render({ connection: 'lost', engine: 'unknown', reconnectInSeconds: 2 });
+
+    assert.equal(announcement().writes.length, 4,
+        'four state changes, four announcements — the repeat beacon adds none');
+});
+
+test('no announcement embeds detail that can go stale between transitions', () => {
+    // The invariant that makes "announce only on change" safe: an announcement
+    // is a fixed sentence per state, so it cannot still be on screen claiming
+    // "3s ago" a minute later.
+    Object.keys(liveStream.LIVE_STREAM_PRESENTATION).forEach((state) => {
+        const row = liveStream.LIVE_STREAM_PRESENTATION[state];
+        assert.equal(typeof row.announcement, 'string',
+            `${state} must announce a fixed sentence, not a rendered view`);
+        assert.ok(row.announcement.length > 0, `${state} must announce something`);
+        assert.ok(!/\d/.test(row.announcement),
+            `${state} announcement must not embed a changing number`);
+    });
+});
+
+test('the polite region keeps its identity and its ARIA across renders', () => {
+    const { indicator, element, announcement } = stubIndicator();
+    indicator.render({ connection: 'connecting', engine: 'unknown' });
+    const first = announcement();
+
+    indicator.render({ connection: 'live', engine: 'advancing', tickId: 3 });
+    indicator.render({ connection: 'lost', engine: 'unknown', reconnectInSeconds: 4 });
+
+    assert.equal(announcement(), first,
+        'a live region rebuilt on every render is a new region each time');
+    assert.equal(first.attributes.role, 'status');
+    assert.equal(first.attributes['aria-live'], 'polite');
+    assert.match(first.className, /visually-hidden/);
+    assert.equal(element.children.length, 3);
+});
+
+test('the indicator adopts the server-rendered nodes instead of replacing them', () => {
+    // The template ships the region already in the DOM, empty, because a live
+    // region has to exist *before* its content changes to be announced at all.
+    const element = stubNode('live-stream-status');
+    const serverIcon = stubNode('live-stream-status__icon');
+    const serverText = stubNode('live-stream-status__text');
+    const serverRegion = stubNode('live-stream-status__announcement visually-hidden');
+    element.appendChild(serverIcon);
+    element.appendChild(serverText);
+    element.appendChild(serverRegion);
+
+    const indicator = liveStream.createLiveStreamIndicator(element, {
+        createElement: () => { throw new Error('must reuse the server-rendered nodes'); },
+    });
+    indicator.render({ connection: 'live', engine: 'advancing', tickId: 7, secondsSinceTick: 1 });
+
+    assert.equal(element.children.length, 3);
+    assert.match(serverText.textContent, /engine tick 7/);
+    assert.equal(serverRegion.writes.length, 1);
+});
+
+test('an indicator with no element fails loudly rather than rendering nowhere', () => {
+    assert.throws(() => liveStream.createLiveStreamIndicator(null, {}), /missing/);
 });
 
 test('formatAge stays readable across seconds, minutes and hours', () => {

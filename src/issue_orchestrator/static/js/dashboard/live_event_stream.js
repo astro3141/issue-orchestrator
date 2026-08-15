@@ -83,10 +83,21 @@
     // the only signal (WCAG 1.4.1), and every row produces text — there is no
     // state that renders as blank, because "blank" is exactly how a dead
     // stream used to look.
+    //
+    // Each row also carries an `announcement`: what a screen reader is told
+    // when the indicator *enters* this state. It is a plain string, not a
+    // function of the view, and that is the point — the visible text ticks
+    // (`3s ago`, `Reconnecting in 7s`) once a second on a healthy dashboard,
+    // and re-announcing that would turn a status region into a metronome. The
+    // announcement therefore says only what changed, and cannot go stale
+    // between transitions because it carries no volatile detail to go stale.
     const LIVE_STREAM_PRESENTATION = {
         lost: {
             tone: 'lost',
             icon: '✕',
+            announcement:
+                'Live updates lost. This view is a cached snapshot, not live. '
+                + 'Reconnecting.',
             text: (view) =>
                 'Live updates lost — this view is a cached snapshot, not live. '
                 + retryClause(view.reconnectInSeconds),
@@ -94,11 +105,13 @@
         connecting: {
             tone: 'connecting',
             icon: '◌',
+            announcement: 'Connecting to the live event stream.',
             text: () => 'Connecting to the live event stream…',
         },
         stalled: {
             tone: 'stalled',
             icon: '⚠',
+            announcement: 'Engine is not completing ticks.',
             text: (view) =>
                 'Engine is not completing ticks — last tick '
                 + `${formatAge(view.secondsSinceTick)}${phaseClause(view.phase)}.`,
@@ -106,11 +119,14 @@
         unknown: {
             tone: 'unknown',
             icon: '◌',
+            announcement:
+                'Live stream connected. The engine has not reported a tick yet.',
             text: () => 'Live stream connected — engine has not reported a tick yet.',
         },
         live: {
             tone: 'live',
             icon: '●',
+            announcement: 'Live. The engine is completing ticks.',
             text: (view) =>
                 `Live${tickClause(view.tickId)}, `
                 + `last tick ${formatAge(view.secondsSinceTick)}.`,
@@ -127,38 +143,101 @@
     }
 
     function describeLiveStreamStatus(view) {
-        const row = LIVE_STREAM_PRESENTATION[liveStreamStateKey(view)]
-            || LIVE_STREAM_PRESENTATION.unknown;
-        return { tone: row.tone, icon: row.icon, text: row.text(view) };
+        const state = liveStreamStateKey(view);
+        const row = LIVE_STREAM_PRESENTATION[state] || LIVE_STREAM_PRESENTATION.unknown;
+        return {
+            state,
+            tone: row.tone,
+            icon: row.icon,
+            announcement: row.announcement,
+            text: row.text(view),
+        };
     }
 
-    function applyLiveStreamStatus(element, view, doc) {
-        if (!element) return null;
-        const described = describeLiveStreamStatus(view);
-        element.className = `live-stream-status live-stream-status--${described.tone}`;
-        // Three hooks, because they answer three different questions and
-        // collapsing them is how "the transport is fine" got mistaken for
-        // "the engine is working". ``data-live-state`` is the presentation
-        // tone; the other two are the underlying facts.
-        element.setAttribute('data-live-state', described.tone);
-        element.setAttribute('data-connection', view.connection);
-        element.setAttribute('data-engine', view.engine);
-        const document_ = doc || (element.ownerDocument || null);
-        if (!document_ || typeof document_.createElement !== 'function') {
-            element.textContent = described.text;
+    // Reuse the node the server already rendered rather than replacing it.
+    // Node identity matters for the announcement region in particular: a live
+    // region that is torn down and rebuilt on every render is a *new* region
+    // each time, and assistive technology either re-reads it or misses the
+    // change entirely.
+    function childByClass(element, className, doc, decorate) {
+        if (typeof element.querySelector === 'function') {
+            const found = element.querySelector(`.${className}`);
+            if (found) return found;
+        }
+        const node = doc.createElement('span');
+        node.className = className;
+        if (decorate) decorate(node);
+        element.appendChild(node);
+        return node;
+    }
+
+    // Owner of the indicator's DOM. It exists because the indicator has state
+    // the caller must not have to keep: which nodes are its own, and which
+    // state was last *announced*. Rendering used to be a free function that
+    // cleared and rebuilt the element on every publish — which, once the
+    // region became permanent and `aria-live`, meant a screen reader user on a
+    // perfectly healthy dashboard heard the status re-read every beacon.
+    //
+    // So the split here is deliberate: the visible text is refreshed on every
+    // render (an operator watching the page wants the countdown to run), and
+    // the polite region is written only when the state itself changes.
+    function createLiveStreamIndicator(element, doc) {
+        if (!element) {
+            // Failing loudly beats a dashboard whose liveness indicator has
+            // silently stopped rendering — an indicator that says nothing is
+            // indistinguishable from the frozen board this module exists to
+            // make impossible.
+            throw new Error('live-stream indicator element is missing');
+        }
+        const document_ = doc || element.ownerDocument || null;
+        const canBuildNodes = !!(document_ && typeof document_.createElement === 'function');
+        let iconNode = null;
+        let textNode = null;
+        let announcementNode = null;
+        let announcedState = null;
+
+        function ensureNodes() {
+            if (iconNode) return;
+            iconNode = childByClass(
+                element, 'live-stream-status__icon', document_,
+                (node) => node.setAttribute('aria-hidden', 'true'),
+            );
+            textNode = childByClass(element, 'live-stream-status__text', document_);
+            announcementNode = childByClass(
+                element, 'live-stream-status__announcement', document_,
+                (node) => {
+                    node.className = 'live-stream-status__announcement visually-hidden';
+                    node.setAttribute('role', 'status');
+                    node.setAttribute('aria-live', 'polite');
+                },
+            );
+        }
+
+        function render(view) {
+            const described = describeLiveStreamStatus(view);
+            element.className = `live-stream-status live-stream-status--${described.tone}`;
+            // Three hooks, because they answer three different questions and
+            // collapsing them is how "the transport is fine" got mistaken for
+            // "the engine is working". ``data-live-state`` is the presentation
+            // tone; the other two are the underlying facts.
+            element.setAttribute('data-live-state', described.tone);
+            element.setAttribute('data-connection', view.connection);
+            element.setAttribute('data-engine', view.engine);
+            if (!canBuildNodes) {
+                element.textContent = described.text;
+                return described;
+            }
+            ensureNodes();
+            iconNode.textContent = described.icon;
+            textNode.textContent = described.text;
+            if (described.state !== announcedState) {
+                announcedState = described.state;
+                announcementNode.textContent = described.announcement;
+            }
             return described;
         }
-        element.textContent = '';
-        const icon = document_.createElement('span');
-        icon.className = 'live-stream-status__icon';
-        icon.setAttribute('aria-hidden', 'true');
-        icon.textContent = described.icon;
-        const text = document_.createElement('span');
-        text.className = 'live-stream-status__text';
-        text.textContent = described.text;
-        element.appendChild(icon);
-        element.appendChild(text);
-        return described;
+
+        return { render };
     }
 
     // The one place a beacon payload becomes an engine reading. Anything the
@@ -202,7 +281,12 @@
         let reconnectTimer = null;
         let watchdogTimer = null;
         let lastFrameAt = null;
+        let connectStartedAt = null;
         let reconnectAt = null;
+        // Every connect attempt is stamped, so an attempt the watchdog has
+        // already given up on cannot resurrect itself when its promise
+        // eventually settles and install a second source.
+        let attemptToken = 0;
         let intervalSeconds = FALLBACK_INTERVAL_SECONDS;
 
         // The published view of the subscription: what the transport is
@@ -257,8 +341,13 @@
         }
 
         function declareLost() {
+            // Abandon any attempt still in flight before opening the next one,
+            // or a hung `openStream` that resolves later would install its
+            // source on top of the reconnect this call is about to schedule.
+            attemptToken += 1;
             closeSource();
             lastFrameAt = null;
+            connectStartedAt = null;
             setConnection('lost');
             scheduleReconnect();
         }
@@ -272,6 +361,11 @@
             publish();
             reconnectTimer = timers.setTimeout(() => {
                 reconnectTimer = null;
+                // The countdown is over the moment the attempt begins. Leaving
+                // `reconnectAt` set would park the watchdog on the countdown
+                // branch below, and a connect that then hangs would never be
+                // timed by anything.
+                reconnectAt = null;
                 connect();
             }, waitMs);
         }
@@ -279,6 +373,14 @@
         // The watchdog is the whole point: it needs no cooperation from the
         // browser's error reporting, so it catches the half-open case that
         // `onerror` provably misses.
+        //
+        // It times whatever the subscription is currently waiting on — a frame
+        // on an established stream, or the connect attempt that has not
+        // produced its first frame yet. Those are the same failure: nothing is
+        // reported. A connect can hang exactly as silently as a stream can
+        // (a `fetch` for the SSE token has no default timeout; a socket can be
+        // accepted and then blackholed, firing neither `open` nor `error`), so
+        // it gets the same deadline rather than being trusted to settle.
         function checkWatchdog() {
             if (!started) return;
             if (reconnectAt !== null) {
@@ -286,8 +388,9 @@
                 publish();
                 return;
             }
-            if (lastFrameAt === null) return;
-            const silentSeconds = (timers.now() - lastFrameAt) / 1000;
+            const waitingSince = lastFrameAt === null ? connectStartedAt : lastFrameAt;
+            if (waitingSince === null) return;
+            const silentSeconds = (timers.now() - waitingSince) / 1000;
             if (silentSeconds > intervalSeconds * MISSED_BEACON_TOLERANCE) {
                 declareLost();
             }
@@ -296,13 +399,22 @@
         async function connect() {
             if (!started) return;
             closeSource();
+            attemptToken += 1;
+            const token = attemptToken;
+            connectStartedAt = timers.now();
+            // The countdown ended with the wait, and the watchdog stops
+            // publishing it here, so clear it rather than leaving the last
+            // rendered "Reconnecting in 1s" frozen on screen for the length of
+            // the attempt.
+            view.reconnectInSeconds = null;
             setConnection(view.connection === 'lost' ? 'lost' : 'connecting');
+            publish();
             try {
                 if (typeof openStream !== 'function') {
                     throw new Error('openStream is not available');
                 }
                 const opened = await openStream();
-                if (!started) {
+                if (!started || token !== attemptToken) {
                     try { opened.close(); } catch (_e) { /* torn down mid-open */ }
                     return;
                 }
@@ -326,6 +438,9 @@
                 });
                 wireEvents(source, noteFrame);
             } catch (_err) {
+                // A superseded attempt has already been accounted for; letting
+                // it declare loss again would restart the backoff it lost.
+                if (!started || token !== attemptToken) return;
                 declareLost();
             }
         }
@@ -342,7 +457,14 @@
 
         function stop() {
             started = false;
+            attemptToken += 1;
             closeSource();
+            // A stale deadline left behind here would still be in force on the
+            // next start(): a non-null `reconnectAt` parks the watchdog on the
+            // countdown branch, which is the branch that never checks silence.
+            reconnectAt = null;
+            connectStartedAt = null;
+            lastFrameAt = null;
             if (reconnectTimer !== null) {
                 timers.clearTimeout(reconnectTimer);
                 reconnectTimer = null;
@@ -366,10 +488,11 @@
 
     const api = {
         LIVENESS_EVENT,
+        LIVE_STREAM_PRESENTATION,
         MISSED_BEACON_TOLERANCE,
-        applyLiveStreamStatus,
         backoffMs,
         createLiveEventStream,
+        createLiveStreamIndicator,
         describeLiveStreamStatus,
         formatAge,
     };

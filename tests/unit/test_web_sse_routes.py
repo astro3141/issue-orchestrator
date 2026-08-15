@@ -364,7 +364,7 @@ class TestSSEEventStreamFormat:
 
         with swapped_event_subscribers(NotifyingSet(ready)):
             request = DummyRequest()
-            response = await web.events(request)
+            response = await web.events(request, orchestrator=None)
             iterator = response.body_iterator
 
             async def read_chunk():
@@ -381,8 +381,11 @@ class TestSSEEventStreamFormat:
             assert beacon_payload["schema"] == EVENT_SCHEMA_VERSION
             assert beacon_payload["interval_seconds"] > 0
 
+            # No yield-to-scheduler needed: the subscriber queue buffers, so
+            # broadcasting before the reader reaches ``queue.get()`` is the
+            # same ordering either way. The registration signal above is the
+            # only synchronisation this test has, by design.
             read_task = asyncio.create_task(read_chunk())
-            await asyncio.sleep(0)
             await broadcast_event("session.started", {"issue_number": 123, "status": "active"})
 
             chunk = await read_task

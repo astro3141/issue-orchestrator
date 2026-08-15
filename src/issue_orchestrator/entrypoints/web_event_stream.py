@@ -36,13 +36,16 @@ import logging
 import time
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
+from typing import Protocol
 
 from fastapi import Request
 from sse_starlette import ServerSentEvent
 
 from ..contracts.public import EngineLivenessPayload
 from ..domain.engine_liveness import EngineLiveness, classify_engine_liveness
+from ..domain.models import OrchestratorState
 from ..events.catalog import EventName
+from ..events.context import EventContext
 from ..events.sse_envelope import apply_sse_envelope
 
 logger = logging.getLogger(__name__)
@@ -51,6 +54,7 @@ __all__ = [
     "LIVENESS_INTERVAL_SECONDS",
     "SUBSCRIBER_QUEUE_MAXSIZE",
     "EngineLivenessReader",
+    "LivenessSource",
     "liveness_frame_payload",
     "stream_events",
 ]
@@ -72,6 +76,21 @@ SUBSCRIBER_QUEUE_MAXSIZE = 100
 #: Supplies the current engine reading. Injected rather than reached for, so
 #: the stream can be driven in tests without an orchestrator.
 EngineLivenessReader = Callable[[], EngineLiveness]
+
+
+class LivenessSource(Protocol):
+    """The slice of the orchestrator facade a liveness reading needs.
+
+    Named as a Protocol rather than taken as ``object`` so this seam is typed:
+    a facade that stops exposing tick state fails type-checking here instead of
+    at runtime behind a suppression.
+    """
+
+    @property
+    def state(self) -> OrchestratorState: ...
+
+    @property
+    def event_context(self) -> EventContext: ...
 
 
 @dataclass(frozen=True)
@@ -108,7 +127,7 @@ def liveness_frame_payload(
     )
 
 
-def read_engine_liveness(orchestrator: object | None) -> EngineLiveness:
+def read_engine_liveness(orchestrator: LivenessSource | None) -> EngineLiveness:
     """Take a liveness reading from a (possibly absent) orchestrator facade.
 
     ``None`` is a real production state — the web surface binds its port
@@ -129,7 +148,7 @@ def read_engine_liveness(orchestrator: object | None) -> EngineLiveness:
     if not isinstance(tick_id, int) or isinstance(tick_id, bool):
         tick_id = None
     return classify_engine_liveness(
-        orchestrator.state,  # pyright: ignore[reportAttributeAccessIssue]
+        orchestrator.state,
         tick_id=tick_id,
         now=time.time(),
     )
