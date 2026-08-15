@@ -208,6 +208,43 @@ install record names the primary checkout provisions without touching that
 checkout — and a reused worktree's *own* environment is proved to survive
 provisioning, so isolation is not being bought with a full install per session.
 
+#### What `.deps-synced` claims
+
+**`<venv>/.deps-synced` states that the environment beside it is usable by this
+checkout — not that a setup recipe ran to the end.** The distinction is the
+whole of issue [#60]. `venv-fast` wrote the marker with a bare `touch` in a
+`;`-separated shell block, so a `uv sync` that failed, or one that succeeded
+having installed nothing, still reached the `touch`; `make` still exited 0,
+because the last statement in the block had succeeded. A provisioning run
+measured during [#53] left the marker present next to three entries in
+`site-packages` and no editable `.pth` — an environment that could not import
+the project it claimed to have installed. A marker that cannot fail is worse
+than no marker, because it invites exactly the reliance that makes the false
+positive load-bearing.
+
+So no recipe writes it. `scripts/deps_marker.sh` owns the rule, and every
+writer goes through it:
+
+| Step | What it does | Why |
+|---|---|---|
+| `clear` before the sync | Removes the marker | The claim is withdrawn before the work that would re-establish it, so a sync that aborts halfway cannot leave yesterday's marker asserting today's environment |
+| the sync itself | `set -e` in the recipe block | A failed `uv sync` fails the recipe instead of being swallowed by the `;` separator |
+| `record` after the sync | Verifies, then writes | `python -I -c "import issue_orchestrator"` must resolve inside this checkout. Isolated mode is required: agent sessions export a `PYTHONPATH` pointing at the Control Centre snapshot, which would otherwise answer for a different checkout |
+
+The Semgrep tool environment carries a marker of the same name
+(`.venv-semgrep/.deps-synced`) and is deliberately outside this rule: it is
+synced with `--no-install-project`, so there is no project install in it to
+probe. Its recipe writes the marker only on a successful sync, and its reuse
+test asks for an executable `bin/semgrep`.
+
+The Control Centre launcher has asked that same question of its own environment
+since before the marker did (`verify_project_install`), and now sources the
+shared rule rather than keeping a second copy of it — one marker, one meaning,
+one owner. `tests/unit/test_deps_synced_marker.py` holds the failure-direction
+proof: a `uv sync` that fails, one that installs nothing, and one that installs
+another checkout each leave `venv-fast` non-zero with no marker, including when
+an earlier healthy run had left one behind.
+
 ### What authority provisioning runs at
 
 Provisioning executes the configured commands at orchestrator host authority,

@@ -85,6 +85,16 @@ SEMGREP_PROJECT ?= tools/semgrep
 SEMGREP_VENV ?= .venv-semgrep
 SEMGREP_DEPS_MARKER ?= $(SEMGREP_VENV)/.deps-synced
 
+# `.venv/.deps-synced` says the environment is usable by this checkout, not that
+# a recipe ran to the end (#60). No recipe here writes it with `touch`: every
+# sync withdraws the claim first (`clear`) and re-establishes it afterwards
+# (`record`), and `record` refuses when the environment cannot import the
+# project from this checkout. `scripts/deps_marker.sh` owns the rule and states
+# why. DEPS_MARKER below is the read side — `sync-deps` compares its
+# mtime against the manifests.
+DEPS_MARKER ?= .venv/.deps-synced
+DEPS_MARKER_TOOL ?= scripts/deps_marker.sh
+
 # Auto-install uv if not present (one-time per machine)
 ensure-uv:
 	@if [ ! -x "$(UV)" ]; then \
@@ -99,13 +109,15 @@ venv: ensure-uv
 		rm -rf .venv; \
 	fi
 	@echo "Creating venv with $(SYSTEM_PYTHON) and installing dependencies..."
-	@t0=$$(date +%s); \
+	@$(DEPS_MARKER_TOOL) clear .venv
+	@set -e; \
+	t0=$$(date +%s); \
 	$(UV) venv .venv --python $(SYSTEM_PYTHON); \
 	t1=$$(date +%s); \
 	$(UV) sync --frozen --all-extras; \
 	t2=$$(date +%s); \
-	touch .venv/.deps-synced; \
 	echo "venv pid=$$$$ ts=$$(date -Iseconds) pwd=$$(pwd) uv_venv=$$((t1-t0))s uv_sync=$$((t2-t1))s total=$$((t2-t0))s" >> $(SETUP_LOG)
+	@$(DEPS_MARKER_TOOL) record .venv .
 	@$(GMAKE) --no-print-directory semgrep-venv
 	@echo ""
 	@echo "Done! Activate with: source .venv/bin/activate"
@@ -129,7 +141,9 @@ venv: ensure-uv
 # orchestrator is not the only caller.
 venv-fast: ensure-uv
 	@mkdir -p $$(dirname $(SETUP_LOG))
-	@if [ ! -f .venv/pyvenv.cfg ] || [ ! -x .venv/bin/python ]; then \
+	@$(DEPS_MARKER_TOOL) clear .venv
+	@set -e; \
+	if [ ! -f .venv/pyvenv.cfg ] || [ ! -x .venv/bin/python ]; then \
 		echo "Creating venv with $(SYSTEM_PYTHON) and installing dependencies..."; \
 		rm -rf .venv; \
 		t0=$$(date +%s); \
@@ -142,8 +156,8 @@ venv-fast: ensure-uv
 	fi; \
 	$(UV) sync --frozen --all-extras; \
 	t2=$$(date +%s); \
-	touch .venv/.deps-synced; \
 	echo "venv-fast pid=$$$$ ts=$$(date -Iseconds) pwd=$$(pwd) uv_venv=$$((t1-t0))s uv_sync=$$((t2-t1))s total=$$((t2-t0))s" >> $(SETUP_LOG)
+	@$(DEPS_MARKER_TOOL) record .venv .
 	@$(GMAKE) --no-print-directory semgrep-venv
 	@echo ""
 	@echo "Done! Activate with: source .venv/bin/activate"
@@ -166,7 +180,9 @@ venv-pip:
 		rm -rf .venv; \
 	fi
 	@echo "Creating venv with $(SYSTEM_PYTHON) (pip fallback)..."
-	@t0=$$(date +%s); \
+	@$(DEPS_MARKER_TOOL) clear .venv
+	@set -e; \
+	t0=$$(date +%s); \
 	$(SYSTEM_PYTHON) -m venv .venv; \
 	t1=$$(date +%s); \
 	echo "Installing agent-runner package first..."; \
@@ -175,8 +191,8 @@ venv-pip:
 	echo "Installing main package with dev dependencies..."; \
 	.venv/bin/pip install -e ".[dev]"; \
 	t3=$$(date +%s); \
-	touch .venv/.deps-synced; \
 	echo "venv-pip pid=$$$$ ts=$$(date -Iseconds) pwd=$$(pwd) venv_create=$$((t1-t0))s pip_agent_runner=$$((t2-t1))s pip_dev_deps=$$((t3-t2))s total=$$((t3-t0))s" >> $(SETUP_LOG)
+	@$(DEPS_MARKER_TOOL) record .venv .
 	@echo ""
 	@echo "Done! Activate with: source .venv/bin/activate"
 
@@ -209,9 +225,10 @@ worktree-setup: venv-fast
 
 # Install/reinstall dependencies
 install: ensure-uv
+	@$(DEPS_MARKER_TOOL) clear .venv
 	$(UV) sync --frozen --all-extras
 	@$(GMAKE) --no-print-directory semgrep-venv
-	@touch .venv/.deps-synced
+	@$(DEPS_MARKER_TOOL) record .venv .
 
 preview-readme:
 	$(SYSTEM_PYTHON) scripts/preview_markdown.py README.md --output .preview/README.html
@@ -228,9 +245,10 @@ else
 	$(UV) lock
 endif
 	@echo "Syncing dependencies..."
+	@$(DEPS_MARKER_TOOL) clear .venv
 	$(UV) sync --frozen --all-extras
 	@$(GMAKE) --no-print-directory semgrep-venv
-	@touch .venv/.deps-synced
+	@$(DEPS_MARKER_TOOL) record .venv .
 	@echo ""
 	@echo "Done! Commit uv.lock with your changes."
 
@@ -276,9 +294,10 @@ else
 	cd packages/vscode && npm update
 endif
 	@echo "==> Syncing Python environment..."
+	@$(DEPS_MARKER_TOOL) clear .venv
 	$(UV) sync --frozen --all-extras
 	@$(GMAKE) --no-print-directory semgrep-venv
-	@touch .venv/.deps-synced
+	@$(DEPS_MARKER_TOOL) record .venv .
 	@echo ""
 	@echo "==> Verifying with the full required suite (agent lane + test-vscode)..."
 	@# validate-pr-raw, not validate: `validate` stops at _validate-impl and omits
@@ -389,13 +408,12 @@ SIMULATED_AGENT_FILES := tests/simulated_scenarios/test_foreign_repo_lifecycle.p
 # Python interpreter for dependency checks
 PYTHON ?= .venv/bin/python
 
-# Marker file for tracking when deps were last synced
-DEPS_MARKER ?= .venv/.deps-synced
-
 # Auto-sync dependencies if pyproject.toml or uv.lock is newer than last sync
 # This prevents cryptic errors like "unrecognized arguments: -n" when pytest-xdist is missing
+# (DEPS_MARKER and the rule it obeys are defined next to the venv targets above.)
 sync-deps:
-	@if [ ! -f $(DEPS_MARKER) ] || [ pyproject.toml -nt $(DEPS_MARKER) ] || [ uv.lock -nt $(DEPS_MARKER) ]; then \
+	@set -e; \
+	if [ ! -f $(DEPS_MARKER) ] || [ pyproject.toml -nt $(DEPS_MARKER) ] || [ uv.lock -nt $(DEPS_MARKER) ]; then \
 		echo ""; \
 		echo "================================================================"; \
 		echo "[sync-deps] Dependencies changed since last install"; \
@@ -405,7 +423,9 @@ sync-deps:
 			echo "ERROR: uv not found. Run: curl -LsSf https://astral.sh/uv/install.sh | sh"; \
 			exit 1; \
 		fi; \
-		$(UV) sync --frozen --all-extras && touch $(DEPS_MARKER) && \
+		$(DEPS_MARKER_TOOL) clear .venv && \
+		$(UV) sync --frozen --all-extras && \
+		$(DEPS_MARKER_TOOL) record .venv . && \
 		echo "[sync-deps] Done. Continuing with original command..."; \
 		echo ""; \
 	fi
