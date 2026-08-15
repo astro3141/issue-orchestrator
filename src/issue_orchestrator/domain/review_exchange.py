@@ -115,6 +115,34 @@ class ReviewExchangeOutcome:
         return self.run_assets.validation_record_path
 
 
+# The review-exchange reviewer worktree is created outside `WorktreeManager`
+# and is deliberately never provisioned: it gets neither the repository's
+# `.venv` symlink nor anything `worktrees.setup` installs
+# (`execution/reviewer_worktree.py`, `docs/architecture/validation.md`).
+# A gate run there fails on the missing prerequisite, not on the candidate —
+# issue #48's failure mode.
+#
+# What *enforces* that is the `PreToolUse` guard
+# (`infra/hooks/review_command_guard.py`) installed into the worktree, which
+# refuses the command before it executes. This note is the explanation the
+# reviewer reads so a refusal is expected rather than a mystery, and it is
+# unconditional on purpose: `review.exchange.loop.require_validation` decides
+# only whether a validation *record* is required before the reviewer may
+# approve, so with it false the reviewer would otherwise meet the guard with no
+# idea why.
+REVIEWER_WORKTREE_IS_UNPROVISIONED_NOTE = (
+    "This reviewer worktree is not provisioned with the repository's runtime "
+    "prerequisites (no virtualenv, no node modules, no browser binaries), so "
+    "do NOT run build, test, or validation commands yourself (no ./gradlew, "
+    "./scripts/validate*, make, npm/pnpm/yarn test, cargo test, pytest, mvn, "
+    "bazel test, or similar) — a PreToolUse guard refuses them here. They would "
+    "fail on the missing prerequisite rather than on the change under review, "
+    "they waste the round's budget, and they can hang on restricted networks "
+    "where wrapper downloads or package fetches fail. Review by reading the "
+    "code."
+)
+
+
 def build_reviewer_prompt(packet: "ReviewExchangeTurnPacket") -> str:
     """Build the reviewer's prompt for one round of the exchange.
 
@@ -140,15 +168,11 @@ def build_reviewer_prompt(packet: "ReviewExchangeTurnPacket") -> str:
         validation_note = (
             "Validation is required. Check "
             f"{validation_record}. Only respond ok if that file exists and has "
-            "passed=true. Trust this file as authoritative — do NOT run build, "
-            "test, or validation commands yourself (no ./gradlew, ./scripts/"
-            "validate*, make, npm/pnpm/yarn test, cargo test, pytest, mvn, "
-            "bazel test, or similar). Running them wastes the round's budget "
-            "and can hang on restricted networks where wrapper downloads or "
-            "package fetches fail. If the file is missing or shows "
-            "passed=false, respond changes_requested asking the coder to run "
-            "validation and fix any failures."
+            "passed=true. Trust this file as authoritative. If the file is "
+            "missing or shows passed=false, respond changes_requested asking "
+            "the coder to run validation and fix any failures. "
         )
+    validation_note += REVIEWER_WORKTREE_IS_UNPROVISIONED_NOTE
     prior = ""
     if packet.last_coder_text:
         prior += f"\nCoder response:\n{packet.last_coder_text}\n"

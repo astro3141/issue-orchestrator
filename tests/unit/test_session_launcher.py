@@ -356,6 +356,9 @@ class MockWorkingCopy:
         self.commits_ahead: list[CommitInfo] = []
         self.current_branch: str | None = "main"
         self.head_sha: str | None = None
+        # Sequenced dirty answers let a test model a worktree that provisioning
+        # dirtied; the default is a clean worktree that stays clean.
+        self.uncommitted_changes: list[bool] = []
 
     def get_commits_ahead_of_main(self, worktree: Path) -> list[CommitInfo]:
         return self.commits_ahead
@@ -365,6 +368,11 @@ class MockWorkingCopy:
 
     def get_head_sha(self, worktree: Path) -> str | None:
         return self.head_sha
+
+    def has_uncommitted_changes(self, worktree: Path) -> bool:
+        if self.uncommitted_changes:
+            return self.uncommitted_changes.pop(0)
+        return False
 
 
 class MockCommandRunner:
@@ -3136,8 +3144,238 @@ class TestLaunchReworkSession:
         assert copied_data["review_issues"] == "Copied feedback content"
 
 
-# Note: TestRunSetupCommands class deleted - tested private _run_setup_commands method.
+# Note: TestRunSetupCommands class deleted - tested a private setup-command method.
 # Setup command behavior is already tested through test_runs_setup_commands in TestLaunchIssueSession.
+
+
+# =============================================================================
+# Worktree Provisioning Across Launch Paths (#48)
+# =============================================================================
+
+
+class TestEveryLaunchPathProvisionsItsWorktree:
+    """A worktree reaches validation provisioned, whichever path created it.
+
+    Provisioning used to be invoked by the coding and validation-retry paths
+    only, so a rework or review worktree — the reused ones — reached the quick
+    and publish gates without the prerequisites those gates run on. The gate
+    then failed on a missing `.venv` or `packages/vscode/node_modules` and the
+    verdict was recorded against the candidate commit (#48).
+    """
+
+    @pytest.fixture(autouse=True)
+    def _no_feedback_sleep(self, monkeypatch):
+        monkeypatch.setattr(
+            "issue_orchestrator.control.session_launcher.time.sleep",
+            lambda _: None,
+        )
+
+    @pytest.fixture
+    def rework(self):
+        return PendingRework(
+            issue_key=GitHubIssueKey(repo="test/repo", external_id="123"),
+            agent_type="agent:web",
+            rework_cycle=1,
+        )
+
+    @pytest.fixture
+    def review(self):
+        return PendingReview(
+            issue_key=GitHubIssueKey(repo="test/repo", external_id="123"),
+            pr_number=456,
+            pr_url="https://github.com/test/repo/pull/456",
+            branch_name="123-feature",
+            _issue_number=123,
+        )
+
+    @pytest.fixture
+    def retrospective_review(self):
+        return PendingRetrospectiveReview(
+            issue_key=GitHubIssueKey(repo="test/repo", external_id="365"),
+            issue_number=365,
+            issue_title="Review old implementation",
+            agent_label="agent:web",
+            trigger_label="lack-of-review-redo",
+            prior_pr_number=512,
+            prior_pr_url="https://github.com/test/repo/pull/512",
+        )
+
+    def test_rework_worktree_is_provisioned_before_the_agent_starts(
+        self,
+        launcher_bundle,
+        rework,
+        mock_command_runner,
+    ):
+        """Removing the rework path's provisioning call must fail this test."""
+        launcher_bundle.launcher.config.setup_worktree = ["make worktree-setup"]
+
+        result = launcher_bundle.launcher.launch_rework_session(rework, active_sessions=[])
+
+        assert result.success is True
+        assert [call["command"] for call in mock_command_runner.run_calls] == [
+            "make worktree-setup"
+        ]
+        setup_cwd = mock_command_runner.run_calls[0]["cwd"]
+        assert setup_cwd == launcher_bundle.create_session_calls[0]["wd"]
+
+    def test_review_worktree_is_provisioned_before_the_agent_starts(
+        self,
+        launcher_bundle,
+        review,
+        mock_command_runner,
+    ):
+        launcher_bundle.launcher.config.setup_worktree = ["make worktree-setup"]
+
+        result = launcher_bundle.launcher.launch_review_session(review, active_sessions=[])
+
+        assert result.success is True
+        assert [call["command"] for call in mock_command_runner.run_calls] == [
+            "make worktree-setup"
+        ]
+        assert (
+            mock_command_runner.run_calls[0]["cwd"]
+            == launcher_bundle.create_session_calls[0]["wd"]
+        )
+
+    def test_retrospective_review_worktree_is_provisioned_before_the_agent_starts(
+        self,
+        launcher_bundle,
+        retrospective_review,
+        mock_command_runner,
+    ):
+        launcher_bundle.launcher.config.setup_worktree = ["make worktree-setup"]
+
+        result = launcher_bundle.launcher.launch_retrospective_review_session(
+            retrospective_review,
+            active_sessions=[],
+        )
+
+        assert result.success is True
+        assert [call["command"] for call in mock_command_runner.run_calls] == [
+            "make worktree-setup"
+        ]
+        assert (
+            mock_command_runner.run_calls[0]["cwd"]
+            == launcher_bundle.create_session_calls[0]["wd"]
+        )
+
+    def test_rework_fails_closed_when_provisioning_fails(
+        self,
+        launcher_bundle,
+        rework,
+        mock_command_runner,
+        mock_events,
+    ):
+        """The launch dies at provisioning, not at a later gate target."""
+        launcher_bundle.launcher.config.setup_worktree = ["make worktree-setup"]
+        mock_command_runner.results = [
+            CommandResult(
+                returncode=2,
+                stdout="",
+                stderr="Missing packages/vscode/node_modules",
+                timed_out=False,
+            ),
+        ]
+
+        result = launcher_bundle.launcher.launch_rework_session(rework, active_sessions=[])
+
+        assert result.success is False
+        assert "Setup commands failed" in result.reason
+        assert "Missing packages/vscode/node_modules" in result.reason
+        assert launcher_bundle.create_session_calls == []
+        failed = next(
+            e for e in mock_events.events if str(e.name) == "session.start_failed"
+        )
+        assert failed.data["reason"] == "setup_commands_failed"
+
+    def test_rework_provisioning_failure_holds_no_claim(
+        self,
+        launcher_bundle,
+        rework,
+        mock_command_runner,
+    ):
+        """Provisioning is checked before anything irreversible happens."""
+        launcher_bundle.launcher.config.setup_worktree = ["make worktree-setup"]
+        mock_command_runner.results = [
+            CommandResult(returncode=1, stdout="", stderr="npm ci failed", timed_out=False),
+        ]
+        work_claim = MagicMock()
+
+        result = launcher_bundle.launcher.launch_rework_session(
+            rework,
+            active_sessions=[],
+            work_claim=work_claim,
+        )
+
+        assert result.success is False
+        work_claim.hold_before_spawn.assert_not_called()
+
+    def test_review_fails_closed_when_provisioning_fails(
+        self,
+        launcher_bundle,
+        review,
+        mock_command_runner,
+    ):
+        launcher_bundle.launcher.config.setup_worktree = ["make worktree-setup"]
+        mock_command_runner.results = [
+            CommandResult(returncode=127, stdout="", stderr="make: not found", timed_out=False),
+        ]
+
+        result = launcher_bundle.launcher.launch_review_session(review, active_sessions=[])
+
+        assert result.success is False
+        assert "Setup commands failed" in result.reason
+        assert launcher_bundle.create_session_calls == []
+
+    def test_retrospective_review_fails_closed_when_provisioning_fails(
+        self,
+        launcher_bundle,
+        retrospective_review,
+        mock_command_runner,
+    ):
+        launcher_bundle.launcher.config.setup_worktree = ["make worktree-setup"]
+        mock_command_runner.results = [
+            CommandResult(returncode=1, stdout="", stderr="uv sync failed", timed_out=False),
+        ]
+
+        result = launcher_bundle.launcher.launch_retrospective_review_session(
+            retrospective_review,
+            active_sessions=[],
+        )
+
+        assert result.success is False
+        assert "Setup commands failed" in result.reason
+        assert launcher_bundle.create_session_calls == []
+
+    def test_rework_refuses_provisioning_that_edits_the_candidate(
+        self,
+        launcher_bundle,
+        rework,
+        mock_working_copy,
+    ):
+        """Installing tooling must not become editing the change under test."""
+        launcher_bundle.launcher.config.setup_worktree = ["make worktree-setup"]
+        mock_working_copy.uncommitted_changes = [False, True]
+
+        result = launcher_bundle.launcher.launch_rework_session(rework, active_sessions=[])
+
+        assert result.success is False
+        assert "uncommitted changes" in result.reason
+        assert launcher_bundle.create_session_calls == []
+
+    def test_unconfigured_setup_leaves_every_path_launching(
+        self,
+        launcher_bundle,
+        rework,
+        mock_command_runner,
+    ):
+        """A repo with no setup commands keeps its existing launch behaviour."""
+        launcher_bundle.launcher.config.setup_worktree = []
+
+        result = launcher_bundle.launcher.launch_rework_session(rework, active_sessions=[])
+
+        assert result.success is True
+        assert mock_command_runner.run_calls == []
 
 
 # =============================================================================

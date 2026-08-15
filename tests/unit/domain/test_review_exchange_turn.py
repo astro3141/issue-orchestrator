@@ -224,6 +224,32 @@ class TestBuildReviewerPrompt:
         # eat the per-round budget for no benefit.
         assert "do NOT run build, test, or validation commands" in prompt
         assert "./gradlew" in prompt
+        assert "not provisioned" in prompt
+
+    def test_unprovisioned_worktree_rules_out_gates_without_require_validation(
+        self,
+    ) -> None:
+        # The reviewer worktree is created outside WorktreeManager and is never
+        # provisioned, so a gate run there fails on the missing prerequisite
+        # rather than on the candidate (#48). require_validation only decides
+        # whether a validation *record* gates approval; with it false the
+        # reviewer must still be told not to run gates.
+        packet = ReviewExchangeTurnPacket(
+            issue_number=42,
+            issue_title="Make it right",
+            round_index=1,
+            role=Role.REVIEWER,
+            require_validation=False,
+            run_dir=Path("/wt/.issue-orchestrator/sessions/review-exchange-run"),
+        )
+
+        prompt = build_reviewer_prompt(packet)
+
+        assert "not provisioned" in prompt
+        assert "do NOT run build, test, or validation commands" in prompt
+        assert "./gradlew" in prompt
+        # ...and nothing claims a validation record it was not given.
+        assert "passed=true" not in prompt
 
     def test_validation_required_without_injected_record_fails_fast(self) -> None:
         packet = ReviewExchangeTurnPacket(

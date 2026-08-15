@@ -310,6 +310,28 @@ def test_checked_in_verify_pr_matches_portable_generated_output() -> None:
     )
 
 
+def test_selfhost_config_provisions_the_worktrees_its_gates_run_in() -> None:
+    """The config this fork runs must declare worktree provisioning (#48).
+
+    The publish gate's last target is `test-vscode` and its quick gate runs
+    `.venv/bin/python`; `quality-guardrails` needs `.venv-semgrep`. Creating a
+    worktree supplies none of those. With no `worktrees.setup` declared, the
+    orchestrator provisioned nothing, worktrees reached validation missing
+    prerequisites, and the resulting failure was recorded against the
+    candidate commit rather than against the environment.
+    """
+    repo_root = Path(__file__).resolve().parents[2]
+    config = Config.load(
+        repo_root / ".issue-orchestrator" / "config" / "modes" / "default" / "selfhost.yaml"
+    )
+
+    assert config.setup_worktree, (
+        "selfhost.yaml must declare worktrees.setup; without it no launch path "
+        "provisions the worktree its validation runs in"
+    )
+    assert any("worktree-setup" in cmd for cmd in config.setup_worktree)
+
+
 def test_render_repo_pre_push_hook_uses_repo_root_relative_path() -> None:
     repo_root = Path("/tmp/example-repo")
     verify_script = repo_root / "scripts" / "gates" / "verify-pr.sh"

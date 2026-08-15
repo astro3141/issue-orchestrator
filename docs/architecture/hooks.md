@@ -77,6 +77,15 @@ These are installed and refreshed in the target project by `issue-orchestrator s
 | Execpolicy rules (Codex) | Codex CLI | `.codex/rules/orchestrator.rules` | Blocks dangerous commands outside sandbox | **YES** |
 | AGENTS.md / CLAUDE.md | Policy | `AGENTS.md` (`CLAUDE.md` symlink for compatibility) | Documents prohibited actions | Advisory |
 
+One more `PreToolUse` guard is installed per *worktree* rather than per project:
+the review-exchange reviewer worktree gets `.claude/settings.local.json`
+registering `infra/hooks/review_command_guard.py`, which refuses build, test
+and validation commands there. That worktree is deliberately created without
+the repository's runtime prerequisites, so a gate command run in it reports on
+the environment while the record says it reports on the candidate. The reviewer
+prompt explains why the refusal happens; per this document, the prompt is not
+what prevents it. See `docs/architecture/validation.md`.
+
 Managed pre-push guardrails also support an optional
 `repo-specific/hooks/post-verify` extension point. When that hook exists during
 `setup-guardrails` or guardrail repair, the rendered wrapper runs it after

@@ -2,14 +2,25 @@
 
 from __future__ import annotations
 
+import json
+import logging
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 
 from issue_orchestrator.adapters.worktree.api import (
+    GUARDABLE_PROVIDERS,
+    REVIEW_COMMAND_GUARD_SETTINGS,
     WorktreeError,
+    install_review_command_guard,
     read_reviewer_head_ownership,
+    review_command_guard_command,
+)
+from issue_orchestrator.domain.artifact_contracts import AgentProvider
+from issue_orchestrator.infra.hooks.review_command_guard import (
+    orchestrator_source_root,
 )
 from issue_orchestrator.domain.review_exchange import (
     REVIEWER_WORKTREE_CHECKOUT_FAILURE_MARKER,
@@ -22,6 +33,12 @@ from issue_orchestrator.execution.reviewer_worktree import (
     remove_reviewer_worktree,
 )
 from issue_orchestrator.ports.worktree_manager import REVIEWER_OWNED_HEAD_MARKER
+
+
+#: The provider the reviewer runs under in these tests. Required by
+#: ``create_reviewer_worktree``: the command guard is installed through one
+#: provider's hook mechanism, so creation has to know which one will run.
+CLAUDE_CODE = AgentProvider("claude-code")
 
 
 def _git(cwd: Path, *args: str) -> str:
@@ -59,6 +76,7 @@ class TestReviewerWorktreeLifecycle:
             coder_worktree=coder,
             coder_branch=branch,
             timestamp="20260502T000000Z",
+            reviewer_provider=CLAUDE_CODE,
         )
 
         assert reviewer.path == coder.parent / f"{coder.name}-review-20260502T000000Z"
@@ -87,7 +105,10 @@ class TestReviewerWorktreeLifecycle:
 
         with pytest.raises(ReviewerWorktreeError, match="already exists"):
             create_reviewer_worktree(
-                coder_worktree=coder, coder_branch=branch, timestamp="T",
+                coder_worktree=coder,
+                coder_branch=branch,
+                timestamp="T",
+                reviewer_provider=CLAUDE_CODE,
             )
 
     def test_create_rolls_back_when_identity_installation_fails(
@@ -111,6 +132,7 @@ class TestReviewerWorktreeLifecycle:
                 coder_worktree=coder,
                 coder_branch=branch,
                 timestamp="T",
+                reviewer_provider=CLAUDE_CODE,
             )
 
         assert not sibling.exists()
@@ -119,7 +141,10 @@ class TestReviewerWorktreeLifecycle:
     def test_fast_forward_picks_up_new_coder_commits(self, tmp_path: Path) -> None:
         repo_root, coder, branch = _bootstrap_repo_with_branch(tmp_path)
         reviewer = create_reviewer_worktree(
-            coder_worktree=coder, coder_branch=branch, timestamp="T",
+            coder_worktree=coder,
+            coder_branch=branch,
+            timestamp="T",
+            reviewer_provider=CLAUDE_CODE,
         )
         original_tip = _git(repo_root, "rev-parse", branch)
 
@@ -143,7 +168,10 @@ class TestReviewerWorktreeLifecycle:
     ) -> None:
         _, coder, branch = _bootstrap_repo_with_branch(tmp_path)
         reviewer = create_reviewer_worktree(
-            coder_worktree=coder, coder_branch=branch, timestamp="T",
+            coder_worktree=coder,
+            coder_branch=branch,
+            timestamp="T",
+            reviewer_provider=CLAUDE_CODE,
         )
         (reviewer.path / REVIEWER_OWNED_HEAD_MARKER).write_text(
             "partial-write",
@@ -158,7 +186,10 @@ class TestReviewerWorktreeLifecycle:
     def test_remove_deletes_the_worktree(self, tmp_path: Path) -> None:
         _, coder, branch = _bootstrap_repo_with_branch(tmp_path)
         reviewer = create_reviewer_worktree(
-            coder_worktree=coder, coder_branch=branch, timestamp="T",
+            coder_worktree=coder,
+            coder_branch=branch,
+            timestamp="T",
+            reviewer_provider=CLAUDE_CODE,
         )
         assert reviewer.path.exists()
 
@@ -169,7 +200,10 @@ class TestReviewerWorktreeLifecycle:
     def test_remove_is_noop_when_path_already_gone(self, tmp_path: Path) -> None:
         _, coder, branch = _bootstrap_repo_with_branch(tmp_path)
         reviewer = create_reviewer_worktree(
-            coder_worktree=coder, coder_branch=branch, timestamp="T",
+            coder_worktree=coder,
+            coder_branch=branch,
+            timestamp="T",
+            reviewer_provider=CLAUDE_CODE,
         )
         # External cleanup beats us to it.
         import shutil
@@ -177,6 +211,235 @@ class TestReviewerWorktreeLifecycle:
 
         # Must not raise — orchestrator shutdown paths rely on idempotence.
         remove_reviewer_worktree(reviewer)
+
+
+class TestReviewerWorktreeRefusesGateCommands:
+    """The unprovisioned worktree carries a barrier, not just an instruction.
+
+    A gate command run in this worktree fails on the missing prerequisite and
+    the failure is attributed to the candidate (#48). `docs/architecture/
+    hooks.md` rules that a prompt cannot be what prevents that, so creation
+    installs a `PreToolUse` policy that refuses the command before it runs.
+    """
+
+    def test_creation_registers_a_bash_pre_tool_use_guard(
+        self, tmp_path: Path
+    ) -> None:
+        _, coder, branch = _bootstrap_repo_with_branch(tmp_path)
+
+        reviewer = create_reviewer_worktree(
+            coder_worktree=coder,
+            coder_branch=branch,
+            timestamp="T",
+            reviewer_provider=CLAUDE_CODE,
+        )
+
+        settings = json.loads(
+            (reviewer.path / REVIEW_COMMAND_GUARD_SETTINGS).read_text()
+        )
+        matchers = settings["hooks"]["PreToolUse"]
+        assert [m["matcher"] for m in matchers] == ["Bash"]
+        assert _guard_command(reviewer.path) == review_command_guard_command()
+
+    def test_the_guard_runs_the_orchestrators_own_policy_not_the_candidates(
+        self, tmp_path: Path
+    ) -> None:
+        """A worktree that supplied its own policy would be judging itself."""
+        _, coder, branch = _bootstrap_repo_with_branch(tmp_path)
+
+        reviewer = create_reviewer_worktree(
+            coder_worktree=coder,
+            coder_branch=branch,
+            timestamp="T",
+            reviewer_provider=CLAUDE_CODE,
+        )
+
+        command = _guard_command(reviewer.path)
+        assert str(orchestrator_source_root()) in command
+        assert sys.executable in command
+        assert str(reviewer.path) not in command
+
+    def test_the_installed_hook_actually_refuses_a_gate_command(
+        self, tmp_path: Path
+    ) -> None:
+        _, coder, branch = _bootstrap_repo_with_branch(tmp_path)
+        reviewer = create_reviewer_worktree(
+            coder_worktree=coder,
+            coder_branch=branch,
+            timestamp="T",
+            reviewer_provider=CLAUDE_CODE,
+        )
+
+        refused = _run_guard(reviewer.path, "make validate-pr-raw")
+
+        assert refused.returncode == 2
+        assert "BLOCKED" in refused.stderr
+
+    def test_the_installed_hook_still_lets_the_reviewer_read_the_code(
+        self, tmp_path: Path
+    ) -> None:
+        _, coder, branch = _bootstrap_repo_with_branch(tmp_path)
+        reviewer = create_reviewer_worktree(
+            coder_worktree=coder,
+            coder_branch=branch,
+            timestamp="T",
+            reviewer_provider=CLAUDE_CODE,
+        )
+
+        assert _run_guard(reviewer.path, "git log --oneline").returncode == 0
+
+    def test_the_guard_leaves_the_candidate_untouched(self, tmp_path: Path) -> None:
+        """It lands in the never-tracked local layer and is hidden from status."""
+        _, coder, branch = _bootstrap_repo_with_branch(tmp_path)
+
+        reviewer = create_reviewer_worktree(
+            coder_worktree=coder,
+            coder_branch=branch,
+            timestamp="T",
+            reviewer_provider=CLAUDE_CODE,
+        )
+
+        tracked = subprocess.run(
+            ["git", "ls-files", str(REVIEW_COMMAND_GUARD_SETTINGS)],
+            cwd=reviewer.path,
+            capture_output=True,
+            text=True,
+        )
+        assert tracked.stdout.strip() == ""
+        assert str(REVIEW_COMMAND_GUARD_SETTINGS) not in _git(
+            reviewer.path, "status", "--short"
+        )
+
+    def test_removal_still_succeeds_with_the_guard_installed(
+        self, tmp_path: Path
+    ) -> None:
+        _, coder, branch = _bootstrap_repo_with_branch(tmp_path)
+        reviewer = create_reviewer_worktree(
+            coder_worktree=coder,
+            coder_branch=branch,
+            timestamp="T",
+            reviewer_provider=CLAUDE_CODE,
+        )
+
+        remove_reviewer_worktree(reviewer)
+
+        assert not reviewer.path.exists()
+
+    def test_create_rolls_back_when_the_guard_cannot_be_installed(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """An unguarded reviewer worktree must not exist at all."""
+        repo_root, coder, branch = _bootstrap_repo_with_branch(tmp_path)
+        sibling = coder.parent / f"{coder.name}-review-T"
+
+        def fail_guard_install(_path: Path, *, provider: AgentProvider) -> None:
+            raise WorktreeError(f"settings unwritable for {provider.value}")
+
+        monkeypatch.setattr(
+            "issue_orchestrator.execution.reviewer_worktree.install_review_command_guard",
+            fail_guard_install,
+        )
+
+        with pytest.raises(ReviewerWorktreeError, match="command guard"):
+            create_reviewer_worktree(
+                coder_worktree=coder,
+                coder_branch=branch,
+                timestamp="T",
+                reviewer_provider=CLAUDE_CODE,
+            )
+
+        assert not sibling.exists()
+        assert str(sibling) not in _git(repo_root, "worktree", "list", "--porcelain")
+
+    @pytest.mark.parametrize("provider", ["codex", "cursor", "gemini", "aider"])
+    def test_no_guard_file_is_planted_for_a_provider_that_cannot_read_it(
+        self, tmp_path: Path, provider: str,
+    ) -> None:
+        """A settings file the reviewer never reads is worse than none.
+
+        The guard is registered in ``.claude/settings.local.json``. A reviewer
+        launched on a provider that reads something else would be handed a
+        worktree that *looks* guarded — settings file present — while nothing
+        refuses anything, which is how a written claim comes to stand in for
+        enforcement (``docs/architecture/hooks.md``). So for such a provider
+        the installer writes nothing at all.
+        """
+        _, coder, branch = _bootstrap_repo_with_branch(tmp_path)
+        assert provider not in GUARDABLE_PROVIDERS
+
+        reviewer = create_reviewer_worktree(
+            coder_worktree=coder,
+            coder_branch=branch,
+            timestamp="T",
+            reviewer_provider=AgentProvider(provider),
+        )
+
+        assert not (reviewer.path / REVIEW_COMMAND_GUARD_SETTINGS).exists()
+
+    def test_an_unguardable_provider_is_reported_as_unguarded_not_installed(
+        self, tmp_path: Path,
+    ) -> None:
+        """The caller is told, in words, which worktree has no barrier."""
+        _, coder, _branch = _bootstrap_repo_with_branch(tmp_path)
+
+        outcome = install_review_command_guard(
+            coder, provider=AgentProvider("codex"),
+        )
+
+        assert outcome.guarded is False
+        assert outcome.settings_file is None
+        assert outcome.provider == AgentProvider("codex")
+
+    def test_a_guardable_provider_reports_the_file_it_installed(
+        self, tmp_path: Path,
+    ) -> None:
+        _, coder, branch = _bootstrap_repo_with_branch(tmp_path)
+
+        reviewer = create_reviewer_worktree(
+            coder_worktree=coder,
+            coder_branch=branch,
+            timestamp="T",
+            reviewer_provider=CLAUDE_CODE,
+        )
+        outcome = install_review_command_guard(reviewer.path, provider=CLAUDE_CODE)
+
+        assert outcome.guarded is True
+        assert outcome.settings_file == reviewer.path / REVIEW_COMMAND_GUARD_SETTINGS
+
+    def test_the_unguarded_case_is_logged_loudly_enough_to_notice(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """An operator reading logs must be able to see the barrier is absent."""
+        _, coder, branch = _bootstrap_repo_with_branch(tmp_path)
+
+        with caplog.at_level(logging.WARNING):
+            create_reviewer_worktree(
+                coder_worktree=coder,
+                coder_branch=branch,
+                timestamp="T",
+                reviewer_provider=AgentProvider("codex"),
+            )
+
+        warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert any("UNGUARDED" in r.getMessage() for r in warnings)
+        assert any("codex" in r.getMessage() for r in warnings)
+
+
+def _guard_command(reviewer_path: Path) -> str:
+    settings = json.loads((reviewer_path / REVIEW_COMMAND_GUARD_SETTINGS).read_text())
+    return settings["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+
+
+def _run_guard(reviewer_path: Path, command: str) -> subprocess.CompletedProcess[str]:
+    """Run the registered hook exactly as the agent CLI would."""
+    return subprocess.run(
+        _guard_command(reviewer_path),
+        shell=True,
+        cwd=reviewer_path,
+        input=json.dumps({"tool_input": {"command": command}}),
+        capture_output=True,
+        text=True,
+    )
 
 
 class TestReviewerCandidatePresentation:
@@ -191,7 +454,10 @@ class TestReviewerCandidatePresentation:
     def test_presents_the_branch_tip_and_reports_it(self, tmp_path: Path) -> None:
         repo_root, coder, branch = _bootstrap_repo_with_branch(tmp_path)
         reviewer = create_reviewer_worktree(
-            coder_worktree=coder, coder_branch=branch, timestamp="T",
+            coder_worktree=coder,
+            coder_branch=branch,
+            timestamp="T",
+            reviewer_provider=CLAUDE_CODE,
         )
         (coder / "work.py").write_text("print('second')\n")
         _git(coder, "add", "work.py")
@@ -217,7 +483,10 @@ class TestReviewerCandidatePresentation:
         """
         _, coder, branch = _bootstrap_repo_with_branch(tmp_path)
         reviewer = create_reviewer_worktree(
-            coder_worktree=coder, coder_branch=branch, timestamp="T",
+            coder_worktree=coder,
+            coder_branch=branch,
+            timestamp="T",
+            reviewer_provider=CLAUDE_CODE,
         )
         sha_a = _git(reviewer.path, "rev-parse", "HEAD")
 
@@ -242,7 +511,10 @@ class TestReviewerCandidatePresentation:
         """Nothing re-points the worktree, so it still holds what it was made at."""
         _, coder, branch = _bootstrap_repo_with_branch(tmp_path)
         reviewer = create_reviewer_worktree(
-            coder_worktree=coder, coder_branch=branch, timestamp="T",
+            coder_worktree=coder,
+            coder_branch=branch,
+            timestamp="T",
+            reviewer_provider=CLAUDE_CODE,
         )
         created_at = _git(reviewer.path, "rev-parse", "HEAD")
         # The coder moves on; with no branch to track, that must not leak in.
@@ -274,7 +546,10 @@ class TestReviewerCandidatePresentation:
     def test_caller_hook_runs_for_every_round(self, tmp_path: Path) -> None:
         _, coder, branch = _bootstrap_repo_with_branch(tmp_path)
         reviewer = create_reviewer_worktree(
-            coder_worktree=coder, coder_branch=branch, timestamp="T",
+            coder_worktree=coder,
+            coder_branch=branch,
+            timestamp="T",
+            reviewer_provider=CLAUDE_CODE,
         )
         seen: list[int] = []
 
@@ -302,7 +577,10 @@ class TestReviewerWorktreeDiagnostics:
     ) -> None:
         repo_root, coder, branch = _bootstrap_repo_with_branch(tmp_path)
         reviewer = create_reviewer_worktree(
-            coder_worktree=coder, coder_branch=branch, timestamp="T",
+            coder_worktree=coder,
+            coder_branch=branch,
+            timestamp="T",
+            reviewer_provider=CLAUDE_CODE,
         )
 
         # Coder advances the branch tip by committing a new tracked file.
@@ -352,6 +630,7 @@ class TestReviewerWorktreeDiagnostics:
                 coder_worktree=coder,
                 coder_branch="does/not/exist",
                 timestamp="T",
+                reviewer_provider=CLAUDE_CODE,
             )
 
         err = excinfo.value
