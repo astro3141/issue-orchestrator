@@ -57,12 +57,15 @@ def _break_read_of(
 
 @pytest.fixture
 def git_worktree(tmp_path: Path) -> GitWorktree:
-    """A real repository plus one linked worktree, with a venv to share.
+    """A real repository plus one linked worktree, and a repository venv.
 
     Real Git rather than a hand-built ``.git``: setup asks the repository
     whether it owns the CLI-tools path before planting anything there, and a
     fabricated ``.git`` directory has no answer to give — which the owner
     treats as a failure rather than a licence to guess.
+
+    The repository venv exists so the tests below can prove setup does *not*
+    reach for it (#53); nothing here shares it.
     """
     worktree = make_git_worktree(tmp_path, name="repo-123")
     (worktree.main_repo / ".venv" / "bin").mkdir(parents=True)
@@ -79,22 +82,20 @@ def worktree_path(git_worktree: GitWorktree) -> Path:
     return git_worktree.worktree_path
 
 
-def _setup(repo_root: Path, **overrides) -> WorktreeRuntimeSetup:
+def _setup(**overrides) -> WorktreeRuntimeSetup:
     options = {"enforce_hooks": False}
     options.update(overrides)
-    return WorktreeRuntimeSetup(repo_root=repo_root, **options)
+    return WorktreeRuntimeSetup(**options)
 
 
 class TestApplyProducesRunnableWorktree:
     """One call must leave the worktree ready for an agent session."""
 
     def test_apply_installs_every_runtime_artifact(self, repo_root, worktree_path):
-        state = _setup(repo_root).apply(worktree_path)
+        state = _setup().apply(worktree_path)
 
         assert (worktree_path / ".claude" / "settings.json").exists()
         assert (worktree_path / WORKTREE_ID_MARKER).read_text() == state.worktree_id
-        assert (worktree_path / ".venv").is_symlink()
-        assert (worktree_path / ".venv").resolve() == (repo_root / ".venv").resolve()
         assert state.synced_cli_tool_paths
         for relative in state.synced_cli_tool_paths:
             assert (worktree_path / relative).exists()
@@ -102,7 +103,7 @@ class TestApplyProducesRunnableWorktree:
     def test_apply_hides_runtime_artifacts_from_git_status(
         self, repo_root, worktree_path
     ):
-        state = _setup(repo_root).apply(worktree_path)
+        state = _setup().apply(worktree_path)
 
         exclude_text = (
             repo_root / ".git" / "worktrees" / "repo-123" / "info" / "exclude"
@@ -113,7 +114,7 @@ class TestApplyProducesRunnableWorktree:
 
     def test_apply_reports_what_it_did(self, repo_root, worktree_path):
         state = _setup(
-            repo_root, enforce_hooks=False, allow_no_verify_dry_run_preflight=True
+            enforce_hooks=False, allow_no_verify_dry_run_preflight=True
         ).apply(worktree_path)
 
         assert state.worktree_path == worktree_path
@@ -124,7 +125,7 @@ class TestApplyProducesRunnableWorktree:
     def test_apply_is_idempotent_and_keeps_worktree_identity(
         self, repo_root, worktree_path
     ):
-        setup = _setup(repo_root)
+        setup = _setup()
 
         first = setup.apply(worktree_path)
         second = setup.apply(worktree_path)
@@ -136,23 +137,107 @@ class TestApplyProducesRunnableWorktree:
         # can be asked.
         wt = make_git_worktree(tmp_path)
 
-        state = WorktreeRuntimeSetup(
-            repo_root=wt.main_repo, enforce_hooks=True
-        ).apply(wt.worktree_path)
+        state = WorktreeRuntimeSetup(enforce_hooks=True).apply(wt.worktree_path)
 
         assert state.hooks_installed is True
         assert (wt.hooks_dir / "pre-push").exists()
         assert effective_hooks_path(wt.worktree_path) == str(wt.hooks_dir)
 
     def test_hooks_are_skipped_when_not_enforced(self, repo_root, worktree_path):
-        state = WorktreeRuntimeSetup(repo_root=repo_root, enforce_hooks=False).apply(
-            worktree_path
-        )
+        state = WorktreeRuntimeSetup(enforce_hooks=False).apply(worktree_path)
 
         assert state.hooks_installed is False
         assert not (
             repo_root / ".git" / "worktrees" / "repo-123" / "hooks" / "pre-push"
         ).exists()
+
+
+class TestWorktreeRuntimeEnvironmentIsNotShared:
+    """A worktree's ``.venv`` is its own, or absent — never another checkout's.
+
+    Setup used to plant a symlink to the repository venv, which made one
+    environment serve every checkout. ``worktrees.setup`` then runs the
+    repository's setup recipe *inside* the worktree, so every provisioning run
+    wrote through that link into the shared environment (#53). These pin the
+    replacement invariant: the link is never created, and an existing one is
+    removed before the worktree is handed on.
+    """
+
+    def test_setup_does_not_share_the_repository_venv(self, repo_root, worktree_path):
+        _setup().apply(worktree_path)
+
+        assert not (worktree_path / ".venv").exists()
+        assert not (worktree_path / ".venv").is_symlink()
+        # Nothing was installed in its place either: building the worktree's
+        # environment belongs to `worktrees.setup`, not to worktree creation.
+        assert (repo_root / ".venv").is_dir()
+
+    def test_an_existing_shared_link_is_removed(self, repo_root, worktree_path):
+        # The state every worktree created before this fix is sitting in.
+        (worktree_path / ".venv").symlink_to(
+            repo_root / ".venv", target_is_directory=True
+        )
+
+        _setup().apply(worktree_path)
+
+        assert not (worktree_path / ".venv").is_symlink()
+        assert (repo_root / ".venv" / "bin").is_dir()
+
+    def test_a_dangling_shared_link_is_removed(self, repo_root, worktree_path):
+        # What removing the *repository* checkout leaves behind; a dangling
+        # link is still a write that would escape the worktree.
+        (worktree_path / ".venv").symlink_to(
+            repo_root / "gone" / ".venv", target_is_directory=True
+        )
+
+        _setup().apply(worktree_path)
+
+        assert not (worktree_path / ".venv").is_symlink()
+
+    def test_a_worktree_local_venv_is_left_alone(self, worktree_path):
+        # The state `worktrees.setup` leaves behind. Deleting it would make
+        # every reused worktree pay a full install it does not need.
+        venv = worktree_path / ".venv"
+        (venv / "bin").mkdir(parents=True)
+        (venv / "bin" / "python").write_text("#!/bin/sh\n")
+
+        _setup().apply(worktree_path)
+
+        assert (venv / "bin" / "python").exists()
+
+    def test_a_link_that_stays_inside_the_worktree_is_left_alone(self, worktree_path):
+        # A write through it cannot reach another checkout, which is the only
+        # property this step is about.
+        (worktree_path / "runtime").mkdir()
+        (worktree_path / ".venv").symlink_to(
+            worktree_path / "runtime", target_is_directory=True
+        )
+
+        _setup().apply(worktree_path)
+
+        assert (worktree_path / ".venv").is_symlink()
+
+    def test_an_unremovable_shared_link_fails_setup(
+        self, repo_root, worktree_path, monkeypatch
+    ):
+        # Continuing here would hand provisioning a worktree that still writes
+        # into the repository's environment — the defect itself.
+        (worktree_path / ".venv").symlink_to(
+            repo_root / ".venv", target_is_directory=True
+        )
+        original_unlink = Path.unlink
+
+        def guarded(self: Path, *args: Any, **kwargs: Any) -> None:
+            if self == worktree_path / ".venv":
+                raise PermissionError("simulated unlink failure")
+            return original_unlink(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "unlink", guarded)
+
+        with pytest.raises(WorktreeError, match="remove shared venv link"):
+            _setup().apply(worktree_path)
+
+        assert (worktree_path / ".venv").is_symlink()
 
 
 class TestEnforcedHooksAreAnInvariantNotARequest:
@@ -168,7 +253,6 @@ class TestEnforcedHooksAreAnInvariantNotARequest:
 
         with pytest.raises(WorktreeError, match="pre-push hook was installed"):
             WorktreeRuntimeSetup(
-                repo_root=wt.main_repo,
                 enforce_hooks=True,
                 pre_push_hook=missing_hook,
             ).apply(wt.worktree_path)
@@ -186,9 +270,7 @@ class TestEnforcedHooksAreAnInvariantNotARequest:
         block_worktree_config_writes(wt.gitdir)
 
         with pytest.raises(WorktreeError, match="pre-push hook was installed"):
-            WorktreeRuntimeSetup(
-                repo_root=wt.main_repo, enforce_hooks=True
-            ).apply(wt.worktree_path)
+            WorktreeRuntimeSetup(enforce_hooks=True).apply(wt.worktree_path)
 
         assert effective_hooks_path(wt.worktree_path) != str(wt.hooks_dir)
 
@@ -201,7 +283,7 @@ class TestEnforcedHooksAreAnInvariantNotARequest:
         detached.mkdir()
 
         with pytest.raises(WorktreeError, match="pre-push hook was installed"):
-            WorktreeRuntimeSetup(repo_root=repo_root, enforce_hooks=True).apply(detached)
+            WorktreeRuntimeSetup(enforce_hooks=True).apply(detached)
 
 
 class TestOwnerErrorBoundary:
@@ -217,7 +299,7 @@ class TestOwnerErrorBoundary:
         )
 
         with pytest.raises(WorktreeError, match="Worktree runtime setup failed"):
-            _setup(repo_root).apply(worktree_path)
+            _setup().apply(worktree_path)
 
 
 class TestNoVerifyDryRunFlag:
@@ -226,7 +308,7 @@ class TestNoVerifyDryRunFlag:
     def test_flag_is_written_when_preflight_allows_no_verify(
         self, repo_root, worktree_path
     ):
-        _setup(repo_root, allow_no_verify_dry_run_preflight=True).apply(worktree_path)
+        _setup(allow_no_verify_dry_run_preflight=True).apply(worktree_path)
 
         assert (worktree_path / ALLOW_NO_VERIFY_DRY_RUN_PATH).exists()
 
@@ -237,7 +319,7 @@ class TestNoVerifyDryRunFlag:
         stale.parent.mkdir(parents=True)
         stale.write_text("allow\n")
 
-        _setup(repo_root, allow_no_verify_dry_run_preflight=False).apply(worktree_path)
+        _setup(allow_no_verify_dry_run_preflight=False).apply(worktree_path)
 
         assert not stale.exists()
 
@@ -249,7 +331,7 @@ class TestNoVerifyDryRunFlag:
         (worktree_path / ".issue-orchestrator").write_text("not a directory")
 
         with pytest.raises(WorktreeError, match="no-verify dry-run flag"):
-            _setup(repo_root, allow_no_verify_dry_run_preflight=True).apply(
+            _setup(allow_no_verify_dry_run_preflight=True).apply(
                 worktree_path
             )
 
@@ -263,14 +345,14 @@ class TestWorktreeIdentityFailureSemantics:
         marker.mkdir()  # a directory where the marker file belongs
 
         with pytest.raises(WorktreeError, match="worktree identity"):
-            _setup(repo_root).apply(worktree_path)
+            _setup().apply(worktree_path)
 
     def test_empty_identity_marker_is_regenerated(self, repo_root, worktree_path):
         marker = worktree_path / WORKTREE_ID_MARKER
         marker.parent.mkdir(parents=True)
         marker.write_text("   \n")
 
-        state = _setup(repo_root).apply(worktree_path)
+        state = _setup().apply(worktree_path)
 
         assert state.worktree_id.startswith("wt-")
         assert marker.read_text() == state.worktree_id
@@ -281,7 +363,7 @@ class TestWorktreeIdentityFailureSemantics:
         marker.parent.mkdir(parents=True)
         marker.write_bytes(b"\xff\xfe not an id")
 
-        state = _setup(repo_root).apply(worktree_path)
+        state = _setup().apply(worktree_path)
 
         assert state.worktree_id.startswith("wt-")
         assert marker.read_text() == state.worktree_id
@@ -298,7 +380,7 @@ class TestWorktreeIdentityFailureSemantics:
         _break_read_of(monkeypatch, marker, PermissionError("simulated read failure"))
 
         with pytest.raises(WorktreeError, match="read worktree identity marker"):
-            _setup(repo_root).apply(worktree_path)
+            _setup().apply(worktree_path)
 
         assert marker.read_bytes() == b"wt-original"
 

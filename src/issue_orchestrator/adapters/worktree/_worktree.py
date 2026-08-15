@@ -869,7 +869,6 @@ def _init_worktree_context(
         policy=policy,
         reuse_options=reuse_options,
         runtime_setup=WorktreeRuntimeSetup(
-            repo_root=repo_root,
             enforce_hooks=enforce_hooks,
             pre_push_hook=pre_push_hook,
             allow_no_verify_dry_run_preflight=(

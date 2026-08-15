@@ -794,7 +794,7 @@ class TestCreateWorktree:
     @patch("issue_orchestrator.adapters.worktree._worktree_runtime_setup.install_claude_settings")
     @patch("issue_orchestrator.adapters.worktree._worktree_runtime_setup.install_hooks")
     @patch("issue_orchestrator.adapters.git.git_cli.subprocess.run")
-    def test_create_worktree_links_repo_venv_into_issue_worktree(
+    def test_create_worktree_does_not_share_the_repo_venv(
         self,
         mock_run,
         mock_install_hooks,
@@ -802,7 +802,12 @@ class TestCreateWorktree:
         mock_sync_cli_tools,
         tmp_path,
     ):
-        """Issue worktrees should reuse the repo venv so validate-quick can run there."""
+        """Issue worktrees get their own environment, never the repository's (#53).
+
+        Creating the worktree used to symlink ``.venv`` to the repository's, so
+        `worktrees.setup` running in the worktree wrote into the environment
+        every other checkout used.
+        """
         repo_root = tmp_path / "repo"
         repo_root.mkdir()
         (repo_root / ".git").mkdir()
@@ -845,9 +850,9 @@ class TestCreateWorktree:
 
         worktree_path, *_ = create_worktree(repo_root, 123, "Test", worktree_base=worktree_base)
 
-        linked_venv = worktree_path / ".venv"
-        assert linked_venv.is_symlink()
-        assert linked_venv.resolve() == (repo_root / ".venv").resolve()
+        assert not (worktree_path / ".venv").exists()
+        assert not (worktree_path / ".venv").is_symlink()
+        assert (repo_root / ".venv" / "bin" / "python").exists()
         mock_install_hooks.assert_called_once()
         mock_install_claude_settings.assert_called_once()
 
