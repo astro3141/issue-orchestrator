@@ -28,6 +28,16 @@ Three invariants ride along with running the commands:
   the orchestrator was started with. That file must live outside the worktree
   being provisioned, so the worktree under test never supplies the list of
   commands run on it.
+* **What it builds belongs to the worktree alone.** The recipe runs with the
+  worktree as its working directory, so what it writes must stay there. It did
+  not: worktree creation used to plant a ``.venv`` symlink to the repository's,
+  and every run of a recipe that populates ``.venv`` wrote through it into the
+  environment every other checkout used — repointing that shared environment's
+  editable install at the worktree being provisioned, and leaving it broken when
+  the worktree was removed (#53). Worktree setup now guarantees the ``.venv`` is
+  the worktree's own (``adapters/worktree/_worktree_runtime.isolate_worktree_venv``),
+  which is also why concurrent provisioning needs no lock here: there is no
+  shared environment left to race over.
 
 Authority
 ---------

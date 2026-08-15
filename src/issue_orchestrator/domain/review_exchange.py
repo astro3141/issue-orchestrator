@@ -116,8 +116,8 @@ class ReviewExchangeOutcome:
 
 
 # The review-exchange reviewer worktree is created outside `WorktreeManager`
-# and is deliberately never provisioned: it gets neither the repository's
-# `.venv` symlink nor anything `worktrees.setup` installs
+# and is deliberately never provisioned: nothing `worktrees.setup` installs
+# reaches it, so it has no runtime environment at all
 # (`execution/reviewer_worktree.py`, `docs/architecture/validation.md`).
 # A gate run there fails on the missing prerequisite, not on the candidate —
 # issue #48's failure mode.

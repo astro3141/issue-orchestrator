@@ -122,9 +122,9 @@ def create_reviewer_worktree(
     the coder worktree; git refuses to check out the same branch twice.
 
     **This worktree is deliberately unprovisioned.** It is created here with a
-    raw ``git worktree add`` rather than through ``WorktreeManager``, so it gets
-    neither the repository ``.venv`` symlink nor anything ``worktrees.setup``
-    installs — it is the one agent worktree ``WorktreeProvisioner`` does not
+    raw ``git worktree add`` rather than through ``WorktreeManager``, so nothing
+    ``worktrees.setup`` installs reaches it and it has no runtime environment at
+    all — it is the one agent worktree ``WorktreeProvisioner`` does not
     own (#48, ``docs/architecture/validation.md``). The reviewer reads code; it
     does not run gates, and paying ``worktrees.setup`` (an ``npm ci`` and a
     browser install for this repository) per exchange to support a command that

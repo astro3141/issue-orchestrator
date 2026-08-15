@@ -69,8 +69,8 @@ Two collaborators decide whether a worktree can run anything:
 
 | Step | Owner | What it guarantees |
 |------|-------|--------------------|
-| Create/reuse the worktree | `WorktreeManager` (adapter) | The checkout, its branch, its hooks, and a symlink from the worktree's `.venv` to the repository's |
-| Provision the worktree | `WorktreeProvisioner` (`control/worktree_provisioning.py`) | Everything `worktrees.setup` installs — anything the symlink does not supply, such as `packages/vscode/node_modules` |
+| Create/reuse the worktree | `WorktreeManager` (adapter) | The checkout, its branch, its hooks, and that the worktree's `.venv` is the worktree's own — never a link to another checkout's |
+| Provision the worktree | `WorktreeProvisioner` (`control/worktree_provisioning.py`) | Everything `worktrees.setup` installs — the whole runtime environment, `.venv` and `packages/vscode/node_modules` alike |
 
 The provisioner is the single owner of provisioning, and **every session launch
 path** goes through it: coding, validation retry, rework, review and
@@ -107,6 +107,64 @@ Provisioning holds three rules:
 A repository that declares no `worktrees.setup` commands provisions nothing;
 its worktrees must be runnable from the checkout alone.
 
+### Each agent worktree gets its own runtime environment
+
+**They do not share one.** This is stated because the opposite arrangement was
+in place and was destructive: worktree creation planted a `.venv` symlink to
+the repository's, so one environment served the primary checkout and every
+worktree at once.
+
+That sharing is what made a single provisioning run break things. Provisioning
+runs the repository's *own* setup recipe inside the worktree, and any recipe
+that populates `.venv` — `uv sync`, `pip install -e .` — writes through the
+link into the shared environment. `uv sync` rewrites the editable install's
+source path to the syncing worktree on **every** run, whether or not the
+lockfile changed; when that worktree was later removed, the shared environment
+imported nothing, and the primary checkout could no longer run its own pre-push
+gate. The failure surfaced at an unrelated moment, because it was discovered by
+the *next* thing that needed a Python environment rather than by the session
+that caused it. That was issue [#53], fired by an ordinary prose-only session
+at `max_concurrent_sessions: 1` — neither a dependency change nor concurrency
+was required.
+
+So the manager removes such a link (including one an older orchestrator left in
+a reused worktree) and never creates one, and building the environment is
+`worktrees.setup`'s job — the same division of labour as everything else in the
+table above. The E2E worker worktree (`infra/e2e_worktree.py`) already worked
+this way: it has always synced a real `.venv` of its own.
+
+The cost was measured on this repository rather than assumed, since paying a
+full install per session would be its own regression:
+
+| Measured on a fresh worktree, warm caches | |
+|---|---|
+| `make worktree-setup` end to end (venv + `uv sync --frozen --all-extras` + `.venv-semgrep` + `npm ci` + `playwright install`) | 5.5 s |
+| `uv venv` + `uv sync --frozen --all-extras` alone | ~0.3 s |
+| Disk actually consumed by the second environment | ~7 MB — 307 MB apparent, but the package files are copy-on-write clones of the shared `uv` cache |
+
+Reusing a worktree costs less still — `venv-fast` keeps the existing `.venv` and
+re-syncs it. The first sync on a machine pays the download once, into the
+shared `uv` cache, which is where the disk actually goes. So no per-session full
+install is being paid: what a session pays is a sync against a cache it shares
+with every other checkout, and `npm ci` — which the previous arrangement paid
+too, and which dominates.
+
+**Concurrency needs no coordination primitive here.** Two sessions provisioning
+at once have no shared environment to race over, so nothing has to be trusted
+to hold a lock — the correctness argument is disjointness, not mutual
+exclusion.
+
+What remains shared is caches, not environments: the `uv` package cache, the
+Playwright browser cache (`PLAYWRIGHT_BROWSERS_PATH`), and the VS Code test
+cache. Each is content-addressed or install-once, managed by the tool that owns
+it, and already shared before this change; a run reads from them and adds to
+them rather than repointing them at itself. That is the property the `.venv`
+symlink did not have.
+
+`tests/integration/test_worktree_runtime_isolation.py` holds the
+failure-direction proof: a worktree provisions, is removed, and the primary
+checkout still resolves the package from its own source.
+
 ### What authority provisioning runs at
 
 Provisioning executes the configured commands at orchestrator host authority,
@@ -139,8 +197,8 @@ Not every worktree an agent sits in is created by a session launch. The
 persistent review-exchange reviewer worktree
 (`execution/reviewer_worktree.py`, `<coder-worktree>-review-<timestamp>`) is
 created with a raw `git worktree add --detach`, outside `WorktreeManager`. It
-therefore gets neither guarantee in the table above: no `.venv` symlink, and
-nothing `worktrees.setup` installs.
+therefore gets neither guarantee in the table above: nothing `worktrees.setup`
+installs, and no runtime environment at all.
 
 That is deliberate, and it is the only such exemption. The reviewer reads the
 candidate's code; it does not run gates, and provisioning it would pay

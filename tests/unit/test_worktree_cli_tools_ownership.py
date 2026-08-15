@@ -602,9 +602,7 @@ def test_runtime_setup_leaves_self_hosting_worktree_equal_to_head(tmp_path) -> N
     worktree_path = git_worktree.worktree_path
     _plant_stale_overlay(git_worktree)
 
-    WorktreeRuntimeSetup(
-        repo_root=git_worktree.main_repo, enforce_hooks=False
-    ).apply(worktree_path)
+    WorktreeRuntimeSetup(enforce_hooks=False).apply(worktree_path)
 
     head_source = _git("show", f"HEAD:{CANDIDATE_TOOL}", cwd=worktree_path)
     assert (worktree_path / CANDIDATE_TOOL).read_text() == head_source
