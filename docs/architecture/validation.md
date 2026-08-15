@@ -183,13 +183,49 @@ pinned outside the worktree, and a candidate the run may not alter — are the
 bounds that are actually enforced, and both are checkable in
 `control/worktree_provisioning.py`.
 
-What is *not* written down is the permission itself: no document in this
-repository states under what contract repository-controlled build code may
-execute at orchestrator host authority, or what bounds that permission beyond
-the two above. That is recorded as a CONTRACT GAP in #55 and is not decided
-here. ADR-0034 (`ADR/0034-sandbox-scope.md`) is **Proposed** and defines
-SandboxScope; it defines no trusted-repository contract, so it cannot be cited
-as one.
+#### Operator-authorized host execution — the contract (decided in #55)
+
+Running a repository's own validation and provisioning code **is an intended
+capability of this orchestrator**, not an accident. What that permission is, and
+what it is not, is stated here.
+
+**The authority comes from outside the candidate.** It is the execution
+configuration the operator started the orchestrator with, and the repository and
+command selectors that configuration resolves to. It does **not** come from the
+repository's contents, and it does **not** come from who wrote them. A candidate
+cannot grant itself this permission by containing anything, which is what
+`_require_pinned_recipe` enforces mechanically: a recipe sourced from inside the
+worktree being provisioned is refused.
+
+**Call it operator-authorized host execution.** Do not call it a "trusted
+repository". That phrasing locates the authority in the repository, which is
+exactly where it does not live, and it invites the inference that repository
+contents can be assessed for trustworthiness. The distinction this contract
+draws is only whether explicit operator authorization exists.
+
+**Validation and provisioning are one execution-authority class.** They run the
+same kind of code, in the same worktree, at the same authority. The extra guards
+each carries — the pinned recipe and the unaltered-candidate checkpoint above —
+are **integrity bounds, not authority bounds**: they constrain what a run may do
+to the candidate, not what the run is permitted to be.
+
+**This is a bootstrap/legacy posture, not a security boundary.** The permission
+is currently unbounded once granted: the executed code runs at host authority
+with no isolation substrate. It is permitted because an operator explicitly
+authorized it, not because anything constrains it. A bounded execution substrate
+is separate hardening and is tracked as its own capability; nothing here claims
+one exists.
+
+**ADR-0034 does not govern this.** `ADR/0034-sandbox-scope.md` addresses the
+**agent-session** sandbox. Repository commands the *orchestrator* runs through
+its own subprocess path are not automatically inside that scope. If ADR-0034 or
+a successor is ever to claim end-to-end bounded execution, it must either
+explicitly include this subprocess path or record it as a limitation. It does not
+precede this decision and this decision does not settle it.
+
+**No rule keys on repository authorship.** A repository the operator did not
+write is not treated differently from one they did. The only distinction is
+whether explicit operator authorization is present.
 
 ### The one worktree that is exempt
 
