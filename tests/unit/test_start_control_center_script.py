@@ -103,6 +103,21 @@ printf '%s\\n' "$(pwd -P)/src" > "${site_packages}/issue_orchestrator_editable.p
     return uv_path
 
 
+def _write_failing_fake_uv(tools_path: Path) -> Path:
+    uv_path = tools_path / "uv"
+    uv_path.write_text(
+        """#!/usr/bin/env bash
+set -euo pipefail
+printf 'uv %s\\n' "$*" >> "${INSTALL_LOG}"
+echo "uv sync exploded" >&2
+exit 1
+""",
+        encoding="utf-8",
+    )
+    uv_path.chmod(0o755)
+    return uv_path
+
+
 def _write_noop_fake_uv(tools_path: Path) -> Path:
     uv_path = tools_path / "uv"
     uv_path.write_text(
@@ -421,6 +436,31 @@ def test_ensure_deps_rejects_sync_that_leaves_stale_install(tmp_path: Path) -> N
     assert "Dependency sync did not install issue_orchestrator" in result.stderr
     assert not (venv_path / ".deps-fingerprint").exists()
     assert not (venv_path / ".deps-synced").exists()
+
+
+def test_ensure_deps_withdraws_stale_marker_when_sync_fails(tmp_path: Path) -> None:
+    # `.venv/.deps-synced` is the marker the Makefile's `sync-deps` reads to
+    # decide whether an environment is current, and this launcher writes it. A
+    # sync that fails here must leave an earlier run's marker withdrawn: keeping
+    # it would let the next `make test-unit` skip the sync and run against the
+    # half-updated environment (#60).
+    repo, venv_path, install_log, tools_path, home_path = _make_fake_repo(tmp_path)
+    _write_failing_fake_uv(tools_path)
+    marker = venv_path / ".deps-synced"
+    marker.touch()
+
+    result = _run_ensure_deps(
+        repo,
+        venv_path,
+        install_log,
+        tools_path,
+        home_path,
+        installed_path=tmp_path / "other" / "issue_orchestrator" / "__init__.py",
+    )
+
+    assert result.returncode != 0
+    assert not marker.exists()
+    assert not (venv_path / ".deps-fingerprint").exists()
 
 
 def test_ensure_deps_accepts_repaired_install_from_symlinked_checkout(
