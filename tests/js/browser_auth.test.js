@@ -108,6 +108,52 @@ test('openAuthenticatedSseStream requests token when auth is enabled', async () 
     assert.deepEqual(fetches, [['/api/sse-token', { cache: 'no-store' }]]);
 });
 
+// The single-use SSE token lives in the URL, and the browser retries URLs on
+// its own. Leaving that replay possible is what produced the persistent
+// `invalid sse token` 401s in #44, so the helper that knows the token is
+// single-use is the one that has to prevent it.
+function recordingEventSourceTarget(sseToken = 'token-1') {
+    const listeners = new Map();
+    const created = [];
+    const target = {
+        ...targetWithMeta({ 'meta[name="io-browser-auth-required"]': '1' }),
+        EventSource: class {
+            constructor(url) {
+                this.url = url;
+                this.closed = false;
+                created.push(this);
+            }
+
+            addEventListener(name, fn) {
+                if (!listeners.has(name)) listeners.set(name, []);
+                listeners.get(name).push(fn);
+            }
+
+            close() { this.closed = true; }
+        },
+        fetch: async () => ({ ok: true, json: async () => ({ sse_token: sseToken }) }),
+    };
+    return { target, created, fire: (name) => (listeners.get(name) || []).forEach((fn) => fn({})) };
+}
+
+test('openAuthenticatedSseStream closes the stream on error so a spent token is never replayed', async () => {
+    const { target, created, fire } = recordingEventSourceTarget();
+
+    const stream = await browserAuth.openAuthenticatedSseStream('/api/events', target);
+    assert.equal(stream.closed, false);
+
+    fire('error');
+
+    assert.equal(created.length, 1);
+    assert.equal(stream.closed, true);
+});
+
+test('sealSpentSseToken tolerates a source that cannot take listeners', () => {
+    assert.equal(browserAuth.sealSpentSseToken(null), null);
+    const bare = {};
+    assert.equal(browserAuth.sealSpentSseToken(bare), bare);
+});
+
 function fakeDomTarget() {
     const elements = new Map();
     const body = makeNode('body');

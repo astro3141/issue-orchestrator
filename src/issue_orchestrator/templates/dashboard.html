@@ -45,7 +45,17 @@
 <body>
     <a href="#mainContent" class="skip-link">Skip to main content</a>
     <div class="container">
-        <div id="engineRestartBanner" class="engine-restart-banner" style="display:none;" role="status" aria-live="polite"></div>
+        <!-- Live-stream liveness indicator (#44). Rendered server-side in the
+             "connecting" state so it occupies its space from first paint (no
+             layout shift when JS takes over) and so the page can never be
+             *silently* non-live: this region always states whether the view is
+             live, and says so in text plus a glyph, never colour alone. -->
+        <div id="liveStreamStatus" class="live-stream-status live-stream-status--connecting"
+             data-live-state="connecting" data-connection="connecting" data-engine="unknown"
+             role="status" aria-live="polite">
+            <span class="live-stream-status__icon" aria-hidden="true">&#x25CC;</span>
+            <span class="live-stream-status__text">Connecting to the live event stream&hellip;</span>
+        </div>
         {% if not validation_configured %}
         <div class="validation-warning-banner" id="validationWarningBanner" role="alert">
             <span class="validation-warning-icon" aria-hidden="true">&#x26A0;</span>

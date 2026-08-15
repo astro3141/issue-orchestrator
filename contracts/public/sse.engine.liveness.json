@@ -1,0 +1,59 @@
+{
+  "additionalProperties": true,
+  "description": "Beacon proving the live stream *and* the engine are both alive.\n\nContracted because a consumer has to act on its absence: the interval it\nshould expect the next frame within is on the wire (``interval_seconds``)\nrather than duplicated as a client-side constant, so changing the server\ncadence cannot leave a watchdog mistuned.\n\n``state`` is the engine's own tick classification \u2014 ``advancing`` (a tick\ncompleted recently), ``stalled`` (ticks have stopped), ``unknown`` (no tick\nrecorded yet, or no engine attached). ``tick_id`` lets a consumer tell a\nhealthy transport apart from a working engine: two frames with the same\n``tick_id`` mean the loop has not moved.",
+  "properties": {
+    "interval_seconds": {
+      "title": "Interval Seconds",
+      "type": "number"
+    },
+    "phase": {
+      "default": "",
+      "title": "Phase",
+      "type": "string"
+    },
+    "seconds_since_tick": {
+      "anyOf": [
+        {
+          "type": "number"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Seconds Since Tick"
+    },
+    "stall_threshold_seconds": {
+      "title": "Stall Threshold Seconds",
+      "type": "number"
+    },
+    "state": {
+      "enum": [
+        "advancing",
+        "stalled",
+        "unknown"
+      ],
+      "title": "State",
+      "type": "string"
+    },
+    "tick_id": {
+      "anyOf": [
+        {
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Tick Id"
+    }
+  },
+  "required": [
+    "state",
+    "interval_seconds",
+    "stall_threshold_seconds"
+  ],
+  "title": "EngineLivenessPayload",
+  "type": "object"
+}

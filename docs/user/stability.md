@@ -226,14 +226,25 @@ breaking change to the envelope bumps it, so a consumer can refuse a version it
 does not understand instead of misparsing it.
 
 That is a guarantee rather than a convention because the field is applied by a
-single owner at the broadcast boundary —
-[`events/sse_envelope.py`](../../src/issue_orchestrator/events/sse_envelope.py),
-called from `broadcast_event()` — not by each producer. Events emitted as plain
-dictionaries (the observer, direct broadcasts such as `startup_complete`) get
-the same envelope as events built through `EventContext`, because nothing
-reaches a subscriber without passing through that function.
-`tests/unit/test_sse_envelope.py` covers both producer paths end to end and
-fails if any other code starts enqueueing to subscribers directly.
+single owner —
+[`events/sse_envelope.py`](../../src/issue_orchestrator/events/sse_envelope.py)
+— not by each producer. Events emitted as plain dictionaries (the observer,
+direct broadcasts such as `startup_complete`) get the same envelope as events
+built through `EventContext`, because nothing reaches a subscriber without
+passing through it.
+
+There are exactly two paths onto the stream, and both call it:
+
+- **Broadcast events** go through `broadcast_event()`, which envelopes them
+  before enqueueing to subscribers. `tests/unit/test_sse_envelope.py` covers
+  both producer paths end to end and fails if any other code starts enqueueing
+  to subscribers directly.
+- **The `engine.liveness` beacon** is emitted by the stream itself in
+  [`entrypoints/web_event_stream.py`](../../src/issue_orchestrator/entrypoints/web_event_stream.py),
+  which envelopes it the same way. It never passes through `broadcast_event()`
+  because it is not broadcast — it is generated per subscriber, carrying that
+  moment's engine reading. `tests/unit/test_web_event_stream.py` asserts the
+  beacon reaches the wire versioned.
 
 **`run_id` and `tick_id` are narrower**, and deliberately so: they identify an
 orchestrator run and control tick, which a direct broadcast like
@@ -285,6 +296,7 @@ These SSE events have a committed payload schema:
 | `stale.in_progress_cleared` | `contracts/public/sse.stale.in_progress_cleared.json` |
 | `stale.persistent_detected` | `contracts/public/sse.stale.persistent_detected.json` |
 | `history.reconciled` | `contracts/public/sse.history.reconciled.json` |
+| `engine.liveness` | `contracts/public/sse.engine.liveness.json` |
 | `startup_complete` | `contracts/public/sse.startup_complete.json` |
 | `shutdown_requested` | `contracts/public/sse.shutdown_requested.json` |
 
@@ -293,6 +305,28 @@ Non-SSE payloads on the same tier: `dashboard.view_model`, `timeline.issue`, and
 
 `tests/unit/test_public_api_surface_docs.py` asserts this table equals the
 `sse.*` entries of `PUBLIC_CONTRACTS` exactly, in both directions.
+
+#### `engine.liveness` — the event you consume by its *absence*
+
+Every other event says something happened. This one says the stream and the
+engine are both still there, and its contract is as much about cadence as about
+payload:
+
+- It arrives **immediately on subscribe**, then at least every
+  `interval_seconds` (which travels on the frame — do not hard-code it). That
+  holds while the stream is busy too, so a flood of other events never starves
+  it.
+- **Not receiving one within a small multiple of `interval_seconds` means the
+  stream is dead**, and that is the only reliable way to know. A half-open
+  connection leaves `EventSource.readyState` at `OPEN` and fires no `error`, so
+  a consumer that waits to be told about a disconnect will wait forever while
+  rendering stale data. Reconnect on the timeout; do not trust the transport to
+  report the failure.
+- `state` and `tick_id` describe the **engine**, not the connection. Beacons
+  arriving with `state: "stalled"`, or with an unchanging `tick_id`, mean a
+  healthy stream carrying an engine that is not advancing. Engine liveness is
+  proven by advancing ticks — never by process existence, HTTP reachability, or
+  the stream itself being up.
 
 **Every other event on the stream is `Experimental`.** The `EventName` catalog
 has well over a hundred entries; the ones above are the payloads that have been

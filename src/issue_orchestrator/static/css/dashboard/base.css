@@ -103,15 +103,58 @@ html[data-embedded="true"] body > .container > header {
     padding: 18px 20px 28px;
 }
 
-.engine-restart-banner {
+/* Live-stream liveness indicator (issue #44). Always present — it states
+   whether the board is live rather than only warning when it is not, because
+   "no banner" used to be indistinguishable from "the stream died an hour ago".
+   Every state pairs a glyph with its text, so colour is never the only signal,
+   and all four palettes are defined for both themes via the shared tokens. */
+.live-stream-status {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
     margin: 0 0 12px;
-    padding: 10px 12px;
+    padding: 8px 12px;
     border-radius: 10px;
-    border: 1px solid var(--status-paused-border);
-    background: var(--status-paused-bg);
-    color: var(--status-paused-text);
+    border: 1px solid var(--border);
+    background: var(--bg-panel-soft);
+    color: var(--text-muted);
     font-size: 13px;
     font-weight: 600;
+}
+
+.live-stream-status__icon {
+    flex: 0 0 auto;
+    font-size: 12px;
+    line-height: 1.4;
+}
+
+.live-stream-status__text {
+    min-width: 0;
+}
+
+.live-stream-status--live {
+    border-color: var(--status-running-border);
+    background: var(--status-running-bg);
+    color: var(--status-running-text);
+}
+
+.live-stream-status--stalled {
+    border-color: var(--status-paused-border);
+    background: var(--status-paused-bg);
+    color: var(--status-paused-text);
+}
+
+.live-stream-status--lost {
+    border-color: var(--danger);
+    background: color-mix(in srgb, var(--danger) 14%, var(--bg-panel));
+    color: var(--danger);
+}
+
+.live-stream-status--connecting,
+.live-stream-status--unknown {
+    border-color: var(--status-starting-border);
+    background: var(--status-starting-bg);
+    color: var(--status-starting-text);
 }
 
 /* Persistent "no validation configured" warning (issue #4109). Always shown

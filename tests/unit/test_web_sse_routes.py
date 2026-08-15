@@ -370,15 +370,26 @@ class TestSSEEventStreamFormat:
             async def read_chunk():
                 return await iterator.__anext__()
 
-            read_task = asyncio.create_task(read_chunk())
+            # Frame one is the engine-liveness beacon: the stream states its
+            # own cadence before anything else so a consumer's watchdog is
+            # armed from the first frame (#44).
+            beacon_task = asyncio.create_task(read_chunk())
             await ready.wait()
+            beacon = await beacon_task
+            assert beacon.event == "engine.liveness"
+            beacon_payload = json.loads(beacon.data)
+            assert beacon_payload["schema"] == EVENT_SCHEMA_VERSION
+            assert beacon_payload["interval_seconds"] > 0
+
+            read_task = asyncio.create_task(read_chunk())
+            await asyncio.sleep(0)
             await broadcast_event("session.started", {"issue_number": 123, "status": "active"})
 
             chunk = await read_task
             request.connected = False
 
-            assert chunk["event"] == "session.started"
-            payload = json.loads(chunk["data"])
+            assert chunk.event == "session.started"
+            payload = json.loads(chunk.data)
             # The broadcast boundary stamps the public envelope, so a raw
             # producer's payload reaches the wire versioned (issue #6464).
             assert payload == {

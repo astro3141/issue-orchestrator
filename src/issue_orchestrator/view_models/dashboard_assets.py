@@ -48,6 +48,11 @@ DASHBOARD_JS_CHUNKS: tuple[str, ...] = (
     "session_dialogs.js",
     "controls_refresh.js",
     "kanban_columns.js",
+    # ``live_event_stream.js`` owns the SSE subscription lifecycle: the
+    # engine-liveness watchdog, fresh-token reconnect, and the human-visible
+    # live/stalled/lost status (#44). Must load before ``issue_metadata.js``,
+    # which wires the dashboard's event handlers into it at load time.
+    "live_event_stream.js",
     "issue_metadata.js",
     "issue_menus.js",
     "issue_detail_modals.js",

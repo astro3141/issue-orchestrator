@@ -2,7 +2,6 @@
 
 import asyncio
 import contextlib
-import json
 import logging
 import os
 import signal
@@ -39,6 +38,7 @@ from .timeline_presentation import (
     _timeline_event_requires_run_dir,
 )
 from .web_diagnostics_routes import install_web_diagnostics_dependencies, web_diagnostics_router
+from .web_event_stream import read_engine_liveness, stream_events
 from .web_retrospective_review_routes import web_retrospective_review_router
 from .web_tech_lead_routes import web_tech_lead_router
 from .web_issue_detail_routes import web_issue_detail_router
@@ -385,34 +385,20 @@ async def events(request: Request):
     """Server-Sent Events endpoint for real-time updates.
 
     The dashboard connects to this endpoint to receive instant notifications
-    when sessions start, complete, or state changes.
+    when sessions start, complete, or state changes. The stream's own
+    mechanics — subscriber registration and the engine-liveness beacon that
+    lets a consumer detect a dead stream — belong to
+    :mod:`issue_orchestrator.entrypoints.web_event_stream`; this route only
+    binds them to this module's subscriber registry and orchestrator.
     """
-    async def event_generator():
-        queue: asyncio.Queue = asyncio.Queue(maxsize=100)
-        _event_subscribers.add(queue)
-        logger.info("[SSE] Client connected, %d total subscribers", len(_event_subscribers))
-
-        try:
-            while True:
-                # Check if client disconnected
-                if await request.is_disconnected():
-                    break
-
-                try:
-                    # Wait for event with timeout (sends keepalive)
-                    event = await asyncio.wait_for(queue.get(), timeout=30.0)
-                    yield {
-                        "event": event["type"],
-                        "data": json.dumps(event["data"]),
-                    }
-                except asyncio.TimeoutError:
-                    # Send keepalive comment to prevent connection timeout
-                    yield {"comment": "keepalive"}
-        finally:
-            _event_subscribers.discard(queue)
-            logger.info("[SSE] Client disconnected, %d remaining subscribers", len(_event_subscribers))
-
-    return EventSourceResponse(event_generator())
+    return EventSourceResponse(
+        stream_events(
+            request,
+            add_subscriber=add_event_subscriber,
+            remove_subscriber=remove_event_subscriber,
+            read_liveness=lambda: read_engine_liveness(get_orchestrator()),
+        )
+    )
 
 
 @app.post("/api/test/create")

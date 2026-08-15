@@ -130,6 +130,23 @@
         return `${path}${joiner}sse_token=${encodeURIComponent(token)}`;
     }
 
+    // The SSE token is single-use and lives in the URL, but reconnection is
+    // the browser's job, not ours: on a dropped stream `EventSource` replays
+    // the *same* URL with the now-spent token, which the server rejects with
+    // `invalid sse token` — the 401 signature in #44 — and it will keep
+    // replaying it. Closing on the first error takes that replay off the
+    // table at the one place that knows the credential is single-use, rather
+    // than relying on every caller to remember. Callers still get their own
+    // `error` listener; they must reconnect by calling this helper again,
+    // which mints a fresh token.
+    function sealSpentSseToken(source) {
+        if (!source || typeof source.addEventListener !== 'function') return source;
+        source.addEventListener('error', () => {
+            try { source.close(); } catch (_e) { /* already closed */ }
+        });
+        return source;
+    }
+
     async function openAuthenticatedSseStream(path, target = root) {
         const EventSourceCtor = target.EventSource;
         if (typeof EventSourceCtor !== 'function') {
@@ -143,7 +160,7 @@
             throw new Error(`sse-token request failed (${resp.status})`);
         }
         const { sse_token } = await resp.json();
-        return new EventSourceCtor(buildSseUrl(path, sse_token));
+        return sealSpentSseToken(new EventSourceCtor(buildSseUrl(path, sse_token)));
     }
 
     function installAuthenticatedFetch(target = root) {
@@ -172,6 +189,7 @@
         maybeShowAuthExpiredOverlay,
         openAuthenticatedSseStream,
         resolveRequestMethod,
+        sealSpentSseToken,
         showAuthExpiredOverlay,
     };
 

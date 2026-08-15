@@ -5,6 +5,7 @@ and external systems. Event names follow the format: {domain}.{action_past_tense
 
 Domains:
 - orchestrator: Lifecycle (started, ready, idle, paused, resumed, shutdown_*)
+- engine: Live-stream liveness beacon (liveness)
 - tick: Per-cycle boundaries (started, completed)
 - facts: Discovery phase (gathered)
 - plan: Planning phase (computed, noop)
@@ -46,6 +47,18 @@ class EventName(str, Enum):
     ORCHESTRATOR_SHUTDOWN_STARTED = "orchestrator.shutdown_started"
     ORCHESTRATOR_SHUTDOWN_COMPLETED = "orchestrator.shutdown_completed"
     ORCHESTRATOR_HEARTBEAT = "orchestrator.heartbeat"
+
+    # =========================================================================
+    # Engine liveness (live-stream beacon)
+    # =========================================================================
+    # Emitted by the SSE stream itself on a fixed cadence, carrying the
+    # engine's tick progression. Its *absence* is the signal: a consumer that
+    # stops receiving it knows the stream is dead even when the transport
+    # never reports an error, and one that receives it with an unchanged
+    # ``tick_id`` knows the transport is fine but the loop is not advancing.
+    # Neither can be inferred from process existence or HTTP reachability
+    # (#44).
+    ENGINE_LIVENESS = "engine.liveness"
 
     # =========================================================================
     # Tick boundaries (main orchestration cycle)
