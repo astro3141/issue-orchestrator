@@ -80,7 +80,7 @@ created it: a rework or review worktree — the reused ones — reached the publ
 gate unprovisioned, and the run died on a late, unrelated gate target. That was
 issue [#48].
 
-Provisioning holds three rules:
+Provisioning holds four rules:
 
 - **Fail closed, where the failure is.** A failing or timing-out setup command
   aborts the launch at provisioning — before a terminal exists — instead of
@@ -89,6 +89,21 @@ Provisioning holds three rules:
   retrospective-review paths provision before the claim is held, while the
   fresh coding and validation-retry paths hold the claim first and release it
   when provisioning fails.
+- **Failing closed is bounded.** Failing the launch is not the same as being
+  finished with it. A provisioning failure is usually environmental and
+  persistent — a missing toolchain, a broken lockfile, an unreachable package
+  registry — so retrying it forever re-ran the recipe and spent a session slot
+  every tick while raising no human-visible signal at all: busy, making no
+  progress, healthy from every signal except the tick log. That was
+  issue [#54]. The provisioner therefore counts **consecutive** failures per
+  issue against `PROVISIONING_ATTEMPT_LIMIT` (3). Under the bound the launch
+  fails and the next tick may try again; a success clears the count, so a
+  genuinely transient blip still recovers with no human involved. At the bound
+  the issue is escalated to `needs-human` (shared block, `SESSION_LIFECYCLE`
+  cause) with an operator comment and an `issue.needs_human` event, and every
+  later launch refuses **before running the recipe**. The count is
+  process-local; the escalation is not, and the label is what ends the refusal
+  — a human clearing it is read as the retry request and restores the budget.
 - **Do not touch the candidate.** Setup commands install tooling. The
   provisioner checkpoints `HEAD` and the worktree's dirty state before running
   them and re-reads both afterwards — **whether or not the commands succeeded**,

@@ -44,6 +44,33 @@ Three invariants ride along with running the commands:
   also why concurrent provisioning needs no lock here: there is no shared
   environment left to race over.
 
+A provisioning failure is bounded
+--------------------------------
+
+Failing the launch closed is not the same as being finished with it. A failure
+here is usually ENVIRONMENTAL and persistent — a missing toolchain, a broken
+lockfile, an unreachable package registry — and retrying it does not help, so
+an unbounded retry re-ran the recipe (for this repository an ``npm ci`` and a
+browser install) every tick, spent a session slot every tick, and raised no
+human-visible signal at all: busy, making no progress, healthy from every
+signal except the tick log (#54).
+
+So provisioning failures are counted per issue and bounded
+(:class:`ProvisioningAttemptLedger`). The count is CONSECUTIVE — a successful
+provisioning clears it — so a genuinely transient blip still recovers with no
+human involved, which is the half a "provisioning failures are human-fixable
+immediately" rule would have got wrong. Once the bound is spent the failure
+stops being retryable: the issue is escalated to ``needs-human`` through the
+injected :class:`ProvisioningEscalation`, and every later launch refuses BEFORE
+running the recipe, so the loop terminates instead of reinstalling a toolchain
+that is not going to appear.
+
+The bound lives here rather than in the launch paths for the same reason the
+commands do: five paths provision, and a ceiling enforced by two of them is not
+a ceiling. What ENDS the refusal is the escalation itself: the ledger is
+process-local, but the label is the repository's crash-safe truth, so a human
+clearing it is read as the retry request and the budget is restored.
+
 Authority
 ---------
 
@@ -68,9 +95,12 @@ repository. It is recorded as a CONTRACT GAP in **#55** and is not decided here.
 from __future__ import annotations
 
 import logging
+import threading
 import time
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Protocol
 
 from ..events import EventName
 from ..infra.config import Config
@@ -79,11 +109,25 @@ from ..ports import EventSink
 from ..ports.command_runner import CommandRunner
 from ..ports.event_sink import make_trace_event
 from ..ports.working_copy import WorkingCopy
+from .actions import Action, AddCommentAction, AddLabelAction
 from .isolation import build_runtime_tool_env
+from .label_manager import LabelManager
+from .needs_human_block import NeedsHumanCause
 from .session_launch_types import LaunchResult
 from .transition_log import log_transition
 
 logger = logging.getLogger(__name__)
+
+#: How many CONSECUTIVE failed provisioning attempts one issue gets before the
+#: failure is treated as environmental and handed to a human.
+#:
+#: Three, matching ``TECH_LEAD_LAUNCH_RETRY_LIMIT``: enough to ride out a
+#: registry timeout or a half-written cache without reinstalling a toolchain
+#: that is never going to appear. It is a constant rather than a configuration
+#: key because the recipe it bounds is already the operator's own
+#: (``Config.setup_worktree``) — what is bounded here is how many times the
+#: orchestrator will re-run it before saying so, not what it runs.
+PROVISIONING_ATTEMPT_LIMIT = 3
 
 
 class WorktreeProvisioningError(RuntimeError):
@@ -92,6 +136,154 @@ class WorktreeProvisioningError(RuntimeError):
     Subclasses :class:`RuntimeError` because the launch paths that already
     treated a setup failure as a runtime error keep catching it unchanged.
     """
+
+
+class ProvisioningAttemptsExhausted(WorktreeProvisioningError):
+    """Provisioning failed past its bound: this is now a human's to fix.
+
+    A distinct type rather than a flag on the message because it means
+    something different to a caller: an ordinary
+    :class:`WorktreeProvisioningError` says "this launch failed and the next
+    tick may try again", and this one says "the retrying has stopped, and the
+    issue has been escalated".
+    """
+
+    def __init__(self, message: str, *, issue_number: int, attempts: int) -> None:
+        super().__init__(message)
+        self.issue_number = issue_number
+        self.attempts = attempts
+
+
+@dataclass(frozen=True, slots=True)
+class ProvisioningAttempt:
+    """One recorded provisioning failure, and what it means for the next tick."""
+
+    issue_number: int
+    #: Consecutive failed provisioning attempts for this issue, including this one.
+    attempts: int
+    limit: int
+    error: str
+
+    @property
+    def exhausted(self) -> bool:
+        return self.attempts >= self.limit
+
+
+class ProvisioningEscalation(Protocol):
+    """How a provisioning failure past its bound reaches a human.
+
+    Separate from the provisioner because the two answer different questions.
+    The provisioner knows the worktree is not runnable and how many times it
+    has not been; only the launcher knows how this repository tells an operator
+    about it. Returns whether the escalation COMMITTED, so an escalation whose
+    label write failed is retried by the next launch rather than leaving an
+    issue silently un-retried and un-reported.
+    """
+
+    def escalate(self, attempt: ProvisioningAttempt) -> bool: ...
+
+    def still_escalated(self, issue_number: int) -> bool:
+        """Whether an escalation this owner raised is still in force.
+
+        The durable escalation, not the in-memory count, is what says an issue
+        is a human's. When a human clears it that IS the retry request, and a
+        process-local ledger that kept refusing afterwards would make the
+        escalation unclearable without a restart.
+        """
+        ...
+
+
+class ApplyActions(Protocol):
+    """The action-applier seam, in the shape both launchers already expose."""
+
+    def __call__(self, actions: list[Action], *, context: str) -> bool: ...
+
+
+@dataclass
+class _IssueProvisioningState:
+    """Consecutive provisioning failures for one issue, and their escalation."""
+
+    failures: int = 0
+    last_error: str = ""
+    #: Whether the escalation for this issue's exhausted budget COMMITTED. False
+    #: past the bound means the label/comment write did not land, so the next
+    #: launch retries it instead of treating an unreported issue as handled.
+    escalated: bool = False
+
+
+class ProvisioningAttemptLedger:
+    """The bound on how often one issue's worktree may fail to provision.
+
+    Counts CONSECUTIVE failures, because that is the only count that separates
+    the two cases the bound has to tell apart: a persistent environmental
+    fault, which never succeeds and must stop, and a transient one, which
+    succeeds on a later attempt and must not cost a human anything. A success
+    therefore forgets the issue entirely rather than decrementing it.
+
+    Keyed by issue number, which is the granularity ``needs-human`` is applied
+    at — a coding launch and a review launch for the same issue share one
+    environment and one escalation.
+    """
+
+    def __init__(self, *, limit: int = PROVISIONING_ATTEMPT_LIMIT) -> None:
+        if limit < 1:
+            raise ValueError(
+                f"ProvisioningAttemptLedger limit must be >= 1, got {limit}"
+            )
+        self.limit = limit
+        self._issues: dict[int, _IssueProvisioningState] = {}
+        # Provisioning is deliberately unserialised (there is no shared
+        # environment left to race over), so two worktrees really can be
+        # provisioned at once. The counter they share is not a worktree, and a
+        # lost increment here is a bound that quietly does not hold.
+        self._lock = threading.Lock()
+
+    def record_failure(self, issue_number: int, error: str) -> ProvisioningAttempt:
+        """Spend one attempt of ``issue_number``'s budget."""
+        with self._lock:
+            state = self._issues.setdefault(issue_number, _IssueProvisioningState())
+            state.failures = min(state.failures + 1, self.limit)
+            state.last_error = error
+            return self._attempt(issue_number, state)
+
+    def record_success(self, issue_number: int) -> None:
+        """Forget this issue: whatever was wrong with its worktree is not now."""
+        self.forget(issue_number)
+
+    def forget(self, issue_number: int) -> None:
+        """Drop this issue's budget so the next attempt starts from a full one."""
+        with self._lock:
+            self._issues.pop(issue_number, None)
+
+    def spent(self, issue_number: int) -> ProvisioningAttempt | None:
+        """The exhausted budget for ``issue_number``, or ``None`` if it has one left."""
+        with self._lock:
+            state = self._issues.get(issue_number)
+            if state is None or state.failures < self.limit:
+                return None
+            return self._attempt(issue_number, state)
+
+    def announced(self, issue_number: int) -> bool:
+        """Whether this issue's exhausted budget has been escalated to a human."""
+        with self._lock:
+            state = self._issues.get(issue_number)
+            return state is not None and state.escalated
+
+    def mark_announced(self, issue_number: int) -> None:
+        with self._lock:
+            state = self._issues.get(issue_number)
+            if state is not None:
+                state.escalated = True
+
+    def _attempt(
+        self, issue_number: int, state: _IssueProvisioningState
+    ) -> ProvisioningAttempt:
+        return ProvisioningAttempt(
+            issue_number=issue_number,
+            attempts=state.failures,
+            limit=self.limit,
+            error=state.last_error,
+        )
 
 
 @dataclass(frozen=True)
@@ -116,17 +308,21 @@ class WorktreeProvisioner:
         config: Config,
         command_runner: CommandRunner,
         working_copy: WorkingCopy,
+        escalation: ProvisioningEscalation,
+        ledger: ProvisioningAttemptLedger | None = None,
     ) -> None:
         self._config = config
         self._command_runner = command_runner
         self._working_copy = working_copy
+        self._escalation = escalation
+        self._ledger = ledger or ProvisioningAttemptLedger()
 
     @property
     def has_commands(self) -> bool:
         """Whether this repository configures any provisioning commands."""
         return bool(self._config.setup_worktree)
 
-    def provision(self, worktree_path: Path) -> None:
+    def provision(self, worktree_path: Path, *, issue_number: int) -> None:
         """Run the configured setup commands in ``worktree_path``.
 
         The candidate check runs on both outcomes. A setup command that alters
@@ -134,7 +330,15 @@ class WorktreeProvisioner:
         alteration left in the worktree and never reported, so the two facts are
         gathered separately and both are named in the failure.
 
+        ``issue_number`` is what the attempt budget is counted and escalated
+        against. It is required rather than optional because a launch that
+        cannot say which issue it is provisioning for cannot be bounded at all,
+        and an unbounded path is the defect this budget closes (#54).
+
         Raises:
+            ProvisioningAttemptsExhausted: this issue has already spent its
+                consecutive-failure budget, or spent the last of it here. The
+                recipe is NOT run in the former case.
             WorktreeProvisioningError: the recipe is not pinned outside the
                 worktree, a command failed or timed out, or provisioning
                 changed the candidate's committed state.
@@ -142,7 +346,28 @@ class WorktreeProvisioner:
         commands = list(self._config.setup_worktree)
         if not commands:
             return
-        self._require_pinned_recipe(worktree_path)
+        self._refuse_if_budget_spent(issue_number)
+        failure = self._run_recipe(commands, worktree_path)
+        if failure is None:
+            # Whatever was wrong with this issue's environment is not wrong now,
+            # so a later unrelated fault starts from a full budget (#54).
+            self._ledger.record_success(issue_number)
+            return
+        raise self._bounded(self._ledger.record_failure(issue_number, str(failure)), failure)
+
+    def _run_recipe(
+        self, commands: list[str], worktree_path: Path
+    ) -> WorktreeProvisioningError | None:
+        """Run the pinned recipe; return why the worktree is not runnable, or ``None``.
+
+        Refusals are RETURNED rather than raised so every reason a worktree is
+        not runnable — including an unpinned recipe, which is as persistent as
+        a missing toolchain — passes through the same attempt budget.
+        """
+        try:
+            self._require_pinned_recipe(worktree_path)
+        except WorktreeProvisioningError as unpinned:
+            return unpinned
         checkpoint = self._checkpoint(worktree_path)
         step_start = time.time()
         setup_failure: WorktreeProvisioningError | None = None
@@ -157,13 +382,87 @@ class WorktreeProvisioner:
         if candidate_change is not None:
             logger.error("Provisioning altered the candidate: %s", candidate_change)
         if setup_failure is not None and candidate_change is not None:
-            raise WorktreeProvisioningError(
+            return WorktreeProvisioningError(
                 f"{setup_failure}; the candidate was also altered: {candidate_change}"
-            ) from setup_failure
+            )
         if setup_failure is not None:
-            raise setup_failure
+            return setup_failure
         if candidate_change is not None:
-            raise WorktreeProvisioningError(candidate_change)
+            return WorktreeProvisioningError(candidate_change)
+        return None
+
+    def _refuse_if_budget_spent(self, issue_number: int) -> None:
+        """Stop before the recipe runs when this issue has no attempts left.
+
+        This is the half that ends the loop. Escalating and then provisioning
+        anyway would keep re-running an ``npm ci`` that has already failed its
+        way to a human; the point of the bound is that the next tick does not
+        pay for it again.
+        """
+        spent = self._ledger.spent(issue_number)
+        if spent is None:
+            return
+        if self._ledger.announced(issue_number) and not self._escalation.still_escalated(
+            issue_number
+        ):
+            # A human cleared the escalation. That IS the retry request, and the
+            # durable label - not this process's counter - is what says whether
+            # an issue is still a human's. Without this the ledger would outlive
+            # the escalation it raised and make it unclearable (#54).
+            logger.info(
+                "[launch] Provisioning escalation for #%d has been cleared; "
+                "restoring its attempt budget",
+                issue_number,
+            )
+            self._ledger.forget(issue_number)
+            return
+        self._announce(spent)
+        raise ProvisioningAttemptsExhausted(
+            f"provisioning for #{issue_number} failed {spent.attempts} consecutive "
+            f"time(s) and is not being retried; last failure: {spent.error}",
+            issue_number=issue_number,
+            attempts=spent.attempts,
+        )
+
+    def _bounded(
+        self, attempt: ProvisioningAttempt, failure: WorktreeProvisioningError
+    ) -> WorktreeProvisioningError:
+        """The error this failure becomes: retryable, or the end of retrying."""
+        if not attempt.exhausted:
+            logger.warning(
+                "[launch] Provisioning failed for #%d (attempt %d of %d)",
+                attempt.issue_number,
+                attempt.attempts,
+                attempt.limit,
+            )
+            return failure
+        self._announce(attempt)
+        return ProvisioningAttemptsExhausted(
+            f"{failure}; provisioning has now failed {attempt.attempts} consecutive "
+            "time(s) and is not being retried",
+            issue_number=attempt.issue_number,
+            attempts=attempt.attempts,
+        )
+
+    def _announce(self, attempt: ProvisioningAttempt) -> None:
+        """Tell a human once, and keep retrying until that actually commits."""
+        if self._ledger.announced(attempt.issue_number):
+            return
+        logger.error(
+            "[launch] Provisioning for #%d has failed %d consecutive time(s); "
+            "escalating and no longer retrying it: %s",
+            attempt.issue_number,
+            attempt.attempts,
+            attempt.error,
+        )
+        if self._escalation.escalate(attempt):
+            self._ledger.mark_announced(attempt.issue_number)
+            return
+        logger.error(
+            "[launch] Could not escalate exhausted provisioning for #%d; the "
+            "next launch attempt retries the escalation",
+            attempt.issue_number,
+        )
 
     def _require_pinned_recipe(self, worktree_path: Path) -> None:
         """Refuse a recipe the provisioned worktree could itself supply.
@@ -245,10 +544,15 @@ def provision_launch_worktree(
     """Provision a launch's worktree, or return that launch's failure.
 
     One reporting shape for every launch path, so the rule cannot be enforced
-    one way for a coder and another way for a reviewer.
+    one way for a coder and another way for a reviewer. The fresh coding and
+    validation-retry paths keep their OWN failure handling rather than calling
+    this, because a failure there must also clean up the pre-active worktree
+    and release the claim those paths hold — but the attempt budget is spent
+    inside the provisioner, so those paths are bounded (#54) whether or not
+    they share this reporting shape.
     """
     try:
-        provisioner.provision(worktree_path)
+        provisioner.provision(worktree_path, issue_number=number)
     except Exception as e:
         log_transition(kind, number, "LAUNCHING", "FAILED", "setup commands failed")
         logger.error(issue_log(number, "FAILED: setup commands failed: %s"), e)
@@ -257,9 +561,141 @@ def provision_launch_worktree(
             {
                 "issue_number": number,
                 "session_name": session_name,
-                "reason": "setup_commands_failed",
-                "error": str(e),
+                **provisioning_failure_facts(e),
             },
         ))
         return LaunchResult(None, False, f"Setup commands failed: {e}")
     return None
+
+
+def provisioning_failure_facts(error: BaseException) -> dict[str, object]:
+    """What a launch-failed event says about a provisioning failure.
+
+    ``attempts_exhausted`` is the fact a reader could not otherwise recover:
+    whether the next tick will try this launch again, or whether the retrying
+    has stopped and the issue is now a human's (#54). Built here so every path
+    that reports one reports the same thing.
+    """
+    return {
+        "reason": "setup_commands_failed",
+        "attempts_exhausted": isinstance(error, ProvisioningAttemptsExhausted),
+        "error": str(error),
+    }
+
+
+def build_launch_provisioner(
+    *,
+    config: Config,
+    command_runner: CommandRunner,
+    working_copy: WorkingCopy,
+    apply_actions: ApplyActions,
+    label_manager: LabelManager,
+    events: EventSink,
+    read_labels: Callable[[int], Sequence[str]],
+) -> WorktreeProvisioner:
+    """The provisioner a launcher uses: the recipe, its bound, and its escalation.
+
+    A launcher wants one collaborator, not three. Assembling them here also
+    keeps the escalation's wiring — which label, under which cause, read from
+    where — beside the owner that decides when to raise it.
+    """
+    return WorktreeProvisioner(
+        config=config,
+        command_runner=command_runner,
+        working_copy=working_copy,
+        escalation=build_provisioning_escalation(
+            apply_actions=apply_actions,
+            label_manager=label_manager,
+            events=events,
+            read_labels=read_labels,
+        ),
+    )
+
+
+def build_provisioning_escalation(
+    *,
+    apply_actions: ApplyActions,
+    label_manager: LabelManager,
+    events: EventSink,
+    read_labels: Callable[[int], Sequence[str]],
+) -> ProvisioningEscalation:
+    """Assemble the needs-human escalation from launcher collaborators.
+
+    The same shape a failed rework worktree already uses — the shared
+    ``needs-human`` block under ``SESSION_LIFECYCLE``, an operator comment, and
+    the ``issue.needs_human`` event — because it is the same kind of fact: a
+    launch-time environment failure a human, not another tick, has to fix.
+
+    The event is published only after the durable half commits (the discipline
+    the claim quarantine keeps): a dashboard warning whose label never landed
+    disappears on restart and takes the only signal with it.
+
+    ``read_labels`` must be the UNCACHED read: whether an escalation has been
+    cleared is exactly the question a stale answer gets wrong in the expensive
+    direction, by leaving an issue refused after the human fixed it.
+    """
+
+    class _Escalation:
+        def escalate(self, attempt: ProvisioningAttempt) -> bool:
+            committed = apply_actions(
+                [
+                    AddLabelAction(
+                        issue_number=attempt.issue_number,
+                        label=label_manager.needs_human,
+                        reason="worktree provisioning failed past its attempt bound",
+                        needs_human_cause=NeedsHumanCause.SESSION_LIFECYCLE,
+                    ),
+                    AddCommentAction(
+                        number=attempt.issue_number,
+                        comment=_provisioning_escalation_comment(attempt),
+                        reason="worktree provisioning failed past its attempt bound",
+                    ),
+                ],
+                context="provisioning_attempts_exhausted",
+            )
+            if not committed:
+                return False
+            events.publish(make_trace_event(
+                EventName.ISSUE_NEEDS_HUMAN,
+                {
+                    "issue_number": attempt.issue_number,
+                    "reason": "provisioning_attempts_exhausted",
+                    "attempts": attempt.attempts,
+                    "limit": attempt.limit,
+                    "error": attempt.error,
+                },
+            ))
+            return True
+
+        def still_escalated(self, issue_number: int) -> bool:
+            try:
+                return label_manager.needs_human in frozenset(read_labels(issue_number))
+            except Exception:
+                logger.exception(
+                    "[launch] Could not read labels for #%d; treating its "
+                    "provisioning escalation as still in force",
+                    issue_number,
+                )
+                # Fails CLOSED, the same direction the shared block reads in:
+                # wrongly keeping the refusal costs one launch, wrongly dropping
+                # it puts the repository back in the loop this bound removed.
+                return True
+
+    return _Escalation()
+
+
+def _provisioning_escalation_comment(attempt: ProvisioningAttempt) -> str:
+    """What an operator reads: what stopped, why retrying will not fix it, what to do."""
+    return (
+        "🛠️ **Worktree provisioning failed and is no longer being retried**\n\n"
+        f"The configured `setup_worktree` recipe failed on {attempt.attempts} "
+        f"consecutive launch attempt(s) for this issue (the bound is "
+        f"{attempt.limit}).\n\n"
+        f"Last failure:\n\n```\n{attempt.error}\n```\n\n"
+        "A provisioning failure is normally environmental — a missing "
+        "toolchain, a broken lockfile, an unreachable package registry — so "
+        "another attempt would re-run the same recipe and fail the same way "
+        "while holding a session slot. No further session for this issue will "
+        "provision a worktree until a human clears this label.\n\n"
+        "Fix the environment (or the recipe), then remove the label to retry."
+    )
