@@ -179,10 +179,14 @@ Such a session is left on its branch's original base on purpose.
 
 **Fix:** If the session is a tech_lead investigation, this is the exemption
 working — nothing to repair. Otherwise the update did not silently skip; it
-failed loudly, and the session either never launched (creation raises, and the
-issue lands in the `needs-human` path above) or its worktree was deleted and
-recreated (reuse). Search the tick log for the branch name to see which, and
-repair what the logged reason names.
+failed loudly. On creation the failure aborts the launch on its first
+occurrence, before any `setup_worktree` recipe runs, and the issue is escalated
+`needs-human` with the reason "worktree preparation failed" — a different stage
+from the attempt-bounded "worktree provisioning failed" entry above, which is
+the recipe failing *after* the worktree exists and has a budget of three tries.
+On reuse the worktree is deleted and recreated instead. Search the tick log by
+issue number for the logged reason — the reuse path's decisive line names the
+reason without the branch — and repair what it names.
 
 ### Sessions Failing Without Completion
 
