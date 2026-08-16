@@ -702,7 +702,7 @@ class CompletionProcessor:
         pr_number: int | None = None,
         completion_path: str | None = None,
         agent_label: str | None = None,
-        issue_key: "IssueKey | None" = None,
+        issue_key: "IssueKey | None",
     ) -> ProcessingResult:
         """Process a completion record and execute actions.
 
@@ -715,11 +715,15 @@ class CompletionProcessor:
             completion_path: Relative path to completion file. If None, uses legacy path.
             issue_key: The session's canonical issue identity — the same one
                 its claim and its attempt records are keyed by. The publish
-                gate files its durable verdict under it (#85). ``None`` on the
-                republish and manual-reprocess entry points, which hold only an
-                issue number: they still run the gate, but leave no receipt,
-                because deriving a key from a work-item number is the drift
-                #40 removed rather than a fallback worth reinstating.
+                gate files its durable verdict under it (#85). Required as an
+                explicit argument — including when it is ``None`` — for the
+                same reason ``PublicationGate.check`` requires it: a caller
+                that omits it silently loses the receipt, while a caller that
+                writes ``issue_key=None`` has said it holds no canonical
+                identity. The manual-reprocess entry point is the ``None``
+                case: it holds only an issue *number*, and deriving a key from
+                a work-item number is the drift #40 removed rather than a
+                fallback worth reinstating.
 
         Returns:
             ProcessingResult with success status and details.

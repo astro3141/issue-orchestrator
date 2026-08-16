@@ -154,6 +154,7 @@ class TestPRAlreadyExistsHandling:
             run_assets=run_assets,
             issue_number=123,
             issue_title="Test Issue",
+            issue_key=None,
         )
 
         assert mock_git_adapter.push.call_count == 2
@@ -197,6 +198,7 @@ class TestPRAlreadyExistsHandling:
             run_assets=run_assets,
             issue_number=123,
             issue_title="Test Issue",
+            issue_key=None,
         )
 
         assert result.success is True
@@ -243,6 +245,7 @@ class TestPRAlreadyExistsHandling:
             run_assets=run_assets,
             issue_number=123,
             issue_title="Test Issue",
+            issue_key=None,
         )
 
         # Cleanup should have happened

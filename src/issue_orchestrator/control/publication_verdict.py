@@ -9,6 +9,14 @@ that the bytes happen to land in an attempt sidecar. This is the same shape as
 ``execution.attempt_execution_identity_store``, which files §4's identity half
 on the same record.
 
+Same shape, different placement, deliberately: that one implements the
+``CandidateExecutionIdentityStore`` port and so lives in ``execution``, while
+this one has no port and no second implementation to swap in — it is a
+concrete collaborator of the publication gate, depends only on ports, and is
+assembled solely by ``build_publication_gate``. If a second writer of
+publication verdicts ever appears, that is the moment to lift this behind a
+port and move it beside its sibling, not before.
+
 The verdict is taken from the gate's own :class:`ValidationRecord` and nothing
 else — in particular ``head_sha`` comes from the record rather than from a
 second read of the working copy. A gate that validated A and a key built from

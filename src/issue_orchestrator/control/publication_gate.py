@@ -205,9 +205,10 @@ class PublicationGate:
                 this run's verdict is filed durably. Required as an explicit
                 argument — including when it is ``None`` — so a caller that has
                 no canonical identity says so rather than omitting it. The
-                republish and manual-reprocess entry points are the ``None``
-                cases: they hold only an issue *number*, and deriving a key
-                from a work-item snapshot is what #40 removed.
+                manual-reprocess route is the ``None`` case: it holds only an
+                issue *number* from a URL path, and deriving a key from a
+                work-item snapshot is what #40 removed. The republish path
+                carries the key on its durable locators instead.
 
         Returns:
             The outcome, including the evidence paths this gate wrote to.
@@ -262,10 +263,17 @@ class PublicationGate:
     ) -> None:
         """File this run's verdict on the attempt, when there is one to file.
 
-        A run with no record executed no contract — the profile configures no
-        publish command — and "never gated" is the *absence* of a receipt, not
-        a receipt saying nothing. Writing one here would make the one state a
-        reader most needs to distinguish indistinguishable.
+        A run with no record executed no contract, and "never gated" is the
+        *absence* of a receipt, not a receipt saying nothing. Writing one here
+        would make the one state a reader most needs to distinguish
+        indistinguishable. Two causes reach this branch, and skipping the
+        receipt is right for both:
+
+        - the profile configures no publish command, so nothing ran;
+        - ``ValidationGate.check`` refused before running because it could not
+          determine HEAD (``control.validation``). That is a refusal rather
+          than an unconfigured gate, but it has no commit — so there is no
+          candidate ``A`` to file a verdict under in the first place.
 
         Failures on both sides are recorded: a FAIL and a timeout are facts
         about A exactly as a PASS is, and a reader that only ever saw passes

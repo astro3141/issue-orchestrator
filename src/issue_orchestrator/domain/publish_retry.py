@@ -15,6 +15,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from .issue_key import IssueKey
+from .issue_key_codec import decode_issue_key, encode_issue_key
 from .session_run import SessionRunAssets
 
 
@@ -46,6 +48,18 @@ class PublishRetryLocators:
     skip_review: bool = False
     review_exchange_completed: bool = False
     review_exchange_halted: bool = False
+    # The candidate's canonical identity, carried rather than derived. The
+    # republish runs the publish gate and opens the PR, so it produces a
+    # verdict that belongs on ``Attempt(issue, A)`` exactly as the live
+    # completion path's does (#85); without the key the gate has nothing to
+    # file it under and the attempt reads "never gated" for work that was
+    # published. ``session_key`` cannot serve: it is a display string for a
+    # *session* slot, not a work item identity, and reversing it back into an
+    # ``IssueKey`` would be a second derivation of the rule #40 gave one owner.
+    # ``None`` only for locators persisted before #85: refusing to decode those
+    # would strand a genuinely publish-failed issue's retry, so they load and
+    # republish exactly as they do today, receipt-less.
+    issue_key: IssueKey | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -61,6 +75,11 @@ class PublishRetryLocators:
             "skip_review": self.skip_review,
             "review_exchange_completed": self.review_exchange_completed,
             "review_exchange_halted": self.review_exchange_halted,
+            "issue_key": (
+                encode_issue_key(self.issue_key)
+                if self.issue_key is not None
+                else None
+            ),
         }
 
     @classmethod
@@ -84,6 +103,14 @@ class PublishRetryLocators:
             ),
             review_exchange_halted=_require_bool(
                 data.get("review_exchange_halted", False), "review_exchange_halted"
+            ),
+            # Absent only in a pre-#85 entry; a *present* payload that cannot
+            # produce a key is corruption and fails loudly rather than
+            # degrading to the receipt-less path.
+            issue_key=(
+                decode_issue_key(data["issue_key"])
+                if data.get("issue_key") is not None
+                else None
             ),
         )
 

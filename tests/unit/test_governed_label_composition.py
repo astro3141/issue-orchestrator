@@ -146,6 +146,7 @@ def test_the_composed_completion_processor_rejects_it_in_pr_labels(
             f".issue-orchestrator/sessions/{run_assets.run_dir.name}/completion.json"
         ),
         agent_label="agent:test",
+        issue_key=None,
     )
 
     assert not result.success

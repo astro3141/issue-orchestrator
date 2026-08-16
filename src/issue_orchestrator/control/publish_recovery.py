@@ -57,6 +57,7 @@ from .publish_retry_finalize import RetryReviewRouting, RetrySuccessFinalizer
 from .republish_job_id import RepublishJobId
 
 if TYPE_CHECKING:
+    from ..domain.issue_key import IssueKey
     from ..domain.models import Session
     from ..domain.session_run import SessionRunAssets
     from .completion_types import ProcessingResult
@@ -87,6 +88,7 @@ class _CompletionProcessor(Protocol):
         pr_number: int | None = ...,
         completion_path: str | None = ...,
         agent_label: str | None = ...,
+        issue_key: "IssueKey | None",
     ) -> "ProcessingResult": ...
 
 
@@ -234,6 +236,11 @@ class PublishRecoveryService:
             skip_review=session.agent_config.skip_review,
             review_exchange_completed=review_exchange_completed,
             review_exchange_halted=review_exchange_halted,
+            # The session's own canonical identity — the key its claim and its
+            # attempt records already use — so the retry's publish verdict
+            # lands on the same ``Attempt(issue, A)`` the first attempt's
+            # evidence did (#85).
+            issue_key=session.key.issue,
         )
         self._locator_store.save(locators)
         logger.info(
@@ -735,6 +742,7 @@ class PublishRecoveryService:
                 pr_number=locators.pr_number,
                 completion_path=locators.completion_path,
                 agent_label=agent_label,
+                issue_key=locators.issue_key,
             )
             with self._lock:
                 self._results[token] = result

@@ -132,6 +132,7 @@ def test_session_output_manifest_and_validation_pointer(tmp_path: Path) -> None:
         issue_number=1,
         issue_title="Test Issue",
         completion_path=completion_path,
+        issue_key=None,
     )
     assert result.success is True
 
@@ -312,6 +313,7 @@ def test_review_completion_writes_feedback_file(tmp_path: Path) -> None:
         issue_title="Test Issue",
         completion_path=completion_path,
         pr_number=42,
+        issue_key=None,
     )
     assert result.success is True
 
@@ -361,6 +363,7 @@ def test_feedback_file_not_written_for_approved(tmp_path: Path) -> None:
         issue_title="Test Issue",
         completion_path=completion_path,
         pr_number=99,
+        issue_key=None,
     )
     assert result.success is True
 

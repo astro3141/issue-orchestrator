@@ -11,17 +11,22 @@ it cannot rebuild, an ``IssueKey`` implementation to its private fields — and
 the failure would only show up as work quietly reappearing wrong after a
 restart. Every decoder here fails loudly on a payload it cannot rebuild.
 
-``IssueKey`` round-trips as scope + stable id and returns as a
-:class:`GitHubIssueKey`. That is not a downgrade: the protocol defines identity
-as structural over exactly those two values, so the rebuilt key IS the same work
-item by its own contract.
+``IssueKey`` round-trips through :mod:`..domain.issue_key_codec`, which owns the
+one durable spelling of a key shared with the publish-retry locators. Encoding
+it a second time here would let two artifacts naming the same work item
+round-trip to keys that compare unequal.
 """
 
 from __future__ import annotations
 
 from typing import Any, Callable
 
-from ..domain.issue_key import GitHubIssueKey, IssueKey
+from ..domain.issue_key import IssueKey
+from ..domain.issue_key_codec import (
+    IssueKeyDecodeError,
+    decode_issue_key,
+    encode_issue_key,
+)
 from ..domain.models import (
     DiscoveredFailure,
     PendingRetrospectiveReview,
@@ -90,22 +95,19 @@ def decode_claim(payload: object) -> PendingWorkClaim:
         ) from exc
 
 
-def _encode_issue_key(key: IssueKey) -> dict[str, str]:
-    return {"scope": key.scope(), "stable_id": str(key.stable_id())}
-
-
 def _decode_issue_key(payload: object) -> IssueKey:
-    if not isinstance(payload, dict):
-        raise PendingWorkClaimDecodeError("issue key payload must be an object")
-    return GitHubIssueKey(
-        repo=str(payload["scope"]), external_id=str(payload["stable_id"])
-    )
+    # Re-raised as this artifact's own decode error: a caller catching a bad
+    # claim should not have to know which shared codec spelled the failure.
+    try:
+        return decode_issue_key(payload)
+    except IssueKeyDecodeError as exc:
+        raise PendingWorkClaimDecodeError(str(exc)) from exc
 
 
 def _encode_review(request: PendingWorkRequest) -> dict[str, Any]:
     assert isinstance(request, PendingReview)
     return {
-        "issue_key": _encode_issue_key(request.issue_key),
+        "issue_key": encode_issue_key(request.issue_key),
         "pr_number": request.pr_number,
         "pr_url": request.pr_url,
         "branch_name": request.branch_name,
@@ -130,7 +132,7 @@ def _decode_review(payload: dict[str, Any]) -> PendingReview:
 def _encode_retrospective_review(request: PendingWorkRequest) -> dict[str, Any]:
     assert isinstance(request, PendingRetrospectiveReview)
     return {
-        "issue_key": _encode_issue_key(request.issue_key),
+        "issue_key": encode_issue_key(request.issue_key),
         "issue_number": request.issue_number,
         "issue_title": request.issue_title,
         "agent_label": request.agent_label,
@@ -159,7 +161,7 @@ def _decode_retrospective_review(
 def _encode_rework(request: PendingWorkRequest) -> dict[str, Any]:
     assert isinstance(request, PendingRework)
     return {
-        "issue_key": _encode_issue_key(request.issue_key),
+        "issue_key": encode_issue_key(request.issue_key),
         "agent_type": request.agent_type,
         "rework_cycle": request.rework_cycle,
         "issue_number": request.issue_number,
