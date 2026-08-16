@@ -132,7 +132,10 @@ writing to the very thing under repair.
 
 A worktree left holding the old symlink needs nothing — the next session's
 worktree setup removes it and `worktrees.setup` builds the worktree its own
-environment.
+environment. A worktree created on a branch that already exists locally is
+likewise safe to reuse: that branch is updated onto the current base before the
+session receives it ([#79]), so a stale local branch cannot hand a session an
+out-of-date starting point.
 
 ### An Issue Is Marked `needs-human` for "Worktree provisioning failed"
 
