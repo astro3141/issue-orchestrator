@@ -77,12 +77,28 @@ once.
 Three states stay distinguishable after cleanup, which is what issue [#85]
 existed to restore: no receipt means the gate never ran, a receipt means it
 ran and says what it decided, and a receipt that does not parse raises rather
-than reading as either. A run whose profile configures no publish command
-writes no receipt — an unconfigured gate is a gate that never ran.
+than reading as either. Two runs write no receipt, and both are honestly "the
+gate never ran": one whose profile configures no publish command, and one the
+gate refused before executing because it could not determine HEAD — the latter
+has no candidate commit to file a verdict under in the first place.
 
-The republish and manual-reprocess entry points hold an issue *number* rather
-than the canonical issue key, so they run the gate but record no receipt, and
-log that they did not. They never write a receipt under a derived identity.
+Which entry points can file a receipt is a question about *identity*, not
+about the gate: a receipt lands on `Attempt(issue, A)` only when the caller
+holds the candidate's canonical issue key.
+
+- The live completion path carries the session's own key, the one its claim
+  and every other attempt-scoped record already use.
+- The **republish** path carries that same key on its durable
+  `PublishRetryLocators`, so a retried publish's verdict lands on the same
+  `Attempt(issue, A)` as the first attempt's evidence. Locators persisted
+  before [#85] have no key on them and republish receipt-less, as they did
+  before.
+- The **manual-reprocess** route holds only an issue *number* from a URL path.
+  It runs the gate, records no receipt, and logs that it did not.
+
+No path writes a receipt under a *derived* identity. Reversing a work-item
+number back into a key is the drift [#40] removed, and a receipt filed under a
+key nothing else uses is worse than no receipt at all.
 
 ## Worktree readiness is a precondition of a meaningful verdict
 
