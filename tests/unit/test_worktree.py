@@ -183,7 +183,7 @@ class TestCreateWorktree:
                 return MagicMock(returncode=0, stderr="")
             if argv[:2] == ["worktree", "list"]:
                 return MagicMock(returncode=0, stdout="", stderr="")
-            if argv[:3] == ["rev-parse", "--verify", "123-add-user-auth"]:
+            if argv[:4] == ["rev-parse", "--verify", "--quiet", "refs/heads/123-add-user-auth"]:
                 return MagicMock(returncode=1, stderr="")
             if argv[:3] == ["fetch", "origin", "123-add-user-auth"]:
                 return MagicMock(returncode=1, stderr="")
@@ -240,7 +240,7 @@ class TestCreateWorktree:
                 return MagicMock(returncode=0, stdout="", stderr="")
             if argv[:2] == ["worktree", "list"]:
                 return MagicMock(returncode=0, stdout="", stderr="")
-            if argv[:3] == ["rev-parse", "--verify", "123-test"]:
+            if argv[:4] == ["rev-parse", "--verify", "--quiet", "refs/heads/123-test"]:
                 return MagicMock(returncode=1, stdout="", stderr="")
             if argv[:3] == ["fetch", "origin", "123-test"]:
                 return MagicMock(returncode=1, stdout="", stderr="")
@@ -290,7 +290,7 @@ class TestCreateWorktree:
 
         def run_side_effect(cmd, *args, **kwargs):
             argv = cmd[3:]
-            if argv[:3] == ["rev-parse", "--verify", "123-test"]:
+            if argv[:4] == ["rev-parse", "--verify", "--quiet", "refs/heads/123-test"]:
                 return MagicMock(returncode=1, stdout="", stderr="")
             if argv[:3] == ["fetch", "origin", "123-test"]:
                 return MagicMock(returncode=1, stdout="", stderr="")
@@ -458,7 +458,7 @@ class TestCreateWorktree:
                 return MagicMock(returncode=0, stdout="", stderr="")
             if argv[:2] == ["worktree", "list"]:
                 return MagicMock(returncode=0, stdout=worktree_list_output, stderr="")
-            if argv[:3] == ["rev-parse", "--verify", "123-test"]:
+            if argv[:4] == ["rev-parse", "--verify", "--quiet", "refs/heads/123-test"]:
                 return MagicMock(returncode=1, stdout="", stderr="")
             if argv[:3] == ["fetch", "origin", "123-test"]:
                 return MagicMock(returncode=1, stdout="", stderr="")
@@ -582,7 +582,7 @@ class TestCreateWorktree:
                 return MagicMock(returncode=0, stdout="", stderr="")
             if argv[:2] == ["worktree", "list"]:
                 return MagicMock(returncode=0, stdout="", stderr="")
-            if argv[:3] == ["rev-parse", "--verify", "123-test"]:
+            if argv[:4] == ["rev-parse", "--verify", "--quiet", "refs/heads/123-test"]:
                 return MagicMock(returncode=1, stdout="", stderr="")
             if argv[:3] == ["fetch", "origin", "123-test"]:
                 return MagicMock(returncode=1, stdout="", stderr="")
@@ -649,7 +649,7 @@ class TestCreateWorktree:
                 return MagicMock(returncode=0, stdout="", stderr="")
             if argv[:2] == ["worktree", "list"]:
                 return MagicMock(returncode=0, stdout="", stderr="")
-            if argv[:3] == ["rev-parse", "--verify", "123-test"]:
+            if argv[:4] == ["rev-parse", "--verify", "--quiet", "refs/heads/123-test"]:
                 return MagicMock(returncode=1, stdout="", stderr="")
             if argv[:3] == ["fetch", "origin", "123-test"]:
                 return MagicMock(returncode=1, stdout="", stderr="")
@@ -739,7 +739,7 @@ class TestCreateWorktree:
                 return MagicMock(returncode=0, stdout="", stderr="")
             if argv[:2] == ["worktree", "list"]:
                 return MagicMock(returncode=0, stdout="", stderr="")
-            if argv[:3] == ["rev-parse", "--verify", "123-test"]:
+            if argv[:4] == ["rev-parse", "--verify", "--quiet", "refs/heads/123-test"]:
                 return MagicMock(returncode=1, stdout="", stderr="")
             if argv[:3] == ["fetch", "origin", "123-test"]:
                 return MagicMock(returncode=1, stdout="", stderr="")
@@ -824,7 +824,7 @@ class TestCreateWorktree:
                 return MagicMock(returncode=0, stdout="", stderr="")
             if argv[:2] == ["worktree", "list"]:
                 return MagicMock(returncode=0, stdout="", stderr="")
-            if argv[:3] == ["rev-parse", "--verify", "123-test"]:
+            if argv[:4] == ["rev-parse", "--verify", "--quiet", "refs/heads/123-test"]:
                 return MagicMock(returncode=1, stdout="", stderr="")
             if argv[:3] == ["fetch", "origin", "123-test"]:
                 return MagicMock(returncode=1, stdout="", stderr="")
