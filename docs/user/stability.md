@@ -120,6 +120,10 @@ handlers: it invokes every `Retired` command and requires a non-zero exit, and
 it fails if any command declared otherwise is in fact a failing stub. The tier
 cannot drift from the behavior again.
 
+Commands the orchestrator runs inside a worktree it manages are given a
+worktree-local uv cache, so a run in one checkout cannot select or modify
+another checkout's environment (#53).
+
 The console scripts installed by the package:
 
 <!-- inventory:console-scripts -->
