@@ -690,17 +690,13 @@ class NeedsHumanProvisioningEscalation:
 
     def escalate(self, attempt: ProvisioningAttempt) -> bool:
         """Block the issue, explain why, and say whether the block landed."""
-        if not self.apply_actions(
-            [
-                AddLabelAction(
-                    issue_number=attempt.issue_number,
-                    label=self.label_manager.needs_human,
-                    reason=_ESCALATION_REASON,
-                    needs_human_cause=NeedsHumanCause.SESSION_LIFECYCLE,
-                )
-            ],
-            context=PROVISIONING_ESCALATION_CONTEXT,
-        ):
+        block = AddLabelAction(
+            issue_number=attempt.issue_number,
+            label=self.label_manager.needs_human,
+            reason=_ESCALATION_REASON,
+            needs_human_cause=NeedsHumanCause.SESSION_LIFECYCLE,
+        )
+        if not self._apply(block):
             return False
         self._explain(attempt)
         self.events.publish(make_trace_event(
@@ -715,18 +711,18 @@ class NeedsHumanProvisioningEscalation:
         ))
         return True
 
+    def _apply(self, action: Action) -> bool:
+        """Hand one action to the launcher's applier; report whether it committed."""
+        return self.apply_actions([action], context=PROVISIONING_ESCALATION_CONTEXT)
+
     def _explain(self, attempt: ProvisioningAttempt) -> None:
         """Post the operator comment, best effort: the block already holds."""
-        if self.apply_actions(
-            [
-                AddCommentAction(
-                    number=attempt.issue_number,
-                    comment=_provisioning_escalation_comment(attempt),
-                    reason=_ESCALATION_REASON,
-                )
-            ],
-            context=PROVISIONING_ESCALATION_CONTEXT,
-        ):
+        explanation = AddCommentAction(
+            number=attempt.issue_number,
+            comment=_provisioning_escalation_comment(attempt),
+            reason=_ESCALATION_REASON,
+        )
+        if self._apply(explanation):
             return
         logger.warning(
             "[launch] #%d is blocked for exhausted provisioning but its "
