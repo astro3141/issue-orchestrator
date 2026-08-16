@@ -34,6 +34,14 @@ def validation_issue_key(session: Session, config: Config) -> IssueKey | None:
     stable-id prefix the two spellings disagree, and validation evidence would
     land under ``(repo, "38", A)`` while the review and execution-principal
     halves of the same attempt land under ``(repo, "M1-011", A)`` (#40).
+
+    It calls the helper rather than reading ``session.issue.key`` because the
+    scope is the one part a session's issue may not carry: the legacy
+    ``domain.models.Issue`` defaults ``repo`` to ``""``, so its ``.key`` would
+    be scoped to nothing. Falling back to ``config.repo`` is the existing rule
+    for that case and is left exactly as it was. Everything else — the
+    stable-id parse — comes from the canonical derivation, so a session holding
+    the ``GitHubIssue`` production runs on gets precisely ``session.issue.key``.
     """
     repo = session.issue.repo or config.repo
     if repo:

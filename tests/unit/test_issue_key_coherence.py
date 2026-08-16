@@ -41,6 +41,7 @@ from issue_orchestrator.domain.issue_key import (
     IssueKey,
 )
 from issue_orchestrator.domain.models import (
+    Issue as LegacyIssue,
     OrchestratorState,
     Session,
     SessionStatus,
@@ -54,6 +55,7 @@ from issue_orchestrator.execution.pending_work_claim_store import (
 )
 from issue_orchestrator.infra.config import Config
 from issue_orchestrator.observation.observation import SessionObservationResult
+from issue_orchestrator.ports.issue import Issue as IssueProtocol
 from tests.unit.session_run_helpers import make_session_run_assets
 from tests.unit.test_completion_review_exchange_async import (
     _build as build_review_exchange,
@@ -152,12 +154,18 @@ def _review_evidence_key(title: str, tmp_path: Path) -> IssueKey:
     return captured[0]
 
 
-def _validation_evidence_key(title: str, tmp_path: Path) -> IssueKey:
+def _validation_evidence_key(
+    title: str,
+    tmp_path: Path,
+    *,
+    issue: IssueProtocol | None = None,
+) -> IssueKey:
     """The key the completion path actually reaches ``decide_outcome`` with.
 
     Driven through ``process_active_sessions`` rather than the private helper,
     so what is captured is the identity a real completion would file validation
-    evidence under.
+    evidence under. ``issue`` overrides the work item the session carries, for
+    the legacy snapshot that has no repository of its own.
     """
     worktree = tmp_path / "worktree"
     worktree.mkdir(exist_ok=True)
@@ -171,7 +179,7 @@ def _validation_evidence_key(title: str, tmp_path: Path) -> IssueKey:
         # derived from the work item, so a session key that disagreed with it
         # cannot be what this captures.
         key=SessionKey(issue=FakeIssueKey("unused-session-scope"), task=TaskKind.CODE),
-        issue=_issue(title),
+        issue=issue if issue is not None else _issue(title),
         agent_config=make_agent_config(tmp_path),
         terminal_id=f"issue-{ISSUE_NUMBER}",
         worktree_path=worktree,
@@ -246,6 +254,26 @@ class TestPrefixedIdentityCoherence:
         assert key.stable_id() == "M1-011"
         assert key.scope() == REPO
         # The same key the issue snapshot itself derives - one rule, one owner.
+        assert key == _issue(PREFIXED_TITLE).key
+
+    def test_a_repoless_work_item_still_keys_on_the_stable_id(
+        self, tmp_path: Path
+    ) -> None:
+        """The one part the work item may not carry is its scope.
+
+        The legacy ``domain.models.Issue`` defaults ``repo`` to ``""``, so the
+        completion path falls back to ``config.repo`` for the scope - the rule
+        that was already there. The stable id is the half #40 changes, and it
+        must still come from the title, not the number.
+        """
+        key = _validation_evidence_key(
+            PREFIXED_TITLE,
+            tmp_path,
+            issue=LegacyIssue(
+                number=ISSUE_NUMBER, title=PREFIXED_TITLE, labels=["agent:backend"]
+            ),
+        )
+
         assert key == _issue(PREFIXED_TITLE).key
 
     def test_validation_and_review_evidence_land_on_one_attempt_record(
