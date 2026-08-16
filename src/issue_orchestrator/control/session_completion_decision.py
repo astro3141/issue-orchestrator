@@ -10,10 +10,9 @@ Split out of ``session_completion``, which owns applying the resulting outcome
 — same split as ``session_completion_diagnostics``.
 """
 
-import logging
 from typing import TYPE_CHECKING, Callable
 
-from ..domain.issue_key import IssueKey, github_issue_key
+from ..domain.issue_key import IssueKey
 from ..domain.models import Session
 from ..infra.config import Config
 
@@ -21,42 +20,28 @@ if TYPE_CHECKING:
     from ..observation.observation import SessionObservationResult
     from .session_controller import SessionController, SessionDecision
 
-logger = logging.getLogger(__name__)
 
+def validation_issue_key(session: Session) -> IssueKey:
+    """The validation attempt's issue identity: the session's own.
 
-def validation_issue_key(session: Session, config: Config) -> IssueKey | None:
-    """The validation attempt's issue identity, derived the one canonical way.
+    This is the key validation evidence for a candidate is filed under, so it
+    must be the key every other attempt-scoped record for the same work item
+    uses. ``Session`` already owns that identity in ``key.issue`` — it is what
+    the session was launched under, what its durable ``PendingWorkClaim`` row
+    is keyed by, and (since #40) what restoration rebuilds it with — so the
+    completion path asks the owner rather than re-deriving from a sibling
+    field.
 
-    This is the attempt identity validation evidence is filed under, so it must
-    be the key every other attempt-scoped record for the same issue uses. It
-    therefore goes through ``github_issue_key`` — the one owner of the rule
-    (#34) — rather than spelling out a number-only key: for a title carrying a
-    stable-id prefix the two spellings disagree, and validation evidence would
-    land under ``(repo, "38", A)`` while the review and execution-principal
-    halves of the same attempt land under ``(repo, "M1-011", A)`` (#40).
-
-    It calls the helper rather than reading ``session.issue.key`` because the
-    scope is the one part a session's issue may not carry: the legacy
-    ``domain.models.Issue`` defaults ``repo`` to ``""``, so its ``.key`` would
-    be scoped to nothing. Falling back to ``config.repo`` is the existing rule
-    for that case and is left exactly as it was. Everything else — the
-    stable-id parse — comes from the canonical derivation, so a session holding
-    the ``GitHubIssue`` production runs on gets precisely ``session.issue.key``.
+    Re-deriving from ``session.issue`` is what this replaces, and it was wrong
+    for more than the spelling: on the rework and review launch paths that
+    field is a *synthetic* work item (``Issue(38, "Rework #99")``, no repo), so
+    a title-aware derivation over it still yields ``(repo, "38", A)`` while the
+    session, its claim and the issue's coding-attempt records all use
+    ``(repo, "M1-011", A)``. Rework is not ``is_review_only``, so it really does
+    reach the validation gate. Asking the owner cannot drift that way: the key
+    is canonical by construction at every site that builds a ``Session``.
     """
-    repo = session.issue.repo or config.repo
-    if repo:
-        return github_issue_key(
-            repo=repo,
-            number=session.issue.number,
-            title=session.issue.title,
-        )
-    if config.is_validation_enabled():
-        logger.info(
-            "[COMPLETION] Validation attempt identity unavailable: repo is unset "
-            "for issue %s",
-            session.issue.number,
-        )
-    return None
+    return session.key.issue
 
 
 def completion_decider(
@@ -71,7 +56,7 @@ def completion_decider(
     tick thread; the returned callable performs the slow git/GitHub/validation
     work and may run off-thread.
     """
-    issue_key = validation_issue_key(session, config)
+    issue_key = validation_issue_key(session)
     retry_prompt_template = (
         session.agent_config.retry_prompt_template or config.retry.retry_prompt_template
     )

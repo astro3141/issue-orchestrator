@@ -6,7 +6,10 @@ keys as ``repo:M1-011``, not ``repo:38``. Two paths used to spell a number-only
 key by hand instead:
 
 - the completion path's validation attempt identity, which is the key
-  validation evidence for a candidate is filed under, and
+  validation evidence for a candidate is filed under - now taken from the
+  session's own ``key.issue``, the identity it was launched under, rather than
+  re-derived from its work-item snapshot (which is synthetic on the rework and
+  review paths), and
 - session restoration, which rebuilds a live session's identity after a
   restart.
 
@@ -36,7 +39,6 @@ from issue_orchestrator.domain.execution_identity import (
     ExecutionRole,
 )
 from issue_orchestrator.domain.issue_key import (
-    FakeIssueKey,
     GitHubIssueKey,
     IssueKey,
 )
@@ -71,6 +73,7 @@ from tests.unit.test_session_restorer import (
 
 REPO = "astro3141/issue-orchestrator"
 ISSUE_NUMBER = 38
+REWORK_PR_NUMBER = 99
 PREFIXED_TITLE = "[M1-011] Example"
 PLAIN_TITLE = "Example"
 CANDIDATE_SHA = "a" * 40
@@ -159,13 +162,15 @@ def _validation_evidence_key(
     tmp_path: Path,
     *,
     issue: IssueProtocol | None = None,
+    session_issue_key: IssueKey | None = None,
 ) -> IssueKey:
     """The key the completion path actually reaches ``decide_outcome`` with.
 
     Driven through ``process_active_sessions`` rather than the private helper,
     so what is captured is the identity a real completion would file validation
-    evidence under. ``issue`` overrides the work item the session carries, for
-    the legacy snapshot that has no repository of its own.
+    evidence under. ``issue`` overrides the work-item snapshot the session
+    carries and ``session_issue_key`` its launched-under identity, so the two
+    can be made to disagree the way the rework path makes them disagree.
     """
     worktree = tmp_path / "worktree"
     worktree.mkdir(exist_ok=True)
@@ -174,12 +179,20 @@ def _validation_evidence_key(
     config.repo = REPO
     config.repo_root = tmp_path
 
+    work_item = issue if issue is not None else _issue(title)
     session = Session(
-        # Deliberately NOT the issue's key: the validation identity must be
-        # derived from the work item, so a session key that disagreed with it
-        # cannot be what this captures.
-        key=SessionKey(issue=FakeIssueKey("unused-session-scope"), task=TaskKind.CODE),
-        issue=issue if issue is not None else _issue(title),
+        # The session's own identity, which is what the completion path must
+        # file under: canonical by construction at every launch site, unlike
+        # the snapshot below.
+        key=SessionKey(
+            issue=(
+                session_issue_key
+                if session_issue_key is not None
+                else _issue(title).key
+            ),
+            task=TaskKind.CODE,
+        ),
+        issue=work_item,
         agent_config=make_agent_config(tmp_path),
         terminal_id=f"issue-{ISSUE_NUMBER}",
         worktree_path=worktree,
@@ -259,12 +272,11 @@ class TestPrefixedIdentityCoherence:
     def test_a_repoless_work_item_still_keys_on_the_stable_id(
         self, tmp_path: Path
     ) -> None:
-        """The one part the work item may not carry is its scope.
+        """The scope is the one part a work-item snapshot may not carry.
 
-        The legacy ``domain.models.Issue`` defaults ``repo`` to ``""``, so the
-        completion path falls back to ``config.repo`` for the scope - the rule
-        that was already there. The stable id is the half #40 changes, and it
-        must still come from the title, not the number.
+        The legacy ``domain.models.Issue`` defaults ``repo`` to ``""``, so its
+        own ``.key`` is scoped to nothing. The completion path never reads it:
+        it files under the session's identity, which carries both halves.
         """
         key = _validation_evidence_key(
             PREFIXED_TITLE,
@@ -275,6 +287,34 @@ class TestPrefixedIdentityCoherence:
         )
 
         assert key == _issue(PREFIXED_TITLE).key
+        assert key.scope() == REPO
+
+    def test_a_synthetic_snapshot_cannot_change_the_filed_identity(
+        self, tmp_path: Path
+    ) -> None:
+        """The rework shape, which is the whole reason to ask the session.
+
+        ``session_rework_launcher`` builds its work item as
+        ``Issue(number, "Rework #<pr>")`` with no repo, while the session it
+        launches keys on ``rework.issue_key`` - the title-aware key the adapter
+        derived from the real issue. ``TaskKind.REWORK`` is not
+        ``is_review_only``, so this completion does reach the validation gate.
+        Deriving from the snapshot would file ``repo:38`` against a claim,
+        review record and coding attempt that all say ``repo:M1-011``.
+        """
+        key = _validation_evidence_key(
+            PREFIXED_TITLE,
+            tmp_path,
+            issue=LegacyIssue(
+                number=ISSUE_NUMBER,
+                title=f"Rework #{REWORK_PR_NUMBER}",
+                labels=["agent:backend"],
+            ),
+            session_issue_key=_issue(PREFIXED_TITLE).key,
+        )
+
+        assert key == _issue(PREFIXED_TITLE).key
+        assert key != GitHubIssueKey(repo=REPO, external_id=str(ISSUE_NUMBER))
 
     def test_validation_and_review_evidence_land_on_one_attempt_record(
         self, tmp_path: Path
@@ -334,6 +374,24 @@ class TestRestartIdentityCoherence:
         assert session.key.issue == session.issue.key
         assert session.key.issue == _review_evidence_key(PREFIXED_TITLE, tmp_path)
         assert session.key.issue.stable_id() == "M1-011"
+
+    def test_a_restored_session_files_its_evidence_under_that_identity(
+        self, tmp_path: Path
+    ) -> None:
+        """The two halves of #40 composed: restart, then complete.
+
+        Restoration decides the identity; the completion path files under it.
+        Proving them together is what the issue actually claims - that a
+        restart cannot move a candidate's evidence to a different work item.
+        """
+        restored = _restore(PREFIXED_TITLE, tmp_path)
+
+        assert len(restored) == 1
+        key = _validation_evidence_key(
+            PREFIXED_TITLE, tmp_path, session_issue_key=restored[0].key.issue
+        )
+
+        assert key == _review_evidence_key(PREFIXED_TITLE, tmp_path)
 
     def test_restore_is_declined_when_the_authoritative_title_is_unavailable(
         self, tmp_path: Path, caplog: Any
