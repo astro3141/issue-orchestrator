@@ -134,77 +134,20 @@ async function toggleExcluded() {
 // Server-Sent Events for real-time updates
 // Always connect - even during startup - so we can receive startup_complete
 // IMPORTANT: Connect first, then fetch initial state on open to avoid race conditions
+//
+// Connection lifecycle — opening, the engine-liveness watchdog, reconnect
+// backoff, and the human-visible status — belongs to
+// ``live_event_stream.js`` (issue #44). This block only says which events the
+// dashboard cares about and what to do when one arrives. Nothing here may
+// re-derive "are we live?"; that question has exactly one owner, because the
+// previous split answer (a non-null EventSource handle here, /api/info
+// reachability there) is what let a dead stream render as a healthy one.
 (function() {
     const startupComplete = window.dashboardData.startupComplete;
-    let evtSource = null;
-    let reconnectAttempts = 0;
-    let reconnectTimer = null;
-    let healthPollTimer = null;
-    const restartBanner = document.getElementById('engineRestartBanner');
-    const HEALTH_POLL_MS = 5000;
-
-    function setRestartBanner(message) {
-        if (!restartBanner) return;
-        restartBanner.textContent = message;
-        restartBanner.style.display = '';
-    }
-
-    function clearRestartBanner() {
-        if (!restartBanner) return;
-        restartBanner.style.display = 'none';
-        restartBanner.textContent = '';
-    }
-
-    async function checkEngineHealth() {
-        try {
-            const response = await fetch('/api/info', { cache: 'no-store' });
-            if (response.ok) {
-                if (evtSource === null) {
-                    setRestartBanner('Engine reachable. Reconnecting event stream...');
-                } else {
-                    clearRestartBanner();
-                }
-                return true;
-            }
-        } catch (_) {
-            // handled below
-        }
-        setRestartBanner('Engine restarting... waiting for service to recover.');
-        return false;
-    }
-
-    function closeEventStream() {
-        if (evtSource) {
-            evtSource.close();
-            evtSource = null;
-        }
-    }
-
-    function scheduleReconnect() {
-        if (reconnectTimer !== null) return;
-        const capped = Math.min(reconnectAttempts, 6);
-        const backoffMs = Math.min(30000, 1000 * (2 ** capped));
-        const jitterMs = Math.floor(Math.random() * 300);
-        const waitMs = backoffMs + jitterMs;
-        const seconds = Math.max(1, Math.round(waitMs / 1000));
-        reconnectAttempts += 1;
-        setRestartBanner(`Event stream disconnected... reconnecting in ${seconds}s.`);
-        reconnectTimer = window.setTimeout(() => {
-            reconnectTimer = null;
-            connectEventStream();
-        }, waitMs);
-    }
+    const statusElement = document.getElementById('liveStreamStatus');
+    const liveStream = window.ioLiveEventStream;
 
     function wireEventListeners(source) {
-        source.onopen = function() {
-            console.log('[SSE] Connected to event stream (startup_complete=' + startupComplete + ')');
-            reconnectAttempts = 0;
-            clearRestartBanner();
-            loadDependencyProblems();
-            loadStaleIssues();
-            refreshViewModel({ reloadOnListChange: false });
-        };
-
         const refreshEvents = [
             'session.started',
             'session.completed',
@@ -342,51 +285,67 @@ async function toggleExcluded() {
             updateE2EProgress();
         });
 
-        source.onerror = function() {
-            console.log('[SSE] Connection error, scheduling reconnect');
-            closeEventStream();
-            scheduleReconnect();
-        };
     }
 
-    async function connectEventStream() {
-        closeEventStream();
-        try {
-            // Control API requires an authenticated query-string token
-            // on /api/events (security #6017). Fail fast if the shared
-            // helper is not loaded; a raw EventSource would produce an
-            // endless unauthenticated reconnect loop.
+    if (!liveStream || typeof liveStream.createLiveEventStream !== 'function') {
+        // Fail loudly rather than degrading to a dashboard with no live feed
+        // and no way to tell: a silently non-live board is the defect this
+        // module exists to prevent.
+        console.error('[SSE] live_event_stream.js is not loaded; no live subscription');
+        if (statusElement) {
+            statusElement.className = 'live-stream-status live-stream-status--lost';
+            statusElement.setAttribute('data-live-state', 'lost');
+            statusElement.textContent =
+                'Live updates unavailable — this view is a cached snapshot, not live.';
+        }
+        return;
+    }
+
+    if (!statusElement) {
+        // ``createLiveStreamIndicator`` throws on a missing element, and it
+        // should — but this is module top-level, so letting it propagate would
+        // take unrelated dashboard code down with it. Report it and leave the
+        // subscription unstarted: a live stream nobody can see the state of is
+        // exactly what #44 was.
+        console.error('[SSE] #liveStreamStatus is missing; no live subscription');
+        return;
+    }
+
+    // The indicator is created once and owns its own nodes from then on, so
+    // the polite live region keeps its identity across every render — see
+    // ``createLiveStreamIndicator``.
+    const indicator = liveStream.createLiveStreamIndicator(statusElement, document);
+
+    const stream = liveStream.createLiveEventStream({
+        target: window,
+        openStream: async () => {
+            // Control API requires an authenticated query-string token on
+            // /api/events (security #6017), and it is single-use: every
+            // reconnect must mint a new one. Fail fast if the shared helper
+            // is missing — a raw EventSource would replay an unauthenticated
+            // URL forever.
             if (typeof window.openAuthenticatedSseStream !== 'function') {
                 throw new Error('authenticated SSE helper is not loaded');
             }
-            evtSource = await window.openAuthenticatedSseStream('/api/events');
-            wireEventListeners(evtSource);
-        } catch (err) {
-            console.error('[SSE] Failed to create EventSource:', err);
-            closeEventStream();
-            scheduleReconnect();
-        }
-    }
+            return window.openAuthenticatedSseStream('/api/events');
+        },
+        wireEvents: wireEventListeners,
+        onOpen: () => {
+            console.log('[SSE] Connected to event stream (startup_complete=' + startupComplete + ')');
+            loadDependencyProblems();
+            loadStaleIssues();
+            refreshViewModel({ reloadOnListChange: false });
+        },
+        onStatus: (status) => {
+            indicator.render(status);
+        },
+    });
 
-    connectEventStream();
-    healthPollTimer = window.setInterval(() => {
-        checkEngineHealth();
-    }, HEALTH_POLL_MS);
-    // No eager checkEngineHealth() here: at init time evtSource is still
-    // null because connectEventStream() is async, so an eager call paints
-    // the "Engine reachable. Reconnecting event stream..." banner that
-    // SSE's onopen clears ~10ms later — a visible whole-screen flicker on
-    // every dashboard load. Real disconnects are caught by the periodic
-    // health poll above and by scheduleReconnect() on SSE failure.
+    stream.start();
+    window.ioDashboardLiveStream = stream;
 
     window.addEventListener('beforeunload', () => {
-        if (healthPollTimer !== null) {
-            window.clearInterval(healthPollTimer);
-        }
-        if (reconnectTimer !== null) {
-            window.clearTimeout(reconnectTimer);
-        }
-        closeEventStream();
+        stream.stop();
     });
 })();
 

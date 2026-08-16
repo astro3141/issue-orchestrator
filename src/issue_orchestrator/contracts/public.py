@@ -207,6 +207,29 @@ class ShutdownRequestedPayload(ContractBase):
     active_sessions: int | None = None
 
 
+class EngineLivenessPayload(ContractBase):
+    """Beacon proving the live stream *and* the engine are both alive.
+
+    Contracted because a consumer has to act on its absence: the interval it
+    should expect the next frame within is on the wire (``interval_seconds``)
+    rather than duplicated as a client-side constant, so changing the server
+    cadence cannot leave a watchdog mistuned.
+
+    ``state`` is the engine's own tick classification — ``advancing`` (a tick
+    completed recently), ``stalled`` (ticks have stopped), ``unknown`` (no tick
+    recorded yet, or no engine attached). ``tick_id`` lets a consumer tell a
+    healthy transport apart from a working engine: two frames with the same
+    ``tick_id`` mean the loop has not moved.
+    """
+
+    state: Literal["advancing", "stalled", "unknown"]
+    tick_id: Optional[int] = None
+    seconds_since_tick: Optional[float] = None
+    phase: str = ""
+    interval_seconds: float
+    stall_threshold_seconds: float
+
+
 class TimelineArtifactContract(ContractBase):
     type: str
     label: str
@@ -339,6 +362,7 @@ PUBLIC_CONTRACTS: dict[str, type[BaseModel]] = {
     "sse.stale.in_progress_cleared": StaleClearedPayload,
     "sse.stale.persistent_detected": PersistentStalePayload,
     "sse.history.reconciled": HistoryReconciledPayload,
+    "sse.engine.liveness": EngineLivenessPayload,
     "sse.startup_complete": StartupCompletePayload,
     "sse.shutdown_requested": ShutdownRequestedPayload,
     "timeline.issue": TimelineIssueContract,

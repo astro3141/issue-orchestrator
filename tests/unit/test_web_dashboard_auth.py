@@ -610,3 +610,43 @@ def test_cookie_minted_via_cc_login_works_on_dashboard() -> None:
         bs_module.shutdown()
         configure_api_token(prev_admin, agent_callback=prev_agent)
         configure_dashboard_admin_token(prev_dashboard)
+
+
+# ---------------------------------------------------------------------------
+# SSE subscription (issue #44)
+#
+# The incident's signature was a persistent 401 ``invalid sse token`` on
+# ``GET /api/events`` while every other dashboard route stayed usable. That
+# asymmetry has one cause: ``/api/events`` is the only route whose credential
+# is single-use, so it is the only one a transport-level *replay* can break.
+# These pin the refusals, which need no stream. The other half — that a
+# freshly minted token really does open a live stream, and that a replay of it
+# is then refused — needs a socket the server can keep open, so it lives in
+# ``tests/integration/test_dashboard_sse_subscription.py`` against a real
+# uvicorn server. ``TestClient`` cannot host it: its transport runs the ASGI
+# app to completion before returning a response, so a never-ending SSE
+# generator simply never returns.
+# ---------------------------------------------------------------------------
+
+
+def test_sse_subscription_without_a_token_is_rejected(
+    logged_in_dashboard_client: TestClient,
+) -> None:
+    resp = logged_in_dashboard_client.get("/api/events")
+
+    assert resp.status_code == 401
+    assert resp.json() == {"error": "invalid sse token"}
+
+
+def test_sse_token_from_another_session_is_rejected(
+    logged_in_dashboard_client: TestClient,
+) -> None:
+    """A token only opens the stream of the session it was minted for."""
+    other_session, _csrf = browser_session.create_session()
+    foreign_token = browser_session.issue_sse_token(other_session)
+    assert foreign_token
+
+    resp = logged_in_dashboard_client.get(f"/api/events?sse_token={foreign_token}")
+
+    assert resp.status_code == 401
+    assert resp.json() == {"error": "invalid sse token"}

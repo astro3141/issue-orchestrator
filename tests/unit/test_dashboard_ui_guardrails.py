@@ -1797,14 +1797,65 @@ def test_dashboard_first_paint_boot_runs_before_stylesheets() -> None:
 
 def test_dashboard_sse_requires_authenticated_stream_helper() -> None:
     js = _read_dashboard_js_bundle()
-    connect_body = _function_body(js, "connectEventStream")
-    reconnect_body = _function_body(js, "scheduleReconnect")
 
-    assert "window.openAuthenticatedSseStream('/api/events')" in connect_body
-    assert "new EventSource('/api/events')" not in connect_body
-    assert "authenticated SSE helper is not loaded" in connect_body
-    assert "Event stream disconnected... reconnecting" in reconnect_body
-    assert "Engine restarting... reconnecting" not in reconnect_body
+    # Every connection is minted through the authenticated helper, which
+    # fetches a fresh single-use token. A raw EventSource would 401 forever.
+    assert "window.openAuthenticatedSseStream('/api/events')" in js
+    assert "new EventSource(" not in js
+    assert "authenticated SSE helper is not loaded" in js
+
+
+def test_dashboard_live_stream_has_one_owner_and_a_beacon_watchdog() -> None:
+    """Structural backstop for #44; behaviour lives in tests/js/.
+
+    Two rules the dashboard must never re-acquire, both cross-cutting enough
+    that losing them would only show up in production:
+
+    1. The connection lifecycle has a single owner. The old split — the SSE
+       block deciding one thing, an ``/api/info`` poll deciding another —
+       is what let a dead stream clear its own warning banner.
+    2. Liveness is proven by the engine beacon's arrival, never inferred from
+       ``EventSource`` not having reported an error. A half-open socket
+       reports nothing, which is exactly the incident.
+    """
+    js = _read_dashboard_js_bundle()
+
+    assert "createLiveEventStream" in js
+    assert "createLiveStreamIndicator" in js
+    assert "MISSED_BEACON_TOLERANCE" in js
+    assert "checkWatchdog" in js
+    # The reachability poll must not own the liveness banner again.
+    assert "Engine restarting... waiting for service to recover." not in js
+    assert "Engine reachable. Reconnecting event stream" not in js
+
+
+def test_live_stream_indicator_announces_state_not_the_ticking_detail() -> None:
+    """The polite region is the empty span, not the sentence that ticks (#44).
+
+    Structural backstop for an accessibility rule that only shows up in a
+    screen reader: the visible sentence carries a tick age and a reconnect
+    countdown and is rewritten about once a second, so if it were the live
+    region a healthy dashboard would announce itself forever. Behaviour —
+    "ten beacons produce one announcement" — is pinned in
+    ``tests/js/live_event_stream.test.js``.
+    """
+    tmpl = _read(DASHBOARD_TEMPLATE)
+    css = _read_dashboard_css_bundle()
+
+    status_open = tmpl[tmpl.index('id="liveStreamStatus"'):]
+    container = status_open[: status_open.index(">")]
+    assert 'aria-live' not in container, (
+        "the container holds the ticking detail; it must not be the live region"
+    )
+    assert 'role="status"' not in container
+
+    assert 'class="live-stream-status__announcement visually-hidden"' in tmpl
+    assert 'role="status" aria-live="polite"></span>' in tmpl, (
+        "the polite region must ship empty and already in the DOM, or the "
+        "first state change has no region to be announced in"
+    )
+    # The region is hidden by a utility the dashboard bundle actually defines.
+    assert ".visually-hidden {" in css
 
 
 def test_settings_page_uses_shared_embedded_nav_helper() -> None:

@@ -173,6 +173,12 @@
     "status": "active",
     "step": "stopped"
   },
+  "engine.liveness": {
+    "level": "detail",
+    "phase": "system",
+    "status": "completed",
+    "step": "engine.liveness"
+  },
   "facts.gathered": {
     "level": "detail",
     "phase": "system",
