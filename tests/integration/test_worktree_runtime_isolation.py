@@ -1,4 +1,4 @@
-"""One worktree's provisioning run must not reach another checkout (#53, #61).
+"""Provisioning against real collaborators: isolation (#53, #61) and its bound (#54).
 
 This is the failure-direction proof for the active blocker. Every collaborator
 here is the real one — the worktree runtime setup owner, `WorktreeProvisioner`,
@@ -29,6 +29,11 @@ already records a *different* checkout — reconcile the mismatch where uv
 reconciles it, in the environment the record names. Restore either the symlink
 step or the trust in a bare directory and these tests fail, which is the point
 of them.
+
+The last test here is the other failure direction, #54: a recipe that fails
+every time it is run must stop being run. It uses the same real collaborators,
+and it counts what the shell actually executed rather than what the production
+counter says it did.
 """
 
 from __future__ import annotations
@@ -41,7 +46,13 @@ from pathlib import Path
 import pytest
 
 from issue_orchestrator.adapters.worktree.api import WorktreeRuntimeSetup
-from issue_orchestrator.control.worktree_provisioning import WorktreeProvisioner
+from issue_orchestrator.control.worktree_provisioning import (
+    PROVISIONING_ATTEMPT_LIMIT,
+    ProvisioningAttempt,
+    ProvisioningAttemptsExhausted,
+    WorktreeProvisioner,
+    WorktreeProvisioningError,
+)
 from issue_orchestrator.execution.command_runner import LocalCommandRunner
 from issue_orchestrator.execution.git_working_copy import GitWorkingCopy
 from issue_orchestrator.infra.config import Config
@@ -75,6 +86,26 @@ printf "%s" "$PWD" > "{EDITABLE_SOURCE}"
 """
 
 
+#: The issue every provisioning run here is attributed to. The isolation tests
+#: all provision successfully, so none of them spends the attempt budget; the
+#: bound test at the bottom of this file spends all of it deliberately.
+ISSUE = 53
+
+
+class _RecordingEscalation:
+    """Records escalations so a test that provisions cleanly can assert none."""
+
+    def __init__(self) -> None:
+        self.escalated: list[ProvisioningAttempt] = []
+
+    def escalate(self, attempt: ProvisioningAttempt) -> bool:
+        self.escalated.append(attempt)
+        return True
+
+    def still_escalated(self, issue_number: int) -> bool:
+        return any(a.issue_number == issue_number for a in self.escalated)
+
+
 def _provisioner(config_path: Path) -> WorktreeProvisioner:
     """A provisioner running the recipe for real, from operator configuration."""
     config = Config()
@@ -84,6 +115,7 @@ def _provisioner(config_path: Path) -> WorktreeProvisioner:
         config=config,
         command_runner=LocalCommandRunner(),
         working_copy=GitWorkingCopy(),
+        escalation=_RecordingEscalation(),
     )
 
 
@@ -156,7 +188,7 @@ def test_provisioning_a_worktree_leaves_the_primary_checkout_working(
     worktree then left that path gone, and the primary checkout could no longer
     import the package or run its pre-push gate.
     """
-    _provisioner(config_path).provision(repo.worktree_path)
+    _provisioner(config_path).provision(repo.worktree_path, issue_number=ISSUE)
 
     _remove_worktree(repo, repo.worktree_path)
 
@@ -171,7 +203,7 @@ def test_provisioning_builds_the_worktree_its_own_environment(repo, config_path)
     environment: the gate would then fail on the missing prerequisite and blame
     the candidate, which is #48's failure mode.
     """
-    _provisioner(config_path).provision(repo.worktree_path)
+    _provisioner(config_path).provision(repo.worktree_path, issue_number=ISSUE)
 
     assert _editable_source(repo.worktree_path) == str(repo.worktree_path)
     assert not (repo.worktree_path / ".venv").is_symlink()
@@ -192,7 +224,7 @@ def test_a_worktree_created_before_the_fix_is_repaired_before_provisioning(
     )
 
     WorktreeRuntimeSetup(enforce_hooks=False).apply(repo.worktree_path)
-    _provisioner(config_path).provision(repo.worktree_path)
+    _provisioner(config_path).provision(repo.worktree_path, issue_number=ISSUE)
 
     assert _editable_source(repo.main_repo) == str(repo.main_repo)
     assert _editable_source(repo.worktree_path) == str(repo.worktree_path)
@@ -219,7 +251,7 @@ def test_a_reused_worktree_carrying_a_stale_environment_reaches_no_other_checkou
     assert not (repo.worktree_path / VENV).is_symlink()
 
     WorktreeRuntimeSetup(enforce_hooks=False).apply(repo.worktree_path)
-    _provisioner(config_path).provision(repo.worktree_path)
+    _provisioner(config_path).provision(repo.worktree_path, issue_number=ISSUE)
 
     assert _editable_source(repo.main_repo) == str(repo.main_repo)
     assert _editable_source(repo.worktree_path) == str(repo.worktree_path)
@@ -238,7 +270,7 @@ def test_a_reused_worktrees_own_environment_is_not_rebuilt(repo, config_path):
     installed.write_text("kept")
 
     WorktreeRuntimeSetup(enforce_hooks=False).apply(repo.worktree_path)
-    _provisioner(config_path).provision(repo.worktree_path)
+    _provisioner(config_path).provision(repo.worktree_path, issue_number=ISSUE)
 
     assert installed.read_text() == "kept"
     assert _editable_source(repo.worktree_path) == str(repo.worktree_path)
@@ -258,17 +290,61 @@ def test_concurrent_provisioning_cannot_corrupt_another_environment(
     provisioner = _provisioner(config_path)
     both_ready = threading.Barrier(2)
 
-    def provision(worktree_path: Path) -> None:
+    def provision(worktree_path: Path, issue_number: int) -> None:
         both_ready.wait(timeout=30)
-        provisioner.provision(worktree_path)
+        provisioner.provision(worktree_path, issue_number=issue_number)
 
     with ThreadPoolExecutor(max_workers=2) as pool:
         for future in [
-            pool.submit(provision, repo.worktree_path),
-            pool.submit(provision, second),
+            pool.submit(provision, repo.worktree_path, ISSUE),
+            pool.submit(provision, second, ISSUE + 1),
         ]:
             future.result(timeout=30)
 
     assert _editable_source(repo.worktree_path) == str(repo.worktree_path)
     assert _editable_source(second) == str(second)
     assert _editable_source(repo.main_repo) == str(repo.main_repo)
+
+
+#: Launches driven by the bound test below — far past any plausible ceiling, so
+#: an unbounded loop is unmistakable in the count of recipe runs it leaves.
+TICKS = 25
+
+
+def test_a_permanently_failing_recipe_stops_being_retried(repo, config_path, tmp_path):
+    """The bound (#54), measured against a recipe that really does fail (#54 A2/A4).
+
+    The failure-direction proof for the OTHER half of provisioning: not what a
+    recipe writes, but how many times a recipe that will never succeed gets to
+    run. Everything here is real — `LocalCommandRunner`, a real shell, a real
+    worktree — and the recipe records each run, so the assertion is on what
+    actually executed rather than on a counter the production code also keeps.
+
+    Remove the bound and the recipe runs `TICKS` times and nothing escalates.
+    """
+    attempts = tmp_path / "provisioning-attempts.log"
+    config = Config()
+    config.setup_worktree = [
+        f"printf 'attempt\\n' >> {attempts}; "
+        "echo 'npm ERR! getaddrinfo ENOTFOUND registry.npmjs.org' >&2; exit 1"
+    ]
+    config.config_path = config_path
+    escalation = _RecordingEscalation()
+    provisioner = WorktreeProvisioner(
+        config=config,
+        command_runner=LocalCommandRunner(),
+        working_copy=GitWorkingCopy(),
+        escalation=escalation,
+    )
+
+    failures = []
+    for _ in range(TICKS):
+        with pytest.raises(WorktreeProvisioningError) as excinfo:
+            provisioner.provision(repo.worktree_path, issue_number=ISSUE)
+        failures.append(excinfo.value)
+
+    assert attempts.read_text().count("attempt") == PROVISIONING_ATTEMPT_LIMIT
+    assert len(escalation.escalated) == 1
+    assert "ENOTFOUND" in escalation.escalated[0].error
+    assert isinstance(failures[-1], ProvisioningAttemptsExhausted)
+    assert not isinstance(failures[0], ProvisioningAttemptsExhausted)

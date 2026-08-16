@@ -134,6 +134,26 @@ A worktree left holding the old symlink needs nothing — the next session's
 worktree setup removes it and `worktrees.setup` builds the worktree its own
 environment.
 
+### An Issue Is Marked `needs-human` for "Worktree provisioning failed"
+
+**Symptom:** An issue carries `needs-human` and a comment saying worktree
+provisioning failed and is no longer being retried. The tick log shows the
+`worktrees.setup` recipe failing three times in a row for that issue and not
+running for it since.
+
+**Cause:** This is the bound working. A provisioning failure is usually
+environmental and persistent — a missing toolchain, a broken lockfile, an
+unreachable package registry — so after
+`PROVISIONING_ATTEMPT_LIMIT` (3) *consecutive* failures the orchestrator stops
+retrying rather than re-running an `npm ci` and spending a session slot every
+tick with nothing to show for it ([#54]). The comment carries the last failure
+verbatim.
+
+**Fix:** Repair the environment (or the recipe) named in the comment, then
+remove the `needs-human` label. Clearing the label *is* the retry request: the
+next launch runs the recipe again from a full budget. See
+[validation.md](../architecture/validation.md) for what the bound guarantees.
+
 ### Sessions Failing Without Completion
 
 **Symptom:** Sessions end with "without completion markers", marked as FAILED.

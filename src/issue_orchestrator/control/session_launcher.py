@@ -53,7 +53,7 @@ from ..domain.coder_prompt import (
 )
 from ..domain.session_run import SessionRunAssets
 from .worktree_context import WorktreeContext
-from .worktree_provisioning import WorktreeProvisioner, provision_launch_worktree
+from .worktree_provisioning import build_launch_provisioner, provision_launch_worktree, provisioning_failure_facts
 from ..infra.validation_state import DEFAULT_RETRY_TEMPLATE, _truncate_with_tail
 from ..domain.tech_lead_session import TechLeadLaunchScope
 from .tech_lead_session_policy import (
@@ -202,16 +202,6 @@ class SessionLauncher:
         self._worktree_manager = worktree_manager
         self._working_copy = working_copy
         self._command_runner = command_runner
-        # One owner decides whether a worktree is runnable, for every launch
-        # path this launcher has (#48). The coding and validation-retry paths
-        # below keep their own failure handling rather than calling
-        # provision_launch_worktree, because a failure there must also clean up
-        # the pre-active worktree and release the claim those paths hold.
-        self._worktree_provisioner = WorktreeProvisioner(
-            config=config,
-            command_runner=command_runner,
-            working_copy=working_copy,
-        )
         self._session_output = session_output
         self._manifest_downloader = manifest_downloader
         self._tech_lead_authority = tech_lead_authority
@@ -249,6 +239,17 @@ class SessionLauncher:
             from .label_manager import LabelManager
             label_manager = LabelManager(config)
         self._lm = label_manager
+        # The one owner of worktree runnability for every launch path this launcher
+        # has (#48), and of how many times it keeps asking before that is a human's (#54).
+        self._worktree_provisioner = build_launch_provisioner(
+            config=config,
+            command_runner=command_runner,
+            working_copy=working_copy,
+            apply_actions=self._apply_actions,
+            label_manager=label_manager,
+            events=events,
+            read_labels=repository_host.get_issue_labels_fresh,
+        )
         self._unrecorded_refusals = unrecorded_refusals or UnrecordedRefusals.process_local()
         self._tech_lead_needs_human = TechLeadNeedsHumanLifecycle(
             labels=label_manager,
@@ -944,7 +945,7 @@ class SessionLauncher:
             # Run setup commands
             if self._worktree_provisioner.has_commands:
                 try:
-                    self._worktree_provisioner.provision(worktree_path)
+                    self._worktree_provisioner.provision(worktree_path, issue_number=issue.number)
                 except Exception as e:
                     log_transition("issue", issue.number, "LAUNCHING", "FAILED", "setup commands failed")
                     logger.error(issue_log(issue.number, "FAILED: setup commands failed: %s"), e)
@@ -953,8 +954,7 @@ class SessionLauncher:
                         {
                             "issue_number": issue.number,
                             "session_name": session_name,
-                            "reason": "setup_commands_failed",
-                            "error": str(e),
+                            **provisioning_failure_facts(e),
                         },
                     ))
                     self._cleanup_pre_active_launch_worktree(
@@ -1438,7 +1438,7 @@ class SessionLauncher:
         if not self._worktree_provisioner.has_commands:
             return None
         try:
-            self._worktree_provisioner.provision(worktree_path)
+            self._worktree_provisioner.provision(worktree_path, issue_number=issue.number)
         except Exception as e:
             log_transition("issue", issue.number, "LAUNCHING", "FAILED", "setup commands failed")
             logger.error(issue_log(issue.number, "FAILED: setup commands failed: %s"), e)
