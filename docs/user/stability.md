@@ -120,10 +120,6 @@ handlers: it invokes every `Retired` command and requires a non-zero exit, and
 it fails if any command declared otherwise is in fact a failing stub. The tier
 cannot drift from the behavior again.
 
-Commands the orchestrator runs inside a worktree it manages are given a
-worktree-local uv cache, so a run in one checkout cannot select or modify
-another checkout's environment (#53).
-
 The console scripts installed by the package:
 
 <!-- inventory:console-scripts -->
@@ -137,6 +133,15 @@ The console scripts installed by the package:
 | `exchange-respond` | Review-exchange agents | Experimental |
 | `prepush-check` | Agents and git hooks | Supported |
 | `verify-agent-sandbox` | Guardrail verification | Internal |
+
+Commands the orchestrator itself runs inside a worktree — setup, validation,
+pre-publish checks, and its own Git calls — are given a worktree-local uv cache,
+so none of them can select or modify another checkout's environment (#53).
+`tests/integration/test_worktree_uv_cache_isolation.py` pins that bound in the
+failure direction, for both shapes the runtime environment is applied in. Agent
+sessions are **not** scoped this way: an agent that invokes `uv` itself still
+uses the shared user cache, so a cross-checkout selection remains possible on
+that path.
 
 ### Agent completion contracts — supported
 
