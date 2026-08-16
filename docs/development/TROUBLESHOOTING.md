@@ -117,6 +117,10 @@ provisioning, and removing the worktree left the path dangling. That was
 [#53]; worktrees no longer share an environment
 (see [validation.md](../architecture/validation.md)), so this cannot recur —
 but an environment already in this state does not repair itself.
+Orchestrator-managed worktree commands likewise run against a worktree-local uv
+cache at `.issue-orchestrator/tool-homes/uv`, so a run in one checkout cannot
+select or modify another checkout's environment through uv's cached interpreter
+answers ([#53]).
 
 **Fix (operator step, run once per affected checkout):**
 
