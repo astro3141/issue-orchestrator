@@ -12,7 +12,16 @@ fast-forward, because none had happened.
 The invariant these tests hold is one sentence, and it belongs to both paths:
 
     when ``create`` returns, the worktree's branch has the current base branch
-    in its ancestry, and still carries its own commits.
+    in its ancestry, and still carries whatever of its own commits the base
+    left applicable.
+
+It belongs to every branch creation *adopts*, not only the local one the
+incident was reported against: a branch fetched from the remote is current
+with respect to the remote and says nothing about the base, so it is held to
+the same rule and covered here too. When the branch's work cannot be replayed
+onto the advanced base, the update resets to the base and reports the loss —
+that direction is exercised as well, because it is the one this change made
+newly reachable from creation.
 
 Everything here is real Git against a real remote — a bare repository on disk,
 which is what keeps the whole file offline and deterministic. Nothing pushes:
@@ -133,17 +142,38 @@ def _publish_base(repo: Repository) -> str:
     return _git(repo.root, "rev-parse", f"origin/{BASE}")
 
 
-def _stranded_branch(repo: Repository, branch: str) -> str:
+def _stranded_branch(
+    repo: Repository,
+    branch: str,
+    *,
+    filename: str = "agent-work.txt",
+    content: str = "work only this branch has\n",
+) -> str:
     """Leave ``branch`` behind at its own commit, with no worktree on it.
 
     Built the way the real one is: a worktree does the work, and cleanup takes
     the checkout away and leaves the branch. Returns the tip it is stranded at.
+
+    ``filename`` is a parameter so a caller can aim the branch's one commit at
+    a path ``_advance_base`` also writes, which is what makes the replay onto
+    the advanced base conflict.
     """
     checkout = repo.scratch / branch
     _git(repo.root, "worktree", "add", "-b", branch, str(checkout), f"origin/{BASE}")
-    head = _commit(checkout, "agent-work.txt", "work only this branch has\n")
+    head = _commit(checkout, filename, content)
     _git(repo.root, "worktree", "remove", "--force", str(checkout))
     return head
+
+
+def _publish_branch(repo: Repository, branch: str) -> None:
+    """Put ``branch`` on the remote and take it off the checkout.
+
+    The state a host that clones fresh finds for an issue that already has a
+    PR: the branch exists on the remote and nowhere locally, so creation
+    fetches it rather than attaching it.
+    """
+    _git(repo.origin, "fetch", str(repo.root), f"{branch}:{branch}")
+    _git(repo.root, "branch", "-D", branch)
 
 
 def _advance_base(repo: Repository, commits: int = 3) -> str:
@@ -209,6 +239,64 @@ def test_the_stranded_branchs_own_commits_survive_the_update(repo):
     assert _is_ancestor(info.path, f"origin/{BASE}", "HEAD")
 
 
+def test_a_branch_that_exists_only_on_the_remote_is_updated_onto_the_base_too(repo):
+    """The same incident, one branch of the same ``if`` (#79 review R1/F1).
+
+    No local branch and no worktree — the state a fresh host finds for an issue
+    that already has a PR, and the state left behind by a scratch cleanup that
+    removed the branch. Creation fetches the remote branch, which makes its tip
+    current with respect to the *remote* and says nothing about the base: the
+    branch was pushed from wherever the base was then. Reuse rebases this very
+    branch when the worktree is still there, so creation must too, or the rule
+    depends on which artefact happens to survive.
+    """
+    branch = f"{ISSUE}-remote-only"
+    stranded_head = _stranded_branch(repo, branch)
+    _publish_branch(repo, branch)
+    base_head = _advance_base(repo)
+    assert not _is_ancestor(repo.origin, base_head, stranded_head)
+    refs_before = _refs(repo.origin)
+
+    info = _create(repo, branch=branch)
+
+    assert info.reuse_status == "created"
+    assert _is_ancestor(info.path, base_head, "HEAD")
+    assert (info.path / "agent-work.txt").read_text() == "work only this branch has\n"
+    assert info.commits_discarded == 0
+    assert _refs(repo.origin) == refs_before
+
+
+def test_a_stranded_branch_whose_work_conflicts_is_reset_and_the_loss_reported(repo):
+    """The direction this change made newly reachable from creation.
+
+    Before the base update, creation could not discard a session's commits at
+    all. It can now: a branch whose work will not replay onto the advanced base
+    takes the rebase-failed path, which aborts, counts, and hard-resets to the
+    base. That is the pre-existing behaviour of the shared update — what is new
+    is creation reaching it — so what needs holding is that creation does not
+    hand over a half-rebased worktree, and that the count reaches the caller,
+    which is what the briefing and the UI report the loss from.
+    """
+    branch = f"{ISSUE}-conflicting"
+    _stranded_branch(
+        repo, branch, filename="base-0.txt", content="the branch's own version\n"
+    )
+    base_head = _advance_base(repo)
+    refs_before = _refs(repo.origin)
+
+    info = _create(repo, branch=branch)
+
+    assert info.reuse_status == "created"
+    assert _git(info.path, "rev-parse", "HEAD") == base_head
+    assert info.commits_discarded == 1
+    assert (info.path / "base-0.txt").read_text() == "base commit 0\n"
+    # No rebase left running: the branch is checked out, not a detached HEAD
+    # mid-replay, and nothing is left unstaged for the session to trip over.
+    assert _git(info.path, "rev-parse", "--abbrev-ref", "HEAD") == branch
+    assert _git(info.path, "status", "--porcelain") == ""
+    assert _refs(repo.origin) == refs_before
+
+
 def test_ordinary_fresh_branch_creation_still_starts_from_the_base(repo):
     """No local branch, no remote branch — the untouched majority path.
 
@@ -227,6 +315,34 @@ def test_ordinary_fresh_branch_creation_still_starts_from_the_base(repo):
     assert _git(info.path, "rev-parse", "--abbrev-ref", "HEAD") == info.branch_name
     assert info.uncommitted_discarded == 0
     assert info.commits_discarded == 0
+    assert _refs(repo.origin) == refs_before
+
+
+def test_a_tag_sharing_the_branch_name_is_not_mistaken_for_the_branch(repo):
+    """"Does this branch exist?" must ask about branches (#79 review R1/N2).
+
+    A bare name resolves through git's whole ref ordering, so a tag answers
+    yes. Attaching it would give the session a detached HEAD at an arbitrary
+    point in history, which the base update would then rebase. The tag is left
+    local so the remote-branch fetch cannot match it either, and the only
+    correct outcome is the ordinary fresh branch built from the base.
+    """
+    branch = f"{ISSUE}-tagged"
+    _advance_base(repo)
+    old_point = _git(repo.root, "rev-parse", f"origin/{BASE}~2")
+    _git(repo.root, "tag", branch, old_point)
+    base_head = _git(repo.root, "rev-parse", f"origin/{BASE}")
+    refs_before = _refs(repo.origin)
+
+    info = _create(repo, branch=branch)
+
+    assert info.reuse_status == "created"
+    # Spelled in full: with the tag present, the abbreviated form disambiguates
+    # to ``heads/<branch>``, which says nothing about HEAD being a branch.
+    assert _git(info.path, "rev-parse", "--symbolic-full-name", "HEAD") == (
+        f"refs/heads/{branch}"
+    )
+    assert _git(info.path, "rev-parse", "HEAD") == base_head
     assert _refs(repo.origin) == refs_before
 
 

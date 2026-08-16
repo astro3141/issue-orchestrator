@@ -595,9 +595,9 @@ def _update_branch_onto_base(
 
     Both lifecycle paths that hand a worktree to a session come through here —
     reuse, which finds the branch already checked out, and creation, which
-    adopts an existing local branch. They differ in what they do when the
-    update fails, not in whether it is owed, so the rule and its one exemption
-    live here rather than being restated per path.
+    adopts a branch that already exists locally or on the remote. They differ
+    in what they do when the update fails, not in whether it is owed, so the
+    rule and its one exemption live here rather than being restated per path.
 
     ``preserve_branch`` is that exemption: a tech_lead investigation reads the
     subject's branch as evidence, so rebasing it would rewrite the commits
@@ -767,16 +767,22 @@ def _handle_branch_on_recreate(
 class _WorktreeAddPlan:
     """How a fresh worktree gets its checkout.
 
-    ``attaches_existing_branch`` is the part the caller cannot infer from the
-    argument list: every other plan builds the branch from a ref resolved
-    right now (``origin/<branch>``, the seed ref, ``origin/<base>``), so its
-    tip is current by construction. Attaching a branch that already exists
-    locally is the one plan that adopts a tip of unknown age — it is the plan
-    that still owes the base update.
+    ``needs_base_update`` is the part the caller cannot infer from the argument
+    list, and it names the obligation rather than the circumstance that
+    produces it: every plan is asked the one question the invariant cares
+    about, so adding a fifth cannot answer a different one by accident.
+
+    A plan owes nothing when it *builds* the branch from a ref this call
+    resolved against the current base — ``origin/<base>``, or the operator's
+    seed ref, which is deliberately chosen. A plan owes the update when it
+    *adopts* a tip whose standing relative to the base is unknown: a local
+    branch left at whatever base it was last on, or a remote issue branch,
+    whose tip is current only with respect to the remote and says nothing
+    about where the branch sits relative to the base.
     """
 
     args: list[str]
-    attaches_existing_branch: bool
+    needs_base_update: bool
 
 
 def _plan_worktree_add(
@@ -789,12 +795,14 @@ def _plan_worktree_add(
     """Plan the git worktree add for a fresh worktree.
 
     Returns:
-        The command arguments plus whether they adopt an existing local branch.
+        The command arguments plus whether they still owe a base update.
     """
-    # Check if branch already exists
+    # Ask for the local branch specifically: a bare name resolves through git's
+    # whole ref ordering, so a tag sharing the issue branch's name would answer
+    # yes and get attached as a detached HEAD the base update would then rebase.
     branch_check = _git_run(
         repo_root,
-        ["rev-parse", "--verify", branch_name],
+        ["rev-parse", "--verify", "--quiet", f"refs/heads/{branch_name}"],
         check=False,
     )
     branch_exists = branch_check.returncode == 0
@@ -810,10 +818,14 @@ def _plan_worktree_add(
         # caller must update it onto the current base before handing it over.
         return _WorktreeAddPlan(
             args=["worktree", "add", str(worktree_path), branch_name],
-            attaches_existing_branch=True,
+            needs_base_update=True,
         )
 
-    # Try to fetch remote branch (for review/rework sessions)
+    # Try to fetch remote branch (for review/rework sessions). The fetch makes
+    # the tip current with respect to the remote and nothing more: a PR branch
+    # pushed thirty commits of the base ago fetches cleanly and still sits on
+    # the base it was pushed from, so it owes the same update reuse gives that
+    # very same branch when the worktree is still there.
     fetch_result = _git_run(
         repo_root,
         ["fetch", "origin", branch_name],
@@ -825,7 +837,7 @@ def _plan_worktree_add(
                 "worktree", "add",
                 str(worktree_path), "-b", branch_name, f"origin/{branch_name}"
             ],
-            attaches_existing_branch=False,
+            needs_base_update=True,
         )
 
     if seed_ref:
@@ -844,7 +856,7 @@ def _plan_worktree_add(
                 "worktree", "add",
                 str(worktree_path), "-b", branch_name, seed_ref
             ],
-            attaches_existing_branch=False,
+            needs_base_update=False,
         )
 
     # Create new branch from default branch, NOT from HEAD
@@ -857,7 +869,7 @@ def _plan_worktree_add(
             "worktree", "add",
             str(worktree_path), "-b", branch_name, f"origin/{default_branch}"
         ],
-        attaches_existing_branch=False,
+        needs_base_update=False,
     )
 
 
@@ -962,10 +974,11 @@ def create_worktree(
 
     Whichever path produces the worktree, its branch is on the current base
     branch when this returns. Reuse rebases the branch it finds in place;
-    creation does the same for the one case that adopts a branch instead of
-    building it — an existing local branch with no worktree on it. The
-    ``preserve_branch`` reuse option exempts both, for callers that read a
-    branch as evidence rather than build on it.
+    creation does the same for every plan that adopts a branch instead of
+    building one — an existing local branch with no worktree on it, or a
+    branch that exists only on the remote. The ``preserve_branch`` reuse
+    option exempts both paths, for callers that read a branch as evidence
+    rather than build on it.
 
     Args:
         repo_root: Path to the main git repository
@@ -990,7 +1003,7 @@ def create_worktree(
         commits_discarded: count of commits that were discarded (on rebase failure)
 
     Raises:
-        WorktreeError: If worktree creation fails, if an adopted local branch
+        WorktreeError: If worktree creation fails, if an adopted branch
             cannot be brought onto the current base, or if a reusable worktree
             fails the runtime owner's reuse preflight — the one case where
             "validate or delete" does not apply, because the worktree is being
@@ -1256,10 +1269,10 @@ def _create_fresh_worktree(
             )
             raise WorktreeError(f"Failed to create worktree: {result.stderr}")
 
-        # An adopted local branch is the only checkout here whose tip predates
-        # this call. It gets the same update onto the current base that reuse
-        # gives a branch it finds in place — before runtime setup, so nothing
-        # the update discards is something setup just built.
+        # A plan that adopted a branch rather than building one gets the same
+        # update onto the current base that reuse gives a branch it finds in
+        # place — before runtime setup, so nothing the update discards is
+        # something setup just built.
         reset_info = _update_created_worktree_onto_base(
             plan,
             worktree_path,
@@ -1303,19 +1316,21 @@ def _update_created_worktree_onto_base(
 ) -> ResetInfo:
     """Bring a just-created worktree's branch onto the current base branch.
 
-    Only an adopted existing local branch needs this: every other creation plan
-    builds its branch from a ref resolved during this call. The update itself,
-    and the ``preserve_branch`` exemption from it, belong to
-    ``_update_branch_onto_base`` — what creation adds is that a failed update
-    is fatal.
+    Which plans owe this is the plan's own answer (``needs_base_update``), not
+    something re-derived here. The update itself, and the ``preserve_branch``
+    exemption from it, belong to ``_update_branch_onto_base`` — what creation
+    adds is that a failed update is fatal.
 
     Raises:
         WorktreeError: If the branch cannot be brought onto the current base.
             Unlike reuse there is no worktree to delete and recreate here — a
             fresh one is what just failed — and a session started on an unknown
-            base produces a candidate built on it.
+            base produces a candidate built on it. The checkout ``git worktree
+            add`` already made is left on disk deliberately, without runtime
+            setup: it is the lifecycle's to reuse or delete, and the next
+            launch fails the same update and deletes it through reuse.
     """
-    if not plan.attaches_existing_branch:
+    if not plan.needs_base_update:
         return ResetInfo(success=True)
 
     reset_info = _update_branch_onto_base(
