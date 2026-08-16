@@ -492,7 +492,12 @@ class WorktreeProvisioner:
 
         The right to escalate is CLAIMED before the escalation runs, so a launch
         that arrives while another is mid-escalation says nothing rather than
-        posting the operator a second copy of the same comment.
+        posting the operator a second copy of the same comment. The claim is
+        given back in a ``finally``, because an escalation that RAISES is not a
+        successful one: the applier re-raises ``ReconciliationRequired`` and
+        ``ClaimLostError`` past this owner, and a claim left standing on the way
+        out would leave the issue with no label, no report, and no launch ever
+        allowed to raise one again — #54's own symptom, without the ``npm ci``.
         """
         if not self._ledger.begin_announcement(attempt.issue_number):
             return
@@ -503,8 +508,13 @@ class WorktreeProvisioner:
             attempt.attempts,
             attempt.error,
         )
-        committed = self._escalation.escalate(attempt)
-        self._ledger.finish_announcement(attempt.issue_number, committed=committed)
+        committed = False
+        try:
+            committed = self._escalation.escalate(attempt)
+        finally:
+            self._ledger.finish_announcement(
+                attempt.issue_number, committed=committed
+            )
         if not committed:
             logger.error(
                 "[launch] Could not escalate exhausted provisioning for #%d; the "

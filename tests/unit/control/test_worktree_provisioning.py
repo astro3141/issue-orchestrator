@@ -149,6 +149,34 @@ class RecordingEscalation:
         return any(a.issue_number == issue_number for a in self.escalations)
 
 
+class EscalationRefused(Exception):
+    """What the applier re-raises past this owner rather than reporting.
+
+    ``ActionApplier.apply`` swallows most faults into a failed ``ActionResult``
+    but deliberately re-raises ``ReconciliationRequired`` and ``ClaimLostError``,
+    and nothing between it and the provisioner catches them. A distinct type here
+    rather than one of those: the provisioner must not care WHICH exception left
+    the escalation unfinished, only that one did.
+    """
+
+
+class RaisingEscalation(RecordingEscalation):
+    """An escalation whose first attempts leave by raising, not by returning."""
+
+    def __init__(self, *, raise_times: int = 1) -> None:
+        super().__init__()
+        self.raise_times = raise_times
+        #: Every call, including the ones that raised. ``escalations`` records
+        #: only the ones that got as far as reporting an outcome.
+        self.attempted: list[ProvisioningAttempt] = []
+
+    def escalate(self, attempt: ProvisioningAttempt) -> bool:
+        self.attempted.append(attempt)
+        if len(self.attempted) <= self.raise_times:
+            raise EscalationRefused("the claim was lost before the label write")
+        return super().escalate(attempt)
+
+
 class ReentrantEscalation(RecordingEscalation):
     """A second launch for the same issue, arriving mid-escalation.
 
@@ -614,6 +642,37 @@ class TestProvisioningFailureIsBounded:
         # Retried on every launch from the one that spent the budget onward,
         # rather than announced once into a failed write and never spoken of again.
         assert len(escalation.escalations) == TICKS - (PROVISIONING_ATTEMPT_LIMIT - 1)
+
+    def test_an_escalation_that_raised_is_retried_by_the_next_launch(self, tmp_path):
+        """Leaving by exception is not an escalation, so the right to raise it returns.
+
+        The applier re-raises two of its refusals past this owner rather than
+        reporting them, and the launch paths that hold a claim while provisioning
+        are exactly the ones a long-failing recipe keeps busy — so this arrives
+        precisely where the bound matters. Holding the announcement claim on the
+        way out would leave the issue with no label, no report, and no later
+        launch permitted to raise one: this bound's own symptom, minus the
+        ``npm ci``.
+        """
+        escalation = RaisingEscalation(raise_times=1)
+        provisioner, runner, _ = _provisioner(
+            commands=["make worktree-setup"],
+            runner=AlwaysFailingCommandRunner(stderr="boom"),
+            escalation=escalation,
+        )
+
+        for _ in range(PROVISIONING_ATTEMPT_LIMIT - 1):
+            _failed_provision(provisioner, tmp_path)
+        with pytest.raises(EscalationRefused):
+            provisioner.provision(tmp_path, issue_number=ISSUE)
+        for _ in range(TICKS):
+            _failed_provision(provisioner, tmp_path)
+
+        # Raised again by the next launch, and that one landed — once.
+        assert len(escalation.attempted) == 2
+        assert len(escalation.escalations) == 1
+        # And the refusal did not buy the recipe another run either.
+        assert len(runner.calls) == PROVISIONING_ATTEMPT_LIMIT
 
     def test_a_human_clearing_the_escalation_restores_the_budget(self, tmp_path):
         """The durable escalation, not this process's counter, ends the refusal."""
