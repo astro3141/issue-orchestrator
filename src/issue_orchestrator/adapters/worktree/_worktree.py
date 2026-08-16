@@ -582,6 +582,44 @@ def _remove_existing_worktree_path(repo_root: Path, worktree_path: Path) -> None
         shutil.rmtree(worktree_path, ignore_errors=True)
 
 
+def _update_branch_onto_base(
+    worktree_path: Path,
+    repo_root: Path,
+    base_branch: str | None,
+    branch_name: str,
+    issue_number: int,
+    *,
+    preserve_branch: bool,
+) -> ResetInfo:
+    """Bring a worktree's branch onto the current base branch.
+
+    Both lifecycle paths that hand a worktree to a session come through here —
+    reuse, which finds the branch already checked out, and creation, which
+    adopts an existing local branch. They differ in what they do when the
+    update fails, not in whether it is owed, so the rule and its one exemption
+    live here rather than being restated per path.
+
+    ``preserve_branch`` is that exemption: a tech_lead investigation reads the
+    subject's branch as evidence, so rebasing it would rewrite the commits
+    being read and hard-resetting it would discard unpushed work no PR holds.
+
+    Returns:
+        ResetInfo describing what the update discarded, or an unconditional
+        success when the branch is exempt from being updated at all.
+    """
+    if preserve_branch:
+        logger.info(
+            issue_log(
+                issue_number,
+                "[WORKTREE_PRESERVE] skipping base update for tech_lead "
+                "investigation, branch %s left intact",
+            ),
+            branch_name,
+        )
+        return ResetInfo(success=True)
+    return _update_worktree_onto_main(worktree_path, repo_root, base_branch)
+
+
 def _try_reuse_worktree(
     worktree_path: Path,
     branch_name: str,
@@ -632,20 +670,14 @@ def _try_reuse_worktree(
     runtime_setup.preflight_reuse(worktree_path)
 
     # Rebase onto latest base branch (critical for reruns with stale branches).
-    # A tech_lead investigation reads the subject's branch as evidence, so it must
-    # never rebase or hard-reset it — skip the update and leave it intact.
-    if preserve_branch:
-        logger.info(
-            issue_log(
-                issue_number,
-                "[WORKTREE_PRESERVE] skipping rebase/reset for tech_lead "
-                "investigation, branch %s left intact",
-            ),
-            branch_name,
-        )
-        reset_info = ResetInfo(success=True)
-    else:
-        reset_info = _update_worktree_onto_main(worktree_path, repo_root, base_branch)
+    reset_info = _update_branch_onto_base(
+        worktree_path,
+        repo_root,
+        base_branch,
+        branch_name,
+        issue_number,
+        preserve_branch=preserve_branch,
+    )
 
     # Policy: sync remote refs to prevent stale-info push failures
     sync_result = policy.sync_remote_refs(worktree_path, branch_name)
@@ -731,17 +763,33 @@ def _handle_branch_on_recreate(
     return branch_name
 
 
-def _build_worktree_add_command(
+@dataclass(frozen=True)
+class _WorktreeAddPlan:
+    """How a fresh worktree gets its checkout.
+
+    ``attaches_existing_branch`` is the part the caller cannot infer from the
+    argument list: every other plan builds the branch from a ref resolved
+    right now (``origin/<branch>``, the seed ref, ``origin/<base>``), so its
+    tip is current by construction. Attaching a branch that already exists
+    locally is the one plan that adopts a tip of unknown age — it is the plan
+    that still owes the base update.
+    """
+
+    args: list[str]
+    attaches_existing_branch: bool
+
+
+def _plan_worktree_add(
     repo_root: Path,
     worktree_path: Path,
     branch_name: str,
     base_branch: str | None,
     seed_ref: str | None,
-) -> list[str]:
-    """Build the git worktree add command.
+) -> _WorktreeAddPlan:
+    """Plan the git worktree add for a fresh worktree.
 
     Returns:
-        The git command arguments list.
+        The command arguments plus whether they adopt an existing local branch.
     """
     # Check if branch already exists
     branch_check = _git_run(
@@ -758,8 +806,12 @@ def _build_worktree_add_command(
     )
 
     if branch_exists:
-        # Use existing branch
-        return ["worktree", "add", str(worktree_path), branch_name]
+        # Use existing branch — at whatever base it was last left on, so the
+        # caller must update it onto the current base before handing it over.
+        return _WorktreeAddPlan(
+            args=["worktree", "add", str(worktree_path), branch_name],
+            attaches_existing_branch=True,
+        )
 
     # Try to fetch remote branch (for review/rework sessions)
     fetch_result = _git_run(
@@ -768,10 +820,13 @@ def _build_worktree_add_command(
         check=False,
     )
     if fetch_result.returncode == 0:
-        return [
-            "worktree", "add",
-            str(worktree_path), "-b", branch_name, f"origin/{branch_name}"
-        ]
+        return _WorktreeAddPlan(
+            args=[
+                "worktree", "add",
+                str(worktree_path), "-b", branch_name, f"origin/{branch_name}"
+            ],
+            attaches_existing_branch=False,
+        )
 
     if seed_ref:
         seed_ref_result = _git_run(
@@ -784,20 +839,26 @@ def _build_worktree_add_command(
                 f"Invalid worktree seed ref {seed_ref!r}: {seed_ref_result.stderr.strip()}"
             )
         logger.info("Creating new branch from worktree seed ref: %s", seed_ref)
-        return [
-            "worktree", "add",
-            str(worktree_path), "-b", branch_name, seed_ref
-        ]
+        return _WorktreeAddPlan(
+            args=[
+                "worktree", "add",
+                str(worktree_path), "-b", branch_name, seed_ref
+            ],
+            attaches_existing_branch=False,
+        )
 
     # Create new branch from default branch, NOT from HEAD
     # This ensures agent worktrees don't inherit commits from user's feature branch
     default_branch = _resolve_base_branch(repo_root, base_branch)
     logger.info("Creating new branch from default branch: %s", default_branch)
     _ensure_origin_branch(repo_root, default_branch)
-    return [
-        "worktree", "add",
-        str(worktree_path), "-b", branch_name, f"origin/{default_branch}"
-    ]
+    return _WorktreeAddPlan(
+        args=[
+            "worktree", "add",
+            str(worktree_path), "-b", branch_name, f"origin/{default_branch}"
+        ],
+        attaches_existing_branch=False,
+    )
 
 
 @dataclass
@@ -899,6 +960,13 @@ def create_worktree(
     Uses a "validate or delete" policy: if an existing worktree cannot be
     prepared for a clean session, it is deleted and a fresh one is created.
 
+    Whichever path produces the worktree, its branch is on the current base
+    branch when this returns. Reuse rebases the branch it finds in place;
+    creation does the same for the one case that adopts a branch instead of
+    building it — an existing local branch with no worktree on it. The
+    ``preserve_branch`` reuse option exempts both, for callers that read a
+    branch as evidence rather than build on it.
+
     Args:
         repo_root: Path to the main git repository
         issue_number: GitHub issue number
@@ -922,7 +990,8 @@ def create_worktree(
         commits_discarded: count of commits that were discarded (on rebase failure)
 
     Raises:
-        WorktreeError: If worktree creation fails, or if a reusable worktree
+        WorktreeError: If worktree creation fails, if an adopted local branch
+            cannot be brought onto the current base, or if a reusable worktree
             fails the runtime owner's reuse preflight — the one case where
             "validate or delete" does not apply, because the worktree is being
             refused precisely to keep what deleting it would destroy.
@@ -951,6 +1020,7 @@ def create_worktree(
         return _create_fresh_worktree(
             ctx.repo_root, ctx.worktree_path, final_branch, ctx.base_branch, ctx.seed_ref, ctx.issue_number,
             ctx.runtime_setup, recreated_reason,
+            preserve_branch=ctx.reuse_options.preserve_branch,
         )
     except WorktreeError:
         raise
@@ -1154,10 +1224,12 @@ def _create_fresh_worktree(
     issue_number: int,
     runtime_setup: WorktreeRuntimeSetup,
     recreated_reason: str | None,
+    *,
+    preserve_branch: bool,
 ) -> tuple[Path, str, str, str | None, bool, int, int]:
     """Create a fresh worktree."""
     try:
-        cmd = _build_worktree_add_command(
+        plan = _plan_worktree_add(
             repo_root,
             worktree_path,
             branch_name,
@@ -1166,7 +1238,7 @@ def _create_fresh_worktree(
         )
 
         logger.info(issue_log(issue_number, "Creating worktree: branch=%s path=%s"), branch_name, worktree_path)
-        result = _git_run(repo_root, cmd, check=False)
+        result = _git_run(repo_root, plan.args, check=False)
         if result.returncode != 0 and _recover_stale_branch_worktree_registration(
             repo_root=repo_root,
             issue_number=issue_number,
@@ -1174,7 +1246,7 @@ def _create_fresh_worktree(
             stderr=result.stderr or "",
         ):
             logger.info(issue_log(issue_number, "Retrying worktree create after prune: branch=%s"), branch_name)
-            result = _git_run(repo_root, cmd, check=False)
+            result = _git_run(repo_root, plan.args, check=False)
 
         if result.returncode != 0:
             logger.error(
@@ -1184,17 +1256,87 @@ def _create_fresh_worktree(
             )
             raise WorktreeError(f"Failed to create worktree: {result.stderr}")
 
+        # An adopted local branch is the only checkout here whose tip predates
+        # this call. It gets the same update onto the current base that reuse
+        # gives a branch it finds in place — before runtime setup, so nothing
+        # the update discards is something setup just built.
+        reset_info = _update_created_worktree_onto_base(
+            plan,
+            worktree_path,
+            repo_root,
+            base_branch,
+            branch_name,
+            issue_number,
+            preserve_branch=preserve_branch,
+        )
+
         runtime_setup.apply(worktree_path)
 
         logger.info(issue_log(issue_number, "Worktree created: branch=%s path=%s"), branch_name, worktree_path)
         reuse_status = "recreated" if recreated_reason else "created"
         reuse_reason = recreated_reason or "no_existing_worktree"
-        return worktree_path, branch_name, reuse_status, reuse_reason, False, 0, 0
+        return (
+            worktree_path,
+            branch_name,
+            reuse_status,
+            reuse_reason,
+            False,
+            reset_info.uncommitted_discarded,
+            reset_info.commits_discarded,
+        )
 
     except WorktreeError:
         raise
     except Exception as e:
         raise WorktreeError(f"Error creating worktree: {e}")
+
+
+def _update_created_worktree_onto_base(
+    plan: _WorktreeAddPlan,
+    worktree_path: Path,
+    repo_root: Path,
+    base_branch: str | None,
+    branch_name: str,
+    issue_number: int,
+    *,
+    preserve_branch: bool,
+) -> ResetInfo:
+    """Bring a just-created worktree's branch onto the current base branch.
+
+    Only an adopted existing local branch needs this: every other creation plan
+    builds its branch from a ref resolved during this call. The update itself,
+    and the ``preserve_branch`` exemption from it, belong to
+    ``_update_branch_onto_base`` — what creation adds is that a failed update
+    is fatal.
+
+    Raises:
+        WorktreeError: If the branch cannot be brought onto the current base.
+            Unlike reuse there is no worktree to delete and recreate here — a
+            fresh one is what just failed — and a session started on an unknown
+            base produces a candidate built on it.
+    """
+    if not plan.attaches_existing_branch:
+        return ResetInfo(success=True)
+
+    reset_info = _update_branch_onto_base(
+        worktree_path,
+        repo_root,
+        base_branch,
+        branch_name,
+        issue_number,
+        preserve_branch=preserve_branch,
+    )
+    if not reset_info.success:
+        logger.error(
+            issue_log(issue_number, "Base update failed for attached branch %s: %s"),
+            branch_name,
+            reset_info.reason or "unknown",
+        )
+        raise WorktreeError(
+            "Failed to update attached branch onto current base: "
+            f"branch={branch_name} reason={reset_info.reason or 'unknown'}"
+        )
+    return reset_info
 
 
 def _recover_stale_branch_worktree_registration(
