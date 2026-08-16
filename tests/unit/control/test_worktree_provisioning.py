@@ -15,11 +15,13 @@ from typing import Any
 
 import pytest
 
+from issue_orchestrator.control.actions import AddCommentAction, AddLabelAction
 from issue_orchestrator.control.isolation import get_worktree_venv_bin
 from issue_orchestrator.control.label_manager import LabelManager
 from issue_orchestrator.control.needs_human_block import NeedsHumanCause
 from issue_orchestrator.control.worktree_provisioning import (
     PROVISIONING_ATTEMPT_LIMIT,
+    PROVISIONING_ESCALATION_CONTEXT,
     ProvisioningAttempt,
     ProvisioningAttemptLedger,
     ProvisioningAttemptsExhausted,
@@ -145,6 +147,33 @@ class RecordingEscalation:
         if self.cleared:
             return False
         return any(a.issue_number == issue_number for a in self.escalations)
+
+
+class ReentrantEscalation(RecordingEscalation):
+    """A second launch for the same issue, arriving mid-escalation.
+
+    Escalating is where the first launch spends real time (a label write and a
+    comment write against GitHub), so it is the window a concurrently launching
+    session actually lands in. Re-entering ``provision`` from inside
+    ``escalate`` reproduces that interleaving deterministically — no threads, no
+    timing — because it puts the second launch at exactly the point the first
+    one has decided to escalate and has not finished doing so.
+    """
+
+    def __init__(self, *, provision: Any) -> None:
+        super().__init__()
+        self._provision = provision
+        self._reentered = False
+        self.reentrant_failure: BaseException | None = None
+
+    def escalate(self, attempt: ProvisioningAttempt) -> bool:
+        if not self._reentered:
+            self._reentered = True
+            try:
+                self._provision()
+            except WorktreeProvisioningError as exc:
+                self.reentrant_failure = exc
+        return super().escalate(attempt)
 
 
 def _provisioner(
@@ -626,6 +655,36 @@ class TestProvisioningFailureIsBounded:
         assert isinstance(failures[-1], ProvisioningAttemptsExhausted)
         assert len(escalation.escalations) == 1
 
+    def test_a_second_launch_arriving_mid_escalation_escalates_nothing(self, tmp_path):
+        """Claiming the escalation and checking for one are ONE step.
+
+        The ledger is keyed per issue because a coding launch and a review
+        launch for one issue share an environment and an escalation, and it
+        takes a lock because those launches really do run at once. Checking
+        "has this been announced?" before the escalation and recording it
+        afterwards leaves both of them reading "no" and both posting the
+        operator the same comment.
+        """
+        holder: list[WorktreeProvisioner] = []
+        escalation = ReentrantEscalation(
+            provision=lambda: holder[0].provision(tmp_path, issue_number=ISSUE)
+        )
+        provisioner, runner, _ = _provisioner(
+            commands=["make worktree-setup"],
+            runner=AlwaysFailingCommandRunner(stderr="boom"),
+            escalation=escalation,
+        )
+        holder.append(provisioner)
+
+        for _ in range(TICKS):
+            _failed_provision(provisioner, tmp_path)
+
+        assert len(escalation.escalations) == 1
+        # The launch that arrived mid-escalation was refused as terminal, and
+        # refused BEFORE the recipe: it must not buy the loop another `npm ci`.
+        assert isinstance(escalation.reentrant_failure, ProvisioningAttemptsExhausted)
+        assert len(runner.calls) == PROVISIONING_ATTEMPT_LIMIT
+
     def test_a_ledger_bound_below_one_is_refused(self):
         with pytest.raises(ValueError):
             ProvisioningAttemptLedger(limit=0)
@@ -640,13 +699,40 @@ class RecordingEventSink:
 
 
 class RecordingApplier:
-    def __init__(self, *, committed: bool = True) -> None:
+    """The applier seam, with each half of the escalation scriptable.
+
+    ``comment_committed`` is separate from ``committed`` because the two halves
+    are not equally load-bearing: the label is what stops the loop, the comment
+    only explains it, and a comment write that fails on an issue that IS
+    correctly labelled must not undo the escalation.
+    """
+
+    def __init__(self, *, committed: bool = True, comment_committed: bool = True) -> None:
         self.applied: list[tuple[list[Any], str]] = []
         self._committed = committed
+        self._comment_committed = comment_committed
 
     def __call__(self, actions: list[Any], *, context: str) -> bool:
         self.applied.append((actions, context))
+        if any(isinstance(action, AddCommentAction) for action in actions):
+            return self._comment_committed
         return self._committed
+
+    def _of_type(self, action_type: type) -> list[Any]:
+        return [
+            action
+            for actions, _context in self.applied
+            for action in actions
+            if isinstance(action, action_type)
+        ]
+
+    @property
+    def label_actions(self) -> list[Any]:
+        return self._of_type(AddLabelAction)
+
+    @property
+    def comment_actions(self) -> list[Any]:
+        return self._of_type(AddCommentAction)
 
 
 def _escalation(
@@ -680,7 +766,10 @@ class TestProvisioningEscalationSurface:
         assert _escalation(applier=applier, events=events).escalate(self.ATTEMPT)
 
         actions, context = applier.applied[0]
-        assert context == "provisioning_attempts_exhausted"
+        assert context == PROVISIONING_ESCALATION_CONTEXT
+        # The durable half goes first and ALONE, so what it committed is what
+        # decides whether this escalation landed.
+        assert len(actions) == 1
         label_action = actions[0]
         assert label_action.issue_number == ISSUE
         assert label_action.label == LabelManager(Config()).needs_human
@@ -692,11 +781,23 @@ class TestProvisioningEscalationSurface:
 
         _escalation(applier=applier, events=events).escalate(self.ATTEMPT)
 
-        comment = applier.applied[0][0][1].comment
+        comment = applier.comment_actions[0].comment
         assert "no longer being retried" in comment
         assert "ENOTFOUND" in comment
         assert "setup_worktree" in comment
         assert "remove the label" in comment
+
+    def test_a_comment_that_did_not_post_still_leaves_the_issue_escalated(self):
+        """The block holds; re-running the whole escalation would double-post it."""
+        applier = RecordingApplier(comment_committed=False)
+        events = RecordingEventSink()
+
+        committed = _escalation(applier=applier, events=events).escalate(self.ATTEMPT)
+
+        assert committed is True
+        assert [name for name, _data in events.events] == [
+            EventName.ISSUE_NEEDS_HUMAN.value
+        ]
 
     def test_the_event_carries_why_the_orchestrator_stopped(self):
         applier = RecordingApplier()
@@ -720,6 +821,8 @@ class TestProvisioningEscalationSurface:
 
         assert committed is False
         assert events.events == []
+        # And nothing explained a block that is not there.
+        assert applier.comment_actions == []
 
     def test_the_escalation_is_in_force_while_the_label_is_on_the_issue(self):
         needs_human = LabelManager(Config()).needs_human

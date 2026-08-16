@@ -83,6 +83,9 @@ from issue_orchestrator.control.actions import (
     RemoveLabelAction,
 )
 from issue_orchestrator.control.label_manager import LabelManager
+from issue_orchestrator.control.worktree_provisioning import (
+    PROVISIONING_ATTEMPT_LIMIT,
+)
 from issue_orchestrator.control.orchestrator_support import OrchestratorSupport
 from issue_orchestrator.control.retrospective_review_completion import (
     retrospective_review_completion_actions,
@@ -167,6 +170,12 @@ from issue_orchestrator.contracts.public import SessionStartedPayload
 from tests.unit.session_run_helpers import make_session_run_assets
 
 
+#: How many launches the provisioning-bound tests drive. Deliberately far past
+#: any plausible ceiling: the assertions are about what STOPPED happening across
+#: them, so the number only has to make an unbounded loop unmistakable.
+TICKS = 25
+
+
 # =============================================================================
 # Mock Adapters - following hexagonal architecture patterns
 # =============================================================================
@@ -202,6 +211,7 @@ class MockRepositoryHost:
         self.prs_with_label: list[PRInfo] = []
         self.get_prs_with_label_calls: list[tuple[str, str]] = []
         self.list_issues_calls: list[tuple[list[str] | None, str, int]] = []
+        self.comments: list[tuple[int, str]] = []
         self.get_issue_labels_fresh = MagicMock(
             side_effect=lambda issue_number: sorted(
                 self.labels.get(issue_number, set())
@@ -215,6 +225,13 @@ class MockRepositoryHost:
     def remove_label(self, issue_number: int, label: str) -> None:
         self.remove_label_calls.append((issue_number, label))
         self.labels.get(issue_number, set()).discard(label)
+
+    def has_label(self, issue_number: int, label: str) -> bool:
+        return label in self.labels.get(issue_number, set())
+
+    def add_comment(self, number: int, comment: str) -> str:
+        self.comments.append((number, comment))
+        return f"https://github.com/test/repo/issues/{number}#issuecomment-1"
 
     def get_prs_for_issue(self, issue_number: int, state: str = "open") -> list[PRInfo]:
         return self.prs.get(issue_number, [])
@@ -576,12 +593,18 @@ def _build_launcher_bundle(
     provider_resilience: ProviderResilienceManager | None = None,
     provider_readiness_probe: ProviderReadinessProbe | None = None,
     unrecorded_refusals: UnrecordedRefusals | None = None,
+    action_applier: object | None = None,
 ) -> LauncherTestBundle:
     """Create a SessionLauncher with mock dependencies and tracking.
 
     ``board_snapshot_provider`` is constructor-injected (it is a REQUIRED
     launcher dependency); defaults to a fresh RecordingBoardSnapshotProvider
     exposed on the bundle for assertions.
+
+    ``action_applier`` defaults to a ``MagicMock`` that records the actions the
+    launcher planned. Tests whose subject is whether a planned action would
+    actually APPLY — a governed label needs its cause, or the applier refuses it
+    at runtime — pass the real one instead.
     """
     if board_snapshot_provider is None:
         board_snapshot_provider = RecordingBoardSnapshotProvider()
@@ -625,7 +648,7 @@ def _build_launcher_bundle(
             review_machines[pr_number] = ReviewStateMachine(pr_number, issue_number)
         return review_machines[pr_number]
 
-    mock_action_applier = MagicMock()
+    mock_action_applier = action_applier if action_applier is not None else MagicMock()
     launcher_kwargs = {}
     if coder_prompt_addendum is not None:
         launcher_kwargs["coder_prompt_addendum"] = coder_prompt_addendum
@@ -3376,6 +3399,203 @@ class TestEveryLaunchPathProvisionsItsWorktree:
 
         assert result.success is True
         assert mock_command_runner.run_calls == []
+
+
+# =============================================================================
+# The Provisioning Bound, As The Launcher Wires It (#54)
+# =============================================================================
+
+
+class AlwaysFailingSetup(MockCommandRunner):
+    """A setup recipe that never succeeds — the persistent environmental fault.
+
+    ``MockCommandRunner`` falls back to success once its scripted results run
+    out, which is exactly the wrong shape for a test whose subject is a loop
+    that has to end.
+    """
+
+    def run(self, command, **kwargs) -> CommandResult:
+        super().run(command, **kwargs)
+        return CommandResult(
+            returncode=1,
+            stdout="",
+            stderr="npm ERR! getaddrinfo ENOTFOUND registry.npmjs.org",
+            timed_out=False,
+        )
+
+
+@dataclass
+class WiredLauncherBundle:
+    """A launcher whose label writes reach the real applier and block owner."""
+
+    bundle: LauncherTestBundle
+    repo_host: MockRepositoryHost
+    events: MockEventSink
+    runner: AlwaysFailingSetup
+    needs_human: str
+
+    @property
+    def setup_runs(self) -> int:
+        return len(self.runner.run_calls)
+
+    @property
+    def labels_now(self) -> set[str]:
+        return set(self.repo_host.labels.get(123, set()))
+
+    def start_failures(self) -> list[dict]:
+        return [
+            event.data
+            for event in self.events.events
+            if event.name == "session.start_failed"
+        ]
+
+
+class TestTheProvisioningBoundAsTheLauncherWiresIt:
+    """The bound's WIRING, driven through the launcher that assembles it (#54).
+
+    The ledger, the escalation surface and the event fact are each pinned in
+    isolation by ``tests/unit/control/test_worktree_provisioning.py``. What that
+    suite cannot see is the assembly: ``build_launch_provisioner`` is handed the
+    launcher's action applier, its label manager, its event sink, and — load
+    bearing — the UNCACHED label read. Each of those can be wrong with that
+    whole suite still green, and each fails only at runtime:
+
+    * a cached label read leaves the escalation unclearable until a restart,
+      which is the one thing the escalation's own docstring says must not happen;
+    * an ``AddLabelAction`` that lost its ``needs_human_cause`` is REFUSED by the
+      real applier, and no recording fake refuses anything;
+    * ``provisioning_failure_facts`` dropped from a launch path leaves a reader
+      unable to tell "the next tick retries this" from "the retrying stopped".
+
+    So these drive a real ``SessionLauncher`` whose label writes go through the
+    real ``ActionApplier`` over the real shared needs-human block.
+    """
+
+    @pytest.fixture
+    def wired(
+        self,
+        sample_config,
+        mock_events,
+        mock_repo_host,
+        mock_worktree_manager,
+        mock_working_copy,
+    ) -> WiredLauncherBundle:
+        from issue_orchestrator.control.action_applier import ActionApplier
+        from issue_orchestrator.control.needs_human_block import NeedsHumanBlock
+        from issue_orchestrator.execution.pending_work_claim_store import (
+            SqlitePendingWorkClaimStore,
+        )
+
+        sample_config.setup_worktree = ["make worktree-setup"]
+        label_manager = LabelManager(sample_config)
+        runner = AlwaysFailingSetup()
+        applier = ActionApplier(
+            labels=mock_repo_host,
+            sessions=MagicMock(),
+            events=mock_events,
+            repository_host=mock_repo_host,
+            label_manager=label_manager,
+            # The real owner of the governed label: it is what refuses an add
+            # that names no cause, so wiring it is what makes this a test of
+            # whether the escalation would actually apply.
+            needs_human_block=NeedsHumanBlock(
+                needs_human_label=label_manager.needs_human,
+                tech_lead_marker=label_manager.tech_lead_needs_human,
+                labels=mock_repo_host,
+                read_labels=mock_repo_host.get_issue_labels_fresh,
+                quarantined_issue_numbers=lambda: frozenset(),
+                causes=SqlitePendingWorkClaimStore.for_repo(sample_config.repo_root),
+            ),
+        )
+        bundle = _build_launcher_bundle(
+            sample_config,
+            mock_events,
+            mock_repo_host,
+            mock_worktree_manager,
+            mock_working_copy,
+            runner,
+            action_applier=applier,
+        )
+        return WiredLauncherBundle(
+            bundle=bundle,
+            repo_host=mock_repo_host,
+            events=mock_events,
+            runner=runner,
+            needs_human=label_manager.needs_human,
+        )
+
+    @pytest.fixture
+    def rework(self):
+        return PendingRework(
+            issue_key=GitHubIssueKey(repo="test/repo", external_id="123"),
+            agent_type="agent:web",
+            rework_cycle=1,
+        )
+
+    def _launch(self, wired: WiredLauncherBundle, sample_issue, times: int) -> None:
+        for _ in range(times):
+            result = wired.bundle.launcher.launch_issue_session(
+                sample_issue, active_sessions=[]
+            )
+            assert result.success is False
+
+    def test_the_bound_blocks_the_issue_and_tells_the_operator_once(
+        self, wired, sample_issue
+    ):
+        """Drive the loop the issue reported, through the wiring that ends it."""
+        self._launch(wired, sample_issue, TICKS)
+
+        # The label the real applier actually applied, not the action a fake
+        # recorded: a governed add that named no cause would have been refused.
+        assert wired.needs_human in wired.labels_now
+        assert [number for number, _comment in wired.repo_host.comments] == [123]
+        assert "ENOTFOUND" in wired.repo_host.comments[0][1]
+        assert len(wired.events.get_events_by_name("issue.needs_human")) == 1
+        # And the recipe this was all costing stopped running.
+        assert wired.setup_runs == PROVISIONING_ATTEMPT_LIMIT
+
+    def test_start_failed_says_whether_the_next_tick_will_try_again(
+        self, wired, sample_issue
+    ):
+        """The one fact about a failed launch a reader cannot recover elsewhere."""
+        self._launch(wired, sample_issue, PROVISIONING_ATTEMPT_LIMIT + 1)
+
+        exhausted = [failure["attempts_exhausted"] for failure in wired.start_failures()]
+        under_the_bound = PROVISIONING_ATTEMPT_LIMIT - 1
+        assert exhausted[:under_the_bound] == [False] * under_the_bound
+        assert exhausted[under_the_bound:] == [True, True]
+        assert {failure["reason"] for failure in wired.start_failures()} == {
+            "setup_commands_failed"
+        }
+
+    def test_a_human_clearing_the_label_restores_the_budget(
+        self, wired, sample_issue
+    ):
+        """The durable label, read FRESH, is what ends the refusal."""
+        self._launch(wired, sample_issue, TICKS)
+        assert wired.setup_runs == PROVISIONING_ATTEMPT_LIMIT
+
+        wired.repo_host.remove_label(123, wired.needs_human)
+        self._launch(wired, sample_issue, 1)
+
+        # The human said they fixed the environment; the only way to find out is
+        # to run the recipe again. A cached label read would still say "blocked"
+        # and this launch would refuse without running anything.
+        assert wired.setup_runs == PROVISIONING_ATTEMPT_LIMIT + 1
+
+    def test_the_rework_path_reports_and_escalates_the_same_way(self, wired, rework):
+        """Both producers of the fact are the shared helper, not two spellings."""
+        for _ in range(TICKS):
+            result = wired.bundle.launcher.launch_rework_session(
+                rework, active_sessions=[]
+            )
+            assert result.success is False
+
+        exhausted = [failure["attempts_exhausted"] for failure in wired.start_failures()]
+        assert exhausted[0] is False
+        assert exhausted[-1] is True
+        assert wired.needs_human in wired.labels_now
+        assert wired.setup_runs == PROVISIONING_ATTEMPT_LIMIT
 
 
 # =============================================================================

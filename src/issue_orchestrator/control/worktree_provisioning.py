@@ -99,6 +99,7 @@ import threading
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 from typing import Protocol
 
@@ -128,6 +129,13 @@ logger = logging.getLogger(__name__)
 #: (``Config.setup_worktree``) — what is bounded here is how many times the
 #: orchestrator will re-run it before saying so, not what it runs.
 PROVISIONING_ATTEMPT_LIMIT = 3
+
+#: The one name this escalation goes by, in the applier's context line and in
+#: the event's ``reason``, so an operator reading either finds the other.
+PROVISIONING_ESCALATION_CONTEXT = "provisioning_attempts_exhausted"
+
+#: Why the label and the comment are being applied, for the mutation log.
+_ESCALATION_REASON = "worktree provisioning failed past its attempt bound"
 
 
 class WorktreeProvisioningError(RuntimeError):
@@ -199,16 +207,31 @@ class ApplyActions(Protocol):
     def __call__(self, actions: list[Action], *, context: str) -> bool: ...
 
 
+class _Announcement(Enum):
+    """How far this issue's escalation has got: unraised, being raised, raised.
+
+    Three states rather than a flag because "nobody has raised it" and "a launch
+    is raising it right now" are different answers to the only question the
+    ledger is asked here — may I escalate? — and collapsing them is what lets two
+    concurrent launches for one issue both post the operator comment.
+    """
+
+    NONE = "none"
+    CLAIMED = "claimed"
+    COMMITTED = "committed"
+
+
 @dataclass
 class _IssueProvisioningState:
     """Consecutive provisioning failures for one issue, and their escalation."""
 
     failures: int = 0
     last_error: str = ""
-    #: Whether the escalation for this issue's exhausted budget COMMITTED. False
-    #: past the bound means the label/comment write did not land, so the next
-    #: launch retries it instead of treating an unreported issue as handled.
-    escalated: bool = False
+    #: How far the escalation for this issue's exhausted budget has got. Anything
+    #: short of COMMITTED past the bound means the durable write has not landed,
+    #: so a later launch retries it instead of treating an unreported issue as
+    #: handled.
+    announcement: _Announcement = _Announcement.NONE
 
 
 class ProvisioningAttemptLedger:
@@ -267,13 +290,33 @@ class ProvisioningAttemptLedger:
         """Whether this issue's exhausted budget has been escalated to a human."""
         with self._lock:
             state = self._issues.get(issue_number)
-            return state is not None and state.escalated
+            return state is not None and state.announcement is _Announcement.COMMITTED
 
-    def mark_announced(self, issue_number: int) -> None:
+    def begin_announcement(self, issue_number: int) -> bool:
+        """Take the right to escalate this issue, or report that it is taken.
+
+        Claiming and checking are ONE operation because the alternative is a
+        check-then-announce the lock does not cover: two launches for the same
+        issue — the ledger is keyed per issue precisely because a coding launch
+        and a review launch share one environment and one escalation — would both
+        read "not announced" and both post the operator comment.
+        """
         with self._lock:
             state = self._issues.get(issue_number)
-            if state is not None:
-                state.escalated = True
+            if state is None or state.announcement is not _Announcement.NONE:
+                return False
+            state.announcement = _Announcement.CLAIMED
+            return True
+
+    def finish_announcement(self, issue_number: int, *, committed: bool) -> None:
+        """Report what the claimed escalation did; a failed write frees the claim."""
+        with self._lock:
+            state = self._issues.get(issue_number)
+            if state is None or state.announcement is not _Announcement.CLAIMED:
+                return
+            state.announcement = (
+                _Announcement.COMMITTED if committed else _Announcement.NONE
+            )
 
     def _attempt(
         self, issue_number: int, state: _IssueProvisioningState
@@ -445,8 +488,13 @@ class WorktreeProvisioner:
         )
 
     def _announce(self, attempt: ProvisioningAttempt) -> None:
-        """Tell a human once, and keep retrying until that actually commits."""
-        if self._ledger.announced(attempt.issue_number):
+        """Tell a human once, and keep retrying until that actually commits.
+
+        The right to escalate is CLAIMED before the escalation runs, so a launch
+        that arrives while another is mid-escalation says nothing rather than
+        posting the operator a second copy of the same comment.
+        """
+        if not self._ledger.begin_announcement(attempt.issue_number):
             return
         logger.error(
             "[launch] Provisioning for #%d has failed %d consecutive time(s); "
@@ -455,14 +503,14 @@ class WorktreeProvisioner:
             attempt.attempts,
             attempt.error,
         )
-        if self._escalation.escalate(attempt):
-            self._ledger.mark_announced(attempt.issue_number)
-            return
-        logger.error(
-            "[launch] Could not escalate exhausted provisioning for #%d; the "
-            "next launch attempt retries the escalation",
-            attempt.issue_number,
-        )
+        committed = self._escalation.escalate(attempt)
+        self._ledger.finish_announcement(attempt.issue_number, committed=committed)
+        if not committed:
+            logger.error(
+                "[launch] Could not escalate exhausted provisioning for #%d; the "
+                "next launch attempt retries the escalation",
+                attempt.issue_number,
+            )
 
     def _require_pinned_recipe(self, worktree_path: Path) -> None:
         """Refuse a recipe the provisioned worktree could itself supply.
@@ -612,76 +660,112 @@ def build_launch_provisioner(
     )
 
 
-def build_provisioning_escalation(
-    *,
-    apply_actions: ApplyActions,
-    label_manager: LabelManager,
-    events: EventSink,
-    read_labels: Callable[[int], Sequence[str]],
-) -> ProvisioningEscalation:
-    """Assemble the needs-human escalation from launcher collaborators.
+@dataclass(frozen=True, slots=True)
+class NeedsHumanProvisioningEscalation:
+    """How an exhausted provisioning budget reaches a human in this repository.
 
     The same shape a failed rework worktree already uses — the shared
     ``needs-human`` block under ``SESSION_LIFECYCLE``, an operator comment, and
     the ``issue.needs_human`` event — because it is the same kind of fact: a
     launch-time environment failure a human, not another tick, has to fix.
 
-    The event is published only after the durable half commits (the discipline
-    the claim quarantine keeps): a dashboard warning whose label never landed
-    disappears on restart and takes the only signal with it.
-
-    ``read_labels`` must be the UNCACHED read: whether an escalation has been
-    cleared is exactly the question a stale answer gets wrong in the expensive
-    direction, by leaving an issue refused after the human fixed it.
+    The DURABLE half is the label alone: it removes the issue from selection, a
+    later launch reads it to decide whether the refusal still stands, and a
+    human clears it to ask for a retry. The comment only explains it. So the
+    label is applied first, on its own, and it alone decides whether this
+    escalation committed — a comment that failed on an issue already correctly
+    labelled must not send the next launch round the whole escalation again and
+    post the operator a second copy. The event follows that durable commit (the
+    discipline the claim quarantine keeps): a dashboard warning whose label
+    never landed disappears on restart and takes the only signal with it.
     """
 
-    class _Escalation:
-        def escalate(self, attempt: ProvisioningAttempt) -> bool:
-            committed = apply_actions(
-                [
-                    AddLabelAction(
-                        issue_number=attempt.issue_number,
-                        label=label_manager.needs_human,
-                        reason="worktree provisioning failed past its attempt bound",
-                        needs_human_cause=NeedsHumanCause.SESSION_LIFECYCLE,
-                    ),
-                    AddCommentAction(
-                        number=attempt.issue_number,
-                        comment=_provisioning_escalation_comment(attempt),
-                        reason="worktree provisioning failed past its attempt bound",
-                    ),
-                ],
-                context="provisioning_attempts_exhausted",
+    apply_actions: ApplyActions
+    label_manager: LabelManager
+    events: EventSink
+    #: Live label read for one issue. Must be the UNCACHED one: a stale answer
+    #: gets this wrong in the expensive direction, leaving an issue refused
+    #: after the human fixed it.
+    read_labels: Callable[[int], Sequence[str]]
+
+    def escalate(self, attempt: ProvisioningAttempt) -> bool:
+        """Block the issue, explain why, and say whether the block landed."""
+        if not self.apply_actions(
+            [
+                AddLabelAction(
+                    issue_number=attempt.issue_number,
+                    label=self.label_manager.needs_human,
+                    reason=_ESCALATION_REASON,
+                    needs_human_cause=NeedsHumanCause.SESSION_LIFECYCLE,
+                )
+            ],
+            context=PROVISIONING_ESCALATION_CONTEXT,
+        ):
+            return False
+        self._explain(attempt)
+        self.events.publish(make_trace_event(
+            EventName.ISSUE_NEEDS_HUMAN,
+            {
+                "issue_number": attempt.issue_number,
+                "reason": PROVISIONING_ESCALATION_CONTEXT,
+                "attempts": attempt.attempts,
+                "limit": attempt.limit,
+                "error": attempt.error,
+            },
+        ))
+        return True
+
+    def _explain(self, attempt: ProvisioningAttempt) -> None:
+        """Post the operator comment, best effort: the block already holds."""
+        if self.apply_actions(
+            [
+                AddCommentAction(
+                    number=attempt.issue_number,
+                    comment=_provisioning_escalation_comment(attempt),
+                    reason=_ESCALATION_REASON,
+                )
+            ],
+            context=PROVISIONING_ESCALATION_CONTEXT,
+        ):
+            return
+        logger.warning(
+            "[launch] #%d is blocked for exhausted provisioning but its "
+            "explanatory comment did not post; the label and the "
+            "issue.needs_human event still carry the reason",
+            attempt.issue_number,
+        )
+
+    def still_escalated(self, issue_number: int) -> bool:
+        try:
+            return self.label_manager.needs_human in frozenset(
+                self.read_labels(issue_number)
             )
-            if not committed:
-                return False
-            events.publish(make_trace_event(
-                EventName.ISSUE_NEEDS_HUMAN,
-                {
-                    "issue_number": attempt.issue_number,
-                    "reason": "provisioning_attempts_exhausted",
-                    "attempts": attempt.attempts,
-                    "limit": attempt.limit,
-                    "error": attempt.error,
-                },
-            ))
+        except Exception:
+            logger.exception(
+                "[launch] Could not read labels for #%d; treating its "
+                "provisioning escalation as still in force",
+                issue_number,
+            )
+            # Fails CLOSED, the same direction the shared block reads in:
+            # wrongly keeping the refusal costs one launch, wrongly dropping
+            # it puts the repository back in the loop this bound removed.
             return True
 
-        def still_escalated(self, issue_number: int) -> bool:
-            try:
-                return label_manager.needs_human in frozenset(read_labels(issue_number))
-            except Exception:
-                logger.exception(
-                    "[launch] Could not read labels for #%d; treating its "
-                    "provisioning escalation as still in force",
-                    issue_number,
-                )
-                # Fails CLOSED, the same direction the shared block reads in:
-                # wrongly keeping the refusal costs one launch, wrongly dropping
-                # it puts the repository back in the loop this bound removed.
-                return True
 
-    return _Escalation()
+def build_provisioning_escalation(
+    *,
+    apply_actions: ApplyActions,
+    label_manager: LabelManager,
+    events: EventSink,
+    read_labels: Callable[[int], Sequence[str]],
+) -> NeedsHumanProvisioningEscalation:
+    """Assemble the needs-human escalation from launcher collaborators."""
+    return NeedsHumanProvisioningEscalation(
+        apply_actions=apply_actions,
+        label_manager=label_manager,
+        events=events,
+        read_labels=read_labels,
+    )
 
 
 def _provisioning_escalation_comment(attempt: ProvisioningAttempt) -> str:
