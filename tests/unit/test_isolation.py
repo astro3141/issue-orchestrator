@@ -11,11 +11,13 @@ from issue_orchestrator.control.isolation import (
     FORBIDDEN_ENV_VARS,
     GIT_SAFE_ENV,
     GRADLE_USER_HOME_ENV,
+    UV_CACHE_DIR_ENV,
     build_agent_tool_env,
     build_agent_tool_env_assignments,
     build_agent_tool_path,
     get_forbidden_env_vars,
     get_gradle_user_home,
+    get_uv_cache_dir,
     get_orchestrator_socket_path,
     build_runtime_tool_env,
     build_runtime_tool_env_assignments,
@@ -182,6 +184,8 @@ class TestRuntimeToolEnv:
         assert assignments == [
             f"{GRADLE_USER_HOME_ENV}="
             "'/path/with spaces/worktree/.issue-orchestrator/tool-homes/gradle'",
+            f"{UV_CACHE_DIR_ENV}="
+            "'/path/with spaces/worktree/.issue-orchestrator/tool-homes/uv'",
             "PATH='/path/with spaces/worktree/.venv/bin':$PATH",
         ]
 
@@ -194,6 +198,7 @@ class TestRuntimeToolEnv:
         assert assignments == [
             f"{GRADLE_USER_HOME_ENV}="
             f"{shlex.quote(str(get_gradle_user_home(worktree)))}",
+            f"{UV_CACHE_DIR_ENV}={shlex.quote(str(get_uv_cache_dir(worktree)))}",
             f"PATH={shlex.quote(str(worktree / '.venv' / 'bin'))}:$PATH",
         ]
 

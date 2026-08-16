@@ -63,6 +63,7 @@ GIT_SAFE_ENV = {
 
 RUNTIME_TOOL_HOME_DIR = ".issue-orchestrator/tool-homes"
 GRADLE_USER_HOME_ENV = "GRADLE_USER_HOME"
+UV_CACHE_DIR_ENV = "UV_CACHE_DIR"
 PATH_ENV = "PATH"
 
 
@@ -72,6 +73,30 @@ def get_gradle_user_home(worktree: Path) -> Path:
     Gradle creates this directory lazily on first use.
     """
     return worktree / RUNTIME_TOOL_HOME_DIR / "gradle"
+
+
+def get_uv_cache_dir(worktree: Path) -> Path:
+    """Return the per-worktree uv cache used by orchestrated commands.
+
+    uv's interpreter cache decides which environment a project resolves to, and
+    it answers from cache without querying the interpreter whenever the entry's
+    recorded timestamp still matches the canonical executable. A shared cache
+    therefore lets one checkout's recorded environment be handed to another: a
+    `uv sync` run inside a worktree resolved its project environment to the
+    primary checkout's `.venv` and repointed that environment's editable install
+    at the worktree (#53).
+
+    Nothing above the cache prevents this. Naming the interpreter with
+    ``--python``, or the environment with ``UV_PROJECT_ENVIRONMENT``, was
+    measured not to change the selection, because the selection is made from
+    the cached answer rather than from those inputs. Only cache identity does,
+    so the cache is scoped here the same way the Gradle home is.
+
+    Per-worktree rather than per-invocation: a reused worktree keeps its own
+    downloads across runs. What it never shares is cache identity with another
+    checkout. uv creates the directory lazily on first use.
+    """
+    return worktree / RUNTIME_TOOL_HOME_DIR / "uv"
 
 
 def get_worktree_venv_bin(worktree: Path) -> Path:
@@ -125,27 +150,37 @@ def build_runtime_tool_env(
 ) -> dict[str, str]:
     """Build an environment with tool homes isolated to the worktree.
 
-    Gradle daemons are scoped by ``GRADLE_USER_HOME``. Python command-line
-    tools are resolved from the worktree's own ``.venv/bin`` first. The
-    worktree path is prepended before the directory exists so sessions launched
-    during setup still pick it up once the venv is created. Without these
-    per-worktree values, concurrent sessions share the user's daemon registry
-    and validation commands can miss repo-local tools.
+    Gradle daemons are scoped by ``GRADLE_USER_HOME`` and uv by
+    ``UV_CACHE_DIR``. Python command-line tools are resolved from the worktree's
+    own ``.venv/bin`` first. The worktree path is prepended before the directory
+    exists so sessions launched during setup still pick it up once the venv is
+    created. Without these per-worktree values, concurrent sessions share the
+    user's daemon registry and validation commands can miss repo-local tools,
+    and a shared uv cache can hand one checkout's environment to another (#53,
+    see :func:`get_uv_cache_dir`).
 
-    The isolated value intentionally overrides any caller-provided
-    ``GRADLE_USER_HOME`` so orchestrator-managed runs remain reproducible.
+    The isolated values intentionally override any caller-provided
+    ``GRADLE_USER_HOME`` or ``UV_CACHE_DIR`` so orchestrator-managed runs remain
+    reproducible and cannot inherit a shared cache from the environment they
+    were launched from.
     """
     env = dict(os.environ if base_env is None else base_env)
     env[GRADLE_USER_HOME_ENV] = str(get_gradle_user_home(worktree))
+    env[UV_CACHE_DIR_ENV] = str(get_uv_cache_dir(worktree))
     current_path = env.get(PATH_ENV, os.environ.get(PATH_ENV, ""))
     env[PATH_ENV] = build_runtime_tool_path(worktree, current_path)
     return env
 
 
 def build_runtime_tool_env_assignments(worktree: Path) -> list[str]:
-    """Build shell assignment texts for non-agent runtime isolation."""
+    """Build shell assignment texts for non-agent runtime isolation.
+
+    Carries the same isolation the env builder applies, so the two runtime-tool
+    invocation shapes cannot drift into different policies.
+    """
     assignments = [
-        f"{GRADLE_USER_HOME_ENV}={shlex.quote(str(get_gradle_user_home(worktree)))}"
+        f"{GRADLE_USER_HOME_ENV}={shlex.quote(str(get_gradle_user_home(worktree)))}",
+        f"{UV_CACHE_DIR_ENV}={shlex.quote(str(get_uv_cache_dir(worktree)))}",
     ]
     worktree_venv_bin = get_worktree_venv_bin(worktree)
     assignments.append(f"{PATH_ENV}={shlex.quote(str(worktree_venv_bin))}:$PATH")
