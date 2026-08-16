@@ -18,11 +18,11 @@ from typing import TYPE_CHECKING, Optional, cast
 
 if TYPE_CHECKING:
     from ..infra.config import Config
+    from ..ports.issue import Issue as IssueProtocol
     from ..ports.tech_lead_authority import TechLeadAuthorityStore
 
-from ..domain.issue_key import GitHubIssueKey
 from ..domain.session_key import SessionKey, TaskKind
-from ..domain.models import Issue, RETROSPECTIVE_REVIEW_TERMINAL_PREFIX, Session
+from ..domain.models import RETROSPECTIVE_REVIEW_TERMINAL_PREFIX, Session
 from ..domain.session_run import SessionRunAssets
 from ..ports import RepositoryHost, WorkingCopy
 from ..ports.session_runner import DiscoveredSession
@@ -231,7 +231,6 @@ class SessionRestorer:
             Session object if restored, None if skipped
         """
         issue_number = self._issue_number(session_info)
-        tab_name = str(session_info.get("tab_name") or "")
         is_review = session_info["is_review"]
         session_name = self.canonical_terminal_id(session_info)
 
@@ -254,20 +253,16 @@ class SessionRestorer:
         worktree_path = run_assets.worktree_path
         branch_name = self._get_branch_name(worktree_path)
 
-        # Fetch single issue details to get agent type
-        issue_obj = self.repository_host.get_issue(issue_number)
+        # The authoritative work item, or nothing at all: its identity is what
+        # the restored session is filed under, so it is not reconstructible
+        # from anything this process can see locally (#40).
+        issue_obj = self._authoritative_work_item(issue_number, session_name)
+        if issue_obj is None:
+            return None
+
         agent_config = None
-
-        if issue_obj and issue_obj.agent_type:
+        if issue_obj.agent_type:
             agent_config = self.config.agents.get(issue_obj.agent_type)
-
-        if not issue_obj:
-            # Create minimal issue object for reviews or if issue not found
-            issue_obj = Issue(
-                number=issue_number,
-                title=tab_name.replace("#", "").strip(),
-                labels=[],
-            )
 
         if not agent_config:
             # Use first available agent config as fallback
@@ -280,11 +275,18 @@ class SessionRestorer:
             return None
 
         if not self.config.repo:
+            # A precondition, not the key's scope - that comes from the issue
+            # itself below. An engine bound to no repository has no work to
+            # restore tracking for.
             logger.warning("No repo configured for session %s - skipping", session_name)
             return None
 
-        # Create session with domain identity
-        issue_key = GitHubIssueKey(repo=self.config.repo, external_id=str(issue_number))
+        # Create session with domain identity. The key is the issue's own
+        # canonical key - the same derivation ``SessionLauncher`` files a fresh
+        # session under - so ``session.key.issue`` is ``session.issue.key`` by
+        # construction and a restart cannot change the identity of the work
+        # underneath it (#40).
+        issue_key = issue_obj.key
         if session_name.startswith(RETROSPECTIVE_REVIEW_TERMINAL_PREFIX):
             task_kind = TaskKind.RETROSPECTIVE_REVIEW
         else:
@@ -311,6 +313,48 @@ class SessionRestorer:
                 self.config, issue_obj, self.tech_lead_authority
             ),
         )
+
+    def _authoritative_work_item(
+        self,
+        issue_number: int,
+        session_name: str,
+    ) -> "IssueProtocol | None":
+        """The work item a restored session may be filed under, or nothing.
+
+        Restart must not silently turn an unknown canonical identity into a
+        number-only one (#40). The canonical key is
+        ``github_issue_key(repo, number, title)``, and the only authoritative
+        title is the one the repository host holds - a terminal's tab text is a
+        UI label that was never the issue's title, and a locally rebuilt issue
+        carries no repository either. For a title like ``[M1-011] ...`` such an
+        object cannot prove the stable id, so deriving a key from it would file
+        the restored session under a confident-looking ``repo:38`` while every
+        other attempt-scoped record for that issue uses ``repo:M1-011``.
+
+        So when the host cannot produce the issue, this declines the
+        restoration rather than completing it under a downgraded identity.
+
+        A durable canonical key does exist on some restored paths: a review,
+        rework or retrospective-review session holds a ``PendingWorkClaim``
+        whose ledger row in ``.issue-orchestrator/state/`` carries the
+        ``issue_key`` itself, and a validation-retry or tech-lead claim
+        carries the number and title that derivation takes. A plain issue
+        session has no claim row, and this path does not consult that ledger.
+        So no durable canonical key is proven for every restored session path,
+        and rather than guessing one, this path declines when the
+        authoritative issue metadata is unavailable.
+        """
+        issue = self.repository_host.get_issue(issue_number)
+        if issue is None:
+            logger.warning(
+                "Cannot restore session %s: issue #%d is unavailable from the "
+                "repository host, so its canonical identity cannot be proven - "
+                "declining rather than restoring under a number-only key",
+                session_name,
+                issue_number,
+            )
+            return None
+        return issue
 
     def _required_run_assets(
         self,
