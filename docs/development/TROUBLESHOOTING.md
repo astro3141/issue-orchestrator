@@ -132,10 +132,7 @@ writing to the very thing under repair.
 
 A worktree left holding the old symlink needs nothing — the next session's
 worktree setup removes it and `worktrees.setup` builds the worktree its own
-environment. A worktree created on a branch that already exists locally is
-likewise safe to reuse: that branch is updated onto the current base before the
-session receives it ([#79]), so a stale local branch cannot hand a session an
-out-of-date starting point.
+environment.
 
 ### An Issue Is Marked `needs-human` for "Worktree provisioning failed"
 
@@ -156,6 +153,36 @@ verbatim.
 remove the `needs-human` label. Clearing the label *is* the retry request: the
 next launch runs the recipe again from a full budget. See
 [validation.md](../architecture/validation.md) for what the bound guarantees.
+
+### A Session Appears To Be Working From an Out-of-Date Base
+
+**Symptom:** A session's branch is missing commits that were merged into the
+base branch before the session launched, so its worktree looks like it started
+from a base that is no longer current.
+
+**Cause:** Usually not what happened. Worktree creation *adopts* an existing
+branch on two paths — a local `refs/heads/<branch>` left by an earlier session,
+and a branch fetched from the remote, which is how review and rework sessions
+get theirs — and reuse finds one already checked out. None of the three says
+anything about the base: a successful `git fetch` makes the tip current with
+respect to the remote only, so a PR branch pushed thirty commits of the base
+ago fetches cleanly and still sits where it was pushed from. Every adopted
+branch is therefore updated onto the current base before the session receives
+it ([#79]). A branch *built* rather than adopted — from `origin/<base>`, or
+from an operator's seed ref — is already on the base it was built from and owes
+nothing.
+
+The one deliberate exemption is a tech_lead investigation (`preserve_branch`):
+it reads the subject's branch as evidence, so rebasing it would rewrite the
+commits being read and resetting it would discard unpushed work no PR holds.
+Such a session is left on its branch's original base on purpose.
+
+**Fix:** If the session is a tech_lead investigation, this is the exemption
+working — nothing to repair. Otherwise the update did not silently skip; it
+failed loudly, and the session either never launched (creation raises, and the
+issue lands in the `needs-human` path above) or its worktree was deleted and
+recreated (reuse). Search the tick log for the branch name to see which, and
+repair what the logged reason names.
 
 ### Sessions Failing Without Completion
 
