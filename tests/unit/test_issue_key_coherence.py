@@ -39,7 +39,6 @@ from issue_orchestrator.domain.issue_key import (
     FakeIssueKey,
     GitHubIssueKey,
     IssueKey,
-    github_issue_key,
 )
 from issue_orchestrator.domain.models import (
     OrchestratorState,
@@ -56,6 +55,11 @@ from issue_orchestrator.execution.pending_work_claim_store import (
 from issue_orchestrator.infra.config import Config
 from issue_orchestrator.observation.observation import SessionObservationResult
 from tests.unit.session_run_helpers import make_session_run_assets
+from tests.unit.test_completion_review_exchange_async import (
+    _build as build_review_exchange,
+    _FakeJobRunner,
+    _FakeReviewExchangeRunner,
+)
 from tests.unit.test_session_restorer import (
     MockWorkingCopy,
     make_agent_config,
@@ -109,15 +113,43 @@ def _identities() -> CandidateExecutionIdentities:
     )
 
 
-def _review_evidence_key(title: str) -> IssueKey:
-    """The key ``completion_review_exchange`` files its #34 records under.
+def _review_evidence_key(title: str, tmp_path: Path) -> IssueKey:
+    """The key ``completion_review_exchange`` actually files its #34 records under.
 
-    That module derives it from ``github_issue_key(config.repo, number, title)``
-    and hands the same value to the exchange runner, which is what the
-    execution-identity store keys its attempt record by - pinned by
-    ``tests/unit/test_completion_review_exchange_async.py::TestExchangeRecordScope``.
+    Driven through ``run_review_exchange_loop`` and captured at the
+    ``ReviewExchangeRunner`` port rather than re-derived here: re-deriving
+    would only restate the rule this test is trying to prove both paths obey,
+    and would keep passing if the exchange stopped obeying it. The captured
+    value is what the execution-identity store keys its attempt record by.
     """
-    return github_issue_key(repo=REPO, number=ISSUE_NUMBER, title=title)
+    captured: list[Any] = []
+
+    class _CapturingRunner(_FakeReviewExchangeRunner):
+        def run(self, **kwargs: Any) -> Any:
+            captured.append(kwargs["issue_key"])
+            return super().run(**kwargs)
+
+    exchange_dir = tmp_path / f"exchange-{len(title)}"
+    exchange_dir.mkdir(exist_ok=True)
+    review, session_output = build_review_exchange(
+        exchange_dir,
+        _FakeJobRunner(),
+        [],
+        [],
+        repo=REPO,
+        review_exchange_runner=_CapturingRunner(),
+    )
+    review.run_review_exchange_loop(
+        exchange_run=session_output.cached_review_run(),
+        worktree=exchange_dir,
+        issue_number=ISSUE_NUMBER,
+        issue_title=title,
+        session_name="coding-1",
+        agent_label="agent:backend",
+    )
+
+    assert len(captured) == 1
+    return captured[0]
 
 
 def _validation_evidence_key(title: str, tmp_path: Path) -> IssueKey:
@@ -230,7 +262,7 @@ class TestPrefixedIdentityCoherence:
         attempts.mkdir()
         store = AttemptExecutionIdentityStore(SidecarAttemptStore(attempts))
         store.record(
-            AttemptKey(_review_evidence_key(PREFIXED_TITLE), CANDIDATE_SHA),
+            AttemptKey(_review_evidence_key(PREFIXED_TITLE, tmp_path), CANDIDATE_SHA),
             _identities(),
         )
 
@@ -251,13 +283,13 @@ class TestPrefixedIdentityCoherence:
         attempts.mkdir()
         store = AttemptExecutionIdentityStore(SidecarAttemptStore(attempts))
         store.record(
-            AttemptKey(_review_evidence_key(PREFIXED_TITLE), CANDIDATE_SHA),
+            AttemptKey(_review_evidence_key(PREFIXED_TITLE, tmp_path), CANDIDATE_SHA),
             _identities(),
         )
 
         number_only = GitHubIssueKey(repo=REPO, external_id=str(ISSUE_NUMBER))
 
-        assert number_only != _review_evidence_key(PREFIXED_TITLE)
+        assert number_only != _review_evidence_key(PREFIXED_TITLE, tmp_path)
         assert store.read(AttemptKey(number_only, CANDIDATE_SHA)) is None
 
 
@@ -272,7 +304,7 @@ class TestRestartIdentityCoherence:
         assert len(restored) == 1
         session = restored[0]
         assert session.key.issue == session.issue.key
-        assert session.key.issue == _review_evidence_key(PREFIXED_TITLE)
+        assert session.key.issue == _review_evidence_key(PREFIXED_TITLE, tmp_path)
         assert session.key.issue.stable_id() == "M1-011"
 
     def test_restore_is_declined_when_the_authoritative_title_is_unavailable(
@@ -302,7 +334,7 @@ class TestOrdinaryLaneIsUnchanged:
         key = _validation_evidence_key(PLAIN_TITLE, tmp_path)
 
         assert key == GitHubIssueKey(repo=REPO, external_id=str(ISSUE_NUMBER))
-        assert key == _review_evidence_key(PLAIN_TITLE)
+        assert key == _review_evidence_key(PLAIN_TITLE, tmp_path)
 
     def test_a_restored_session_still_keys_on_the_issue_number(
         self, tmp_path: Path
