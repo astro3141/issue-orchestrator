@@ -155,14 +155,22 @@ full install per session would be its own regression:
 |---|---|
 | `make worktree-setup` end to end (venv + `uv sync --frozen --all-extras` + `.venv-semgrep` + `npm ci` + `playwright install`) | 5.5 s |
 | `uv venv` + `uv sync --frozen --all-extras` alone | ~0.3 s |
-| Disk actually consumed by the second environment | ~7 MB — 307 MB apparent, but the package files are copy-on-write clones of the shared `uv` cache |
+| Disk actually consumed by the second environment | ~7 MB — 307 MB apparent, but the package files are copy-on-write clones of the `uv` cache |
 
-Reusing a worktree costs less still — `venv-fast` keeps the existing `.venv` and
-re-syncs it. The first sync on a machine pays the download once, into the
-shared `uv` cache, which is where the disk actually goes. So no per-session full
-install is being paid: what a session pays is a sync against a cache it shares
-with every other checkout, and `npm ci` — which the previous arrangement paid
-too, and which dominates.
+Those figures were measured while every checkout shared one `uv` cache, which
+is no longer how the orchestrator provisions (see below). A worktree
+provisioned today fills its own cache on first use, so a first run in a new
+worktree pays downloads these numbers do not include, and the disk it consumes
+is that cache rather than clones of another checkout's. What the table
+describes is the state it was measured in — a worktree whose cache is already
+warm. It has not been re-measured since.
+
+Reusing a worktree costs less still — `venv-fast` keeps the existing `.venv`
+and re-syncs it, and the worktree's `uv` cache is kept alongside it. A cache
+pays each download once and keeps it, which is where the disk actually goes. So
+no per-session full install is being paid: what a session in a provisioned
+worktree pays is a sync against that worktree's own warm cache, and `npm ci` —
+which the previous arrangement paid too, and which dominates.
 
 **Concurrency needs no coordination primitive here.** Two sessions provisioning
 at once have no shared environment to race over, so nothing has to be trusted
@@ -177,8 +185,8 @@ them rather than repointing them at itself. That is the property the `.venv`
 symlink did not have. The `uv` cache is shared only where the orchestrator does
 not own the invocation: orchestrator-managed worktree commands resolve a
 worktree-local `UV_CACHE_DIR`, because uv answers *which environment does this
-project use?* from that cache, so a run in one checkout cannot select or modify
-another checkout's environment (issue [#53]).
+project use?* from that cache, so such a run cannot select or modify another
+checkout's environment (issue [#53]).
 
 #### A directory is not evidence that the environment is this worktree's
 
