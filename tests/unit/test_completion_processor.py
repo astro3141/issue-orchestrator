@@ -94,7 +94,7 @@ def publish_gate_outcome(
     from issue_orchestrator.control.validation import GateEvidence
     from issue_orchestrator.domain.session_run import ValidationArtifactPaths
 
-    def check(*, worktree: Path, run_assets):
+    def check(*, worktree: Path, run_assets, issue_key=None):
         return PublicationGateOutcome(
             allowed=allowed,
             reason=reason,

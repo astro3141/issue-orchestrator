@@ -349,6 +349,11 @@ class SessionController:
             pr_number=pr_number,
             completion_path=completion_path,
             run_assets=run_assets,
+            # The same canonical identity the quick gate's attempt evidence is
+            # filed under, so the publish gate's durable verdict lands on the
+            # very ``Attempt(issue, A)`` the rest of this candidate's evidence
+            # already uses (#85).
+            issue_key=issue_key,
         )
         deferred_decision = self._deferred_review_exchange_decision(
             result=result,

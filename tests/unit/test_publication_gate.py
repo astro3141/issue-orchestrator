@@ -19,11 +19,14 @@ from types import SimpleNamespace
 
 import pytest
 
+from issue_orchestrator.adapters.sidecar_attempt_store import SidecarAttemptStore
 from issue_orchestrator.control.publication_gate import (
     PublicationGate,
     RunValidationContracts,
     publish_gate_output_dir,
 )
+from issue_orchestrator.control.publication_verdict import PublicationVerdictReceipts
+from issue_orchestrator.domain.attempt import AttemptKey
 from issue_orchestrator.control.validation import ValidationGate
 from issue_orchestrator.domain.validation_profile import ValidationGateKind
 from issue_orchestrator.execution.session_output_adapter import FileSystemSessionOutput
@@ -64,6 +67,24 @@ class StubWorkingCopy:
 
     def get_head_sha(self, worktree: Path) -> str:
         return self._head_sha
+
+
+class StubAttemptKeys:
+    """The production derivation: the caller's issue key, at the gate's HEAD."""
+
+    def for_validation_attempt(self, *, issue_key, head_sha: str) -> AttemptKey:
+        return AttemptKey(issue_key, head_sha)
+
+
+def verdict_receipts(worktree: Path) -> PublicationVerdictReceipts:
+    """A receipt writer over a real sidecar store, outside the worktree.
+
+    ``.parent`` on purpose: the attempt sidecar is what has to survive the
+    worktree being removed, so these tests never let it live inside one.
+    """
+    return PublicationVerdictReceipts(
+        SidecarAttemptStore(worktree.parent), StubAttemptKeys()
+    )
 
 
 def sentinel_registry(profile_name: str = "default") -> ValidationProfileRegistry:
@@ -118,6 +139,7 @@ class TestThePublishGateRunsThePublishContract:
             contracts=contracts,
             command_runner=runner,
             working_copy=StubWorkingCopy(),
+            verdicts=verdict_receipts(worktree),
         )
 
         # A stale QUICK_SENTINEL result for this exact HEAD and profile must
@@ -134,7 +156,7 @@ class TestThePublishGateRunsThePublishContract:
         assert quick_result.record is not None
         assert quick_result.record.suite == "quick_gate"
 
-        result = gate.check(worktree=worktree, run_assets=run)
+        result = gate.check(worktree=worktree, run_assets=run, issue_key=None)
 
         # 1. The requested gate kind resolves the publish contract...
         contract = contracts.contract_for_run(
@@ -189,9 +211,10 @@ class TestThePublishGateRunsThePublishContract:
             contracts=RunValidationContracts(session_output, sentinel_registry()),
             command_runner=runner,
             working_copy=StubWorkingCopy(),
+            verdicts=verdict_receipts(worktree),
         )
 
-        result = gate.check(worktree=worktree, run_assets=run)
+        result = gate.check(worktree=worktree, run_assets=run, issue_key=None)
 
         # The mutation is observable in every one of the pinned values.
         assert runner.commands == [QUICK_SENTINEL]
@@ -360,7 +383,8 @@ class TestTheRunsFrozenProfileSelectsTheContract:
             contracts=RunValidationContracts(session_output, registry),
             command_runner=runner,
             working_copy=StubWorkingCopy(),
-        ).check(worktree=worktree, run_assets=run)
+            verdicts=verdict_receipts(worktree),
+        ).check(worktree=worktree, run_assets=run, issue_key=None)
 
         assert runner.commands == [PUBLISH_SENTINEL]
         assert result.record is not None
@@ -378,7 +402,8 @@ class TestTheRunsFrozenProfileSelectsTheContract:
             contracts=RunValidationContracts(session_output, sentinel_registry()),
             command_runner=runner,
             working_copy=StubWorkingCopy(),
-        ).check(worktree=worktree, run_assets=run)
+            verdicts=verdict_receipts(worktree),
+        ).check(worktree=worktree, run_assets=run, issue_key=None)
 
         assert runner.commands == [PUBLISH_SENTINEL]
         assert result.allowed is False
@@ -402,7 +427,8 @@ class TestTheRunsFrozenProfileSelectsTheContract:
             contracts=RunValidationContracts(session_output, registry),
             command_runner=runner,
             working_copy=StubWorkingCopy(),
-        ).check(worktree=worktree, run_assets=run)
+            verdicts=verdict_receipts(worktree),
+        ).check(worktree=worktree, run_assets=run, issue_key=None)
 
         assert runner.commands == []
         assert result.allowed is True
@@ -426,6 +452,7 @@ class TestTheGateReportsWhereItsEvidenceLives:
             ),
             command_runner=runner,
             working_copy=StubWorkingCopy(),
+            verdicts=verdict_receipts(worktree),
         )
 
     def test_evidence_paths_are_the_files_the_gate_actually_wrote(
@@ -434,7 +461,7 @@ class TestTheGateReportsWhereItsEvidenceLives:
         run = start_run(worktree)
 
         outcome = self._gate(worktree, RecordingCommandRunner()).check(
-            worktree=worktree, run_assets=run
+            worktree=worktree, run_assets=run, issue_key=None
         )
 
         publish_dir = publish_gate_output_dir(run.run_dir)
@@ -452,7 +479,7 @@ class TestTheGateReportsWhereItsEvidenceLives:
         run = start_run(worktree)
 
         outcome = self._gate(worktree, RecordingCommandRunner(returncode=1)).check(
-            worktree=worktree, run_assets=run
+            worktree=worktree, run_assets=run, issue_key=None
         )
 
         quick = run.validation_artifacts
@@ -467,7 +494,7 @@ class TestTheGateReportsWhereItsEvidenceLives:
         run = start_run(worktree)
 
         outcome = self._gate(worktree, RecordingCommandRunner(returncode=1)).check(
-            worktree=worktree, run_assets=run
+            worktree=worktree, run_assets=run, issue_key=None
         )
 
         assert outcome.allowed is False

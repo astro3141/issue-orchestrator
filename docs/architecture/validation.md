@@ -57,6 +57,33 @@ while stamping `suite=publish_gate` onto the record, and the completion
 processor's publish-gate seam was never wired in composition — so
 `validation.publish.cmd` ran nowhere in the orchestrator path.
 
+### The verdict outlives the run directory
+
+Every path named above lives inside the coder worktree, so all of it is gone
+once the worktree is reaped. The publication gate therefore also files a
+**verdict receipt** on `Attempt(issue, HEAD_SHA)` — the record already keyed by
+exactly that pair, whose sidecar lives in the primary checkout under
+`.issue-orchestrator/attempts` and survives both worktree removal and an
+orchestrator restart.
+
+The receipt is not a copy of the record. It carries only what a later reader
+needs in order to decide whether *this exact candidate* passed *the
+publication contract*: the suite, the exact `head_sha`, the verdict
+(`passed` / `failed` / `timed_out`), and the `command` + `profile` that
+identify the contract that actually executed — the same three values cache
+reuse compares. `Attempt.publication_validation_passed` asks all of it at
+once.
+
+Three states stay distinguishable after cleanup, which is what issue [#85]
+existed to restore: no receipt means the gate never ran, a receipt means it
+ran and says what it decided, and a receipt that does not parse raises rather
+than reading as either. A run whose profile configures no publish command
+writes no receipt — an unconfigured gate is a gate that never ran.
+
+The republish and manual-reprocess entry points hold an issue *number* rather
+than the canonical issue key, so they run the gate but record no receipt, and
+log that they did not. They never write a receipt under a derived identity.
+
 ## Worktree readiness is a precondition of a meaningful verdict
 
 Every gate above runs *inside a worktree*. A worktree that lacks the

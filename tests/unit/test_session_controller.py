@@ -47,6 +47,7 @@ from issue_orchestrator.domain.models import (
     CompletionOutcome,
     RequestedAction,
 )
+from issue_orchestrator.domain.issue_key import IssueKey
 from issue_orchestrator.domain.session_run import SessionRunAssets
 from issue_orchestrator.ports import NullEventSink
 from issue_orchestrator.ports.event_sink import TraceEvent
@@ -185,6 +186,7 @@ class MockCompletionProcessor:
         run_assets: SessionRunAssets,
         pr_number: int | None = None,
         completion_path: str | None = None,
+        issue_key: IssueKey | None = None,
     ):
         self.process_calls.append(
             {
@@ -194,6 +196,7 @@ class MockCompletionProcessor:
                 "pr_number": pr_number,
                 "completion_path": completion_path,
                 "run_assets": run_assets,
+                "issue_key": issue_key,
             }
         )
         return self.process_result

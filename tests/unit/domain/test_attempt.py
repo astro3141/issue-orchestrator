@@ -6,6 +6,10 @@ import pytest
 
 from issue_orchestrator.domain.attempt import Attempt, AttemptKey
 from issue_orchestrator.domain.issue_key import FakeIssueKey, GitHubIssueKey
+from issue_orchestrator.domain.validation_verdict_receipt import (
+    ValidationVerdict,
+    ValidationVerdictReceipt,
+)
 
 SHA = "a" * 40
 
@@ -72,3 +76,32 @@ def test_attempt_to_dict_rejects_unsupported_issue_key_type() -> None:
 
     with pytest.raises(ValueError, match="unsupported IssueKey type"):
         attempt.to_dict()
+
+
+def test_attempt_round_trips_a_publication_verdict() -> None:
+    key = AttemptKey(GitHubIssueKey("owner/repo", "85"), SHA)
+    receipt = ValidationVerdictReceipt(
+        suite="publish_gate",
+        head_sha=SHA,
+        verdict=ValidationVerdict.PASSED,
+        command="make validate-pr-raw",
+        profile="default",
+    )
+
+    restored = Attempt.from_dict(
+        Attempt(key=key, publication_verdict=receipt).to_dict()
+    )
+
+    assert restored.publication_verdict == receipt
+    assert restored.publication_validation_passed is True
+
+
+def test_a_sidecar_written_before_verdicts_existed_still_parses() -> None:
+    """Absence is "no publication gate has reported", not a parse failure."""
+    payload = Attempt(key=AttemptKey(GitHubIssueKey("owner/repo", "85"), SHA)).to_dict()
+    del payload["publication_verdict"]
+
+    restored = Attempt.from_dict(payload)
+
+    assert restored.publication_verdict is None
+    assert restored.publication_validation_passed is False
