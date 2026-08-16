@@ -174,7 +174,11 @@ Playwright browser cache (`PLAYWRIGHT_BROWSERS_PATH`), and the VS Code test
 cache. Each is content-addressed or install-once, managed by the tool that owns
 it, and already shared before this change; a run reads from them and adds to
 them rather than repointing them at itself. That is the property the `.venv`
-symlink did not have.
+symlink did not have. The `uv` cache is shared only where the orchestrator does
+not own the invocation: orchestrator-managed worktree commands resolve a
+worktree-local `UV_CACHE_DIR`, because uv answers *which environment does this
+project use?* from that cache, so a run in one checkout cannot select or modify
+another checkout's environment (issue [#53]).
 
 #### A directory is not evidence that the environment is this worktree's
 
