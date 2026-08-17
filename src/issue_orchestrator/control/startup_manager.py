@@ -363,7 +363,8 @@ class StartupManager:
                 if outcome.status != QueueMutationStatus.ACCEPTED:
                     logger.warning(
                         "[startup] Recovered locally in-progress issue is out of dashboard queue scope: issue=%d status=%s",
-                        issue.number, outcome.status.value,
+                        issue.number,
+                        outcome.status.value,
                     )
             if stale_in_progress and self._queue_cache_store is not None:
                 queue_cache.save_snapshot()
@@ -383,13 +384,14 @@ class StartupManager:
                 for agent_label in self.config.agents.keys()
                 for issue in self._fetch_in_progress_issues_for_agent(state, agent_label)
             ]
-        # Both paths take the queue owner's verdict before analysis, so the engine's
-        # configured scope binds recovery: a rejected issue is reported, never resumed.
-        # REJECTED_EXCLUDED is kept — in scope, already claimed by history or a session.
-        out_of_scope = {issue.number for issue, _ in candidates
-                        if queue_cache.evaluate_issue(issue) is QueueMutationStatus.REJECTED_OUT_OF_SCOPE}
+        # Both paths ask the queue owner one question before analysis, so the engine's
+        # configured scope binds recovery: an out-of-scope issue is reported, never
+        # resumed. Deliberately the scope predicate and not the queue verdict — the
+        # verdict reports the duplicate-launch guard first, so an out-of-scope issue
+        # already in session_history or active_sessions would read REJECTED_EXCLUDED
+        # and slip through. An in-scope issue that is merely claimed still recovers.
         for issue, agent_label in candidates:
-            if issue.number in out_of_scope:
+            if queue_cache.is_outside_engine_scope(issue):
                 logger.info("[startup] Skipping in-progress recovery for out-of-scope issue=%d", issue.number)
                 continue
             self._analyze_and_handle_issue(state, issue, issue_branches, issues_to_resume, agent_label)
@@ -485,8 +487,7 @@ class StartupManager:
                 )
                 continue
 
-            queue_status = queue_cache.evaluate_issue(issue)
-            if queue_status == QueueMutationStatus.REJECTED_OUT_OF_SCOPE:
+            if queue_cache.is_outside_engine_scope(issue):
                 logger.info(
                     "[startup] Skipping pr-pending dashboard recovery for out-of-scope issue=%d",
                     issue_number,

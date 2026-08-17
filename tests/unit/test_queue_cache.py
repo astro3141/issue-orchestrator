@@ -341,6 +341,52 @@ def test_replace_from_refresh_filters_excluded_history_issue():
     assert [issue.number for issue in state.cached_queue_issues] == [1]
 
 
+def _history_entry(issue_number: int) -> SessionHistoryEntry:
+    return SessionHistoryEntry(
+        issue_number=issue_number,
+        title=f"Issue {issue_number}",
+        agent_type="agent:web",
+        status="completed",
+        runtime_minutes=3,
+    )
+
+
+def test_is_outside_engine_scope_sees_single_issue_filter_through_the_exclusion_guard():
+    """`evaluate_issue` reports the duplicate-launch guard first; scope must not."""
+    config = _make_config()
+    config.filtering.label = "agent:web"
+    config.filtering.issue = 45
+    state = OrchestratorState(session_history=[_history_entry(60)])
+    cache = QueueCache(config, state)
+    unscoped = Issue(number=60, title="Unscoped", labels=["agent:web"])
+
+    assert cache.evaluate_issue(unscoped) is QueueMutationStatus.REJECTED_EXCLUDED
+    assert cache.is_outside_engine_scope(unscoped) is True
+
+
+def test_is_outside_engine_scope_keeps_in_scope_issue_claimed_this_run():
+    """`REJECTED_EXCLUDED` on the engine's own issue is not an out-of-scope answer."""
+    config = _make_config()
+    config.filtering.label = "agent:web"
+    config.filtering.issue = 45
+    state = OrchestratorState(session_history=[_history_entry(45)])
+    cache = QueueCache(config, state)
+    scoped = Issue(number=45, title="Scoped", labels=["agent:web"])
+
+    assert cache.evaluate_issue(scoped) is QueueMutationStatus.REJECTED_EXCLUDED
+    assert cache.is_outside_engine_scope(scoped) is False
+
+
+def test_is_outside_engine_scope_applies_label_scope_without_a_single_issue_filter():
+    config = _make_config()
+    config.filtering.label = "agent:web"
+    state = OrchestratorState()
+    cache = QueueCache(config, state)
+
+    assert cache.is_outside_engine_scope(Issue(number=1, title="Keep", labels=["agent:web"])) is False
+    assert cache.is_outside_engine_scope(Issue(number=2, title="Other", labels=["agent:other"])) is True
+
+
 def test_prune_refresh_timestamps_keeps_only_tracked_issue_numbers():
     config = _make_config()
     state = OrchestratorState(

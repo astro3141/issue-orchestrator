@@ -166,6 +166,26 @@ class QueueCache:
 
         return QueueMutationStatus.ACCEPTED
 
+    def is_outside_engine_scope(self, issue: "Issue") -> bool:
+        """Whether this engine's configured scope excludes the issue outright.
+
+        The unshadowed scope question, and the one every caller asking "is this
+        issue mine to act on at all?" must use. :meth:`evaluate_issue` answers
+        the composite question "may this issue enter the queue?", and it reports
+        the duplicate-launch guard BEFORE the ``--issue`` filter — so an issue in
+        ``session_history`` or ``active_sessions`` reads ``REJECTED_EXCLUDED``
+        and never reaches its ``--issue`` check. Reading scope off that verdict
+        lets an operator-narrowed run widen back out through any issue it has
+        already seen.
+
+        Answers scope only. ``REJECTED_EXCLUDED`` means in scope but already
+        claimed this run, which is a different question and stays with
+        :meth:`evaluate_issue`.
+        """
+        return not evaluate_issue_scope(
+            self._config, issue, include_issue_number_filter=True
+        ).in_scope
+
     def reconciliation_only_issues(self) -> list["Issue"]:
         """In-scope issues the duplicate-launch guard keeps out of the queue (#46).
 
@@ -181,11 +201,10 @@ class QueueCache:
         Deliberately NOT the whole in-scope set: everything
         ``REJECTED_OUT_OF_SCOPE`` covers stays excluded here exactly as it is
         from the queue. The engine's single-issue scope is re-asked through
-        :func:`evaluate_issue_scope` because :meth:`evaluate_issue` reports the
-        duplicate-launch guard FIRST, so an issue in ``session_history`` never
-        reaches its ``--issue`` check — an operator-narrowed run would otherwise
-        widen back out here. Disjoint from the queue by construction, so callers
-        can concatenate the two without deduplicating.
+        :meth:`is_outside_engine_scope` for the precedence reason documented
+        there — an operator-narrowed run would otherwise widen back out here.
+        Disjoint from the queue by construction, so callers can concatenate the
+        two without deduplicating.
         """
         queued = {issue.number for issue in self._state.cached_queue_issues}
         return [
@@ -193,9 +212,7 @@ class QueueCache:
             for issue in self._state.cached_scope_issues
             if issue.number not in queued
             and self.evaluate_issue(issue) is QueueMutationStatus.REJECTED_EXCLUDED
-            and evaluate_issue_scope(
-                self._config, issue, include_issue_number_filter=True
-            ).in_scope
+            and not self.is_outside_engine_scope(issue)
         ]
 
     def prune_refresh_timestamps(self) -> None:
