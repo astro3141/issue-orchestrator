@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -21,6 +22,7 @@ from issue_orchestrator.ports.tech_lead_authority import (
     InMemoryTechLeadAuthorityStore,
 )
 from issue_orchestrator.control.publish_recovery import PublishRecoveryService
+from issue_orchestrator.domain.issue_key import IssueKey
 from issue_orchestrator.domain.models import (
     DiscoveredFailure,
     Issue,
@@ -101,6 +103,10 @@ class _CompletionProcessor:
         pr_number: int | None = None,
         completion_path: str | None = None,
         agent_label: str | None = None,
+        # Required, like the real processor's: a stand-in that defaulted this
+        # would let the republish stop carrying the candidate's identity
+        # without a test noticing, and its publish verdict would go unfiled.
+        issue_key: IssueKey | None,
     ) -> ProcessingResult:
         record_path = worktree / (completion_path or "completion.json")
         self.calls.append({
@@ -109,6 +115,7 @@ class _CompletionProcessor:
             "issue_title": issue_title,
             "completion_path": completion_path,
             "agent_label": agent_label,
+            "issue_key": issue_key,
             # Captured at call time so tests can prove the completion record was
             # available to the processor when the republish actually ran.
             "completion_present": record_path.exists(),
@@ -791,6 +798,116 @@ def test_retry_after_live_cleanup_restores_durable_completion_record(
     # The worker restored the durable record so the processor had a valid input.
     assert original.exists()
     assert processor.calls[-1]["completion_present"] is True
+
+
+def _identity(key: IssueKey) -> tuple[str, str]:
+    """A work item's identity as the protocol defines it: scope + stable id."""
+    return (key.scope(), str(key.stable_id()))
+
+
+class TestRepublishCarriesTheCandidateIdentity:
+    """A retried publish files its verdict on the same ``Attempt(issue, A)`` (#85).
+
+    The republish runs the publish gate and opens the PR, so it produces a
+    verdict about a real candidate. The process that decided the first attempt
+    is gone by then, so the identity has to survive on the durable locators —
+    carried, never re-derived from the issue number the retry route also holds.
+    """
+
+    def test_the_persisted_locators_carry_the_sessions_canonical_key(
+        self, make_session, tmp_path
+    ) -> None:
+        lm = LabelManager(_config(tmp_path))
+        repo = _Repo(issue=_issue(lm), labels=list(_issue(lm).labels))
+        service, store, _ = _service(tmp_path, repo, lm)
+
+        session = _record_failure(service, make_session, tmp_path)
+
+        locators = store.get(4057)
+        assert locators is not None
+        assert locators.issue_key is not None
+        # Structural identity — scope + stable id — which is what the protocol
+        # defines a work item by and what ``AttemptStore`` keys on. The stored
+        # key returns as a ``GitHubIssueKey`` by design, so asserting on the
+        # implementation type would pin the codec, not the identity.
+        assert _identity(locators.issue_key) == _identity(session.key.issue)
+
+    def test_the_key_survives_a_restart_and_reaches_the_processor(
+        self, make_session, tmp_path
+    ) -> None:
+        """Through the store's own bytes, not the in-memory locator object.
+
+        This is the durability half: the process that recorded the failure is
+        gone, so what the republish forwards has to come back out of the JSON
+        the store wrote.
+        """
+        lm = LabelManager(_config(tmp_path))
+        repo = _Repo(issue=_issue(lm), labels=list(_issue(lm).labels))
+        service, store, runner, processor = _service_with_processor(
+            tmp_path, repo, lm
+        )
+        session = make_session(
+            issue_number=4057,
+            issue_title="UI: Surface provider status",
+            branch_name=BRANCH,
+        )
+        completion_file = session.worktree_path / session.completion_path
+        completion_file.parent.mkdir(parents=True, exist_ok=True)
+        completion_file.write_text("{}")
+        service.record_publish_failure(
+            session, ["push_branch: Push failed: remote rejected"]
+        )
+
+        # A fresh reader over the same file: what a restarted orchestrator sees.
+        reopened = JsonPublishRetryLocatorStore(
+            tmp_path / "publish_retry_locators.json"
+        ).get(4057)
+        assert reopened is not None
+        assert reopened.issue_key is not None
+        assert _identity(reopened.issue_key) == _identity(session.key.issue)
+
+        assert service.retry_publish(4057, OrchestratorState()).status == "submitted"
+        runner.run_all()
+
+        forwarded = processor.calls[-1]["issue_key"]
+        assert forwarded is not None
+        assert _identity(forwarded) == _identity(session.key.issue)
+
+    def test_a_pre_85_locator_republishes_receiptless_rather_than_failing(
+        self, make_session, tmp_path
+    ) -> None:
+        """Locators written before #85 have no key, and must stay retryable.
+
+        Refusing to decode them would strand a genuinely publish-failed issue.
+        They republish exactly as they did before, saying ``None`` to the gate
+        rather than having a key invented for them.
+        """
+        lm = LabelManager(_config(tmp_path))
+        repo = _Repo(issue=_issue(lm), labels=list(_issue(lm).labels))
+        recorder, _, _, _ = _service_with_processor(tmp_path, repo, lm)
+        session = make_session(
+            issue_number=4057,
+            issue_title="UI: Surface provider status",
+            branch_name=BRANCH,
+        )
+        completion_file = session.worktree_path / session.completion_path
+        completion_file.parent.mkdir(parents=True, exist_ok=True)
+        completion_file.write_text("{}")
+        recorder.record_publish_failure(
+            session, ["push_branch: Push failed: remote rejected"]
+        )
+        # Age the persisted entry back to what the previous build wrote.
+        path = tmp_path / "publish_retry_locators.json"
+        stored = json.loads(path.read_text())
+        del stored["4057"]["issue_key"]
+        path.write_text(json.dumps(stored))
+
+        # A service built over that file, as a restarted orchestrator would.
+        service, _, runner, processor = _service_with_processor(tmp_path, repo, lm)
+        assert service.retry_publish(4057, OrchestratorState()).status == "submitted"
+        runner.run_all()
+
+        assert processor.calls[-1]["issue_key"] is None
 
 
 def test_retry_rejected_when_no_completion_record_anywhere(make_session, tmp_path) -> None:

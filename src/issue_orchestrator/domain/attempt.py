@@ -11,6 +11,14 @@ actor/reviewer half. Both are about the same ``(issue, A)``, and an attempt
 refuses to hold identities naming a different commit than the key it is filed
 under — so the exact-``A`` binding is the storage key itself, not a field that
 could disagree with it.
+
+``publication_verdict`` (#85) is the third such fact, and the one that closes a
+gap the other two left open: ``validation_record_path`` *points at* the
+validation half rather than stating it, and it points into the session
+directory inside the coder worktree — so once that worktree is reaped the
+attempt still says a gate ran, without saying what it decided. The receipt
+states the verdict itself, and is bound to the key by the same rule the
+identities are.
 """
 
 from __future__ import annotations
@@ -20,6 +28,7 @@ from dataclasses import dataclass
 from .commit_sha import normalize_commit_sha
 from .execution_identity import CandidateExecutionIdentities
 from .issue_key import GitHubIssueKey, IssueKey, StableIssueId
+from .validation_verdict_receipt import ValidationVerdictReceipt
 
 _SCHEMA_VERSION = 1
 
@@ -77,6 +86,12 @@ class Attempt:
     review_exchange_summary_path: str | None = None
     review_exchange_job_id: str | None = None
     execution_identities: CandidateExecutionIdentities | None = None
+    # The publication gate's own verdict for this candidate (#85). One slot,
+    # holding the *publish* contract's receipt: the quick gate runs again after
+    # every completion, so a shared slot would let a later quick verdict erase
+    # the publication one. ``None`` means no publication gate has reported on
+    # this candidate — never-run, which is not a failure and not a pass.
+    publication_verdict: ValidationVerdictReceipt | None = None
 
     def __post_init__(self) -> None:
         if self.reroute_budget_used < 0:
@@ -90,6 +105,32 @@ class Attempt:
                 f"commit: key={self.key.head_sha} "
                 f"identities={self.execution_identities.candidate_sha}"
             )
+        if (
+            self.publication_verdict is not None
+            and not self.publication_verdict.covers(self.key.head_sha)
+        ):
+            # Same rule as the identities above, for the same reason: the key
+            # *is* the binding to one candidate, so a receipt naming another
+            # commit is not evidence filed under the wrong name — it is
+            # evidence about other work, and must not be readable here at all.
+            raise ValueError(
+                "Attempt.publication_verdict must name the attempt's own "
+                f"commit: key={self.key.head_sha} "
+                f"receipt={self.publication_verdict.head_sha}"
+            )
+
+    @property
+    def publication_validation_passed(self) -> bool:
+        """Whether this candidate passed the publication contract.
+
+        The question the durable receipt exists to answer, asked of the
+        attempt's own commit so no caller has to re-supply it. ``False`` covers
+        every way the answer is not yes: no receipt (never gated), a failure, a
+        timeout, and a receipt produced by some other contract.
+        """
+        return self.publication_verdict is not None and (
+            self.publication_verdict.certifies_publication(self.key.head_sha)
+        )
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -105,6 +146,11 @@ class Attempt:
             "execution_identities": (
                 self.execution_identities.to_payload()
                 if self.execution_identities is not None
+                else None
+            ),
+            "publication_verdict": (
+                self.publication_verdict.to_payload()
+                if self.publication_verdict is not None
                 else None
             ),
         }
@@ -143,6 +189,9 @@ class Attempt:
             review_exchange_job_id=_optional_str(data.get("review_exchange_job_id")),
             execution_identities=_optional_execution_identities(
                 data.get("execution_identities")
+            ),
+            publication_verdict=_optional_publication_verdict(
+                data.get("publication_verdict")
             ),
         )
 
@@ -193,6 +242,23 @@ def _optional_execution_identities(
     if not isinstance(value, dict):
         raise ValueError("Attempt sidecar execution_identities must be an object")
     return CandidateExecutionIdentities.from_payload(value)
+
+
+def _optional_publication_verdict(value: object) -> ValidationVerdictReceipt | None:
+    """Parse the publication verdict, or ``None`` when none was recorded.
+
+    A malformed receipt raises rather than reading as absent, for the reason
+    :func:`_optional_execution_identities` gives: absent means "no publication
+    gate has reported on this candidate", unparseable means the durable
+    evidence is damaged, and a gate must not mistake the second for the first.
+    Reading damage as "never gated" is the safe direction only by accident —
+    it is a claim about the world made from a broken instrument.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ValueError("Attempt sidecar publication_verdict must be an object")
+    return ValidationVerdictReceipt.from_payload(value)
 
 
 def _optional_str(value: object) -> str | None:

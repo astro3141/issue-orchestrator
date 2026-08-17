@@ -1206,6 +1206,7 @@ class TestTheBlockOwnerIsNotBypassableInProduction:
                 "completion.json"
             ),
             agent_label="agent:test",
+            issue_key=None,
         )
         return _CompletionRun(
             result=result, labels=adapter, pr=pr_adapter, git=git_adapter

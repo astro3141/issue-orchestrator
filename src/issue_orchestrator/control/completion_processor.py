@@ -51,7 +51,7 @@ from ..domain.events import EventBus, SessionEvent
 from ..domain.review_artifacts import review_artifacts_from_exchange_result
 from ..domain.review_exchange_run import ReviewExchangeRun, ReviewExchangeRunAssets
 from ..domain.runtime_identity import RuntimeIdentity
-from ..domain.session_run import SessionRunAssets, ValidationArtifactPaths
+from ..domain.session_run import SessionRunAssets
 from ..events import EventContext, EventName
 from ..ports import EventSink
 from ..ports.review_artifact_reader import (
@@ -98,6 +98,7 @@ from .completion_result_artifacts import (
     write_reviewer_feedback_file,
 )
 from .completion_review_exchange import CompletionReviewExchange
+from .completion_validation_evidence import CompletionValidationEvidence
 from .completion_ports import GitAdapter, LabelAdapter, PRAdapter
 from .completion_pr_labels import apply_pr_labels, reserved_pr_label_error
 from .completion_types import (
@@ -125,6 +126,7 @@ from ..ports.working_copy import PushResult
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
+    from ..domain.issue_key import IssueKey
     from ..infra.config import Config
     from ..ports.agent_callback_endpoint import AgentCallbackEndpoint
     from ..ports.review_exchange_approval_gate import ReviewExchangeApprovalGate
@@ -169,8 +171,6 @@ class _MissingTechLeadAuthorityStore:
 # owner module; the private aliases keep the processor's call sites stable.
 from .validation_record_containment import (
     contain_validation_record_path as _contain_validation_record_path,
-    copy_from_fd as _copy_from_fd,
-    open_contained_validation_record as _open_contained_validation_record,
 )
 
 # Completion actions that assert the shared needs-human block, and the cause
@@ -256,6 +256,9 @@ class CompletionProcessor:
         self.pr_adapter = pr_adapter
         self.git_adapter = git_adapter
         self.session_output = session_output
+        # One owner for "this gate's record and logs, on this run's manifest"
+        # — the precedence and symlink-safety rules live there, not here.
+        self.validation_evidence = CompletionValidationEvidence(session_output)
         self.event_bus = event_bus
         self._trace_events: EventSink | None = None
         self._event_context: EventContext | None = None
@@ -646,12 +649,16 @@ class CompletionProcessor:
         self,
         worktree: Path,
         run_assets: SessionRunAssets,
+        issue_key: "IssueKey | None",
     ) -> PublicationGateOutcome | None:
         """Run the run's publish contract and decide whether publishing may proceed.
 
         Args:
             worktree: Path to the worktree.
             run_assets: The owned run whose frozen profile selects the contract.
+            issue_key: The candidate's canonical issue identity, under which
+                the gate files its durable verdict receipt (#85), or ``None``
+                when this entry point has none.
 
         Returns:
             The gate's outcome, or ``None`` when no gate is configured at all.
@@ -663,6 +670,7 @@ class CompletionProcessor:
         outcome = self.publication_gate.check(
             worktree=worktree,
             run_assets=run_assets,
+            issue_key=issue_key,
         )
         if outcome.allowed:
             cache_note = " (cached)" if outcome.cache_hit else ""
@@ -684,91 +692,6 @@ class CompletionProcessor:
         except TypeError:
             return None
 
-    def _attach_validation_artifacts(
-        self,
-        worktree: Path,
-        validation_artifacts: ValidationArtifactPaths,
-        record: ValidationRecord | None = None,
-        record_path: Path | None = None,
-    ) -> None:
-        """Attach validation artifacts to session output.
-
-        Updates manifest with paths to validation files that should already exist
-        in the session output directory (written directly by validation).
-        """
-        run_dir = validation_artifacts.run_dir
-        if record_path is None and record is not None:
-            record_path = contract_record_path(worktree, record)
-        run_dir_record_path = validation_artifacts.record_path
-        effective_record_path = self._materialize_validation_record(
-            worktree=worktree,
-            record_path=record_path,
-            run_dir_record_path=run_dir_record_path,
-        )
-        if effective_record_path is not None:
-            self.session_output.update_manifest(
-                run_dir,
-                {"validation_record_path": str(effective_record_path)},
-            )
-            try:
-                (run_dir / "validation-record.path").write_text(str(effective_record_path))
-            except OSError:
-                logger.debug("Failed to write validation pointer for %s", run_dir)
-
-        # Update manifest with validation output paths (files written by validation)
-        updates: dict[str, str] = {}
-        stdout_path = validation_artifacts.stdout_path
-        stderr_path = validation_artifacts.stderr_path
-
-        if stdout_path.exists():
-            updates["validation_stdout"] = str(stdout_path)
-        if stderr_path.exists():
-            updates["validation_stderr"] = str(stderr_path)
-
-        if updates:
-            self.session_output.update_manifest(run_dir, updates)
-
-    def _materialize_validation_record(
-        self,
-        *,
-        worktree: Path,
-        record_path: Path | None,
-        run_dir_record_path: Path,
-    ) -> Path | None:
-        """Resolve the run-dir record's authoritative content and return its path.
-
-        Precedence: when ``record_path`` is supplied, the caller is asking
-        the helper to publish that source as the run-dir's authoritative
-        record. Falls back to a pre-existing run-dir file ONLY when no
-        source was supplied — refusing the caller's source and silently
-        publishing a stale local snapshot would be the #6017 P2 path-leak
-        class in reverse. Returns ``None`` when nothing can be attached.
-        """
-        if record_path is None or not record_path.exists():
-            return run_dir_record_path if run_dir_record_path.exists() else None
-        # Source/destination identity check. ``_copy_from_fd`` opens
-        # ``dst`` with ``open(dst, "wb")`` which truncates the file
-        # before reading completes, so a same-file copy ends up as empty
-        # JSON. When the caller already wrote the authoritative record
-        # into run_dir (the common case post-PublishGate fix), there's
-        # nothing to copy — just attach.
-        try:
-            same_file = (
-                record_path.resolve(strict=False)
-                == run_dir_record_path.resolve(strict=False)
-            )
-        except OSError:
-            same_file = False
-        if same_file:
-            return run_dir_record_path
-        # Symlink-safe walk: opens the source under the worktree with
-        # O_NOFOLLOW on every path component (#6017 re-review-4 P2),
-        # never reopens by path string.
-        src_fd = _open_contained_validation_record(str(record_path), worktree)
-        if src_fd is not None and _copy_from_fd(src_fd, run_dir_record_path):
-            return run_dir_record_path
-        return None
-
     def process(
         self,
         worktree: Path,
@@ -779,6 +702,7 @@ class CompletionProcessor:
         pr_number: int | None = None,
         completion_path: str | None = None,
         agent_label: str | None = None,
+        issue_key: "IssueKey | None",
     ) -> ProcessingResult:
         """Process a completion record and execute actions.
 
@@ -789,6 +713,17 @@ class CompletionProcessor:
             pr_number: Optional PR number for review sessions. When provided,
                 label operations will target the PR instead of the issue.
             completion_path: Relative path to completion file. If None, uses legacy path.
+            issue_key: The session's canonical issue identity — the same one
+                its claim and its attempt records are keyed by. The publish
+                gate files its durable verdict under it (#85). Required as an
+                explicit argument — including when it is ``None`` — for the
+                same reason ``PublicationGate.check`` requires it: a caller
+                that omits it silently loses the receipt, while a caller that
+                writes ``issue_key=None`` has said it holds no canonical
+                identity. The manual-reprocess entry point is the ``None``
+                case: it holds only an issue *number*, and deriving a key from
+                a work-item number is the drift #40 removed rather than a
+                fallback worth reinstating.
 
         Returns:
             ProcessingResult with success status and details.
@@ -851,6 +786,7 @@ class CompletionProcessor:
             issue_number,
             run_assets,
             agent_label=agent_label,
+            issue_key=issue_key,
         )
         if pre_action_failure:
             return pre_action_failure
@@ -1018,6 +954,7 @@ class CompletionProcessor:
         run_assets: SessionRunAssets,
         *,
         agent_label: str | None,
+        issue_key: "IssueKey | None",
     ) -> ProcessingResult | None:
         """Run completion policies that must pass before any action executes."""
         # First: tech_lead scope/decision authority (#6769 finding 1). Checked
@@ -1069,6 +1006,7 @@ class CompletionProcessor:
             record,
             issue_number,
             run_assets,
+            issue_key,
         )
         if gate_failure is not None:
             return gate_failure
@@ -1120,7 +1058,7 @@ class CompletionProcessor:
                 record.validation_record_path, worktree
             )
             if contained is not None:
-                self._attach_validation_artifacts(
+                self.validation_evidence.attach(
                     worktree,
                     run_assets.validation_artifacts,
                     record_path=contained,
@@ -1309,6 +1247,7 @@ class CompletionProcessor:
         record: CompletionRecord,
         issue_number: int,
         run_assets: SessionRunAssets,
+        issue_key: "IssueKey | None",
     ) -> ProcessingResult | None:
         """Run the publish contract before offering this work as a change.
 
@@ -1319,7 +1258,7 @@ class CompletionProcessor:
             return None
         gate_session_name = run_assets.session_name
 
-        outcome = self._check_publish_gate(worktree, run_assets)
+        outcome = self._check_publish_gate(worktree, run_assets, issue_key)
         if outcome is None:
             return None
         if not outcome.allowed:
@@ -1345,7 +1284,7 @@ class CompletionProcessor:
         """Attach a gate's record together with the logs that gate wrote."""
         if evidence.record is None:
             return
-        self._attach_validation_artifacts(
+        self.validation_evidence.attach(
             worktree,
             evidence.paths,
             record=evidence.record,

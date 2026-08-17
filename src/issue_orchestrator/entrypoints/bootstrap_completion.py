@@ -186,6 +186,12 @@ def create_completion_components(
         profiles=validation_profiles,
         command_runner=command_runner,
         working_copy=working_copy,
+        # The gate's own record dies with the coder worktree, so its verdict
+        # is filed on the durable attempt record instead (#85). Same store and
+        # same key derivation as the quick gate below, so both gates' evidence
+        # about one candidate lands under one identity.
+        attempt_store=attempt_store,
+        attempt_keys=_validation_attempt_key_factory(config),
     )
 
     completion_processor = CompletionProcessor(

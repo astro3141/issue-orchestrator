@@ -307,6 +307,11 @@ async def resume_issue(
             issue_title=issue_title,
             completion_path=completion_path,
             run_assets=run_assets,
+            # Stated, not omitted: this route holds an issue *number* from the
+            # URL path and nothing else, so it has no canonical identity to
+            # file the publish gate's verdict under (#85). Reversing a number
+            # into a key is the drift #40 removed.
+            issue_key=None,
         )
         return JSONResponse({
             "success": result.success,

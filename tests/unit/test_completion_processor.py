@@ -86,6 +86,13 @@ def publish_gate_outcome(
     the fake does too: a fixed ``return_value`` could not, and a test using
     one would not notice the processor attaching some *other* gate's
     artifacts (#25 F1).
+
+    ``issue_key`` is required here for the same reason the real gate requires
+    it: a permissive stand-in that defaulted it would let the processor stop
+    forwarding the canonical identity without a single test noticing, and the
+    verdict receipt #85 files would silently stop being written. The keys it
+    was handed are recorded on ``check.issue_keys`` so a test can prove *which*
+    identity was forwarded, not merely that something was.
     """
     from issue_orchestrator.control.publication_gate import (
         PublicationGateOutcome,
@@ -94,7 +101,10 @@ def publish_gate_outcome(
     from issue_orchestrator.control.validation import GateEvidence
     from issue_orchestrator.domain.session_run import ValidationArtifactPaths
 
-    def check(*, worktree: Path, run_assets):
+    issue_keys: list[object] = []
+
+    def check(*, worktree: Path, run_assets, issue_key):
+        issue_keys.append(issue_key)
         return PublicationGateOutcome(
             allowed=allowed,
             reason=reason,
@@ -108,6 +118,7 @@ def publish_gate_outcome(
             cache_hit=cache_hit,
         )
 
+    check.issue_keys = issue_keys
     return check
 
 
@@ -402,6 +413,7 @@ class TestCompletionProcessorLabelActions:
             run_assets=make_session_run_assets(worktree),
             issue_number=123,
             issue_title="Test Issue",
+            issue_key=None,
         )
 
         assert result.success
@@ -462,6 +474,7 @@ class TestStackPublishGateWiring:
             run_assets=make_session_run_assets(worktree),
             issue_number=123,
             issue_title="Test Issue",
+            issue_key=None,
         )
 
         assert result.success
@@ -485,6 +498,7 @@ class TestStackPublishGateWiring:
             run_assets=make_session_run_assets(worktree),
             issue_number=123,
             issue_title="Test Issue",
+            issue_key=None,
         )
 
         assert not result.success
@@ -506,6 +520,7 @@ class TestStackPublishGateWiring:
             run_assets=make_session_run_assets(worktree),
             issue_number=123,
             issue_title="Test Issue",
+            issue_key=None,
         )
 
         assert result.success
@@ -558,6 +573,7 @@ class TestStackPublishGatePRReuse:
             run_assets=make_session_run_assets(worktree),
             issue_number=123,
             issue_title="Test Issue",
+            issue_key=None,
         )
 
     def test_reuse_with_correct_stack_base_does_not_retarget(
@@ -639,6 +655,7 @@ class TestStackCreatedPRBaseEnforcement:
             run_assets=make_session_run_assets(worktree),
             issue_number=123,
             issue_title="Test",
+            issue_key=None,
         )
 
     def test_idempotent_create_wrong_base_is_retargeted(
@@ -724,6 +741,7 @@ class TestRuntimeArtifactBranchGuard:
             run_assets=make_session_run_assets(worktree),
             issue_number=6594,
             issue_title="Test Issue",
+            issue_key=None,
         )
 
         assert not result.success
@@ -749,6 +767,7 @@ class TestRuntimeArtifactBranchGuard:
             run_assets=make_session_run_assets(worktree),
             issue_number=123,
             issue_title="Test Issue",
+            issue_key=None,
         )
 
         assert result.success
@@ -771,6 +790,7 @@ class TestRuntimeArtifactBranchGuard:
             run_assets=make_session_run_assets(worktree),
             issue_number=123,
             issue_title="Test Issue",
+            issue_key=None,
         )
 
         assert not result.success
@@ -937,6 +957,7 @@ class TestReviewExchangeExecution:
             issue_number=123,
             issue_title="Test Issue",
             agent_label="agent:coder",
+            issue_key=None,
         )
 
         assert result.success is False
@@ -990,6 +1011,7 @@ class TestReviewExchangeExecution:
             issue_number=123,
             issue_title="Test Issue",
             agent_label="agent:coder",
+            issue_key=None,
         )
 
         assert result.success is True
@@ -1070,6 +1092,7 @@ class TestReviewExchangeExecution:
             issue_number=123,
             issue_title="Test Issue",
             agent_label="agent:coder",
+            issue_key=None,
         )
 
         assert result.success is False
@@ -1146,6 +1169,7 @@ class TestReviewExchangeExecution:
             issue_number=123,
             issue_title="Test Issue",
             agent_label="agent:coder",
+            issue_key=None,
         )
 
         assert result.success is False
@@ -1212,6 +1236,7 @@ class TestReviewExchangeExecution:
             issue_number=123,
             issue_title="Test Issue",
             agent_label="agent:coder",
+            issue_key=None,
         )
 
         assert result.success is True
@@ -1292,6 +1317,7 @@ class TestReviewExchangeExecution:
                 issue_number=123,
                 issue_title="Test Issue",
                 agent_label="agent:coder",
+                issue_key=None,
             )
 
         assert result.success is True
@@ -1378,6 +1404,7 @@ class TestReviewExchangeExecution:
             issue_number=123,
             issue_title="Test Issue",
             agent_label="agent:coder",
+            issue_key=None,
         )
 
         assert result.success is True
@@ -1486,6 +1513,7 @@ class TestReviewExchangeExecution:
             issue_number=123,
             issue_title="Test Issue",
             agent_label="agent:coder",
+            issue_key=None,
         )
 
         assert result.success is True
@@ -1579,6 +1607,7 @@ class TestReviewExchangeExecution:
             issue_number=123,
             issue_title="Test Issue",
             agent_label="agent:coder",
+            issue_key=None,
         )
 
         assert result.success is True
@@ -1665,6 +1694,7 @@ class TestReviewExchangeExecution:
             issue_number=123,
             issue_title="Test Issue",
             agent_label="agent:coder",
+            issue_key=None,
         )
 
         assert result.success is True
@@ -1717,6 +1747,7 @@ class TestReviewExchangeExecution:
             issue_number=123,
             issue_title="Test Issue",
             agent_label="agent:coder",
+            issue_key=None,
         )
 
         assert result.success is False
@@ -1829,6 +1860,7 @@ class TestReviewExchangeExecution:
             issue_title="Test Issue",
             agent_label="agent:coder",
             completion_path=completion_path,
+            issue_key=None,
         )
 
         assert result.success is True
@@ -1945,6 +1977,7 @@ class TestReviewExchangeExecution:
             issue_title="Test Issue",
             agent_label="agent:coder",
             completion_path=completion_path,
+            issue_key=None,
         )
 
         assert result.success is False
@@ -2058,6 +2091,7 @@ class TestReviewExchangeExecution:
             issue_title="Test Issue",
             agent_label="agent:coder",
             completion_path=completion_path,
+            issue_key=None,
         )
 
         assert result.success is False
@@ -2144,6 +2178,7 @@ class TestReviewExchangeExecution:
             issue_title="Test Issue",
             agent_label="agent:coder",
             completion_path=completion_path,
+            issue_key=None,
         )
 
         assert result.success is False
@@ -2243,6 +2278,7 @@ class TestReviewExchangeExecution:
             issue_title="Test Issue",
             agent_label="agent:coder",
             completion_path=completion_path,
+            issue_key=None,
         )
 
         assert result.success is True
@@ -2378,6 +2414,7 @@ class TestReviewExchangeExecution:
             run_assets=make_session_run_assets(worktree),
             issue_number=123,
             issue_title="Test Issue",
+            issue_key=None,
         )
 
         assert result.success
@@ -2403,6 +2440,7 @@ class TestReviewExchangeExecution:
             run_assets=make_session_run_assets(worktree),
             issue_number=123,
             issue_title="Test Issue",
+            issue_key=None,
         )
 
         assert result.success
@@ -2430,6 +2468,7 @@ class TestReviewExchangeExecution:
             run_assets=make_session_run_assets(worktree),
             issue_number=42,
             issue_title="PR Title",
+            issue_key=None,
         )
 
         assert result.success
@@ -2459,6 +2498,7 @@ class TestReviewExchangeExecution:
             run_assets=make_session_run_assets(worktree),
             issue_number=42,
             issue_title="PR Title",
+            issue_key=None,
         )
 
         assert result.success
@@ -2488,6 +2528,7 @@ class TestReviewExchangeExecution:
             issue_number=42,
             issue_title="Fix bug",
             pr_number=456,
+            issue_key=None,
         )
 
         assert result.success
@@ -2521,6 +2562,7 @@ class TestReviewExchangeExecution:
             issue_number=42,
             issue_title="Fix bug",
             pr_number=456,
+            issue_key=None,
         )
 
         assert result.success
@@ -2550,6 +2592,7 @@ class TestCompletionProcessorPRActions:
             run_assets=make_session_run_assets(worktree),
             issue_number=123,
             issue_title="Add feature",
+            issue_key=None,
         )
 
         assert result.success
@@ -2586,6 +2629,7 @@ class TestCompletionProcessorPRActions:
             run_assets=make_session_run_assets(worktree),
             issue_number=123,
             issue_title="Add feature",
+            issue_key=None,
         )
 
         assert not result.success
@@ -2617,6 +2661,7 @@ class TestCompletionProcessorPRActions:
             run_assets=make_session_run_assets(worktree),
             issue_number=123,
             issue_title="Add feature",
+            issue_key=None,
         )
 
         assert result.success
@@ -2649,6 +2694,7 @@ class TestCompletionProcessorPRActions:
             run_assets=make_session_run_assets(worktree),
             issue_number=123,
             issue_title="Add feature",
+            issue_key=None,
         )
 
         assert result.success
@@ -2676,6 +2722,7 @@ class TestCompletionProcessorPRActions:
             run_assets=make_session_run_assets(worktree),
             issue_number=123,
             issue_title="Test Issue",
+            issue_key=None,
         )
 
         assert result.success
@@ -2767,6 +2814,7 @@ class TestTechLeadCompletionEffects:
             issue_number=123,
             issue_title="Batch Review",
             agent_label=agent_label,
+            issue_key=None,
         )
 
     def _armed_run_assets(self, authority_store, worktree):
@@ -3041,6 +3089,7 @@ class TestTechLeadCompletionEffects:
             issue_number=123,
             issue_title="Batch Review",
             agent_label="agent:tech-lead",
+            issue_key=None,
         )
 
         assert result.success is False
@@ -3082,6 +3131,7 @@ class TestTechLeadCompletionEffects:
             issue_number=123,
             issue_title="Batch Review",
             agent_label="agent:tech-lead",
+            issue_key=None,
         )
 
         assert result.success is False
@@ -3136,6 +3186,7 @@ class TestTechLeadCompletionEffects:
             issue_number=123,
             issue_title="Batch Review",
             agent_label="agent:tech-lead",
+            issue_key=None,
         )
 
         assert result.success is False
@@ -3179,6 +3230,7 @@ class TestTechLeadCompletionEffects:
             issue_number=123,
             issue_title="Batch Review",
             agent_label="agent:tech-lead",
+            issue_key=None,
         )
 
         assert not result.errors
@@ -3204,6 +3256,7 @@ class TestCompletionProcessorGitActions:
             run_assets=make_session_run_assets(worktree),
             issue_number=123,
             issue_title="Test",
+            issue_key=None,
         )
 
         assert result.success
@@ -3231,6 +3284,7 @@ class TestCompletionProcessorGitActions:
             run_assets=make_session_run_assets(worktree),
             issue_number=123,
             issue_title="Test",
+            issue_key=None,
         )
 
         assert not result.success
@@ -3265,6 +3319,7 @@ class TestCompletionProcessorGitActions:
             run_assets=make_session_run_assets(worktree),
             issue_number=123,
             issue_title="Test",
+            issue_key=None,
         )
 
         publish_failed = [
@@ -3309,6 +3364,7 @@ class TestCompletionProcessorGitActions:
             run_assets=make_session_run_assets(worktree),
             issue_number=123,
             issue_title="Test",
+            issue_key=None,
         )
 
         assert result.success
@@ -3344,6 +3400,7 @@ class TestCompletionProcessorGitActions:
             run_assets=make_session_run_assets(worktree),
             issue_number=123,
             issue_title="Test",
+            issue_key=None,
         )
 
         assert result.success
@@ -3378,6 +3435,7 @@ class TestCompletionProcessorGitActions:
             run_assets=make_session_run_assets(worktree),
             issue_number=123,
             issue_title="Test",
+            issue_key=None,
         )
 
         assert not result.success
@@ -3399,6 +3457,7 @@ class TestCompletionProcessorValidation:
             run_assets=make_session_run_assets(worktree),
             issue_number=123,
             issue_title="Test",
+            issue_key=None,
         )
 
         assert not result.success
@@ -3417,6 +3476,7 @@ class TestCompletionProcessorValidation:
             run_assets=make_session_run_assets(worktree),
             issue_number=123,
             issue_title="Test",
+            issue_key=None,
         )
 
         assert not result.success
@@ -3438,6 +3498,7 @@ class TestCompletionProcessorValidation:
             run_assets=make_session_run_assets(worktree),
             issue_number=123,
             issue_title="Test",
+            issue_key=None,
         )
 
         assert not result.success
@@ -3472,6 +3533,7 @@ class TestCompletionProcessorEvents:
             run_assets=make_session_run_assets(worktree),
             issue_number=123,
             issue_title="Test",
+            issue_key=None,
         )
 
         assert len(events_received) == 1
@@ -3515,6 +3577,7 @@ class TestCompletionProcessorDirtyPolicy:
             run_assets=make_session_run_assets(worktree),
             issue_number=123,
             issue_title="Test",
+            issue_key=None,
         )
 
         assert not result.success
@@ -3564,6 +3627,7 @@ class TestCompletionProcessorDirtyPolicy:
             run_assets=make_session_run_assets(worktree),
             issue_number=123,
             issue_title="Test",
+            issue_key=None,
         )
 
         assert not result.success
@@ -3610,6 +3674,7 @@ class TestCompletionProcessorDirtyPolicy:
             run_assets=make_session_run_assets(worktree),
             issue_number=123,
             issue_title="Test",
+            issue_key=None,
         )
 
         assert result.success
@@ -3651,6 +3716,7 @@ class TestCompletionProcessorDirtyPolicy:
             run_assets=make_session_run_assets(worktree),
             issue_number=123,
             issue_title="Test",
+            issue_key=None,
         )
 
         assert result.success
@@ -3699,6 +3765,7 @@ class TestCompletionProcessorDirtyPolicy:
             run_assets=make_session_run_assets(worktree),
             issue_number=123,
             issue_title="Test",
+            issue_key=None,
         )
 
         assert not result.success
@@ -3737,6 +3804,7 @@ class TestCompletionProcessorDirtyPolicy:
             run_assets=make_session_run_assets(worktree),
             issue_number=123,
             issue_title="Test",
+            issue_key=None,
         )
 
         assert result.success
@@ -3767,6 +3835,7 @@ class TestCompletionProcessorDirtyPolicy:
             run_assets=make_session_run_assets(worktree),
             issue_number=123,
             issue_title="Test",
+            issue_key=None,
         )
 
         assert len(events_received) == 1
@@ -3798,6 +3867,7 @@ class TestCompletionProcessorAuditLogging:
                 run_assets=make_session_run_assets(worktree),
                 issue_number=42,
                 issue_title="Test PR",
+                issue_key=None,
             )
 
         # Verify key actions are logged
@@ -3822,6 +3892,7 @@ class TestCompletionProcessorAuditLogging:
             run_assets=make_session_run_assets(worktree),
             issue_number=123,
             issue_title="Test",
+            issue_key=None,
         )
 
         assert result.actions_taken is not None
@@ -3908,6 +3979,7 @@ class TestCompletionProcessorPublishGate:
             run_assets=make_session_run_assets(worktree),
             issue_number=123,
             issue_title="Test",
+            issue_key=None,
         )
 
         # Processing must fail
@@ -3941,11 +4013,88 @@ class TestCompletionProcessorPublishGate:
             run_assets=make_session_run_assets(worktree),
             issue_number=123,
             issue_title="Test",
+            issue_key=None,
         )
 
         assert result.success
         mock_publish_gate.check.assert_called_once()
         mock_git_adapter.push.assert_called_once()
+
+    def test_the_gate_is_handed_the_canonical_identity_it_was_given(
+        self,
+        processor_with_gate,
+        mock_publish_gate,
+        worktree_with_completion,
+    ):
+        """The hop that decides where the durable verdict lands (#85).
+
+        The gate files its receipt under the key it is handed, so the receipt
+        only reaches ``Attempt(issue, A)`` if the processor forwards the
+        session's canonical identity verbatim. Stop forwarding it — or forward
+        something derived from the issue *number* it also holds — and the gate
+        takes its keyless branch: the candidate is gated and the attempt still
+        reads "never gated".
+        """
+        from issue_orchestrator.domain.issue_key import GitHubIssueKey
+
+        gate_check = publish_gate_outcome()
+        mock_publish_gate.check.side_effect = gate_check
+        # Deliberately not the issue number: a key re-derived from ``123``
+        # would satisfy "some key was passed" but not this assertion.
+        issue_key = GitHubIssueKey(repo="owner/repo", external_id="M1-011")
+
+        record = make_record(
+            outcome=CompletionOutcome.COMPLETED,
+            requested_actions=[RequestedAction.PUSH_BRANCH, RequestedAction.CREATE_PR],
+            summary="Done",
+        )
+        worktree = worktree_with_completion(record)
+
+        result = processor_with_gate.process(
+            worktree,
+            run_assets=make_session_run_assets(worktree),
+            issue_number=123,
+            issue_title="Test",
+            issue_key=issue_key,
+        )
+
+        assert result.success
+        assert gate_check.issue_keys == [issue_key]
+        assert gate_check.issue_keys[0] is issue_key
+
+    def test_an_entry_point_with_no_identity_says_so_to_the_gate(
+        self,
+        processor_with_gate,
+        mock_publish_gate,
+        worktree_with_completion,
+    ):
+        """Absence is forwarded as absence, never repaired into a key.
+
+        The manual-reprocess route holds only an issue number. It still runs
+        the gate, and the gate must see ``None`` rather than a key derived from
+        that number — deriving one is the drift #40 removed, and it would file
+        a real candidate's verdict under an identity nothing else uses.
+        """
+        gate_check = publish_gate_outcome()
+        mock_publish_gate.check.side_effect = gate_check
+
+        record = make_record(
+            outcome=CompletionOutcome.COMPLETED,
+            requested_actions=[RequestedAction.PUSH_BRANCH, RequestedAction.CREATE_PR],
+            summary="Done",
+        )
+        worktree = worktree_with_completion(record)
+
+        result = processor_with_gate.process(
+            worktree,
+            run_assets=make_session_run_assets(worktree),
+            issue_number=123,
+            issue_title="Test",
+            issue_key=None,
+        )
+
+        assert result.success
+        assert gate_check.issue_keys == [None]
 
     @pytest.mark.parametrize(
         "outcome",
@@ -3985,6 +4134,7 @@ class TestCompletionProcessorPublishGate:
             run_assets=make_session_run_assets(worktree),
             issue_number=123,
             issue_title="Test",
+            issue_key=None,
         )
 
         assert result.success
@@ -4017,6 +4167,7 @@ class TestCompletionProcessorPublishGate:
             run_assets=make_session_run_assets(worktree),
             issue_number=123,
             issue_title="Test",
+            issue_key=None,
         )
 
         # Label actions should succeed without gate check
@@ -4051,6 +4202,7 @@ class TestCompletionProcessorPublishGate:
             run_assets=make_session_run_assets(worktree),
             issue_number=123,
             issue_title="Test",
+            issue_key=None,
         )
 
         # Processing must fail
@@ -4123,6 +4275,7 @@ class TestCompletionProcessorPublishGate:
             run_assets=make_session_run_assets(worktree),
             issue_number=123,
             issue_title="Test",
+            issue_key=None,
         )
 
         # The refusal is still reported, in full.
@@ -4186,6 +4339,7 @@ class TestCompletionProcessorPublishGate:
             run_assets=make_session_run_assets(worktree),
             issue_number=123,
             issue_title="Test",
+            issue_key=None,
         )
 
         assert result.success
@@ -4221,6 +4375,7 @@ class TestCompletionProcessorPublishGate:
             run_assets=make_session_run_assets(worktree),
             issue_number=123,
             issue_title="Test",
+            issue_key=None,
         )
 
         mock_publish_gate.check.assert_not_called()
@@ -4310,6 +4465,7 @@ class TestCompletionProcessorPublishGate:
             run_assets=run,
             issue_number=123,
             issue_title="Test",
+            issue_key=None,
         )
 
         assert not result.success
@@ -4378,6 +4534,7 @@ class TestCompletionProcessorPublishGate:
             run_assets=make_session_run_assets(worktree),
             issue_number=123,
             issue_title="Test",
+            issue_key=None,
         )
 
         assert result.success
@@ -4427,6 +4584,7 @@ class TestCompletionProcessorPublishGate:
             run_assets=make_session_run_assets(worktree),
             issue_number=123,
             issue_title="Test",
+            issue_key=None,
         )
 
         assert not result.success
@@ -4476,6 +4634,7 @@ class TestCompletionProcessorPublishGate:
             run_assets=make_session_run_assets(worktree, run_id=run_id),
             issue_number=123,
             issue_title="Test",
+            issue_key=None,
         )
 
         assert result.success is True
@@ -4537,6 +4696,7 @@ class TestCompletionProcessorPublishGate:
             run_assets=make_session_run_assets(worktree),
             issue_number=123,
             issue_title="Test",
+            issue_key=None,
         )
 
         assert not result.success
@@ -4591,6 +4751,7 @@ class TestCompletionProcessorPublishGate:
             run_assets=make_session_run_assets(worktree),
             issue_number=123,
             issue_title="Test",
+            issue_key=None,
         )
 
         assert result.success
@@ -4653,6 +4814,7 @@ class TestCompletionProcessorPublishGate:
             run_assets=make_session_run_assets(worktree),
             issue_number=123,
             issue_title="Test",
+            issue_key=None,
         )
 
         assert not result.success
@@ -4686,6 +4848,7 @@ class TestCompletionProcessorPublishGate:
             run_assets=make_session_run_assets(worktree),
             issue_number=123,
             issue_title="Test",
+            issue_key=None,
         )
 
         assert not result.success
@@ -4729,6 +4892,7 @@ class TestCompletionProcessorPublishGate:
             run_assets=make_session_run_assets(worktree),
             issue_number=123,
             issue_title="Test",
+            issue_key=None,
         )
 
         assert not result.success
@@ -4833,6 +4997,7 @@ class TestCompletionProcessorPublishGate:
                 issue_number=123,
                 issue_title="Test Issue",
                 agent_label="agent:coder",
+                issue_key=None,
             )
 
         assert result.success
@@ -4952,6 +5117,7 @@ class TestCompletionProcessorPublishGate:
                 issue_number=123,
                 issue_title="Test Issue",
                 agent_label="agent:coder",
+                issue_key=None,
             )
 
         assert not result.success
@@ -5256,6 +5422,7 @@ def test_cleanup_failure_posts_diagnostic_comment(
                 123,
                 "Test issue",
                 run_assets=make_session_run_assets(worktree),
+                issue_key=None,
             )
 
     mock_pr_adapter.add_comment.assert_called_once()
@@ -5312,6 +5479,7 @@ class TestRunScopedArtifacts:
             issue_title="Test Issue",
             completion_path=completion_rel,
             agent_label="agent:web",
+            issue_key=None,
         )
 
         preserved_path = run.run_dir / "completion-record.json"
@@ -5417,6 +5585,7 @@ class TestRunScopedArtifacts:
             issue_title="Test Issue",
             completion_path=completion_rel,
             agent_label="agent:coder",
+            issue_key=None,
         )
 
         assert result.success is True
@@ -5514,6 +5683,7 @@ class TestRunScopedArtifacts:
             issue_title="Test Issue",
             completion_path=completion_rel,
             agent_label="agent:coder",
+            issue_key=None,
         )
 
         assert result.success is True

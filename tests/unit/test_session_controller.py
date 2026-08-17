@@ -47,6 +47,7 @@ from issue_orchestrator.domain.models import (
     CompletionOutcome,
     RequestedAction,
 )
+from issue_orchestrator.domain.issue_key import IssueKey
 from issue_orchestrator.domain.session_run import SessionRunAssets
 from issue_orchestrator.ports import NullEventSink
 from issue_orchestrator.ports.event_sink import TraceEvent
@@ -185,6 +186,10 @@ class MockCompletionProcessor:
         run_assets: SessionRunAssets,
         pr_number: int | None = None,
         completion_path: str | None = None,
+        # Required, like the real processor's: a stand-in that defaulted this
+        # would let the controller stop forwarding the canonical identity
+        # without a test noticing (#85).
+        issue_key: IssueKey | None,
     ):
         self.process_calls.append(
             {
@@ -194,6 +199,7 @@ class MockCompletionProcessor:
                 "pr_number": pr_number,
                 "completion_path": completion_path,
                 "run_assets": run_assets,
+                "issue_key": issue_key,
             }
         )
         return self.process_result
@@ -291,6 +297,76 @@ class TestSessionControllerRunning:
 
         assert decision.status == SessionStatus.RUNNING
         assert not decision.completion_processed
+
+
+class TestCanonicalIdentityReachesCompletion:
+    """The hop that carries a candidate's identity into completion (#85).
+
+    ``completion_decider`` derives the canonical key from the session, and
+    ``test_issue_key_coherence`` pins that derivation — including the rework
+    path's synthetic work item, which is exactly the drift it exists to
+    prevent. Pinned here is the *next* hop: what ``decide_outcome`` was handed
+    is what the completion processor receives, verbatim, because that is what
+    carries the key on to the publish gate's durable verdict. Drop the
+    forwarding and the gate takes its keyless branch: the candidate is gated,
+    and ``Attempt(issue, A)`` still reads "never gated" — the state #85 exists
+    to remove.
+    """
+
+    def _controller(self, processor, session_output):
+        return SessionController(
+            completion_processor=processor,
+            events=NullEventSink(),
+            session_output=session_output,
+            working_copy=StubWorkingCopy(),
+        )
+
+    def test_the_key_the_controller_was_given_reaches_the_processor(
+        self, tmp_path: Path
+    ) -> None:
+        from issue_orchestrator.domain.issue_key import GitHubIssueKey
+
+        processor = MockCompletionProcessor()
+        processor.completion_record = make_record(CompletionOutcome.COMPLETED)
+        session_output = FileSystemSessionOutput()
+        controller = self._controller(processor, session_output)
+        # Deliberately not the issue number: a key re-derived from ``123``
+        # downstream would still be "a key", but not this one.
+        issue_key = GitHubIssueKey(repo="owner/repo", external_id="M1-011")
+
+        decide_with_run_assets(
+            controller,
+            observation=SessionObservationResult.terminated(runtime_minutes=10.0),
+            worktree_path=tmp_path / "worktree",
+            issue_number=123,
+            issue_title="Test Issue",
+            session_name="issue-123",
+            issue_key=issue_key,
+        )
+
+        assert len(processor.process_calls) == 1
+        assert processor.process_calls[0]["issue_key"] is issue_key
+
+    def test_a_caller_with_no_key_forwards_absence_not_a_derived_key(
+        self, tmp_path: Path
+    ) -> None:
+        """Absence stays absence: no identity is manufactured from the number."""
+        processor = MockCompletionProcessor()
+        processor.completion_record = make_record(CompletionOutcome.COMPLETED)
+        session_output = FileSystemSessionOutput()
+        controller = self._controller(processor, session_output)
+
+        decide_with_run_assets(
+            controller,
+            observation=SessionObservationResult.terminated(runtime_minutes=10.0),
+            worktree_path=tmp_path / "worktree",
+            issue_number=123,
+            issue_title="Test Issue",
+            session_name="issue-123",
+        )
+
+        assert len(processor.process_calls) == 1
+        assert processor.process_calls[0]["issue_key"] is None
 
 
 class TestSessionControllerTerminated:

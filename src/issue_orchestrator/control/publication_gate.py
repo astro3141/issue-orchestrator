@@ -28,6 +28,13 @@ Isolation only holds if the gate's *readers* look in the same place, so
 decision. Callers attaching the result to a run must not name those paths
 themselves: doing so is how the run's manifest came to point at the quick
 gate's logs while carrying the publish gate's record.
+
+All of that evidence lives inside the coder worktree and dies with it. So
+every run of the publish contract also files a durable verdict receipt on
+``Attempt(issue, A)`` (#85) — see :mod:`.publication_verdict`. The gate is the
+producer seam for that fact because it is the only thing that knows the
+contract it just executed; a caller reconstructing the verdict from the
+outcome would be a second place that decides what the gate decided.
 """
 
 from __future__ import annotations
@@ -36,6 +43,7 @@ import logging
 from dataclasses import dataclass
 from pathlib import Path
 
+from ..domain.issue_key import IssueKey
 from ..domain.session_run import SessionRunAssets, ValidationArtifactPaths
 from ..domain.validation_profile import ValidationGateKind
 from ..infra.validation_profiles import (
@@ -44,7 +52,10 @@ from ..infra.validation_profiles import (
     ValidationProfileRegistry,
 )
 from ..ports import CommandRunner, WorkingCopy
+from ..ports.attempt_store import AttemptStore
 from ..ports.session_output import SessionOutput, ValidationRecord
+from ..ports.validation_attempt_key_factory import ValidationAttemptKeyFactory
+from .publication_verdict import PublicationVerdictReceipts
 from .validation import GateEvidence, ValidationGate
 
 logger = logging.getLogger(__name__)
@@ -125,6 +136,8 @@ def build_publication_gate(
     profiles: ValidationProfileRegistry,
     command_runner: CommandRunner,
     working_copy: WorkingCopy,
+    attempt_store: AttemptStore,
+    attempt_keys: ValidationAttemptKeyFactory,
 ) -> "PublicationGate":
     """The one way to assemble the publication gate.
 
@@ -132,11 +145,16 @@ def build_publication_gate(
     themselves, so the production root and the testing root cannot build
     differently-shaped pipelines — the divergence that let simulated
     scenarios pass while production ran no publish contract at all (#25).
+
+    ``attempt_store`` and ``attempt_keys`` are required, not optional: a gate
+    built without them would run the publish contract and leave no durable
+    trace of what it decided, which is the defect #85 exists to close.
     """
     return PublicationGate(
         contracts=RunValidationContracts(session_output, profiles),
         command_runner=command_runner,
         working_copy=working_copy,
+        verdicts=PublicationVerdictReceipts(attempt_store, attempt_keys),
     )
 
 
@@ -152,7 +170,10 @@ class PublicationGate:
     store. Attempt-scoped caching is deliberately not used here: an attempt
     carries one validation record path, and letting the publish gate read or
     write it would put quick and publish results in one slot — the reuse this
-    issue exists to prevent.
+    issue exists to prevent. The verdict receipt this gate files on the
+    attempt (#85) is a different slot with a different meaning: it states what
+    this contract decided rather than pointing at a record, and the quick gate
+    never writes it.
     """
 
     def __init__(
@@ -161,18 +182,33 @@ class PublicationGate:
         contracts: RunValidationContracts,
         command_runner: CommandRunner,
         working_copy: WorkingCopy,
+        verdicts: PublicationVerdictReceipts,
     ) -> None:
         self._contracts = contracts
         self._command_runner = command_runner
         self._working_copy = working_copy
+        self._verdicts = verdicts
 
     def check(
         self,
         *,
         worktree: Path,
         run_assets: SessionRunAssets,
+        issue_key: IssueKey | None,
     ) -> PublicationGateOutcome:
         """Run the publish contract for ``run_assets`` and decide publication.
+
+        Args:
+            worktree: The working copy the contract runs in.
+            run_assets: The owned run whose frozen profile selects the contract.
+            issue_key: The candidate's canonical issue identity, under which
+                this run's verdict is filed durably. Required as an explicit
+                argument — including when it is ``None`` — so a caller that has
+                no canonical identity says so rather than omitting it. The
+                manual-reprocess route is the ``None`` case: it holds only an
+                issue *number* from a URL path, and deriving a key from a
+                work-item snapshot is what #40 removed. The republish path
+                carries the key on its durable locators instead.
 
         Returns:
             The outcome, including the evidence paths this gate wrote to.
@@ -207,6 +243,7 @@ class PublicationGate:
         # could name a different one.
         output_dir = publish_gate_output_dir(run_assets.run_dir)
         result = gate.check(session_output_dir=output_dir)
+        self._record_verdict(result.record, issue_key)
         return PublicationGateOutcome(
             allowed=result.allowed,
             reason=result.reason,
@@ -218,3 +255,39 @@ class PublicationGate:
             ),
             cache_hit=result.cache_hit,
         )
+
+    def _record_verdict(
+        self,
+        record: ValidationRecord | None,
+        issue_key: IssueKey | None,
+    ) -> None:
+        """File this run's verdict on the attempt, when there is one to file.
+
+        A run with no record executed no contract, and "never gated" is the
+        *absence* of a receipt, not a receipt saying nothing. Writing one here
+        would make the one state a reader most needs to distinguish
+        indistinguishable. Two causes reach this branch, and skipping the
+        receipt is right for both:
+
+        - the profile configures no publish command, so nothing ran;
+        - ``ValidationGate.check`` refused before running because it could not
+          determine HEAD (``control.validation``). That is a refusal rather
+          than an unconfigured gate, but it has no commit — so there is no
+          candidate ``A`` to file a verdict under in the first place.
+
+        Failures on both sides are recorded: a FAIL and a timeout are facts
+        about A exactly as a PASS is, and a reader that only ever saw passes
+        could not tell a refusal from a gate that never ran.
+        """
+        if record is None:
+            return
+        if issue_key is None:
+            logger.warning(
+                "Publish verdict not durably recorded: no canonical issue "
+                "identity for %s@%s; Attempt(issue, A) keeps no receipt for "
+                "this run",
+                record.suite,
+                record.head_sha[:12],
+            )
+            return
+        self._verdicts.record(issue_key=issue_key, record=record)

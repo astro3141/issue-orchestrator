@@ -1125,6 +1125,8 @@ def build_orchestrator_for_testing(
             profiles=config.validation_profiles(),
             command_runner=command_runner,
             working_copy=working_copy,
+            attempt_store=attempt_store,
+            attempt_keys=_validation_attempt_key_factory(config),
         ),
         pre_publish_gate=PrePublishGate(command_runner) if config.enforce_hooks else None,
         config=config,

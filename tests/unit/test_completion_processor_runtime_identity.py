@@ -132,6 +132,7 @@ def test_completion_processor_stamps_runtime_identity_on_created_pr(
         issue_title="Add feature",
         completion_path=completion_path,
         run_assets=run_assets,
+        issue_key=None,
     )
 
     assert result.success
