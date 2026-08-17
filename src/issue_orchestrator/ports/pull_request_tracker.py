@@ -200,6 +200,13 @@ class PRInfo:
             close-on-merge fallback can ask for close-event evidence at/after
             the merge instead of inferring from issue state alone. `None` when
             unmerged or when the source did not provide it.
+        head_sha: The commit at the head of this PR — the *candidate* a review
+            of it would actually see. Carried so review admission can ask for
+            the publication verdict of that exact commit rather than trusting a
+            review-trigger label an earlier candidate left behind (#45).
+            `None` when the source did not provide it, which admission must
+            read as "the candidate is unknown" and refuse; it is never a licence
+            to assume the current one.
     """
 
     number: int
@@ -214,6 +221,7 @@ class PRInfo:
     status_check_rollup: StatusCheckRollupState | None = None
     base_branch: str | None = None
     merged_at: str | None = None
+    head_sha: str | None = None
 
     @property
     def is_closed_unmerged(self) -> bool:

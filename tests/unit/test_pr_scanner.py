@@ -18,6 +18,12 @@ from issue_orchestrator.domain.issue_key import FakeIssueKey
 from issue_orchestrator.ports.pull_request_tracker import PRInfo
 from issue_orchestrator.events import EventName
 from tests.conftest import MockEventSink, MockGitHubAdapter
+from tests.unit.publication_evidence_helpers import (
+    configure_publication_contract,
+    verdict_with,
+    verdict_with_no_evidence,
+    publication_receipt,
+)
 from tests.builders import IssueBuilder
 
 
@@ -58,6 +64,7 @@ def scanner(mock_config, mock_repository, mock_events):
         config=mock_config,
         repository=mock_repository,
         events=mock_events,
+        publication_verdict=verdict_with_no_evidence(),
     )
 
 
@@ -67,6 +74,7 @@ def make_pr_info(
     body: str = "",
     labels: list[str] | None = None,
     state: str = "open",
+    head_sha: str | None = None,
 ) -> PRInfo:
     """Create a PRInfo for testing."""
     return PRInfo(
@@ -77,6 +85,7 @@ def make_pr_info(
         body=body,
         state=state,
         labels=labels or [],
+        head_sha=head_sha,
     )
 
 
@@ -136,7 +145,12 @@ class TestScanForReviewsBasic:
         """Returns empty list when code review is not configured."""
         config = Config()
         config.code_review_agent = None  # Not configured
-        scanner = PRScanner(config=config, repository=mock_repository, events=mock_events)
+        scanner = PRScanner(
+            config=config,
+            repository=mock_repository,
+            events=mock_events,
+            publication_verdict=verdict_with_no_evidence(),
+        )
 
         # Add PRs that would otherwise be found
         mock_repository.prs["feature-1"] = [
@@ -155,7 +169,12 @@ class TestScanForReviewsBasic:
         config = Config()
         config.code_review_agent = "agent:reviewer"
         config.code_review_label = None  # Not configured
-        scanner = PRScanner(config=config, repository=mock_repository, events=mock_events)
+        scanner = PRScanner(
+            config=config,
+            repository=mock_repository,
+            events=mock_events,
+            publication_verdict=verdict_with_no_evidence(),
+        )
 
         result = scanner.scan_for_reviews(
             already_queued=[],
@@ -333,6 +352,7 @@ class TestScanForReviewsFiltering:
             repository=mock_repository,
             events=mock_events,
             issue_branches_fn=lambda: {42: "42-fresh-branch"},
+            publication_verdict=verdict_with_no_evidence(),
         )
 
         result = scanner.scan_for_reviews(
@@ -428,7 +448,7 @@ class TestScanForReviewsFiltering:
             config=mock_config,
             repository=mock_repository,
             events=mock_events,
-            unrecorded_refusals=unrecorded,
+            publication_verdict=verdict_with_no_evidence(unrecorded=unrecorded),
         )
         mock_repository.issues.append(
             IssueBuilder()
@@ -457,6 +477,160 @@ class TestScanForReviewsFiltering:
             "Skipping stale review PR: pr=100 issue=42 "
             "reason=issue_publication_gate_failed"
         ) in caplog.text
+
+
+class TestScanForReviewsPublicationEvidence:
+    """The positive rule: the scanner queues a candidate, not a label (#45)."""
+
+    CANDIDATE_A = "a" * 40
+    CANDIDATE_A_PRIME = "b" * 40
+
+    def _gated(self, mock_config: Config) -> Config:
+        configure_publication_contract(mock_config)
+        return mock_config
+
+    def _issue_and_pr(self, mock_repository, *, head_sha: str | None):
+        issue = (
+            IssueBuilder()
+            .with_number(42)
+            .with_title("A candidate awaiting review")
+            .with_labels("agent:developer")
+            .build()
+        )
+        mock_repository.issues.append(issue)
+        mock_repository.prs["42-feature"] = [
+            make_pr_info(
+                100,
+                branch="42-feature",
+                body="Closes #42",
+                labels=["needs-code-review"],
+                head_sha=head_sha,
+            )
+        ]
+        return issue
+
+    def _scanner(self, mock_config, mock_repository, mock_events, evidence):
+        return PRScanner(
+            config=mock_config,
+            repository=mock_repository,
+            events=mock_events,
+            publication_verdict=evidence,
+        )
+
+    def test_queues_a_candidate_that_passed_its_publication_gate(
+        self, mock_config, mock_repository, mock_events
+    ):
+        """Proof 1: PASS(A) under the required contract reaches the queue."""
+        config = self._gated(mock_config)
+        issue = self._issue_and_pr(mock_repository, head_sha=self.CANDIDATE_A)
+        scanner = self._scanner(
+            config,
+            mock_repository,
+            mock_events,
+            verdict_with((issue.key, publication_receipt(self.CANDIDATE_A))),
+        )
+
+        result = scanner.scan_for_reviews(already_queued=[], active_sessions=[])
+
+        assert [r.pr_number for r in result] == [100]
+
+    def test_does_not_queue_a_candidate_that_was_never_gated(
+        self, mock_config, mock_repository, mock_events, caplog
+    ):
+        """The scanner half of proof 15, and of the incident.
+
+        Nothing about the issue or the PR is wrong — the label is there, no
+        marker, no rework. Remove the positive check from the shared seam and
+        this candidate is queued for review having never been validated.
+        """
+        config = self._gated(mock_config)
+        self._issue_and_pr(mock_repository, head_sha=self.CANDIDATE_A)
+        scanner = self._scanner(
+            config, mock_repository, mock_events, verdict_with_no_evidence()
+        )
+
+        with caplog.at_level("INFO"):
+            result = scanner.scan_for_reviews(
+                already_queued=[], active_sessions=[]
+            )
+
+        assert result == []
+        assert (
+            "Skipping stale review PR: pr=100 issue=42 "
+            "reason=publication_receipt_missing"
+        ) in caplog.text
+
+    def test_an_uncertified_candidate_is_announced_not_only_logged(
+        self, mock_config, mock_repository, mock_events
+    ):
+        """This refusal does not decay, so it is not left in the console.
+
+        Every other reason the scanner drops a PR heals itself — a block is
+        lifted, a rework finishes. "The commit at this head was never gated"
+        only changes when a new candidate is gated, and a PR the orchestrator
+        did not open never gets one. So the UI hears about it.
+        """
+        config = self._gated(mock_config)
+        self._issue_and_pr(mock_repository, head_sha=self.CANDIDATE_A)
+        scanner = self._scanner(
+            config, mock_repository, mock_events, verdict_with_no_evidence()
+        )
+
+        scanner.scan_for_reviews(already_queued=[], active_sessions=[])
+
+        skipped = [
+            event
+            for event in mock_events.events
+            if str(event.name) == str(EventName.REVIEW_SKIPPED)
+        ]
+        assert len(skipped) == 1
+        assert skipped[0].data["pr_number"] == 100
+        assert skipped[0].data["issue_number"] == 42
+        assert (
+            skipped[0].data["reason"]
+            == "uncertified_candidate:publication_receipt_missing"
+        )
+
+    def test_a_self_healing_refusal_is_not_announced(
+        self, mock_config, mock_repository, mock_events
+    ):
+        """A blocked issue is a passing state; announcing it would cry wolf."""
+        config = self._gated(mock_config)
+        issue = self._issue_and_pr(mock_repository, head_sha=self.CANDIDATE_A)
+        issue.labels = ["blocked:provider-unavailable"]
+        scanner = self._scanner(
+            config,
+            mock_repository,
+            mock_events,
+            verdict_with((issue.key, publication_receipt(self.CANDIDATE_A))),
+        )
+
+        scanner.scan_for_reviews(already_queued=[], active_sessions=[])
+
+        assert [
+            event
+            for event in mock_events.events
+            if str(event.name) == str(EventName.REVIEW_SKIPPED)
+        ] == []
+
+    def test_does_not_queue_a_head_the_receipt_does_not_name(
+        self, mock_config, mock_repository, mock_events
+    ):
+        """Proof 3/5: PASS(A) does not carry a PR whose head is now A′."""
+        config = self._gated(mock_config)
+        issue = self._issue_and_pr(
+            mock_repository, head_sha=self.CANDIDATE_A_PRIME
+        )
+        scanner = self._scanner(
+            config,
+            mock_repository,
+            mock_events,
+            verdict_with((issue.key, publication_receipt(self.CANDIDATE_A))),
+        )
+
+        result = scanner.scan_for_reviews(already_queued=[], active_sessions=[])
+
+        assert result == []
 
 
 class TestScanForReviewsEvents:
@@ -518,7 +692,12 @@ class TestScanForReworksBasic:
         """Returns empty lists when code review is not configured."""
         config = Config()
         config.code_review_agent = None  # Not configured
-        scanner = PRScanner(config=config, repository=mock_repository, events=mock_events)
+        scanner = PRScanner(
+            config=config,
+            repository=mock_repository,
+            events=mock_events,
+            publication_verdict=verdict_with_no_evidence(),
+        )
 
         result, escalations = scanner.scan_for_reworks(
             already_queued=[],
@@ -720,6 +899,7 @@ class TestScanForReworksFiltering:
             repository=mock_repository,
             events=mock_events,
             issue_branches_fn=lambda: {42: "42-fresh-branch"},
+            publication_verdict=verdict_with_no_evidence(),
         )
 
         result, escalations = scanner.scan_for_reworks(

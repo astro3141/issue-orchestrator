@@ -56,7 +56,7 @@ from .stuck_sweep import hydrate_stuck_sweep_state
 from .action_applier import ActionApplier
 from .issue_fetch_resilience import IssueFetchResilience, TransientIssueFetchError
 from .queue_cache import QueueCache, QueueMutationStatus, record_issue_refreshes
-from .publication_authority import UnrecordedRefusals
+from .publication_authority import PublicationVerdictReader
 from .review_validity import evaluate_review_validity
 from .review_scope import ReviewScopeChecker, extract_issue_number_from_pr
 from .retrospective_review import recover_pending_retrospective_reviews
@@ -100,7 +100,8 @@ class StartupManager:
         label_manager: "LabelManager | None" = None,
         label_store: "LabelStore | None" = None,
         tech_lead_authority: "TechLeadAuthorityStore | None" = None,
-        unrecorded_refusals: "UnrecordedRefusals | None" = None,
+        *,
+        publication_verdict: "PublicationVerdictReader",
     ):
         """Initialize the startup manager.
 
@@ -122,11 +123,13 @@ class StartupManager:
             startup_worktree_reconciler: Owner of crash-safe worktree recovery.
             queue_cache_store: Persistent store for queue cache (enables warm restarts)
             label_manager: Label registry for prefix-aware queries.
-            unrecorded_refusals: The shared record of publication-gate
-                refusals whose label write did not commit (#45). Wired like
-                the other two readers of the verdict so no path can answer it
-                differently, though startup runs before any gate in this
-                process has failed and so reads it empty.
+            publication_verdict: The shared reader of the publication verdict
+                (#45). Startup is the path that most needs the durable half:
+                everything this process knew is gone, so the receipt on
+                ``Attempt(issue, A)`` is the only thing left that can say
+                whether the PR waiting with ``needs-code-review`` ever cleared
+                a gate. Required, with no default, for the reason the scanner's
+                is.
         """
         self.config = config
         self.events = events
@@ -145,7 +148,7 @@ class StartupManager:
             from .label_manager import LabelManager
             label_manager = LabelManager(config)
         self._lm = label_manager
-        self._unrecorded_refusals = unrecorded_refusals or UnrecordedRefusals.process_local()
+        self._publication_verdict = publication_verdict
         self._label_store = label_store
         # Gated-proposal ledger (#6778); None (tests) = no op-backed exclusions.
         self._tech_lead_authority = tech_lead_authority
@@ -673,7 +676,7 @@ class StartupManager:
                 config=self.config,
                 label_manager=self._lm,
                 issue=issue,
-                unrecorded_refusals=self._unrecorded_refusals,
+                publication_verdict=self._publication_verdict,
                 pr=pr,
                 review_label_confirmed=True,
             )

@@ -20,10 +20,16 @@ from issue_orchestrator.infra.validation_config_loader import (
     extract_validation_config,
     load_runtime_validation_config,
 )
+from issue_orchestrator.infra.config_models import (
+    PublishValidationConfig,
+    ValidationCommandConfig,
+    ValidationConfig,
+)
 from issue_orchestrator.infra.validation_profiles import (
     DEFAULT_VALIDATION_PROFILE,
     UnknownValidationProfileError,
     ValidationProfileRegistry,
+    profiles_from_mapping,
 )
 from issue_orchestrator.control.session_controller import SessionController
 from issue_orchestrator.control.session_env import build_session_env_exports
@@ -955,3 +961,122 @@ class TestLaunchPathParity:
         )
 
         assert "ISSUE_ORCHESTRATOR_VALIDATION_PROFILE='foundation'" in exports
+
+
+class TestOneMeaningForWhichContractRan:
+    """``result_mismatch`` is the single spelling of "was this ours" (#45).
+
+    The validation cache asks it of a stored ``ValidationRecord`` before reusing
+    it; review admission asks it of a durable ``ValidationVerdictReceipt``
+    before treating a past pass as authority. Two spellings could drift, and the
+    drift would read as the gate and the admission disagreeing about which
+    contract ran — the confusion the receipt carries ``command`` *and*
+    ``profile`` to prevent (#7059).
+    """
+
+    def test_the_contract_that_ran_agrees_with_itself(self) -> None:
+        contract = publish_contract(cmd="make validate-pr-raw")
+
+        assert (
+            contract.result_mismatch(
+                suite=contract.suite,
+                command="make validate-pr-raw",
+                profile=contract.profile,
+            )
+            is None
+        )
+
+    def test_the_other_gate_of_the_same_profile_is_a_contract_mismatch(self) -> None:
+        contract = publish_contract(cmd="make validate-pr-raw")
+
+        assert (
+            contract.result_mismatch(
+                suite=ValidationGateKind.QUICK.suite,
+                command="make validate-pr-raw",
+                profile=contract.profile,
+            )
+            == "contract"
+        )
+
+    def test_a_changed_command_is_a_command_mismatch(self) -> None:
+        contract = publish_contract(cmd="make validate-pr-raw --now-more")
+
+        assert (
+            contract.result_mismatch(
+                suite=contract.suite,
+                command="make validate-pr-raw",
+                profile=contract.profile,
+            )
+            == "command"
+        )
+
+    def test_another_profiles_result_is_a_profile_mismatch(self) -> None:
+        contract = publish_contract(cmd="make validate-pr-raw")
+
+        assert (
+            contract.result_mismatch(
+                suite=contract.suite,
+                command="make validate-pr-raw",
+                profile="somebody-elses-profile",
+            )
+            == "profile"
+        )
+
+    def test_an_unconfigured_gate_has_no_command_to_disagree_with(self) -> None:
+        """The reading ``ValidationGate`` has always had, kept verbatim."""
+        contract = publish_contract(cmd=None)
+
+        assert (
+            contract.result_mismatch(
+                suite=contract.suite,
+                command="whatever ran back then",
+                profile=contract.profile,
+            )
+            is None
+        )
+
+    def test_an_unknown_suite_satisfies_no_contract(self) -> None:
+        contract = publish_contract(cmd="make validate-pr-raw")
+
+        assert (
+            contract.result_mismatch(
+                suite="some_gate_this_vocabulary_never_defined",
+                command="make validate-pr-raw",
+                profile=contract.profile,
+            )
+            == "contract"
+        )
+
+
+def _registry(validation: dict) -> ValidationProfileRegistry:
+    """A registry built from one ``validation:`` YAML section."""
+    config = Config()
+    config.validation = ValidationConfig(
+        quick=ValidationCommandConfig(cmd=(validation.get("quick") or {}).get("cmd")),
+        publish=PublishValidationConfig(
+            cmd=(validation.get("publish") or {}).get("cmd")
+        ),
+        profiles=profiles_from_mapping(validation.get("profiles")),
+    )
+    return config.validation_profiles()
+
+
+class TestAnyPublishCommandConfigured:
+    """Whether the repository has a publication contract at all (#45)."""
+
+    def test_no_profile_defines_one(self) -> None:
+        registry = _registry({"quick": {"cmd": "make q"}})
+
+        assert registry.any_publish_command_configured is False
+
+    def test_the_default_profile_defines_one(self) -> None:
+        registry = _registry({"publish": {"cmd": "make validate-pr-raw"}})
+
+        assert registry.any_publish_command_configured is True
+
+    def test_a_named_profile_alone_is_enough(self) -> None:
+        registry = _registry(
+            {"profiles": {"strict": {"publish": {"cmd": "make validate-pr-raw"}}}}
+        )
+
+        assert registry.any_publish_command_configured is True

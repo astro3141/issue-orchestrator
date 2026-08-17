@@ -124,7 +124,15 @@ class GitHubAdapterCacheSupport:
 
     @staticmethod
     def _pr_info_from_cache(cached: dict[str, Any]) -> PRInfo | None:
-        """Convert cached PR data back to PRInfo."""
+        """Convert cached PR data back to PRInfo.
+
+        ``head_sha`` is deliberately absent, in both directions: a cached head
+        is precisely the stale candidate review admission must not trust (#45).
+        A push moves the PR head while this entry still names the commit before
+        it, and a receipt proving the old commit passed would then admit a
+        review of the new one. Reading back as ``None`` fails closed instead,
+        and the admission paths read PRs fresh rather than from here.
+        """
         if not cached:
             return None
         return PRInfo(

@@ -21,17 +21,17 @@ from ..control.worktree_manager import get_worktree_path
 from ..domain.models import get_completion_path
 from ..domain.review_exchange_verdict import ExchangeVerdict
 from ..domain.session_run import SessionRunAssets
+from ..ports import Issue as IssueProtocol
 from ..ports.operator_issue_commands import (
     OperatorCommandIntent,
     OperatorCommandOutcome,
     OperatorCommandStatus,
 )
 from ..infra.env import ENV_PREFIX
-from .control_api_issue_support import ControlApiIssueDependency, StateLockFn
+from .control_api_issue_support import ControlApiIssueDependency
 
 if TYPE_CHECKING:
     from ..infra.orchestrator import Orchestrator
-    from ..ports import Issue as IssueProtocol
 
 logger = logging.getLogger(__name__)
 
@@ -299,19 +299,35 @@ async def resume_issue(
             "hint": "Run 'coding-done completed --implementation ... --problems ...' first.",
         }, status_code=404)
 
-    issue_title = _get_issue_title(orchestrator, issue_number, deps.with_state_lock)
+    authoritative_issue = _authoritative_issue(orchestrator, issue_number)
+    if authoritative_issue is None:
+        # Declined rather than downgraded (#40/#45). This route drives ordinary
+        # completion progression — the same processor the normal path runs, and
+        # it can end in a review — so a run it drives must be able to leave a
+        # publication receipt under the candidate's canonical identity. Without
+        # authoritative issue metadata there is no such identity: a key built
+        # from a number, or from a display placeholder like ``f"Issue #{n}"``,
+        # is the number-only downgrade #40 removed, and a receipt filed under
+        # it would be evidence about a work item that does not exist. Refusing
+        # here costs an operator one retry; the downgrade would cost the
+        # ordering rule.
+        return JSONResponse({
+            "success": False,
+            "error": f"Could not read issue #{issue_number} from the repository",
+            "hint": (
+                "Resume needs the issue's authoritative metadata to identify "
+                "the candidate it validates. Check repository connectivity and "
+                "retry."
+            ),
+        }, status_code=502)
     try:
         result = orchestrator.deps.completion_processor.process(
             worktree=worktree,
             issue_number=issue_number,
-            issue_title=issue_title,
+            issue_title=authoritative_issue.title,
             completion_path=completion_path,
             run_assets=run_assets,
-            # Stated, not omitted: this route holds an issue *number* from the
-            # URL path and nothing else, so it has no canonical identity to
-            # file the publish gate's verdict under (#85). Reversing a number
-            # into a key is the drift #40 removed.
-            issue_key=None,
+            issue_key=authoritative_issue.key,
         )
         return JSONResponse({
             "success": result.success,
@@ -686,28 +702,31 @@ async def close_issue(
         }, status_code=500)
 
 
-def _get_issue_title(
+def _authoritative_issue(
     orchestrator: "Orchestrator",
     issue_number: int,
-    with_state_lock: StateLockFn,
-) -> str:
-    """Resolve issue title from cache, falling back to GitHub."""
-    issue_title = f"Issue #{issue_number}"
+) -> "IssueProtocol | None":
+    """The repository's own record of this issue, or ``None`` if unreadable.
+
+    Deliberately not the cache-then-placeholder title lookup this route used
+    to call. That answered a display question, and answered it with
+    ``f"Issue #{n}"`` when nothing responded — the right shape for a toast and
+    the wrong shape for identity, because an ``IssueKey`` derived from it names
+    a work item nobody has. This asks the repository host and reports failure
+    as failure, so the caller decides whether to proceed without an identity —
+    and on the completion path it must not (#40/#45).
+
+    The result is narrowed with ``isinstance`` for the same reason
+    ``review_launch_validity`` narrows it: ``get_issue`` is a port call, and
+    the two readers of that port must not differ on what counts as an answer.
+    Anything that is not an issue is reported as no issue rather than handed on
+    for its ``.key`` to be read.
+    """
     try:
-        def _cached_title() -> str | None:
-            for issue in orchestrator.state.cached_queue_issues:
-                if issue.number == issue_number:
-                    return issue.title
-            return None
-
-        cached_title = with_state_lock(_cached_title)
-        if cached_title:
-            return cached_title
-
-        issue_data = orchestrator.deps.repository_host.get_issue(issue_number)
-        if issue_data:
-            return issue_data.title
+        issue = orchestrator.deps.repository_host.get_issue(issue_number)
     except Exception as exc:
-        logger.warning("Could not fetch issue title for #%d: %s", issue_number, exc)
-
-    return issue_title
+        logger.warning(
+            "Could not read authoritative issue #%d: %s", issue_number, exc
+        )
+        return None
+    return issue if isinstance(issue, IssueProtocol) else None

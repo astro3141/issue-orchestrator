@@ -89,6 +89,38 @@ class ValidationGateContract:
         """Whether this is the profile's quick contract."""
         return self.kind is ValidationGateKind.QUICK
 
+    def result_mismatch(
+        self, *, suite: str, command: str, profile: str
+    ) -> str | None:
+        """Why a stored gate result was *not* produced by this contract.
+
+        The one place this codebase decides whether a result already on disk
+        answers for the contract now being asked about. ``None`` means it
+        agrees; otherwise the returned word names which half disagreed, so
+        callers can say what drifted rather than only that something did.
+
+        Two callers, deliberately one predicate. ``ValidationGate`` asks it of
+        a cached :class:`~...ports.session_output.ValidationRecord` before
+        reusing it; review admission asks it of the durable
+        :class:`~...domain.validation_verdict_receipt.ValidationVerdictReceipt`
+        before treating a past pass as authority for a review (#45). A second
+        spelling of the comparison could drift from this one, and the drift
+        would read as "the gate and the admission disagree about which
+        contract ran" — the exact confusion the receipt carries ``command``
+        *and* ``profile`` to prevent (#7059).
+
+        ``cmd`` being unset means this profile defines no command for this
+        gate, so there is nothing for a recorded command to disagree with —
+        the same reading :class:`ValidationGate` has always had.
+        """
+        if not self.kind.produced(suite):
+            return "contract"
+        if self.cmd and command != self.cmd:
+            return "command"
+        if profile != self.profile:
+            return "profile"
+        return None
+
 
 @dataclass(frozen=True)
 class ValidationProfile:
@@ -206,6 +238,30 @@ class ValidationProfileRegistry:
         still needs one.
         """
         return any(profile.quick.cmd for profile in self._profiles.values())
+
+    @property
+    def any_publish_command_configured(self) -> bool:
+        """Whether *any* profile configures a publication gate.
+
+        Review admission asks this before demanding a publication receipt
+        (#45). A repository that configures no publish command anywhere has no
+        publication contract at all: :class:`~..control.publication_gate.
+        PublicationGate` treats that as the operator's explicit choice and
+        allows publication without running or recording anything. Requiring
+        evidence of a gate the configuration does not define would block every
+        review in such a repository forever, so the requirement attaches to
+        repositories that actually have a publication contract.
+
+        Repository-wide is the right granularity for the *reader* because a
+        PR does not say which profile produced it — the receipt is the only
+        thing that would. The gate asks the same question on the producing
+        side, where the run's own frozen profile is known, and refuses a
+        candidate this property would demand a receipt for while its own
+        profile could never file one (``PublicationGate.
+        _uncertifiable_candidate``). So "any profile has a contract" and "this
+        candidate could have been certified" never come apart.
+        """
+        return any(profile.publish.cmd for profile in self._profiles.values())
 
     @property
     def any_command_configured(self) -> bool:

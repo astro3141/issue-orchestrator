@@ -19,7 +19,7 @@ from .review_validity import ReviewValidity, evaluate_review_validity
 
 if TYPE_CHECKING:
     from .label_manager import LabelManager
-    from .publication_authority import UnrecordedRefusals
+    from .publication_authority import PublicationVerdictReader
 
 logger = logging.getLogger(__name__)
 
@@ -65,12 +65,16 @@ def review_launch_validity(
     config: Config,
     repository_host: RepositoryHost,
     label_manager: "LabelManager",
-    unrecorded_refusals: "UnrecordedRefusals",
+    publication_verdict: "PublicationVerdictReader",
 ) -> ReviewValidity:
     """Load current review facts and decide whether launch is still valid.
 
     Launch is the last moment the verdict can be re-read, so it re-reads all
-    of it: the live labels, and the refusals that never reached a label (#45).
+    of it: the live labels, the refusals that never reached a label, and the
+    PR's *current* head (#45). The fresh read is what makes queue history
+    unable to authorize anything — a candidate that moved from A to A′ while
+    the review sat in the queue is judged as A′, and A's publication receipt
+    does not answer for it.
     """
     current_issue = repository_host.get_issue(review.issue_number)
     if not isinstance(current_issue, IssueProtocol):
@@ -82,7 +86,7 @@ def review_launch_validity(
         config=config,
         label_manager=label_manager,
         issue=current_issue,
-        unrecorded_refusals=unrecorded_refusals,
+        publication_verdict=publication_verdict,
         pr=current_pr,
     )
 

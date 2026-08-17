@@ -15,7 +15,6 @@ from ..ports.provider_readiness import (
     NO_PROVIDER_READINESS_PROBE,
     ProviderReadinessProbe,
 )
-from .publication_authority import UnrecordedRefusals
 
 if TYPE_CHECKING:
     from ..ports.label_store import LabelStore
@@ -36,6 +35,7 @@ if TYPE_CHECKING:
     from .label_manager import LabelManager
     from .provider_launch_readiness import ProviderLaunchReadinessSampler
     from .provider_resilience import ProviderResilienceManager
+    from .publication_authority import PublicationVerdictReader
 
 
 def _noop_health_check() -> None:
@@ -60,6 +60,14 @@ class InfraServices:
     timeline_writer: "TimelineWriter"
     goal_pilot_store: "GoalPilotStore"
     attempt_store: "AttemptStore"
+    # The orchestrator-wide reader of the publication verdict (#45): the
+    # refusal marker, the refusals whose label write did not commit, and the
+    # receipt on ``Attempt(issue, A)``, bundled so the scanner, startup
+    # recovery and the launcher cannot read different subsets and reach
+    # different answers. Required rather than defaulted for the same reason —
+    # a reader wired to nothing refuses every review, and a permissive one
+    # restores the fail-open state this closes.
+    publication_verdict: "PublicationVerdictReader"
     # Orchestrator-owned tech_lead launch authority port (ADR-0031 / #6769 F2).
     tech_lead_authority: "TechLeadAuthorityStore"
     # Rebuildable GitHub open-issue corpus owner (#6881).
@@ -78,13 +86,5 @@ class InfraServices:
     pair_registry: "PersistentExchangePairRegistry | None" = None
     turn_mailbox: "TurnMailbox | None" = None
     background_job_supervisor: "BackgroundJobSupervisor | None" = None
-    # The orchestrator-wide record of publication-gate refusals whose label
-    # write did not commit (#45). One instance per orchestrator: the
-    # completion processor holds refusals here, and the scanner, startup
-    # recovery and the launcher read them back, so a refusal that never
-    # reached the issue still withholds review from the candidate it refused.
-    unrecorded_refusals: UnrecordedRefusals = field(
-        default_factory=UnrecordedRefusals.process_local
-    )
     instance_id: str = ""
     state_health_check: Callable[[], None] = field(default=_noop_health_check)

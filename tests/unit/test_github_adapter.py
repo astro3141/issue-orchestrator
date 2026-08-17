@@ -1299,6 +1299,69 @@ class TestPROperations:
         # REST fallback should NOT be called
         mock_http_client.get_prs_with_label.assert_not_called()
 
+    def test_graphql_discovered_pr_carries_its_candidate_head(
+        self, adapter, mock_http_client
+    ):
+        """One extractor serves both provider shapes (#45).
+
+        The GraphQL list reshapes ``headRefOid`` into the same ``head.sha`` key
+        the REST detail payload already uses, so ``PRInfo.head_sha`` is
+        populated at the single normalization site whichever path found the PR.
+        """
+        mock_http_client.get_prs_with_label_graphql.return_value = [
+            {
+                "number": 10,
+                "title": "Test PR",
+                "html_url": "https://github.com/owner/repo/pull/10",
+                "head": {"ref": "feature", "sha": "a" * 40},
+                "body": "",
+                "state": "open",
+                "labels": [{"name": "needs-code-review"}],
+            },
+        ]
+
+        prs = adapter.get_prs_with_label("needs-code-review")
+
+        assert prs[0].head_sha == "a" * 40
+
+    def test_rest_pr_detail_carries_its_candidate_head(
+        self, adapter, mock_http_client
+    ):
+        """The launcher's fresh re-read names the commit it just read."""
+        mock_http_client.get_pr.return_value = {
+            "number": 10,
+            "title": "Test PR",
+            "html_url": "https://github.com/owner/repo/pull/10",
+            "head": {"ref": "feature", "sha": "b" * 40},
+            "body": "",
+            "state": "open",
+            "labels": [{"name": "needs-code-review"}],
+        }
+
+        pr = adapter.get_pr(10)
+
+        assert pr is not None
+        assert pr.head_sha == "b" * 40
+
+    def test_a_pr_payload_without_a_head_sha_reads_as_unknown(
+        self, adapter, mock_http_client
+    ):
+        """``None``, never a guess: admission must fail closed on this."""
+        mock_http_client.get_pr.return_value = {
+            "number": 10,
+            "title": "Test PR",
+            "html_url": "https://github.com/owner/repo/pull/10",
+            "head": {"ref": "feature"},
+            "body": "",
+            "state": "open",
+            "labels": [],
+        }
+
+        pr = adapter.get_pr(10)
+
+        assert pr is not None
+        assert pr.head_sha is None
+
     def test_get_prs_with_label_graphql_http_error_propagates(self, adapter, mock_http_client):
         """GraphQL PR label lookup preserves upstream HTTP failures."""
         mock_http_client.get_prs_with_label_graphql.side_effect = GitHubHttpError(

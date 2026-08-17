@@ -58,6 +58,17 @@ def _bind_resume_run(
         },
     )
     mock_orch.deps.session_output = session_output
+    # A real work item, not the auto-mock the repository host would otherwise
+    # hand back: resume reads the issue's canonical key off this and refuses
+    # anything that is not an issue (#40/#45), so a stand-in that only looks
+    # like one under `getattr` would exercise the refusal path by accident.
+    # Tests about the refusal override this deliberately.
+    mock_orch.deps.repository_host.get_issue.return_value = Issue(
+        number=issue_number,
+        title=f"Issue {issue_number} authoritative title",
+        labels=["agent:test"],
+        body="",
+    )
     return _BoundResumeRun(run_assets=run_assets, completion_path=completion_path)
 
 
@@ -257,13 +268,20 @@ class TestResumeIssueEndpoint:
         assert data["success"] is False
         assert "remote rejected" in data["error"]
 
-    def test_resume_fetches_issue_title_from_cache(
+    def test_resume_carries_the_authoritative_canonical_key(
         self, client_with_orchestrator, tmp_path
     ):
-        """Uses cached issue title when available."""
+        """The key the gate files its receipt under is the issue's own (#45).
+
+        ``/resume`` re-drives ordinary completion processing, and that path can
+        end in a review. So the run it drives must be able to leave a
+        publication receipt under the candidate's canonical identity — which
+        means the route has to hand the processor a real ``IssueKey``, taken
+        from the repository's own record rather than reversed out of the URL's
+        issue number.
+        """
         client, mock_orch = client_with_orchestrator
 
-        # Create worktree with completion.json
         worktree = tmp_path / "repo-123"
         worktree.mkdir()
         bound_run = _bind_resume_run(mock_orch, worktree)
@@ -271,11 +289,13 @@ class TestResumeIssueEndpoint:
         completion_path.parent.mkdir(parents=True, exist_ok=True)
         completion_path.write_text('{"outcome": "completed"}')
 
-        # Add issue to cached queue
-        mock_issue = MagicMock()
-        mock_issue.number = 123
-        mock_issue.title = "Cached Issue Title"
-        mock_orch.state.cached_queue_issues = [mock_issue]
+        authoritative = Issue(
+            number=123,
+            title="M1-011: the authoritative title",
+            labels=["agent:backend"],
+            body="",
+        )
+        mock_orch.deps.repository_host.get_issue.return_value = authoritative
 
         mock_result = MagicMock()
         mock_result.success = True
@@ -296,9 +316,109 @@ class TestResumeIssueEndpoint:
             )
 
         assert response.status_code == 200
-        # Verify title was used from cache
         call_kwargs = mock_orch.deps.completion_processor.process.call_args.kwargs
-        assert call_kwargs["issue_title"] == "Cached Issue Title"
+        assert call_kwargs["issue_key"] == authoritative.key
+        assert call_kwargs["issue_key"] is not None
+        assert call_kwargs["issue_title"] == "M1-011: the authoritative title"
+
+    def test_resume_declines_rather_than_downgrading_an_unknown_issue(
+        self, client_with_orchestrator, tmp_path
+    ):
+        """No number-only key when the authoritative issue cannot be read (#40).
+
+        The route used to fall back to the display placeholder ``Issue #123``.
+        A key derived from that names a work item nobody has, and a receipt
+        filed under it would be evidence about the wrong candidate. Declining
+        costs one retry; the downgrade costs the ordering rule.
+        """
+        client, mock_orch = client_with_orchestrator
+
+        worktree = tmp_path / "repo-123"
+        worktree.mkdir()
+        bound_run = _bind_resume_run(mock_orch, worktree)
+        completion_path = worktree / bound_run.completion_path
+        completion_path.parent.mkdir(parents=True, exist_ok=True)
+        completion_path.write_text('{"outcome": "completed"}')
+
+        mock_orch.deps.repository_host.get_issue.return_value = None
+
+        with patch(
+            "issue_orchestrator.entrypoints.control_api_issue_routes.get_worktree_path"
+        ) as mock_get_path:
+            mock_get_path.return_value = worktree
+
+            response = client.post(
+                "/api/issues/123/resume",
+                json={"run_dir": str(bound_run.run_assets.run_dir)},
+            )
+
+        assert response.status_code == 502
+        assert response.json()["success"] is False
+        mock_orch.deps.completion_processor.process.assert_not_called()
+
+    def test_resume_declines_when_the_issue_read_raises(
+        self, client_with_orchestrator, tmp_path
+    ):
+        """A transport failure is an unreadable issue, not an absent one."""
+        client, mock_orch = client_with_orchestrator
+
+        worktree = tmp_path / "repo-123"
+        worktree.mkdir()
+        bound_run = _bind_resume_run(mock_orch, worktree)
+        completion_path = worktree / bound_run.completion_path
+        completion_path.parent.mkdir(parents=True, exist_ok=True)
+        completion_path.write_text('{"outcome": "completed"}')
+
+        mock_orch.deps.repository_host.get_issue.side_effect = RuntimeError(
+            "GitHub unreachable"
+        )
+
+        with patch(
+            "issue_orchestrator.entrypoints.control_api_issue_routes.get_worktree_path"
+        ) as mock_get_path:
+            mock_get_path.return_value = worktree
+
+            response = client.post(
+                "/api/issues/123/resume",
+                json={"run_dir": str(bound_run.run_assets.run_dir)},
+            )
+
+        assert response.status_code == 502
+        mock_orch.deps.completion_processor.process.assert_not_called()
+
+    def test_resume_declines_when_the_issue_read_returns_a_non_issue(
+        self, client_with_orchestrator, tmp_path
+    ):
+        """The port's answer is narrowed here as it is at the launch seam.
+
+        ``review_launch_validity`` already refuses to trust whatever
+        ``get_issue`` hands back without an ``isinstance`` check. Two readers of
+        one port must not disagree about what counts as an issue, and this one
+        goes straight on to read ``.key`` and ``.title`` off the result.
+        """
+        client, mock_orch = client_with_orchestrator
+
+        worktree = tmp_path / "repo-123"
+        worktree.mkdir()
+        bound_run = _bind_resume_run(mock_orch, worktree)
+        completion_path = worktree / bound_run.completion_path
+        completion_path.parent.mkdir(parents=True, exist_ok=True)
+        completion_path.write_text('{"outcome": "completed"}')
+
+        mock_orch.deps.repository_host.get_issue.return_value = object()
+
+        with patch(
+            "issue_orchestrator.entrypoints.control_api_issue_routes.get_worktree_path"
+        ) as mock_get_path:
+            mock_get_path.return_value = worktree
+
+            response = client.post(
+                "/api/issues/123/resume",
+                json={"run_dir": str(bound_run.run_assets.run_dir)},
+            )
+
+        assert response.status_code == 502
+        mock_orch.deps.completion_processor.process.assert_not_called()
 
 
 class TestDebugSessionEndpoint:

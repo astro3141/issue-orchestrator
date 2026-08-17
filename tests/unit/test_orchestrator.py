@@ -10,6 +10,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch, call, AsyncMock, PropertyMock
 from tests.conftest import MockSessionRunner
+from tests.unit.publication_evidence_helpers import verdict_with_no_evidence
 from issue_orchestrator.infra.orchestrator import Orchestrator, run_orchestrator
 from issue_orchestrator.domain.models import (
     Issue,
@@ -3939,6 +3940,7 @@ class TestReworkEscalation:
             config=sample_config,
             repository=MagicMock(),
             events=MagicMock(),
+            publication_verdict=verdict_with_no_evidence(),
         )
 
         # No rework label - first cycle

@@ -1,5 +1,6 @@
 """Shared completion-processing result types."""
 
+from collections.abc import Callable
 from dataclasses import dataclass
 
 ERROR_PREFIX_PUSH = "push_branch"
@@ -73,3 +74,15 @@ class ProcessingResult:
         state before publish actually completes.
         """
         return self.review_exchange_deferred or self.validation_failed_rerouted
+
+
+RepublicationCheck = Callable[[], ProcessingResult | None]
+"""Re-runs the publication gate for a commit a push retry rewrote (#45).
+
+Bound at the completion boundary that owns the run — the only place holding
+the candidate's canonical identity and its frozen run assets — so the retry
+deep inside the push path can ask "is the commit I am about to publish
+certified?" without carrying five loose values down to ask it. ``None`` means
+publication may proceed; a ``ProcessingResult`` is the refusal, already
+reported and labelled by the ordinary gate-failure handler.
+"""

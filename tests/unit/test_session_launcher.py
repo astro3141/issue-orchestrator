@@ -168,6 +168,15 @@ from issue_orchestrator.execution.stack_predecessor_facts import (
 from issue_orchestrator.execution.session_output_adapter import FileSystemSessionOutput
 from issue_orchestrator.contracts.public import SessionStartedPayload
 from tests.unit.session_run_helpers import make_session_run_assets
+from issue_orchestrator.control.publication_authority import (
+    PublicationVerdictReader,
+)
+from tests.unit.publication_evidence_helpers import (
+    configure_publication_contract,
+    publication_receipt,
+    verdict_with,
+    verdict_with_no_evidence,
+)
 
 
 #: How many launches the provisioning-bound tests drive. Deliberately far past
@@ -593,6 +602,7 @@ def _build_launcher_bundle(
     provider_resilience: ProviderResilienceManager | None = None,
     provider_readiness_probe: ProviderReadinessProbe | None = None,
     unrecorded_refusals: UnrecordedRefusals | None = None,
+    publication_verdict: PublicationVerdictReader | None = None,
     action_applier: object | None = None,
 ) -> LauncherTestBundle:
     """Create a SessionLauncher with mock dependencies and tracking.
@@ -656,8 +666,6 @@ def _build_launcher_bundle(
         launcher_kwargs["provider_resilience"] = provider_resilience
     if provider_readiness_probe is not None:
         launcher_kwargs["provider_readiness_probe"] = provider_readiness_probe
-    if unrecorded_refusals is not None:
-        launcher_kwargs["unrecorded_refusals"] = unrecorded_refusals
     launcher = SessionLauncher(
         config=sample_config,
         events=mock_events,
@@ -679,6 +687,11 @@ def _build_launcher_bundle(
         board_snapshot_provider=board_snapshot_provider,
         agent_callback_endpoint=ready_callback_endpoint(),
         claim_manager=claim_manager,
+        publication_verdict=(
+            publication_verdict
+            if publication_verdict is not None
+            else verdict_with_no_evidence(unrecorded=unrecorded_refusals)
+        ),
         **launcher_kwargs,
     )
 
@@ -1556,6 +1569,7 @@ class TestLaunchIssueSession:
             dependency_evaluator=_Evaluator(),
             board_snapshot_provider=NullBoardSnapshotProvider(),
             agent_callback_endpoint=ready_callback_endpoint(),
+            publication_verdict=verdict_with_no_evidence(),
         )
 
         result = launcher.launch_issue_session(sample_issue, active_sessions=[])
@@ -2372,6 +2386,187 @@ class TestLaunchReviewSession:
 
         assert result.success is False
         assert result.reason == "Stale pending review: issue_publication_gate_failed"
+        assert launcher_bundle.create_session_calls == []
+
+    def test_launch_admits_a_review_whose_fresh_head_passed(
+        self,
+        sample_config,
+        mock_events,
+        mock_repo_host,
+        mock_worktree_manager,
+        mock_working_copy,
+        mock_command_runner,
+    ):
+        """Proof 3: fresh read is A and PASS(A) exists, so launch proceeds."""
+        candidate_a = "a" * 40
+        configure_publication_contract(sample_config)
+        issue = Issue(
+            number=123,
+            title="A validated candidate",
+            labels=["agent:web"],
+            repo="test/repo",
+        )
+        mock_repo_host.issues[123] = issue
+        mock_repo_host.prs["123-feature"] = [
+            PRInfo(
+                number=456,
+                title="PR",
+                url="https://github.com/test/repo/pull/456",
+                branch="123-feature",
+                body="Closes #123",
+                state="open",
+                labels=["needs-code-review"],
+                head_sha=candidate_a,
+            )
+        ]
+        launcher_bundle = _build_launcher_bundle(
+            sample_config,
+            mock_events,
+            mock_repo_host,
+            mock_worktree_manager,
+            mock_working_copy,
+            mock_command_runner,
+            publication_verdict=verdict_with(
+                (issue.key, publication_receipt(candidate_a))
+            ),
+        )
+        review = PendingReview(
+            issue_key=GitHubIssueKey(repo="test/repo", external_id="123"),
+            pr_number=456,
+            pr_url="https://github.com/test/repo/pull/456",
+            branch_name="123-feature",
+            _issue_number=123,
+        )
+
+        result = launcher_bundle.launcher.launch_review_session(
+            review, active_sessions=[]
+        )
+
+        assert result.success is True
+        assert launcher_bundle.create_session_calls != []
+
+    def test_launch_refuses_a_review_whose_head_moved_after_queueing(
+        self,
+        sample_config,
+        mock_events,
+        mock_repo_host,
+        mock_worktree_manager,
+        mock_working_copy,
+        mock_command_runner,
+        caplog,
+    ):
+        """Proofs 4 and 5, and the launcher half of proof 15.
+
+        The review was queued against A, which really did pass. A push then
+        moved the PR head to A′. Launch re-reads the PR, so the candidate it
+        would show a reviewer is A′ — and A's receipt says nothing about it.
+        Queue history is not authority.
+        """
+        candidate_a = "a" * 40
+        candidate_a_prime = "b" * 40
+        configure_publication_contract(sample_config)
+        issue = Issue(
+            number=123,
+            title="A candidate that moved",
+            labels=["agent:web"],
+            repo="test/repo",
+        )
+        mock_repo_host.issues[123] = issue
+        mock_repo_host.prs["123-feature"] = [
+            PRInfo(
+                number=456,
+                title="PR",
+                url="https://github.com/test/repo/pull/456",
+                branch="123-feature",
+                body="Closes #123",
+                state="open",
+                labels=["needs-code-review"],
+                head_sha=candidate_a_prime,
+            )
+        ]
+        launcher_bundle = _build_launcher_bundle(
+            sample_config,
+            mock_events,
+            mock_repo_host,
+            mock_worktree_manager,
+            mock_working_copy,
+            mock_command_runner,
+            publication_verdict=verdict_with(
+                (issue.key, publication_receipt(candidate_a))
+            ),
+        )
+        review = PendingReview(
+            issue_key=GitHubIssueKey(repo="test/repo", external_id="123"),
+            pr_number=456,
+            pr_url="https://github.com/test/repo/pull/456",
+            branch_name="123-feature",
+            _issue_number=123,
+        )
+
+        with caplog.at_level("INFO"):
+            result = launcher_bundle.launcher.launch_review_session(
+                review, active_sessions=[]
+            )
+
+        assert result.success is False
+        assert result.reason == "Stale pending review: publication_receipt_missing"
+        assert launcher_bundle.create_session_calls == []
+        assert (
+            "Dropping stale pending review: pr=456 issue=123 "
+            "reason=publication_receipt_missing"
+        ) in caplog.text
+
+    def test_launch_refuses_a_review_of_a_candidate_never_gated(
+        self,
+        sample_config,
+        mock_events,
+        mock_repo_host,
+        mock_worktree_manager,
+        mock_working_copy,
+        mock_command_runner,
+    ):
+        """A queue entry alone cannot authorize an unvalidated candidate."""
+        configure_publication_contract(sample_config)
+        mock_repo_host.issues[123] = Issue(
+            number=123,
+            title="An ungated candidate",
+            labels=["agent:web"],
+            repo="test/repo",
+        )
+        mock_repo_host.prs["123-feature"] = [
+            PRInfo(
+                number=456,
+                title="PR",
+                url="https://github.com/test/repo/pull/456",
+                branch="123-feature",
+                body="Closes #123",
+                state="open",
+                labels=["needs-code-review"],
+                head_sha="c" * 40,
+            )
+        ]
+        launcher_bundle = _build_launcher_bundle(
+            sample_config,
+            mock_events,
+            mock_repo_host,
+            mock_worktree_manager,
+            mock_working_copy,
+            mock_command_runner,
+            publication_verdict=verdict_with_no_evidence(),
+        )
+        review = PendingReview(
+            issue_key=GitHubIssueKey(repo="test/repo", external_id="123"),
+            pr_number=456,
+            pr_url="https://github.com/test/repo/pull/456",
+            branch_name="123-feature",
+            _issue_number=123,
+        )
+
+        result = launcher_bundle.launcher.launch_review_session(
+            review, active_sessions=[]
+        )
+
+        assert result.success is False
         assert launcher_bundle.create_session_calls == []
 
     def test_review_existing_work_includes_keep_current_note(
@@ -7947,6 +8142,7 @@ class TestStackRelaunchGate:
             dependency_evaluator=self._CannedWorkEvaluator(report_fn),
             board_snapshot_provider=NullBoardSnapshotProvider(),
             agent_callback_endpoint=ready_callback_endpoint(),
+            publication_verdict=verdict_with_no_evidence(),
         )
 
     @pytest.fixture

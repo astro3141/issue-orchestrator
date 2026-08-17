@@ -93,12 +93,45 @@ holds the candidate's canonical issue key.
   `Attempt(issue, A)` as the first attempt's evidence. Locators persisted
   before [#85] have no key on them and republish receipt-less, as they did
   before.
-- The **manual-reprocess** route holds only an issue *number* from a URL path.
-  It runs the gate, records no receipt, and logs that it did not.
+- The **manual resume** route (`POST /api/issues/{n}/resume`) starts from an
+  issue *number* in a URL path, so it fetches the authoritative issue and
+  derives the canonical key from that. It re-drives ordinary completion
+  processing — the same processor the live path runs, and a path that can end
+  in a review — so a run it drives has to be able to leave a receipt. When the
+  issue cannot be read it declines the request rather than proceeding
+  key-less.
 
 No path writes a receipt under a *derived* identity. Reversing a work-item
 number back into a key is the drift [#40] removed, and a receipt filed under a
-key nothing else uses is worse than no receipt at all.
+key nothing else uses is worse than no receipt at all. That is why resume asks
+the repository instead of reusing the display-title lookup, which answers with
+the placeholder `Issue #<n>` when nothing responds.
+
+### What the receipt authorizes
+
+The receipt exists to be read, and [#45] is what reads it: review admission
+requires that the PR's **current** head SHA have a receipt certifying the
+publication contract passed for that exact commit. `PublicationVerdictReader`
+is the one collaborator the PR scanner, startup recovery and the launcher all
+consult, so none of them can admit a candidate on evidence the others would
+reject. See [Review workflow](../development/REVIEW_WORKFLOW.md) for the
+admission rules themselves.
+
+Which makes "did a receipt get filed for the commit we published" a
+publication-side obligation, and two shapes have to be closed there rather
+than at the reader:
+
+- A **non-fast-forward push retry** rebases before it pushes, so the commit it
+  publishes is not the commit the gate ran against. The retry re-runs the
+  publish contract on the rewritten HEAD before pushing. Passing files the
+  receipt for the published commit; failing refuses the publication, and
+  nothing is pushed.
+- A run whose **own profile defines no `publish.cmd`**, in a repository where
+  another profile does, could never file a receipt while admission would
+  always demand one. The gate refuses such a candidate — naming the profile —
+  instead of publishing something no review could ever be launched for. This
+  is only ever asked of a completion that offers its work as a change, so a
+  reviewer or tech lead profile with no publish command is unaffected.
 
 ## Worktree readiness is a precondition of a meaningful verdict
 

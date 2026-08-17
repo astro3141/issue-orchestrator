@@ -879,6 +879,7 @@ def build_test_orchestrator_deps(
     from issue_orchestrator.control.board_snapshot_builder import BoardSnapshotBuilder
     from issue_orchestrator.control.orchestrator_deps import OrchestratorDeps
     from issue_orchestrator.entrypoints.bootstrap_completion import (
+        _validation_attempt_key_factory,
         build_completion_handler_factory,
     )
     from issue_orchestrator.entrypoints.bootstrap_operator_commands import (
@@ -923,9 +924,20 @@ def build_test_orchestrator_deps(
     # ledger to latch into, so restart durability (#51) is proved against the
     # composition root instead.
     from issue_orchestrator.control.publication_authority import (
+        PublicationVerdictReader,
         UnrecordedRefusals,
     )
     unrecorded_refusals = UnrecordedRefusals.process_local()
+    # The whole verdict, over the same attempt store the rest of the rig writes
+    # to, so a receipt a test files really is the one admission reads (#45).
+    shared_attempt_store = create_attempt_store(config)
+    publication_verdict = PublicationVerdictReader.over(
+        unrecorded_refusals,
+        shared_attempt_store,
+        # The production factory, so the rig identifies a candidate exactly as
+        # the gate that files its receipt does (#45 A1).
+        _validation_attempt_key_factory(config),
+    )
 
     completion_processor = CompletionProcessor(
         agent_callback_endpoint=agent_callback_endpoint,
@@ -937,7 +949,7 @@ def build_test_orchestrator_deps(
         review_exchange_runner=PersistentReviewExchangeRunner(
             session_output,
             InMemoryPersistentExchangePairRegistry(),
-            AttemptExecutionIdentityStore(create_attempt_store(config)),
+            AttemptExecutionIdentityStore(shared_attempt_store),
         ),
         label_config={
             "blocked": config.get_label_blocked(),
@@ -964,7 +976,7 @@ def build_test_orchestrator_deps(
         config=config,
         repository=repo_host,
         events=events,
-        unrecorded_refusals=unrecorded_refusals,
+        publication_verdict=publication_verdict,
     )
     fresh_reader = MagicMock()
     fresh_reader.read_issue_labels.return_value = []
@@ -1037,7 +1049,7 @@ def build_test_orchestrator_deps(
 
     label_manager = LabelManager(config)
     label_store = LabelStore(config.repo_root / ".issue-orchestrator" / "label_store.sqlite")
-    attempt_store = create_attempt_store(config)
+    attempt_store = shared_attempt_store
     from issue_orchestrator.infra.tech_lead_authority_store import (
         SqliteTechLeadAuthorityStore,
     )
@@ -1078,9 +1090,9 @@ def build_test_orchestrator_deps(
         timeline_writer=timeline_writer,
         goal_pilot_store=goal_pilot_store,
         attempt_store=attempt_store,
+        publication_verdict=publication_verdict,
         tech_lead_authority=tech_lead_authority,
         open_issue_corpus=open_issue_corpus,
-        unrecorded_refusals=unrecorded_refusals,
     )
 
     from issue_orchestrator.execution.json_publish_retry_locator_store import (
@@ -1171,7 +1183,7 @@ def build_test_orchestrator_deps(
             agent_callback_endpoint=agent_callback_endpoint,
             provider_readiness_probe=readiness_probe,
             needs_human_block=needs_human_block,
-            unrecorded_refusals=unrecorded_refusals,
+            publication_verdict=publication_verdict,
         ),
         # Same shape again for the completion handler (#6999 A4).
         completion_handler_factory=build_completion_handler_factory(

@@ -67,6 +67,7 @@ from issue_orchestrator.ports.working_copy import (
 )
 from issue_orchestrator.domain.events import EventBus, SessionEvent
 from issue_orchestrator.infra.issue_diagnostics import DiagnosticReference
+from tests.unit.publication_evidence_helpers import verdict_with_no_evidence
 from tests.unit.session_run_helpers import make_session_run_assets
 
 
@@ -3444,6 +3445,266 @@ class TestCompletionProcessorGitActions:
         assert any("ambiguous_stack_base" in e for e in result.errors)
 
 
+HEAD_BEFORE_REBASE = "1111111111111111111111111111111111111111"
+HEAD_AFTER_REBASE = "2222222222222222222222222222222222222222"
+PUBLISH_CONTRACT_CMD = "run-the-publish-contract"
+
+
+class _JournallingCommandRunner:
+    """Runs commands, returning one caller-supplied exit code per invocation."""
+
+    def __init__(self, exit_codes, journal: list[str]) -> None:
+        self._exit_codes = list(exit_codes)
+        self._journal = journal
+        self.commands: list[str] = []
+
+    def run(self, command, *, cwd=None, env=None, timeout_seconds=None, shell=False):
+        self.commands.append(command)
+        self._journal.append("publish-contract")
+        index = min(len(self.commands), len(self._exit_codes)) - 1
+        return SimpleNamespace(
+            returncode=self._exit_codes[index],
+            stdout="",
+            stderr="",
+            timed_out=False,
+        )
+
+
+class _MovingHead:
+    """A working copy whose HEAD is whatever the branch was last rewritten to."""
+
+    def __init__(self, head_sha: str) -> None:
+        self.head_sha = head_sha
+
+    def get_head_sha(self, worktree) -> str:
+        return self.head_sha
+
+
+class TestPushRetryRepublicationGate:
+    """A rebased push publishes a commit the first gate run never saw (#45).
+
+    The publication gate runs before any action executes, against the HEAD the
+    completion started from, and files its receipt under that commit. A
+    non-fast-forward push retry then rebases, which rewrites HEAD — so without
+    a second gate run the orchestrator would push a commit nothing validated,
+    open a PR at it, and leave review admission asking forever for a receipt
+    that could not exist. These drive that exact path, with the real gate, and
+    ask review admission itself whether the published head is admissible.
+    """
+
+    @pytest.fixture
+    def journal(self) -> list[str]:
+        """Every gate run, push and rebase, in the order they happened."""
+        return []
+
+    @pytest.fixture
+    def head(self) -> _MovingHead:
+        return _MovingHead(HEAD_BEFORE_REBASE)
+
+    @pytest.fixture
+    def rebasing_git_adapter(self, mock_git_adapter, head, journal):
+        def push(worktree, skip_hooks=False):
+            journal.append("push")
+            if len([entry for entry in journal if entry == "push"]) == 1:
+                return PushResult(
+                    success=False,
+                    branch="issue-123",
+                    remote="origin",
+                    message="Updates were rejected (non-fast-forward)",
+                )
+            return PushResult(
+                success=True, branch="issue-123", remote="origin", message="Pushed"
+            )
+
+        def rebase(worktree, target):
+            journal.append("rebase")
+            head.head_sha = HEAD_AFTER_REBASE
+            return SimpleNamespace(
+                success=True, message="Rebased", conflicts=[], aborted=False
+            )
+
+        mock_git_adapter.push = Mock(side_effect=push)
+        mock_git_adapter.rebase_on_branch = Mock(side_effect=rebase)
+        return mock_git_adapter
+
+    @staticmethod
+    def _registry():
+        from issue_orchestrator.infra.config_models import (
+            PublishValidationConfig,
+            ValidationConfig,
+        )
+        from issue_orchestrator.infra.validation_profiles import (
+            ValidationProfileRegistry,
+        )
+
+        return ValidationProfileRegistry(
+            ValidationConfig(
+                publish=PublishValidationConfig(cmd=PUBLISH_CONTRACT_CMD)
+            )
+        )
+
+    def _processor(
+        self,
+        *,
+        exit_codes,
+        journal,
+        head,
+        git_adapter,
+        label_adapter,
+        pr_adapter,
+        attempt_store,
+    ):
+        from issue_orchestrator.control.publication_gate import (
+            build_publication_gate,
+        )
+        from issue_orchestrator.entrypoints.bootstrap_completion import (
+            _validation_attempt_key_factory,
+        )
+
+        gate = build_publication_gate(
+            session_output=FileSystemSessionOutput(),
+            profiles=self._registry(),
+            command_runner=_JournallingCommandRunner(exit_codes, journal),
+            working_copy=head,
+            attempt_store=attempt_store,
+            attempt_keys=_validation_attempt_key_factory(Config()),
+        )
+        return CompletionProcessor(
+            agent_callback_endpoint=ready_callback_endpoint(),
+            label_adapter=label_adapter,
+            pr_adapter=pr_adapter,
+            git_adapter=git_adapter,
+            publication_gate=gate,
+            session_output=FileSystemSessionOutput(),
+        )
+
+    @staticmethod
+    def _certification(attempt_store, issue_key, head_sha):
+        from issue_orchestrator.control.publication_evidence import (
+            CandidatePublicationEvidence,
+        )
+        from issue_orchestrator.entrypoints.bootstrap_completion import (
+            _validation_attempt_key_factory,
+        )
+
+        return CandidatePublicationEvidence(
+            attempt_store, _validation_attempt_key_factory(Config())
+        ).certification(
+            issue_key=issue_key,
+            head_sha=head_sha,
+            profiles=TestPushRetryRepublicationGate._registry(),
+        )
+
+    def test_the_rebased_commit_is_certified_before_it_is_pushed(
+        self,
+        rebasing_git_adapter,
+        head,
+        journal,
+        mock_label_adapter,
+        mock_pr_adapter,
+        worktree_with_completion,
+    ):
+        """The published head — not the pre-rebase one — carries the receipt."""
+        from issue_orchestrator.domain.issue_key import FakeIssueKey
+        from tests.unit.publication_evidence_helpers import InMemoryAttemptStore
+
+        attempt_store = InMemoryAttemptStore()
+        issue_key = FakeIssueKey(name="123")
+        worktree = worktree_with_completion(make_record(
+            outcome=CompletionOutcome.COMPLETED,
+            requested_actions=[
+                RequestedAction.PUSH_BRANCH,
+                RequestedAction.CREATE_PR,
+            ],
+        ))
+        processor = self._processor(
+            exit_codes=[0, 0],
+            journal=journal,
+            head=head,
+            git_adapter=rebasing_git_adapter,
+            label_adapter=mock_label_adapter,
+            pr_adapter=mock_pr_adapter,
+            attempt_store=attempt_store,
+        )
+
+        result = processor.process(
+            worktree,
+            run_assets=make_session_run_assets(worktree),
+            issue_number=123,
+            issue_title="Test",
+            issue_key=issue_key,
+        )
+
+        assert result.success
+        # No push follows a rebase without a gate run in between. Asserted as
+        # the whole sequence rather than as call counts, because "the gate ran
+        # twice" is satisfied by a gate that ran twice before the rebase.
+        assert journal == [
+            "publish-contract",
+            "push",
+            "rebase",
+            "publish-contract",
+            "push",
+        ]
+        # And the fact review admission actually reads: the commit that
+        # reached the remote is the one carrying a passing receipt.
+        assert self._certification(
+            attempt_store, issue_key, HEAD_AFTER_REBASE
+        ).admitted is True
+        mock_pr_adapter.create_pr.assert_called_once()
+
+    def test_a_rebased_commit_the_gate_rejects_is_never_published(
+        self,
+        rebasing_git_adapter,
+        head,
+        journal,
+        mock_label_adapter,
+        mock_pr_adapter,
+        worktree_with_completion,
+    ):
+        """Refused loudly, and refused before the push — not after the PR."""
+        from issue_orchestrator.domain.issue_key import FakeIssueKey
+        from tests.unit.publication_evidence_helpers import InMemoryAttemptStore
+
+        attempt_store = InMemoryAttemptStore()
+        issue_key = FakeIssueKey(name="123")
+        worktree = worktree_with_completion(make_record(
+            outcome=CompletionOutcome.COMPLETED,
+            requested_actions=[
+                RequestedAction.PUSH_BRANCH,
+                RequestedAction.CREATE_PR,
+            ],
+        ))
+        processor = self._processor(
+            exit_codes=[0, 1],
+            journal=journal,
+            head=head,
+            git_adapter=rebasing_git_adapter,
+            label_adapter=mock_label_adapter,
+            pr_adapter=mock_pr_adapter,
+            attempt_store=attempt_store,
+        )
+
+        result = processor.process(
+            worktree,
+            run_assets=make_session_run_assets(worktree),
+            issue_number=123,
+            issue_title="Test",
+            issue_key=issue_key,
+        )
+
+        assert result.success is False
+        assert result.failure_kind == "validation_failed"
+        assert journal == ["publish-contract", "push", "rebase", "publish-contract"]
+        mock_pr_adapter.create_pr.assert_not_called()
+        mock_label_adapter.add_label.assert_any_call(123, "validation-failed")
+        certification = self._certification(
+            attempt_store, issue_key, HEAD_AFTER_REBASE
+        )
+        assert certification.admitted is False
+        assert certification.reason == "publication_verdict_not_passed"
+
+
 class TestCompletionProcessorValidation:
     """Tests for validation logic."""
 
@@ -4294,7 +4555,7 @@ class TestCompletionProcessorPublishGate:
             config=config,
             label_manager=LabelManager(config),
             issue=SimpleNamespace(number=123, labels=["agent:backend"]),
-            unrecorded_refusals=unrecorded,
+            publication_verdict=verdict_with_no_evidence(unrecorded=unrecorded),
             pr=PRInfo(
                 number=41,
                 title="PR",
