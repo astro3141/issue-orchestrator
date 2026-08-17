@@ -33,6 +33,9 @@ from issue_orchestrator.control.publication_gate import (
     RunValidationContracts,
 )
 from issue_orchestrator.control.publication_verdict import PublicationVerdictReceipts
+from issue_orchestrator.control.publish_gate_diagnostics import (
+    PublishGateDiagnostics,
+)
 from issue_orchestrator.domain.attempt import Attempt, AttemptKey
 from issue_orchestrator.domain.execution_identity import (
     AgentExecutionIdentity,
@@ -145,6 +148,9 @@ def _gate(
         verdicts=PublicationVerdictReceipts(
             SidecarAttemptStore(repo_root), StubAttemptKeys()
         ),
+        # Durable failure output lands in the same root the receipts do (#94);
+        # these proofs are about the receipt, not about that artefact.
+        diagnostics=PublishGateDiagnostics(repo_root),
     )
 
 

@@ -35,6 +35,13 @@ every run of the publish contract also files a durable verdict receipt on
 producer seam for that fact because it is the only thing that knows the
 contract it just executed; a caller reconstructing the verdict from the
 outcome would be a second place that decides what the gate decided.
+
+The receipt states *what* the gate decided. A run that FAILS also has to leave
+*why*, and for the same reason: its stdout and stderr are in the run directory
+that cleanup reaps. So a failing run's output is written to a durable
+destination as well (#94) — see :mod:`.publish_gate_diagnostics`. The two are
+deliberately asymmetric in what they authorize: the receipt is read by
+admission, the diagnostic is read by people.
 """
 
 from __future__ import annotations
@@ -56,6 +63,10 @@ from ..ports.attempt_store import AttemptStore
 from ..ports.session_output import SessionOutput, ValidationRecord
 from ..ports.validation_attempt_key_factory import ValidationAttemptKeyFactory
 from .publication_verdict import PublicationVerdictReceipts
+from .publish_gate_diagnostics import (
+    CandidateGateDiagnostics,
+    PublishGateDiagnostics,
+)
 from .validation import GateEvidence, ValidationGate
 
 logger = logging.getLogger(__name__)
@@ -152,6 +163,7 @@ def build_publication_gate(
     working_copy: WorkingCopy,
     attempt_store: AttemptStore,
     attempt_keys: ValidationAttemptKeyFactory,
+    repo_root: Path,
 ) -> "PublicationGate":
     """The one way to assemble the publication gate.
 
@@ -163,12 +175,16 @@ def build_publication_gate(
     ``attempt_store`` and ``attempt_keys`` are required, not optional: a gate
     built without them would run the publish contract and leave no durable
     trace of what it decided, which is the defect #85 exists to close.
+    ``repo_root`` is required for the same reason one step further: without it
+    the gate would record *that* a candidate failed and destroy the only
+    account of *why* along with the worktree, which is #94's defect.
     """
     return PublicationGate(
         contracts=RunValidationContracts(session_output, profiles),
         command_runner=command_runner,
         working_copy=working_copy,
         verdicts=PublicationVerdictReceipts(attempt_store, attempt_keys),
+        diagnostics=PublishGateDiagnostics(repo_root),
     )
 
 
@@ -197,11 +213,13 @@ class PublicationGate:
         command_runner: CommandRunner,
         working_copy: WorkingCopy,
         verdicts: PublicationVerdictReceipts,
+        diagnostics: PublishGateDiagnostics,
     ) -> None:
         self._contracts = contracts
         self._command_runner = command_runner
         self._working_copy = working_copy
         self._verdicts = verdicts
+        self._diagnostics = diagnostics
 
     def check(
         self,
@@ -255,6 +273,7 @@ class PublicationGate:
             command_runner=self._command_runner,
             working_copy=self._working_copy,
             contract=contract,
+            failure_diagnostics=self._failure_diagnostics_for(contract, issue_key),
         )
         # One local for both: the directory the gate runs into is the
         # directory the outcome reports. There is no second expression that
@@ -328,6 +347,39 @@ class PublicationGate:
                 ),
             ),
         )
+
+    def _failure_diagnostics_for(
+        self,
+        contract: ValidationGateContract,
+        issue_key: IssueKey | None,
+    ) -> CandidateGateDiagnostics | None:
+        """The durable destination a failing run's output is written to (#94).
+
+        Bound to the candidate's issue identity before the command runs, so the
+        write happens at gate-execution time rather than being reconstructed
+        from the outcome afterwards — the copy that races worktree cleanup, and
+        loses.
+
+        An unconfigured contract executes nothing, so there is no output to
+        keep and nothing is degraded by having no destination for it.
+
+        ``None`` where there is no canonical issue identity, which is the same
+        answer :meth:`_record_verdict` gives and for the same reason: the
+        artefact is bound to ``(issue, A)``, and one filed under an identity
+        nothing else uses could not be found from the receipt. Warned about
+        here rather than silently, because the consequence — a failure nobody
+        can explain afterwards — is exactly what #94 exists to prevent.
+        """
+        if not contract.configured:
+            return None
+        if issue_key is None:
+            logger.warning(
+                "Publish gate failure output will not be kept durably: no "
+                "canonical issue identity for this run, so a failure's "
+                "explanation dies with the worktree"
+            )
+            return None
+        return self._diagnostics.for_candidate(issue_key)
 
     def _record_verdict(
         self,

@@ -3,15 +3,13 @@
 from __future__ import annotations
 
 import json
-import re
 from collections.abc import Callable
 from pathlib import Path
 
 from ..domain.attempt import Attempt, AttemptKey
 from ..domain.issue_key import IssueKey
+from ..domain.issue_key_codec import issue_key_path_part
 from ..infra.atomic_json import atomic_write_json
-
-_SAFE_PART_RE = re.compile(r"[^A-Za-z0-9_.-]+")
 
 
 class SidecarAttemptStore:
@@ -81,11 +79,11 @@ def _names_same_attempt(left: AttemptKey, right: AttemptKey) -> bool:
 
 
 def _issue_part(issue_key: IssueKey) -> str:
-    return _safe_part(f"{issue_key.scope()}--{issue_key.stable_id()}")
+    """The candidate's name on disk, in the one spelling every artifact uses.
 
-
-def _safe_part(value: str) -> str:
-    safe = _SAFE_PART_RE.sub("-", value.strip())
-    if not safe:
-        raise ValueError("attempt path component must be non-empty")
-    return safe
+    Shared with the publish gate's durable failure diagnostic (#94) rather than
+    respelled here: that diagnostic and this sidecar are evidence about the same
+    ``(issue, commit)``, and a reader who has found one has to be able to find
+    the other by name.
+    """
+    return issue_key_path_part(issue_key)
