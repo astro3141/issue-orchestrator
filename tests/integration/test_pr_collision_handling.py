@@ -14,7 +14,12 @@ from pathlib import Path
 from unittest.mock import Mock, MagicMock, patch
 
 from issue_orchestrator.infra.config import Config, DangerousConfig
-from tests.unit.publication_evidence_helpers import verdict_with_no_evidence
+from tests.unit.publication_evidence_helpers import (
+    configure_publication_contract,
+    publication_receipt,
+    verdict_with,
+    verdict_with_no_evidence,
+)
 from issue_orchestrator.domain.models import (
     Issue,
     Session,
@@ -320,6 +325,53 @@ class TestPRScannerSessionFiltering:
             already_queued=[],
             active_sessions=[],
         )
+
+        assert len(results) == 1
+        assert results[0].pr_number == 42
+
+    def test_scanner_finds_orphaned_pr_through_a_real_publication_receipt(
+        self, test_config, mock_repository_scanner, mock_event_sink
+    ):
+        """The same collision path, in the gated shape rather than the exempt one.
+
+        The tests around this one run against a repository that configures no
+        publish command, so admission lets their PRs through because there is
+        no publication contract at all — which proves the session filtering
+        they are about, but never exercises it beside a real receipt. This one
+        configures the contract and files a passing receipt for the PR's own
+        head, so the orphan is found the way production finds one (#45).
+        """
+        configure_publication_contract(test_config)
+        head_sha = "a" * 40
+        issue = Issue(
+            number=123, title="Test issue", labels=["agent:backend"], body=""
+        )
+        mock_repository_scanner.get_issue = Mock(return_value=issue)
+        mock_repository_scanner.get_prs_with_label = Mock(
+            return_value=[
+                PRInfo(
+                    number=42,
+                    title="Test PR",
+                    url="https://...",
+                    branch="issue-123",
+                    body="Closes #123",
+                    state="open",
+                    labels=["needs-code-review"],
+                    head_sha=head_sha,
+                )
+            ]
+        )
+
+        scanner = PRScanner(
+            config=test_config,
+            repository=mock_repository_scanner,
+            events=mock_event_sink,
+            publication_verdict=verdict_with(
+                (issue.key, publication_receipt(head_sha))
+            ),
+        )
+
+        results = scanner.scan_for_reviews(already_queued=[], active_sessions=[])
 
         assert len(results) == 1
         assert results[0].pr_number == 42

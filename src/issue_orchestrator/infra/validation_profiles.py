@@ -251,6 +251,15 @@ class ValidationProfileRegistry:
         evidence of a gate the configuration does not define would block every
         review in such a repository forever, so the requirement attaches to
         repositories that actually have a publication contract.
+
+        Repository-wide is the right granularity for the *reader* because a
+        PR does not say which profile produced it — the receipt is the only
+        thing that would. The gate asks the same question on the producing
+        side, where the run's own frozen profile is known, and refuses a
+        candidate this property would demand a receipt for while its own
+        profile could never file one (``PublicationGate.
+        _uncertifiable_candidate``). So "any profile has a contract" and "this
+        candidate could have been certified" never come apart.
         """
         return any(profile.publish.cmd for profile in self._profiles.values())
 

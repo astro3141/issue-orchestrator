@@ -23,6 +23,7 @@ import traceback
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from functools import partial
 from pathlib import Path
 from typing import Any, TYPE_CHECKING
 
@@ -106,6 +107,7 @@ from .completion_types import (
     ERROR_PREFIX_PUBLISH_BLOCKED,
     ERROR_PREFIX_PUSH,
     ProcessingResult,
+    RepublicationCheck,
     REVIEW_EXCHANGE_ERROR_PREFIX,
 )
 from .pre_publish_gate import PrePublishGate, PrePublishGateResult
@@ -835,6 +837,7 @@ class CompletionProcessor:
             errors=errors,
             error_details=error_details,
             run_assets=run_assets,
+            issue_key=issue_key,
         )
         if early_result is not None:
             return early_result
@@ -1614,6 +1617,7 @@ class CompletionProcessor:
         errors: list[str],
         error_details: list[dict[str, Any]],
         run_assets: SessionRunAssets,
+        issue_key: "IssueKey | None",
     ) -> tuple[str | None, str | None, bool, bool, ProcessingResult | None]:
         """Execute all requested actions from completion record.
 
@@ -1676,7 +1680,12 @@ class CompletionProcessor:
         if pre_publish_failure is not None:
             return branch, pr_url, review_exchange_completed, False, pre_publish_failure
 
-        branch, pr_url, review_exchange_completed = self._execute_planned_actions(
+        (
+            branch,
+            pr_url,
+            review_exchange_completed,
+            action_result,
+        ) = self._execute_planned_actions(
             plan=plan,
             worktree=worktree,
             record=record,
@@ -1692,8 +1701,14 @@ class CompletionProcessor:
             exchange_mode=exchange_mode,
             exchange_result=exchange_result,
             review_exchange_completed=review_exchange_completed,
+            # Bound here because this is where the run is owned: the retry can
+            # then re-run the very same check for the commit it rewrote (#45).
+            recertify_rewritten_head=partial(
+                self._check_publish_gate_if_required,
+                worktree, record, issue_number, run_assets, issue_key,
+            ),
         )
-        return branch, pr_url, review_exchange_completed, False, None
+        return branch, pr_url, review_exchange_completed, False, action_result
 
     def _execute_planned_actions(
         self,
@@ -1713,8 +1728,10 @@ class CompletionProcessor:
         exchange_mode: str | None,
         exchange_result: Any | None,
         review_exchange_completed: bool,
-    ) -> tuple[str | None, str | None, bool]:
+        recertify_rewritten_head: RepublicationCheck,
+    ) -> tuple[str | None, str | None, bool, ProcessingResult | None]:
         pr_url: str | None = None
+        early_result: ProcessingResult | None = None
 
         for action in plan.ordered_actions:
             result = self._execute_action_with_observability(
@@ -1732,6 +1749,7 @@ class CompletionProcessor:
                 error_details=error_details,
                 exchange_mode=exchange_mode,
                 exchange_result=exchange_result,
+                recertify_rewritten_head=recertify_rewritten_head,
             )
             if result is None:
                 continue
@@ -1741,6 +1759,8 @@ class CompletionProcessor:
                 pr_url = result.pr_url
             if result.review_exchange_completed:
                 review_exchange_completed = True
+            if result.early_result is not None:
+                early_result = result.early_result
             if result.skip_remaining:
                 continue
             if result.halt:
@@ -1749,7 +1769,7 @@ class CompletionProcessor:
                     issue_number,
                 )
                 break
-        return branch, pr_url, review_exchange_completed
+        return branch, pr_url, review_exchange_completed, early_result
 
     def _execute_action_with_observability(
         self,
@@ -1768,6 +1788,7 @@ class CompletionProcessor:
         error_details: list[dict[str, Any]],
         exchange_mode: str | None,
         exchange_result: Any | None,
+        recertify_rewritten_head: RepublicationCheck,
     ) -> "_ActionResult | None":
         action_start = time.monotonic()
         logger.info("Executing action: %s for issue #%d", action.value, issue_number)
@@ -1795,6 +1816,7 @@ class CompletionProcessor:
                 error_details=error_details,
                 exchange_mode=exchange_mode,
                 exchange_result=exchange_result,
+                recertify_rewritten_head=recertify_rewritten_head,
             )
         except Exception as e:
             # A clean tech_lead audit has nothing to publish; that is success,
@@ -1850,6 +1872,9 @@ class CompletionProcessor:
         branch: str | None = None  # Updated branch name
         pr_url: str | None = None  # PR URL if created
         review_exchange_completed: bool = False
+        # The completion's whole outcome, when an action refused publication
+        # rather than merely failing: reported as the gate failure it is (#45).
+        early_result: "ProcessingResult | None" = None
 
     def _execute_single_action(
         self,
@@ -1868,6 +1893,7 @@ class CompletionProcessor:
         error_details: list[dict[str, Any]],
         exchange_mode: str | None,
         exchange_result: Any | None,
+        recertify_rewritten_head: RepublicationCheck,
     ) -> "_ActionResult":
         """Execute a single action and return the result."""
         if action == RequestedAction.PUSH_BRANCH:
@@ -1878,6 +1904,7 @@ class CompletionProcessor:
                 actions_taken,
                 errors,
                 error_details,
+                recertify_rewritten_head=recertify_rewritten_head,
             )
         elif action == RequestedAction.CREATE_PR:
             return self._execute_create_pr_action(
@@ -2035,6 +2062,7 @@ class CompletionProcessor:
         errors: list[str],
         error_details: list[dict[str, Any]],
         *,
+        recertify_rewritten_head: RepublicationCheck,
         skip_hooks: bool = False,
     ) -> "_ActionResult":
         """Execute push branch action."""
@@ -2048,9 +2076,20 @@ class CompletionProcessor:
         # Handle push failure with potential rebase retry
         retry_result: PushResult | None = None
         if self._push_rebase_retry and self._is_non_fast_forward(result.message):
-            retry_result = self._attempt_rebase_and_retry_push(
-                worktree, issue_number, action, actions_taken, errors, error_details, skip_hooks
+            retry_result, refused = self._attempt_rebase_and_retry_push(
+                worktree,
+                issue_number,
+                action,
+                actions_taken,
+                errors,
+                error_details,
+                skip_hooks,
+                recertify_rewritten_head=recertify_rewritten_head,
             )
+            if refused is not None:
+                # The rebase produced a commit the publication gate rejected,
+                # so nothing was pushed. Reported as the gate failure it is.
+                return self._ActionResult(halt=True, early_result=refused)
 
         if retry_result and retry_result.success:
             actions_taken.append("Pushed branch to remote after rebase")
@@ -2124,14 +2163,26 @@ class CompletionProcessor:
         errors: list[str],
         error_details: list[dict[str, Any]],
         skip_hooks: bool,
-    ) -> PushResult | None:
-        """Attempt to rebase and retry push after non-fast-forward failure."""
+        *,
+        recertify_rewritten_head: RepublicationCheck,
+    ) -> tuple[PushResult | None, ProcessingResult | None]:
+        """Attempt to rebase and retry push after non-fast-forward failure.
+
+        Returns ``(push_result, refusal)``. A rebase rewrites the branch, so
+        the commit this would push is *not* the one the publication gate
+        certified before the actions ran, and nothing else ever would — the
+        gate only runs inside a completion. Publishing it anyway is the
+        ordering violation #45 closes, and admission would then ask forever
+        for a receipt naming a head no gate ever saw. So the rewritten commit
+        goes through the same publish contract first; ``refusal`` is
+        non-``None`` when it did not pass, and then nothing is pushed.
+        """
         if self.git_adapter.has_uncommitted_changes(worktree):
             logger.warning(
                 "Push retry skipped due to uncommitted changes: issue=%s",
                 issue_number,
             )
-            return None
+            return None, None
 
         # Pick the rebase base through the stack base owner: a stack successor
         # rebases onto its predecessor branch (never the default base), and a
@@ -2140,7 +2191,7 @@ class CompletionProcessor:
             issue_number, action, errors, error_details
         )
         if halt:
-            return None
+            return None, None
 
         rebase_result = self.git_adapter.rebase_on_branch(
             worktree,
@@ -2148,7 +2199,17 @@ class CompletionProcessor:
         )
         if rebase_result.success:
             actions_taken.append(f"Rebased onto origin/{rebase_base}")
-            return self.git_adapter.push(worktree, skip_hooks=skip_hooks)
+            refusal = recertify_rewritten_head()
+            if refusal is not None:
+                # No `errors` entry: the refusal travels as the completion's
+                # whole typed result, and an entry would file a gate refusal
+                # under the push prefix the publish-retry lane reads.
+                logger.warning(
+                    "Rebased candidate refused for #%d; nothing pushed: %s",
+                    issue_number, refusal.message,
+                )
+                return None, refusal
+            return self.git_adapter.push(worktree, skip_hooks=skip_hooks), None
 
         errors.append(f"{ERROR_PREFIX_PUSH}: Rebase failed: {rebase_result.message}")
         error_details.append({
@@ -2158,7 +2219,7 @@ class CompletionProcessor:
             "conflicts": rebase_result.conflicts,
             "aborted": rebase_result.aborted,
         })
-        return None
+        return None, None
 
     def _resolve_publish_base(
         self,

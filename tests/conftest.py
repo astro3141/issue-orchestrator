@@ -879,6 +879,7 @@ def build_test_orchestrator_deps(
     from issue_orchestrator.control.board_snapshot_builder import BoardSnapshotBuilder
     from issue_orchestrator.control.orchestrator_deps import OrchestratorDeps
     from issue_orchestrator.entrypoints.bootstrap_completion import (
+        _validation_attempt_key_factory,
         build_completion_handler_factory,
     )
     from issue_orchestrator.entrypoints.bootstrap_operator_commands import (
@@ -931,7 +932,11 @@ def build_test_orchestrator_deps(
     # to, so a receipt a test files really is the one admission reads (#45).
     shared_attempt_store = create_attempt_store(config)
     publication_verdict = PublicationVerdictReader.over(
-        unrecorded_refusals, shared_attempt_store
+        unrecorded_refusals,
+        shared_attempt_store,
+        # The production factory, so the rig identifies a candidate exactly as
+        # the gate that files its receipt does (#45 A1).
+        _validation_attempt_key_factory(config),
     )
 
     completion_processor = CompletionProcessor(

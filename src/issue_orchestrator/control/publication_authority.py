@@ -65,6 +65,7 @@ if TYPE_CHECKING:
     from ..domain.issue_key import IssueKey
     from ..infra.validation_profiles import ValidationProfileRegistry
     from ..ports.attempt_store import AttemptStore
+    from ..ports.validation_attempt_key_factory import ValidationAttemptKeyFactory
     from .label_manager import LabelManager
 
 logger = logging.getLogger(__name__)
@@ -223,16 +224,24 @@ class PublicationVerdictReader:
 
     @classmethod
     def over(
-        cls, unrecorded: UnrecordedRefusals, attempts: "AttemptStore"
+        cls,
+        unrecorded: UnrecordedRefusals,
+        attempts: "AttemptStore",
+        attempt_keys: "ValidationAttemptKeyFactory",
     ) -> "PublicationVerdictReader":
         """Build the reader from the stores the verdict actually lives in.
 
         The composition root names the two durable homes — the refusal latch
-        and the attempt store — and nothing else. That the candidate half is
-        read by wrapping the attempt store is this module's business, not the
-        wiring's.
+        and the attempt store — plus the factory that says how a candidate is
+        identified within the latter, and nothing else. It is the same factory
+        the publication gate files receipts through, so the read and the write
+        cannot disagree about which attempt a candidate is. That the candidate
+        half is read by wrapping the attempt store is this module's business,
+        not the wiring's.
         """
-        return cls(unrecorded, CandidatePublicationEvidence(attempts))
+        return cls(
+            unrecorded, CandidatePublicationEvidence(attempts, attempt_keys)
+        )
 
     def refuses_issue(
         self,

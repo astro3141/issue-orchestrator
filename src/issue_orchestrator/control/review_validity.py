@@ -36,6 +36,17 @@ class ReviewValidity:
     issue_labels: tuple[str, ...] = ()
     pr_labels: tuple[str, ...] = ()
     blocking_labels: tuple[str, ...] = ()
+    candidate_uncertified: bool = False
+    """Whether the refusal was the *positive* rule, not a label-shaped one.
+
+    The label-shaped refusals all decay on their own: a block is lifted, a
+    rework finishes, a PR is reopened. This one does not — it says the commit
+    at the PR's head has no publication receipt, and only a new candidate can
+    change that. A PR the orchestrator did not create (a human-opened one
+    carrying the review trigger) will therefore wear this refusal forever, so
+    readers that report refusals announce this one rather than leaving it in a
+    console log nobody is watching (#45).
+    """
 
 
 @dataclass(frozen=True)
@@ -44,6 +55,7 @@ class _Refusal:
 
     reason: str
     blocking_labels: tuple[str, ...] = ()
+    candidate_uncertified: bool = False
 
 
 def _refuse_if(reason: str, refused: bool) -> _Refusal | None:
@@ -146,7 +158,9 @@ def _candidate_refusal(
         head_sha=pr.head_sha if pr is not None else None,
         profiles=config.validation_profiles(),
     )
-    return _refuse_if(certification.reason, not certification.admitted)
+    if certification.admitted:
+        return None
+    return _Refusal(certification.reason, candidate_uncertified=True)
 
 
 def evaluate_review_validity(
@@ -211,4 +225,5 @@ def evaluate_review_validity(
         issue_labels=issue_labels,
         pr_labels=pr_labels,
         blocking_labels=refusal.blocking_labels,
+        candidate_uncertified=refusal.candidate_uncertified,
     )

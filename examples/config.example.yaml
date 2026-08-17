@@ -287,6 +287,13 @@ validation:
   # name fails at config validation rather than at first use. The selected
   # profile is frozen for the run, recorded in the run manifest and validation
   # record, and included in the validation cache key.
+  #
+  # If any profile defines `publish.cmd`, every profile that publishes work for
+  # review needs one too: a review is admitted only on a publication receipt
+  # naming the PR's own head commit, and a profile with no publish contract can
+  # never file one. A completion that would publish under such a profile is
+  # refused, naming the profile to configure. Profiles used only by roles that
+  # never offer a change for review (reviewer, tech lead) are unaffected.
   # profiles:
   #   foundation:
   #     quick:

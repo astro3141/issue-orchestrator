@@ -58,6 +58,17 @@ def _bind_resume_run(
         },
     )
     mock_orch.deps.session_output = session_output
+    # A real work item, not the auto-mock the repository host would otherwise
+    # hand back: resume reads the issue's canonical key off this and refuses
+    # anything that is not an issue (#40/#45), so a stand-in that only looks
+    # like one under `getattr` would exercise the refusal path by accident.
+    # Tests about the refusal override this deliberately.
+    mock_orch.deps.repository_host.get_issue.return_value = Issue(
+        number=issue_number,
+        title=f"Issue {issue_number} authoritative title",
+        labels=["agent:test"],
+        body="",
+    )
     return _BoundResumeRun(run_assets=run_assets, completion_path=completion_path)
 
 
@@ -361,6 +372,40 @@ class TestResumeIssueEndpoint:
         mock_orch.deps.repository_host.get_issue.side_effect = RuntimeError(
             "GitHub unreachable"
         )
+
+        with patch(
+            "issue_orchestrator.entrypoints.control_api_issue_routes.get_worktree_path"
+        ) as mock_get_path:
+            mock_get_path.return_value = worktree
+
+            response = client.post(
+                "/api/issues/123/resume",
+                json={"run_dir": str(bound_run.run_assets.run_dir)},
+            )
+
+        assert response.status_code == 502
+        mock_orch.deps.completion_processor.process.assert_not_called()
+
+    def test_resume_declines_when_the_issue_read_returns_a_non_issue(
+        self, client_with_orchestrator, tmp_path
+    ):
+        """The port's answer is narrowed here as it is at the launch seam.
+
+        ``review_launch_validity`` already refuses to trust whatever
+        ``get_issue`` hands back without an ``isinstance`` check. Two readers of
+        one port must not disagree about what counts as an issue, and this one
+        goes straight on to read ``.key`` and ``.title`` off the result.
+        """
+        client, mock_orch = client_with_orchestrator
+
+        worktree = tmp_path / "repo-123"
+        worktree.mkdir()
+        bound_run = _bind_resume_run(mock_orch, worktree)
+        completion_path = worktree / bound_run.completion_path
+        completion_path.parent.mkdir(parents=True, exist_ok=True)
+        completion_path.write_text('{"outcome": "completed"}')
+
+        mock_orch.deps.repository_host.get_issue.return_value = object()
 
         with patch(
             "issue_orchestrator.entrypoints.control_api_issue_routes.get_worktree_path"

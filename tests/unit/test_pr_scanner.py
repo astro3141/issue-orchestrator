@@ -560,6 +560,59 @@ class TestScanForReviewsPublicationEvidence:
             "reason=publication_receipt_missing"
         ) in caplog.text
 
+    def test_an_uncertified_candidate_is_announced_not_only_logged(
+        self, mock_config, mock_repository, mock_events
+    ):
+        """This refusal does not decay, so it is not left in the console.
+
+        Every other reason the scanner drops a PR heals itself — a block is
+        lifted, a rework finishes. "The commit at this head was never gated"
+        only changes when a new candidate is gated, and a PR the orchestrator
+        did not open never gets one. So the UI hears about it.
+        """
+        config = self._gated(mock_config)
+        self._issue_and_pr(mock_repository, head_sha=self.CANDIDATE_A)
+        scanner = self._scanner(
+            config, mock_repository, mock_events, verdict_with_no_evidence()
+        )
+
+        scanner.scan_for_reviews(already_queued=[], active_sessions=[])
+
+        skipped = [
+            event
+            for event in mock_events.events
+            if str(event.name) == str(EventName.REVIEW_SKIPPED)
+        ]
+        assert len(skipped) == 1
+        assert skipped[0].data["pr_number"] == 100
+        assert skipped[0].data["issue_number"] == 42
+        assert (
+            skipped[0].data["reason"]
+            == "uncertified_candidate:publication_receipt_missing"
+        )
+
+    def test_a_self_healing_refusal_is_not_announced(
+        self, mock_config, mock_repository, mock_events
+    ):
+        """A blocked issue is a passing state; announcing it would cry wolf."""
+        config = self._gated(mock_config)
+        issue = self._issue_and_pr(mock_repository, head_sha=self.CANDIDATE_A)
+        issue.labels = ["blocked:provider-unavailable"]
+        scanner = self._scanner(
+            config,
+            mock_repository,
+            mock_events,
+            verdict_with((issue.key, publication_receipt(self.CANDIDATE_A))),
+        )
+
+        scanner.scan_for_reviews(already_queued=[], active_sessions=[])
+
+        assert [
+            event
+            for event in mock_events.events
+            if str(event.name) == str(EventName.REVIEW_SKIPPED)
+        ] == []
+
     def test_does_not_queue_a_head_the_receipt_does_not_name(
         self, mock_config, mock_repository, mock_events
     ):

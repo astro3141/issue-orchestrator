@@ -435,6 +435,102 @@ class TestTheRunsFrozenProfileSelectsTheContract:
         assert result.record is None
 
 
+class TestAProfileThatCouldNeverCertifyItsCandidate:
+    """The mixed shape: this profile has no publish contract, another does (#45).
+
+    Whether a receipt is *produced* is the run's own frozen profile's business;
+    whether one is *required* is the repository's, because a PR does not say
+    which profile made it. Where those two disagree the candidate is
+    uncertifiable: publication would succeed, the PR would open wearing the
+    review trigger, and every scan and every launch would refuse the review
+    with ``publication_receipt_missing`` forever — no label, no terminal state,
+    nothing to retry. The gate is the one place holding both facts, so it is
+    where the disagreement is refused.
+    """
+
+    @staticmethod
+    def _mixed_registry() -> ValidationProfileRegistry:
+        """``default`` gates publication; ``docs`` defines no publish command."""
+        return ValidationProfileRegistry(
+            ValidationConfig(
+                quick=ValidationCommandConfig(cmd=QUICK_SENTINEL),
+                publish=PublishValidationConfig(cmd=PUBLISH_SENTINEL),
+                profiles={
+                    "docs": ValidationProfileConfig(
+                        quick=ValidationCommandConfig(cmd=QUICK_SENTINEL),
+                        publish=PublishValidationConfig(cmd=None),
+                    )
+                },
+            )
+        )
+
+    def _check(self, worktree: Path, registry: ValidationProfileRegistry):
+        run = start_run(worktree, profile="docs")
+        runner = RecordingCommandRunner()
+        result = PublicationGate(
+            contracts=RunValidationContracts(FileSystemSessionOutput(), registry),
+            command_runner=runner,
+            working_copy=StubWorkingCopy(),
+            verdicts=verdict_receipts(worktree),
+        ).check(worktree=worktree, run_assets=run, issue_key=None)
+        return result, runner
+
+    def test_a_candidate_under_a_publish_less_profile_is_refused(
+        self, worktree: Path
+    ) -> None:
+        result, runner = self._check(worktree, self._mixed_registry())
+
+        assert result.allowed is False
+        # Nothing ran, and nothing was recorded — there was no contract to run.
+        # The refusal is about the configuration, and says so by name so an
+        # operator reads which profile to fix rather than which commit failed.
+        assert runner.commands == []
+        assert result.record is None
+        assert "docs" in result.reason
+        assert "validation.publish.cmd" in result.reason
+
+    def test_the_refusal_carries_this_gates_own_evidence_paths(
+        self, worktree: Path
+    ) -> None:
+        """A refusal is still an outcome, and outcomes name where they wrote."""
+        run = start_run(worktree, profile="docs")
+        result = PublicationGate(
+            contracts=RunValidationContracts(
+                FileSystemSessionOutput(), self._mixed_registry()
+            ),
+            command_runner=RecordingCommandRunner(),
+            working_copy=StubWorkingCopy(),
+            verdicts=verdict_receipts(worktree),
+        ).check(worktree=worktree, run_assets=run, issue_key=None)
+
+        assert result.evidence.paths.record_path.parent == publish_gate_output_dir(
+            run.run_dir
+        )
+
+    def test_a_repository_that_gates_nothing_anywhere_is_still_exempt(
+        self, worktree: Path
+    ) -> None:
+        """No contract exists, so none can be missing — the operator's choice."""
+        registry = ValidationProfileRegistry(
+            ValidationConfig(
+                quick=ValidationCommandConfig(cmd=QUICK_SENTINEL),
+                publish=PublishValidationConfig(cmd=None),
+                profiles={
+                    "docs": ValidationProfileConfig(
+                        quick=ValidationCommandConfig(cmd=QUICK_SENTINEL),
+                        publish=PublishValidationConfig(cmd=None),
+                    )
+                },
+            )
+        )
+
+        result, runner = self._check(worktree, registry)
+
+        assert result.allowed is True
+        assert runner.commands == []
+        assert result.record is None
+
+
 class TestTheGateReportsWhereItsEvidenceLives:
     """Where the gate wrote and what a caller attaches are one answer (#25).
 

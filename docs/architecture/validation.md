@@ -117,6 +117,22 @@ consult, so none of them can admit a candidate on evidence the others would
 reject. See [Review workflow](../development/REVIEW_WORKFLOW.md) for the
 admission rules themselves.
 
+Which makes "did a receipt get filed for the commit we published" a
+publication-side obligation, and two shapes have to be closed there rather
+than at the reader:
+
+- A **non-fast-forward push retry** rebases before it pushes, so the commit it
+  publishes is not the commit the gate ran against. The retry re-runs the
+  publish contract on the rewritten HEAD before pushing. Passing files the
+  receipt for the published commit; failing refuses the publication, and
+  nothing is pushed.
+- A run whose **own profile defines no `publish.cmd`**, in a repository where
+  another profile does, could never file a receipt while admission would
+  always demand one. The gate refuses such a candidate — naming the profile —
+  instead of publishing something no review could ever be launched for. This
+  is only ever asked of a completion that offers its work as a change, so a
+  reviewer or tech lead profile with no publish command is unaffected.
+
 ## Worktree readiness is a precondition of a meaningful verdict
 
 Every gate above runs *inside a worktree*. A worktree that lacks the

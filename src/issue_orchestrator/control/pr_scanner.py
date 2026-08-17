@@ -191,6 +191,24 @@ class PRScanner:
                     ",".join(validity.issue_labels) or "(missing)",
                     ",".join(validity.pr_labels) or "(none)",
                 )
+                if validity.candidate_uncertified:
+                    # Announced, not just logged. Every other refusal here
+                    # decays on its own, so the log line is a passing note; this
+                    # one holds until a new candidate is gated, and a PR the
+                    # orchestrator did not create never gets one. The launcher
+                    # already reports its refusals this way, so a PR that is
+                    # dropped before ever reaching the queue is visible in the
+                    # same place rather than only in the console (#45).
+                    self.events.publish(
+                        make_trace_event(
+                            EventName.REVIEW_SKIPPED,
+                            {
+                                "pr_number": pr.number,
+                                "issue_number": issue_number,
+                                "reason": f"uncertified_candidate:{validity.reason}",
+                            },
+                        )
+                    )
                 continue
 
             review = PendingReview(

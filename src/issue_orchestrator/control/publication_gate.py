@@ -124,6 +124,20 @@ class RunValidationContracts:
         """The typed contract this run executes for ``kind``."""
         return self.profile_for_run(run_dir).contract(kind)
 
+    @property
+    def repository_has_publication_contract(self) -> bool:
+        """Whether *any* profile in the registry defines a publish command.
+
+        The registry-wide question, asked here because this class already owns
+        "which contract does a run execute" and is the only collaborator the
+        gate has to ask it of. Review admission asks the same registry the same
+        question (:attr:`~..infra.validation_profiles.
+        ValidationProfileRegistry.any_publish_command_configured`), so the two
+        sides of #45's requirement cannot disagree about whether this
+        repository gates publication at all.
+        """
+        return self._profiles.any_publish_command_configured
+
 
 def publish_gate_output_dir(run_dir: Path) -> Path:
     """Where a run's publish-gate evidence is written."""
@@ -214,9 +228,10 @@ class PublicationGate:
             The outcome, including the evidence paths this gate wrote to.
             ``allowed`` is True when the publish command passed (or was reused
             from a passing record for this exact HEAD/command/profile), and
-            when the run's profile configures no publish command at all — an
-            explicit operator choice, validated at config load, not a silent
-            skip.
+            when *no* profile in the repository configures a publish command —
+            an explicit operator choice, not a silent skip. A run whose own
+            profile configures none while another profile does is refused
+            instead: see :meth:`_uncertifiable_candidate`.
         """
         contract = self._contracts.contract_for_run(
             run_assets.run_dir, ValidationGateKind.PUBLISH
@@ -228,6 +243,9 @@ class PublicationGate:
                 contract.cmd,
             )
         else:
+            uncertifiable = self._uncertifiable_candidate(contract, run_assets)
+            if uncertifiable is not None:
+                return uncertifiable
             logger.debug(
                 "Publication gate: no publish command configured [profile=%s]",
                 contract.profile,
@@ -256,6 +274,61 @@ class PublicationGate:
             cache_hit=result.cache_hit,
         )
 
+    def _uncertifiable_candidate(
+        self,
+        contract: ValidationGateContract,
+        run_assets: SessionRunAssets,
+    ) -> PublicationGateOutcome | None:
+        """Refuse a candidate whose own profile can never certify it (#45).
+
+        Whether a receipt is *produced* is decided by the run's own frozen
+        profile: an unconfigured publish contract runs nothing and files
+        nothing. Whether a receipt is *required* is decided by the repository:
+        review admission demands one as soon as any profile defines a publish
+        command, because a candidate's profile is not knowable from the PR it
+        opened — the receipt is the only thing that would say.
+
+        Those two granularities meet here, and only here, with both facts in
+        hand. Left alone they produce the worst possible outcome: publication
+        succeeds, the PR opens with the review trigger on it, and every scan
+        and every launch refuses the review with ``publication_receipt_missing``
+        forever, with no label, no terminal state and nothing to retry. So this
+        fails closed instead, at the one moment an operator is watching: the
+        completion is refused through the ordinary gate-failure path, wearing
+        the ordinary refusal label and carrying a reason that names the profile
+        and what to do about it.
+
+        ``None`` — no refusal — is the honest answer in the two other shapes: a
+        repository that gates nothing anywhere (no contract exists, so none can
+        be missing), and a completion whose profile *does* define the contract,
+        which never reaches here.
+        """
+        if not self._contracts.repository_has_publication_contract:
+            return None
+        reason = (
+            f"Validation profile '{contract.profile}' defines no "
+            "validation.publish.cmd, but this repository gates publication in "
+            "another profile. A candidate published under this profile could "
+            "never carry the publication receipt review admission requires, so "
+            "it would open a pull request no review could ever be launched "
+            f"for. Configure validation.publish.cmd for profile "
+            f"'{contract.profile}', or remove it everywhere."
+        )
+        logger.error(
+            "Publication gate refused #%s: %s", run_assets.run_id, reason
+        )
+        return PublicationGateOutcome(
+            allowed=False,
+            reason=reason,
+            evidence=GateEvidence(
+                record=None,
+                paths=ValidationArtifactPaths.in_directory(
+                    run_dir=run_assets.run_dir,
+                    output_dir=publish_gate_output_dir(run_assets.run_dir),
+                ),
+            ),
+        )
+
     def _record_verdict(
         self,
         record: ValidationRecord | None,
@@ -269,7 +342,9 @@ class PublicationGate:
         indistinguishable. Two causes reach this branch, and skipping the
         receipt is right for both:
 
-        - the profile configures no publish command, so nothing ran;
+        - no profile configures a publish command, so nothing ran and nothing
+          will ever ask for a receipt (a profile that is alone in configuring
+          none is refused before this, by :meth:`_uncertifiable_candidate`);
         - ``ValidationGate.check`` refused before running because it could not
           determine HEAD (``control.validation``). That is a refusal rather
           than an unconfigured gate, but it has no commit — so there is no

@@ -44,6 +44,14 @@ receipt there would leave publication permitted and review blocked forever.
 See :attr:`~..infra.validation_profiles.ValidationProfileRegistry.
 any_publish_command_configured`. The negative half of the verdict is
 unconditional and still applies in such a repository.
+
+That question is repository-wide because this reader has only a PR to go on,
+and a PR does not say which validation profile produced it. The mixed shape it
+cannot see — one profile defining a publish command while the profile a
+candidate actually ran under defines none — is therefore not left for this
+reader to guess at: the gate refuses such a candidate at publication time,
+where the run's frozen profile is known, so no PR reaches admission needing a
+receipt its own contract could never have filed.
 """
 
 from __future__ import annotations
@@ -51,7 +59,6 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 
-from ..domain.attempt import AttemptKey
 from ..domain.issue_key import IssueKey
 from ..domain.validation_profile import ValidationGateKind
 from ..infra.validation_profiles import (
@@ -59,6 +66,7 @@ from ..infra.validation_profiles import (
     ValidationProfileRegistry,
 )
 from ..ports.attempt_store import AttemptStore
+from ..ports.validation_attempt_key_factory import ValidationAttemptKeyFactory
 
 logger = logging.getLogger(__name__)
 
@@ -88,10 +96,22 @@ class CandidatePublicationEvidence:
     registry per call rather than at construction: the registry is rebuilt from
     the current config on every access, so a reloaded config must not be able
     to leave a long-lived reader answering from the contract it was built with.
+
+    ``attempt_keys`` is the same port the *writer* derives its key from
+    (:class:`~.publication_verdict.PublicationVerdictReceipts`). Filing a
+    receipt and finding it again are two halves of one identity question, and
+    spelling that identity out separately on each side is how the two ends of a
+    record drift apart — the drift ``result_mismatch`` was extracted to prevent
+    for "which contract ran".
     """
 
-    def __init__(self, attempts: AttemptStore) -> None:
+    def __init__(
+        self,
+        attempts: AttemptStore,
+        attempt_keys: ValidationAttemptKeyFactory,
+    ) -> None:
         self._attempts = attempts
+        self._attempt_keys = attempt_keys
 
     def certification(
         self,
@@ -119,11 +139,16 @@ class CandidatePublicationEvidence:
         if issue_key is None:
             return _refuse("publication_candidate_unidentified")
         try:
-            key = AttemptKey(issue_key, head_sha or "")
+            key = self._attempt_keys.for_validation_attempt(
+                issue_key=issue_key,
+                head_sha=head_sha or "",
+            )
         except (TypeError, ValueError):
             # No usable candidate SHA: the PR read did not carry a head, or
             # carried one this codebase will not compare (abbreviated, non-hex).
             # "Assume it is the current one" is the assumption #45 forbids.
+            # Normalization lives in ``AttemptKey.__post_init__``, so the
+            # refusal covers a rejected SHA however the factory builds the key.
             return _refuse("publication_candidate_unknown")
 
         try:

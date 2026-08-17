@@ -23,6 +23,10 @@ from issue_orchestrator.domain.validation_verdict_receipt import (
     ValidationVerdict,
     ValidationVerdictReceipt,
 )
+from issue_orchestrator.entrypoints.bootstrap_completion import (
+    _validation_attempt_key_factory,
+)
+from issue_orchestrator.infra.config import Config
 
 PUBLISH_COMMAND = "make validate-pr-raw"
 """The publish command the fixtures configure and receipts claim to have run."""
@@ -117,10 +121,17 @@ def verdict_over(
     *,
     unrecorded: UnrecordedRefusals | None = None,
 ) -> PublicationVerdictReader:
-    """A whole-verdict reader over ``store``, with no refusals by default."""
+    """A whole-verdict reader over ``store``, with no refusals by default.
+
+    Built with the production attempt-key factory rather than a local
+    stand-in: identifying a candidate is the one thing the read side must do
+    exactly as the write side does, so a double that spelled it out itself
+    could not catch the two coming apart (#45 A1).
+    """
     return PublicationVerdictReader.over(
         unrecorded or UnrecordedRefusals.process_local(),
         store,  # type: ignore[arg-type]
+        _validation_attempt_key_factory(Config()),
     )
 
 

@@ -21,6 +21,7 @@ from ..control.worktree_manager import get_worktree_path
 from ..domain.models import get_completion_path
 from ..domain.review_exchange_verdict import ExchangeVerdict
 from ..domain.session_run import SessionRunAssets
+from ..ports import Issue as IssueProtocol
 from ..ports.operator_issue_commands import (
     OperatorCommandIntent,
     OperatorCommandOutcome,
@@ -31,7 +32,6 @@ from .control_api_issue_support import ControlApiIssueDependency
 
 if TYPE_CHECKING:
     from ..infra.orchestrator import Orchestrator
-    from ..ports import Issue as IssueProtocol
 
 logger = logging.getLogger(__name__)
 
@@ -307,10 +307,10 @@ async def resume_issue(
         # publication receipt under the candidate's canonical identity. Without
         # authoritative issue metadata there is no such identity: a key built
         # from a number, or from a display placeholder like ``f"Issue #{n}"``,
-        # placeholder, is the number-only downgrade #40 removed, and a receipt
-        # filed under it would be evidence about a work item that does not
-        # exist. Refusing here costs an operator one retry; the downgrade would
-        # cost the ordering rule.
+        # is the number-only downgrade #40 removed, and a receipt filed under
+        # it would be evidence about a work item that does not exist. Refusing
+        # here costs an operator one retry; the downgrade would cost the
+        # ordering rule.
         return JSONResponse({
             "success": False,
             "error": f"Could not read issue #{issue_number} from the repository",
@@ -710,17 +710,23 @@ def _authoritative_issue(
 
     Deliberately not the cache-then-placeholder title lookup this route used
     to call. That answered a display question, and answered it with
-    ``f"Issue #{n}"`` when nothing responded — the right shape for a toast
-    and the wrong shape for identity, because an ``IssueKey`` derived from it
-    names a work item nobody has. This asks the
-    repository host and reports failure as failure, so the caller decides
-    whether to proceed without an identity — and on the completion path it must
-    not (#40/#45).
+    ``f"Issue #{n}"`` when nothing responded — the right shape for a toast and
+    the wrong shape for identity, because an ``IssueKey`` derived from it names
+    a work item nobody has. This asks the repository host and reports failure
+    as failure, so the caller decides whether to proceed without an identity —
+    and on the completion path it must not (#40/#45).
+
+    The result is narrowed with ``isinstance`` for the same reason
+    ``review_launch_validity`` narrows it: ``get_issue`` is a port call, and
+    the two readers of that port must not differ on what counts as an answer.
+    Anything that is not an issue is reported as no issue rather than handed on
+    for its ``.key`` to be read.
     """
     try:
-        return orchestrator.deps.repository_host.get_issue(issue_number)
+        issue = orchestrator.deps.repository_host.get_issue(issue_number)
     except Exception as exc:
         logger.warning(
             "Could not read authoritative issue #%d: %s", issue_number, exc
         )
         return None
+    return issue if isinstance(issue, IssueProtocol) else None

@@ -500,7 +500,16 @@ def test_a_repository_without_a_publish_command_still_honours_a_refusal() -> Non
 
 
 def test_a_publish_command_in_any_profile_makes_the_receipt_required() -> None:
-    """The requirement attaches as soon as a publication contract exists."""
+    """The requirement attaches as soon as a publication contract exists.
+
+    Repository-wide because a PR does not say which profile produced it — the
+    receipt is the only thing that would. Which leaves the mixed shape (this
+    candidate's own profile defines no publish command while another does)
+    refused here, with no way out from this side; that is why the *gate*
+    refuses such a candidate at publication time, before any PR exists for
+    admission to be asked about. This asserts the reader still fails closed if
+    one ever reaches it (#45 F2).
+    """
     config = Config()
     config.code_review_label = "needs-code-review"
     config.validation.profiles["strict"] = ValidationProfileConfig(

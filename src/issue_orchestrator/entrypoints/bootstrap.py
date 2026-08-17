@@ -696,7 +696,7 @@ def build_orchestrator(
     # refusals are durable (#51): they latch into the orchestrator-owned claim
     # store and rebuild from it, so a refusal nothing could write to the issue
     # still withholds review after a restart.
-    publication_verdict = PublicationVerdictReader.over(UnrecordedRefusals(pending_work.claims), attempt_store)
+    publication_verdict = PublicationVerdictReader.over(UnrecordedRefusals(pending_work.claims), attempt_store, _validation_attempt_key_factory(config))
 
     # Create PR scanner (after the refusals record it reads)
     pr_scanner = (
@@ -1092,7 +1092,7 @@ def build_orchestrator_for_testing(
     # One per orchestrator (#45), durably latched in the ledger above and
     # rebuilt from it, so a test composition exercises the same restart
     # behaviour production gets (#51).
-    publication_verdict = PublicationVerdictReader.over(UnrecordedRefusals(pending_work.claims), attempt_store)
+    publication_verdict = PublicationVerdictReader.over(UnrecordedRefusals(pending_work.claims), attempt_store, _validation_attempt_key_factory(config))
 
     # Create PRScanner for testing (after the refusals record it reads)
     from ..control.pr_scanner import PRScanner

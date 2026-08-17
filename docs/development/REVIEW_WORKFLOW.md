@@ -444,11 +444,29 @@ configuring `review.tech_lead_review_agent` enables the workflow.
 
    Ordinary successful work gains no step: the publication gate files the
    receipt itself, so a candidate that genuinely passed already carries its own
-   authority. The one repository shape exempt from the requirement is one that
-   configures no `validation.publish.cmd` in any profile: there is no
-   publication contract, the gate allows publication without running anything,
-   and demanding evidence of a gate that cannot exist would block every review
+   authority. That holds because the *published* commit is always the certified
+   one. A non-fast-forward push retry rebases, which rewrites the branch, so
+   before it pushes the rewritten HEAD it puts it through the same publish
+   contract — the commit that reaches the remote is the commit the gate
+   judged, and it carries its own receipt. A rebased commit the contract
+   rejects is not published at all; the completion fails as any other gate
+   refusal does, with the `validation-failed` marker and a comment saying why.
+
+   The one repository shape exempt from the requirement is one that configures
+   no `validation.publish.cmd` in any profile: there is no publication
+   contract, the gate allows publication without running anything, and
+   demanding evidence of a gate that cannot exist would block every review
    forever. The negative rules still apply there.
+
+   Exemption is a property of the repository, because a PR does not say which
+   validation profile produced it. So the mixed shape — one profile defining
+   `validation.publish.cmd` while the profile a candidate actually ran under
+   defines none — is refused at publication rather than left to admission: the
+   gate holds both facts, and a candidate it let through could never carry the
+   receipt admission would then demand. The refusal names the profile to
+   configure. Profiles that never publish a change for review (a reviewer's or
+   tech lead's, say) are unaffected: the publish contract only applies to a
+   completion that offers its work as a change.
 
 ## Review Decision Policy (Strict)
 
