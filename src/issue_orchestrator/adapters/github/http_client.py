@@ -1880,6 +1880,7 @@ class GitHubHttpClient:
                 title
                 url
                 headRefName
+                headRefOid
                 body
                 state
                 isDraft
@@ -1920,7 +1921,14 @@ class GitHubHttpClient:
                     "number": node["number"],
                     "title": node.get("title", ""),
                     "html_url": node.get("url", ""),
-                    "head": {"ref": node.get("headRefName", "")},
+                    # ``sha`` alongside ``ref`` so the REST-shaped head dict
+                    # this reshapes into carries the candidate commit too:
+                    # review admission needs the exact SHA a review would see,
+                    # and the scanner discovers its PRs through this query (#45).
+                    "head": {
+                        "ref": node.get("headRefName", ""),
+                        "sha": node.get("headRefOid", ""),
+                    },
                     "body": node.get("body", "") or "",
                     "state": node.get("state", "OPEN").lower(),
                     "labels": labels,

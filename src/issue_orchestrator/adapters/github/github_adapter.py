@@ -1616,6 +1616,11 @@ class GitHubAdapter:
             or pr.get("baseRefName")
             or None,
             merged_at=pr.get("merged_at") or None,
+            # One extractor for both provider shapes: the REST detail payload
+            # carries head.sha directly, and the GraphQL list normalization
+            # writes headRefOid into the same key, so review admission reads
+            # the candidate the same way whichever path found the PR (#45).
+            head_sha=_head_sha_from_pr(pr),
         )
 
     def _fetch_pr_info_from_search(self, pr: dict[str, Any]) -> PRInfo | None:

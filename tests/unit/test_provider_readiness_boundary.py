@@ -76,6 +76,7 @@ from issue_orchestrator.ports.provider_readiness import (
 )
 from issue_orchestrator.ports.provider_resilience import ProviderErrorType
 
+from tests.unit.publication_evidence_helpers import verdict_with_no_evidence
 from tests.unit.test_session_controller import (
     MockCompletionProcessor,
     StubWorkingCopy,
@@ -578,6 +579,7 @@ class _LauncherHarness:
             board_snapshot_provider=NullBoardSnapshotProvider(),
             agent_callback_endpoint=ready_callback_endpoint(),
             provider_readiness_probe=probe,
+            publication_verdict=verdict_with_no_evidence(),
         )
 
     def launch(self):

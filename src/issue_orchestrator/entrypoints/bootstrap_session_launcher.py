@@ -22,7 +22,7 @@ from ..ports.provider_readiness import ProviderReadinessProbe
 
 if TYPE_CHECKING:
     from ..control.dependency_evaluator import DependencyEvaluator
-    from ..control.publication_authority import UnrecordedRefusals
+    from ..control.publication_authority import PublicationVerdictReader
     from ..domain.state_machines.issue_machine import IssueStateMachine
     from ..domain.state_machines.review_machine import ReviewStateMachine
     from ..domain.state_machines.session_machine import SessionStateMachine
@@ -53,7 +53,7 @@ def build_session_launcher_factory(
     agent_callback_endpoint: "AgentCallbackEndpoint",
     provider_readiness_probe: ProviderReadinessProbe,
     needs_human_block: SharedNeedsHumanBlock,
-    unrecorded_refusals: "UnrecordedRefusals",
+    publication_verdict: "PublicationVerdictReader",
     coder_prompt_addendum: CoderPromptAddendumProvider = NO_CODER_PROMPT_ADDENDUM,
 ) -> "SessionLauncherFactory":
     """Bind the application dependencies; return the facade-facing factory."""
@@ -92,7 +92,7 @@ def build_session_launcher_factory(
             provider_readiness_probe=provider_readiness_probe,
             needs_human_block=needs_human_block,
             coder_prompt_addendum=coder_prompt_addendum,
-            unrecorded_refusals=unrecorded_refusals,
+            publication_verdict=publication_verdict,
         )
 
     return _factory

@@ -31,6 +31,7 @@ from issue_orchestrator.infra.agent_callback_endpoint import (
 )
 from issue_orchestrator.infra.config import Config
 from issue_orchestrator.ports import NullBoardSnapshotProvider
+from tests.unit.publication_evidence_helpers import verdict_with_no_evidence
 
 DEFER_REASON = "Agent callback endpoint not published yet"
 
@@ -55,6 +56,7 @@ def _launcher(endpoint) -> SessionLauncher:
         get_review_machine=lambda *args: MagicMock(),
         board_snapshot_provider=NullBoardSnapshotProvider(),
         agent_callback_endpoint=endpoint,
+        publication_verdict=verdict_with_no_evidence(),
     )
 
 

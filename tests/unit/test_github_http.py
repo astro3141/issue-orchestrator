@@ -2457,3 +2457,93 @@ def test_never_closed_issue_has_no_closing_pull_request() -> None:
     client, _ = _closing_pr_client([])
 
     assert client.get_closing_pull_request(501) is None
+
+
+def test_graphql_pr_list_carries_the_candidate_head_sha() -> None:
+    """The scanner's provider shape must name the commit it found (#45).
+
+    Review admission asks for the publication verdict of the *exact* candidate
+    a review would see. The scanner discovers its PRs through this GraphQL
+    query, so a selection set that requests only ``headRefName`` leaves every
+    discovered PR anonymous at the commit level — and a candidate that cannot
+    be named cannot be admitted. This pins both halves: the field is requested,
+    and it lands on the REST-shaped ``head`` dict the one extractor reads.
+    """
+    seen_queries: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode())
+        seen_queries.append(body["query"])
+        return httpx.Response(
+            200,
+            json={
+                "data": {
+                    "repository": {
+                        "pullRequests": {
+                            "pageInfo": {"hasNextPage": False, "endCursor": None},
+                            "nodes": [
+                                {
+                                    "number": 41,
+                                    "title": "PR",
+                                    "url": "https://github.com/owner/repo/pull/41",
+                                    "headRefName": "40-feature",
+                                    "headRefOid": "a" * 40,
+                                    "body": "Closes #40",
+                                    "state": "OPEN",
+                                    "isDraft": False,
+                                    "labels": {"nodes": [{"name": "needs-code-review"}]},
+                                }
+                            ],
+                        }
+                    }
+                }
+            },
+        )
+
+    client = _client_with_transport(httpx.MockTransport(handler))
+
+    prs = client.get_prs_with_label_graphql("needs-code-review")
+
+    assert "headRefOid" in seen_queries[0]
+    assert prs[0]["head"] == {"ref": "40-feature", "sha": "a" * 40}
+
+
+def test_graphql_pr_list_leaves_an_absent_head_sha_empty() -> None:
+    """A provider that answers without the oid must not fake one.
+
+    Empty reads as "the candidate is unknown" downstream, which fails closed.
+    Substituting anything here would be the "assume the current one" guess the
+    ordering rule forbids.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "data": {
+                    "repository": {
+                        "pullRequests": {
+                            "pageInfo": {"hasNextPage": False, "endCursor": None},
+                            "nodes": [
+                                {
+                                    "number": 41,
+                                    "title": "PR",
+                                    "url": "https://github.com/owner/repo/pull/41",
+                                    "headRefName": "40-feature",
+                                    "body": "",
+                                    "state": "OPEN",
+                                    "isDraft": False,
+                                    "labels": {"nodes": []},
+                                }
+                            ],
+                        }
+                    }
+                }
+            },
+        )
+
+    client = _client_with_transport(httpx.MockTransport(handler))
+
+    prs = client.get_prs_with_label_graphql("needs-code-review")
+
+    assert prs[0]["head"]["sha"] == ""

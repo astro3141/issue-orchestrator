@@ -120,7 +120,7 @@ from .session_worktree_diagnostics import (
 )
 from .transition_log import log_transition
 from .launch_dependency_gate import LaunchDependencyGate
-from .publication_authority import UnrecordedRefusals
+from .publication_authority import PublicationVerdictReader
 from .launch_guards import (
     callback_endpoint_not_ready,
     retrospective_session_conflict,
@@ -189,10 +189,11 @@ class SessionLauncher:
         # Every OTHER durable cause of the shared needs-human label (#6999 F4).
         needs_human_block: SharedNeedsHumanBlock = NO_OTHER_NEEDS_HUMAN_CAUSES,
         coder_prompt_addendum: CoderPromptAddendumProvider = NO_CODER_PROMPT_ADDENDUM,
-        # The orchestrator's shared record of publication-gate refusals whose
-        # label write did not commit (#45). Launch is the last chance to
-        # re-read the verdict, so it reads this half too.
-        unrecorded_refusals: "UnrecordedRefusals | None" = None,
+        # The orchestrator's shared reader of the publication verdict (#45).
+        # Launch is the last moment before a reviewer sees the code, so it
+        # re-reads all of it; a launcher built without one would trust the
+        # queue, which is what the ordering defect did.
+        publication_verdict: "PublicationVerdictReader",
     ):
         self.config = config
         self.events = events
@@ -250,7 +251,7 @@ class SessionLauncher:
             events=events,
             read_labels=repository_host.get_issue_labels_fresh,
         )
-        self._unrecorded_refusals = unrecorded_refusals or UnrecordedRefusals.process_local()
+        self._publication_verdict = publication_verdict
         self._tech_lead_needs_human = TechLeadNeedsHumanLifecycle(
             labels=label_manager,
             events=events,
@@ -1533,7 +1534,7 @@ class SessionLauncher:
             config=self.config,
             repository_host=self.repository_host,
             label_manager=self._lm,
-            unrecorded_refusals=self._unrecorded_refusals,
+            publication_verdict=self._publication_verdict,
         )
         if not validity.valid:
             log_transition(

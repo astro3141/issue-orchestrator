@@ -57,7 +57,7 @@ from ..ports.timeline_reader import NullTimelineReader
 from ..ports.timeline_store import NullTimelineStore, TimelineStore
 from ..ports.timeline_writer import NullTimelineWriter
 from ..control.orchestrator_deps import OrchestratorDeps
-from ..control.publication_authority import UnrecordedRefusals
+from ..control.publication_authority import PublicationVerdictReader, UnrecordedRefusals
 from ..control.provider_resilience import ProviderResilienceManager
 from ..execution import (
     create_plugin_manager,
@@ -690,13 +690,13 @@ def build_orchestrator(
         label_writer=repository_host,
         label_manager=label_manager, events=events)
 
-    # ONE record of publication-gate refusals whose label write did not commit
-    # (#45), shared by the processor that holds them and every reader of the
-    # verdict. Built here, after the ledger, because the record is durable
-    # (#51): it latches into the orchestrator-owned claim store and rebuilds
-    # itself from it, so a refusal nothing could write to the issue still
-    # withholds review after a restart.
-    unrecorded_refusals = UnrecordedRefusals(pending_work.claims)
+    # ONE reader of the publication verdict (#45), shared by the scanner,
+    # startup recovery and the launcher; the processor that holds refusals
+    # takes its unrecorded half. Built here, after the ledger, because the
+    # refusals are durable (#51): they latch into the orchestrator-owned claim
+    # store and rebuild from it, so a refusal nothing could write to the issue
+    # still withholds review after a restart.
+    publication_verdict = PublicationVerdictReader.over(UnrecordedRefusals(pending_work.claims), attempt_store)
 
     # Create PR scanner (after the refusals record it reads)
     pr_scanner = (
@@ -705,7 +705,7 @@ def build_orchestrator(
             repository=github,
             events=events,
             issue_branches_fn=lambda: extract_issue_branches(working_copy, config.repo_root),
-            unrecorded_refusals=unrecorded_refusals,
+            publication_verdict=publication_verdict,
         )
         if github
         else None
@@ -723,7 +723,7 @@ def build_orchestrator(
         open_issue_corpus=tech_lead.open_issue_corpus,
         repository_host=github,
         needs_human_block=pending_work.needs_human_block,
-        unrecorded_refusals=unrecorded_refusals,
+        unrecorded_refusals=publication_verdict.unrecorded,
         coder_prompt_addendum=coder_prompt_addendum,
     )
     _wire_stack_publish_gate(
@@ -799,13 +799,13 @@ def build_orchestrator(
         timeline_writer=timeline_writer,
         goal_pilot_store=goal_pilot_store,
         attempt_store=attempt_store,
+        publication_verdict=publication_verdict,
         tech_lead_authority=tech_lead_authority,
         promotion_target=tech_lead.promotion_target,
         open_issue_corpus=tech_lead.open_issue_corpus,
         pair_registry=pair_registry,
         turn_mailbox=turn_mailbox,
         background_job_supervisor=background_job_supervisor,
-        unrecorded_refusals=unrecorded_refusals,
         instance_id=instance_id,
         state_health_check=timeline_store.check_health,
     )
@@ -832,7 +832,7 @@ def build_orchestrator(
         agent_callback_endpoint=agent_callback_endpoint,
         provider_readiness_probe=provider_readiness_probe,
         needs_human_block=pending_work.needs_human_block,
-        unrecorded_refusals=unrecorded_refusals,
+        publication_verdict=publication_verdict,
         coder_prompt_addendum=coder_prompt_addendum,
     )
     deps = OrchestratorDeps(
@@ -1092,7 +1092,7 @@ def build_orchestrator_for_testing(
     # One per orchestrator (#45), durably latched in the ledger above and
     # rebuilt from it, so a test composition exercises the same restart
     # behaviour production gets (#51).
-    unrecorded_refusals = UnrecordedRefusals(pending_work.claims)
+    publication_verdict = PublicationVerdictReader.over(UnrecordedRefusals(pending_work.claims), attempt_store)
 
     # Create PRScanner for testing (after the refusals record it reads)
     from ..control.pr_scanner import PRScanner
@@ -1101,7 +1101,7 @@ def build_orchestrator_for_testing(
         repository=github,
         events=events,
         issue_branches_fn=lambda: extract_issue_branches(working_copy, config.repo_root),
-        unrecorded_refusals=unrecorded_refusals,
+        publication_verdict=publication_verdict,
     )
 
     completion_processor = CompletionProcessor(
@@ -1137,7 +1137,7 @@ def build_orchestrator_for_testing(
         runtime_identity=runtime_identity.resolve_runtime_identity(),
         tech_lead_authority=tech_lead_authority_for_testing,
         needs_human_block=pending_work.needs_human_block,
-        unrecorded_refusals=unrecorded_refusals,
+        unrecorded_refusals=publication_verdict.unrecorded,
     )
     _wire_stack_publish_gate(
         completion_processor, _dependency_evaluator, github, command_runner, config,
@@ -1222,13 +1222,13 @@ def build_orchestrator_for_testing(
         timeline_writer=timeline_writer,
         goal_pilot_store=goal_pilot_store,
         attempt_store=attempt_store,
+        publication_verdict=publication_verdict,
         tech_lead_authority=tech_lead_authority_for_testing,
         promotion_target=tech_lead.promotion_target,
         open_issue_corpus=tech_lead.open_issue_corpus,
         pair_registry=pair_registry_for_testing,
         turn_mailbox=turn_mailbox,
         background_job_supervisor=background_job_supervisor,
-        unrecorded_refusals=unrecorded_refusals,
     )
 
     # Bundle all dependencies into OrchestratorDeps (no nulls, no optionals)
@@ -1253,7 +1253,7 @@ def build_orchestrator_for_testing(
         agent_callback_endpoint=agent_callback_endpoint,
         provider_readiness_probe=provider_readiness_probe,
         needs_human_block=pending_work.needs_human_block,
-        unrecorded_refusals=unrecorded_refusals,
+        publication_verdict=publication_verdict,
         coder_prompt_addendum=coder_prompt_addendum,
     )
     completion_handler_factory = build_completion_handler_factory(

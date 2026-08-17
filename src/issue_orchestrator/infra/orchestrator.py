@@ -350,7 +350,7 @@ class Orchestrator:
             label_manager=self.deps.label_manager,
             label_store=self.deps.label_store,
             tech_lead_authority=self.deps.services.tech_lead_authority,
-            unrecorded_refusals=self.deps.unrecorded_refusals,
+            publication_verdict=self.deps.publication_verdict,
         )
 
     @cached_property

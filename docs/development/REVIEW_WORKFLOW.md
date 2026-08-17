@@ -414,8 +414,41 @@ configuring `review.tech_lead_review_agent` enables the workflow.
    The latch is strictly negative: it only ever *adds* a refusal, never grants
    one, and it is not a second source of truth — the label remains the primary
    record, and the next candidate that clears the gate releases the latch with
-   it. Which candidate holds review authority is a separate question the latch
-   deliberately does not answer.
+   it.
+
+5. **Authority binds to the candidate, not the issue** - Everything above is
+   *negative*: it names reasons a review may not proceed, so a review still
+   passes by the absence of a refusal. That is not enough, because the refusal
+   is recorded on the issue and the issue outlives the candidate it was about:
+   clearing it for a later candidate clears it for every reader, and the review
+   trigger an earlier candidate left on the PR is then read as authority for
+   whatever commit is at the head now.
+
+   So admission also requires a *positive* fact about one commit: the
+   publication gate's own verdict receipt, filed on `Attempt(issue, A)` and
+   read back at scan time, at startup recovery, and again at launch. A review
+   is admitted only when the PR's **current** head has a receipt that says the
+   publish contract passed for that exact SHA. Absence refuses — a candidate no
+   gate ever reported on has not cleared one — and so does a failure, a
+   timeout, a receipt from the quick contract, and a receipt for a different
+   commit. Because the launcher re-reads the PR, a head that moves from A to A′
+   while a review sits in the queue is judged as A′: queue history authorizes
+   nothing.
+
+   Freshness is checked against the contract that is required *now*. A run
+   freezes its validation profile's **name**; the contract behind that name is
+   re-resolved live, so a receipt is stale if the profile's command has since
+   changed, and fails closed if the profile no longer exists. A candidate
+   validated under `P1` stays judged against `P1` — moving the default profile
+   does not invalidate it.
+
+   Ordinary successful work gains no step: the publication gate files the
+   receipt itself, so a candidate that genuinely passed already carries its own
+   authority. The one repository shape exempt from the requirement is one that
+   configures no `validation.publish.cmd` in any profile: there is no
+   publication contract, the gate allows publication without running anything,
+   and demanding evidence of a gate that cannot exist would block every review
+   forever. The negative rules still apply there.
 
 ## Review Decision Policy (Strict)
 

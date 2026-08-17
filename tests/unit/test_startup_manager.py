@@ -27,6 +27,12 @@ from issue_orchestrator.domain.models import (
     ORCHESTRATOR_PR_MARKER,
 )
 from issue_orchestrator.domain.tech_lead_session import TechLeadSessionFlavor
+from tests.unit.publication_evidence_helpers import (
+    configure_publication_contract,
+    verdict_with,
+    verdict_with_no_evidence,
+    publication_receipt,
+)
 
 
 def _startup_worktree_reconciler() -> MagicMock:
@@ -156,6 +162,7 @@ def startup_manager(
         issue_fetch_resilience=IssueFetchResilience("owner/repo"),
         startup_worktree_reconciler=_startup_worktree_reconciler(),
         label_store=mock_label_store,
+        publication_verdict=verdict_with_no_evidence(),
     )
 
 
@@ -378,6 +385,7 @@ class TestStartupManagerInProgressIssues:
             startup_worktree_reconciler=_startup_worktree_reconciler(),
             queue_cache_store=queue_cache_store,
             label_store=mock_label_store,
+            publication_verdict=verdict_with_no_evidence(),
         )
 
         mock_state = MagicMock()
@@ -563,6 +571,7 @@ class TestStartupManagerLabelStoreReconcile:
             issue_fetch_resilience=IssueFetchResilience("owner/repo"),
             startup_worktree_reconciler=_startup_worktree_reconciler(),
             label_store=store,
+            publication_verdict=verdict_with_no_evidence(),
         )
 
         # Warm cache snapshot captured before recovery: still in-progress.
@@ -635,6 +644,7 @@ class TestStartupManagerLabelStoreReconcile:
             startup_worktree_reconciler=_startup_worktree_reconciler(),
             queue_cache_store=queue_cache_store,
             label_store=store,
+            publication_verdict=verdict_with_no_evidence(),
         )
         return sm, store, mock_repository_host
 
@@ -926,6 +936,154 @@ class TestStartupManagerCodeReviewRecovery:
             "reason=issue_publication_gate_failed"
             in caplog.text
         )
+
+
+class TestStartupManagerPublicationEvidenceRecovery:
+    """Startup rebuilds the queue from the receipt, not the label (#45).
+
+    This is where the durable receipt earns its keep: everything the process
+    knew is gone, so ``Attempt(issue, A)`` in the primary checkout is the only
+    thing that can still say whether the PR waiting with ``needs-code-review``
+    ever cleared a gate.
+    """
+
+    CANDIDATE_A = "a" * 40
+    CANDIDATE_A_PRIME = "b" * 40
+
+    def _pr(self, head_sha: str | None):
+        from issue_orchestrator.ports import PRInfo
+
+        return PRInfo(
+            number=10,
+            url="https://github.com/owner/repo/pull/10",
+            title="Test PR",
+            branch="1-feature",
+            labels=["needs-code-review"],
+            body=f"Closes #1\n\n{ORCHESTRATOR_PR_MARKER}",
+            state="open",
+            head_sha=head_sha,
+        )
+
+    def _issue(self):
+        return Issue(
+            number=1,
+            title="A candidate awaiting review",
+            labels=["agent:web"],
+            repo="owner/repo",
+        )
+
+    def _manager(self, *, config, events, runner, repository_host,
+                 action_applier, issue_branches_fn, label_store, evidence):
+        return StartupManager(
+            config=config,
+            events=events,
+            runner=runner,
+            repository_host=repository_host,
+            action_applier=action_applier,
+            issue_branches_fn=issue_branches_fn,
+            session_exists_fn=lambda name: False,
+            restore_sessions_fn=MagicMock(),
+            launch_session_fn=lambda issue: None,
+            update_queue_cache_fn=lambda: None,
+            issue_fetch_resilience=IssueFetchResilience("owner/repo"),
+            startup_worktree_reconciler=_startup_worktree_reconciler(),
+            label_store=label_store,
+            publication_verdict=evidence,
+        )
+
+    def _configure(self, mock_config, mock_repository_host, *, head_sha):
+        mock_config.agents = {}
+        mock_config.code_review_agent = "agent:reviewer"
+        mock_config.code_review_label = "needs-code-review"
+        configure_publication_contract(mock_config)
+        issue = self._issue()
+        mock_repository_host.get_prs_with_label.return_value = [self._pr(head_sha)]
+        mock_repository_host.get_issue.return_value = issue
+        return issue
+
+    @pytest.mark.asyncio
+    async def test_recovers_a_review_whose_candidate_passed(
+        self, mock_config, mock_events, mock_runner, mock_repository_host,
+        mock_action_applier, mock_issue_branches_fn, mock_label_store,
+        sample_state,
+    ):
+        """Proof 2: the same PASS(A) survives cleanup and a restart."""
+        issue = self._configure(
+            mock_config, mock_repository_host, head_sha=self.CANDIDATE_A
+        )
+        manager = self._manager(
+            config=mock_config, events=mock_events, runner=mock_runner,
+            repository_host=mock_repository_host,
+            action_applier=mock_action_applier,
+            issue_branches_fn=mock_issue_branches_fn,
+            label_store=mock_label_store,
+            evidence=verdict_with(
+                (issue.key, publication_receipt(self.CANDIDATE_A))
+            ),
+        )
+
+        await manager.run_startup(sample_state)
+
+        assert [r.pr_number for r in sample_state.pending_reviews] == [10]
+
+    @pytest.mark.asyncio
+    async def test_does_not_recover_a_review_for_an_ungated_candidate(
+        self, mock_config, mock_events, mock_runner, mock_repository_host,
+        mock_action_applier, mock_issue_branches_fn, mock_label_store,
+        sample_state, caplog,
+    ):
+        """The startup half of proof 15.
+
+        Remove the positive check and this rebuild re-admits a candidate that
+        no gate ever reported on — the fail-open state a restart used to reach
+        even after the in-process refusal was fixed.
+        """
+        self._configure(
+            mock_config, mock_repository_host, head_sha=self.CANDIDATE_A
+        )
+        manager = self._manager(
+            config=mock_config, events=mock_events, runner=mock_runner,
+            repository_host=mock_repository_host,
+            action_applier=mock_action_applier,
+            issue_branches_fn=mock_issue_branches_fn,
+            label_store=mock_label_store,
+            evidence=verdict_with_no_evidence(),
+        )
+
+        with caplog.at_level("INFO"):
+            await manager.run_startup(sample_state)
+
+        assert sample_state.pending_reviews == []
+        assert (
+            "Dropping stale pending review recovery: pr=10 issue=1 "
+            "reason=publication_receipt_missing"
+            in caplog.text
+        )
+
+    @pytest.mark.asyncio
+    async def test_does_not_recover_a_review_for_a_head_the_receipt_missed(
+        self, mock_config, mock_events, mock_runner, mock_repository_host,
+        mock_action_applier, mock_issue_branches_fn, mock_label_store,
+        sample_state,
+    ):
+        """Proof 3: recovery reads the PR's current head, not a stored one."""
+        issue = self._configure(
+            mock_config, mock_repository_host, head_sha=self.CANDIDATE_A_PRIME
+        )
+        manager = self._manager(
+            config=mock_config, events=mock_events, runner=mock_runner,
+            repository_host=mock_repository_host,
+            action_applier=mock_action_applier,
+            issue_branches_fn=mock_issue_branches_fn,
+            label_store=mock_label_store,
+            evidence=verdict_with(
+                (issue.key, publication_receipt(self.CANDIDATE_A))
+            ),
+        )
+
+        await manager.run_startup(sample_state)
+
+        assert sample_state.pending_reviews == []
 
 
 class TestStartupManagerAwaitingMergeRecovery:
@@ -1385,6 +1543,7 @@ class TestStartupManagerResumePartialWork:
             issue_fetch_resilience=IssueFetchResilience("owner/repo"),
             startup_worktree_reconciler=_startup_worktree_reconciler(),
             label_store=mock_label_store,
+            publication_verdict=verdict_with_no_evidence(),
         )
 
         await manager.run_startup(sample_state)
@@ -1445,6 +1604,7 @@ class TestStartupManagerResumePartialWork:
             issue_fetch_resilience=IssueFetchResilience("owner/repo"),
             startup_worktree_reconciler=_startup_worktree_reconciler(),
             label_store=mock_label_store,
+            publication_verdict=verdict_with_no_evidence(),
         )
 
         await manager.run_startup(sample_state)
@@ -1772,6 +1932,7 @@ class TestStartupGitHubCallBudget:
             update_queue_cache_fn=lambda: None,
             issue_fetch_resilience=IssueFetchResilience("owner/repo"),
             startup_worktree_reconciler=_startup_worktree_reconciler(),
+            publication_verdict=verdict_with_no_evidence(),
         )
 
         await sm.run_startup(OrchestratorState())
@@ -1805,6 +1966,7 @@ class TestStartupGitHubCallBudget:
             update_queue_cache_fn=lambda: None,
             issue_fetch_resilience=IssueFetchResilience("owner/repo"),
             startup_worktree_reconciler=_startup_worktree_reconciler(),
+            publication_verdict=verdict_with_no_evidence(),
         )
 
         await sm.run_startup(OrchestratorState())
@@ -1831,6 +1993,7 @@ class TestStartupGitHubCallBudget:
             update_queue_cache_fn=lambda: None,
             issue_fetch_resilience=IssueFetchResilience("owner/repo"),
             startup_worktree_reconciler=_startup_worktree_reconciler(),
+            publication_verdict=verdict_with_no_evidence(),
         )
 
         await sm.run_startup(OrchestratorState())
@@ -1884,6 +2047,7 @@ class TestStartupGitHubCallBudget:
             issue_fetch_resilience=IssueFetchResilience("owner/repo"),
             startup_worktree_reconciler=_startup_worktree_reconciler(),
             queue_cache_store=mock_store,
+            publication_verdict=verdict_with_no_evidence(),
         )
 
         await sm.run_startup(OrchestratorState())
@@ -1922,6 +2086,7 @@ class TestStartupGitHubCallBudget:
             issue_fetch_resilience=IssueFetchResilience("owner/repo"),
             startup_worktree_reconciler=_startup_worktree_reconciler(),
             queue_cache_store=mock_store,
+            publication_verdict=verdict_with_no_evidence(),
         )
 
         state = OrchestratorState()
@@ -1954,6 +2119,7 @@ class TestStartupGitHubCallBudget:
             issue_fetch_resilience=IssueFetchResilience("owner/repo"),
             startup_worktree_reconciler=_startup_worktree_reconciler(),
             queue_cache_store=mock_store,
+            publication_verdict=verdict_with_no_evidence(),
         )
 
         state = OrchestratorState()
@@ -1992,6 +2158,7 @@ class TestStartupGitHubCallBudget:
             issue_fetch_resilience=IssueFetchResilience("owner/repo"),
             startup_worktree_reconciler=_startup_worktree_reconciler(),
             queue_cache_store=mock_store,
+            publication_verdict=verdict_with_no_evidence(),
         )
 
         caplog.clear()
@@ -2096,6 +2263,7 @@ class TestStartupSweepsThePendingWorkLedger:
             issue_fetch_resilience=IssueFetchResilience("owner/repo"),
             startup_worktree_reconciler=_startup_worktree_reconciler(),
             label_store=mock_label_store,
+            publication_verdict=verdict_with_no_evidence(),
         )
 
         await manager.run_startup(sample_state)

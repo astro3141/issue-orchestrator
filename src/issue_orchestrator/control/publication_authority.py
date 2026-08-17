@@ -10,7 +10,7 @@ back: ``needs-code-review`` left on a PR by an earlier candidate stayed
 review-eligible, and a review launched against a candidate the gate had just
 rejected.
 
-Two halves of one verdict live here, deliberately in one module:
+Two halves of the issue-scoped verdict live here, deliberately in one module:
 
 * :class:`PublicationAuthority` writes it. ``revoke`` on a failed gate,
   ``grant`` when a candidate clears every publication precondition. Both are
@@ -34,6 +34,12 @@ exists to prevent, reachable through one failed write. A refusal that cannot be
 proved recorded is therefore held here instead, and read back beside the label,
 so "not provably recorded" withholds review rather than silently allowing it.
 
+The third record is the candidate-scoped receipt, and it lives in
+:mod:`.publication_evidence` because it is about one commit rather than one
+issue. :class:`PublicationVerdictReader` binds all three into the single
+collaborator every reader of the verdict is given, so no consumer can read a
+subset of them and reach a different answer.
+
 That hold is itself durable (#51). Held only in process, it was lost to a
 restart, and review became eligible again for a candidate the gate had refused
 — the same hole one step further out. It is now latched in the
@@ -45,12 +51,20 @@ outlives the process that observed it.
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Sequence
 
 from ..ports.publication_refusal_latch import PublicationRefusalLatch
 from .completion_ports import LabelAdapter
+from .publication_evidence import (
+    CandidatePublicationEvidence,
+    PublicationCertification,
+)
 
 if TYPE_CHECKING:
+    from ..domain.issue_key import IssueKey
+    from ..infra.validation_profiles import ValidationProfileRegistry
+    from ..ports.attempt_store import AttemptStore
     from .label_manager import LabelManager
 
 logger = logging.getLogger(__name__)
@@ -187,6 +201,69 @@ def publication_gate_failed(
     return unrecorded.holds(issue_number)
 
 
+@dataclass(frozen=True, slots=True)
+class PublicationVerdictReader:
+    """One candidate's publication verdict, however it happens to be recorded.
+
+    Three records answer the same question and none of them answers it alone:
+    the refusal marker on the issue, the refusals whose write to that issue did
+    not commit, and the receipt filed against ``Attempt(issue, A)``. They are
+    bundled into one collaborator because a reader that held only some of them
+    would answer *differently*, and the three consumers of the verdict — the PR
+    scanner, startup recovery and the launcher — must not be able to do that.
+
+    That is not hypothetical: reading only the marker is the pre-#45 behaviour
+    that let a review launch against a rejected candidate, and reading only the
+    marker plus the unrecorded refusals still admits a candidate no gate ever
+    saw. Passing the halves separately makes forgetting one a valid call.
+    """
+
+    unrecorded: UnrecordedRefusals
+    candidate_evidence: CandidatePublicationEvidence
+
+    @classmethod
+    def over(
+        cls, unrecorded: UnrecordedRefusals, attempts: "AttemptStore"
+    ) -> "PublicationVerdictReader":
+        """Build the reader from the stores the verdict actually lives in.
+
+        The composition root names the two durable homes — the refusal latch
+        and the attempt store — and nothing else. That the candidate half is
+        read by wrapping the attempt store is this module's business, not the
+        wiring's.
+        """
+        return cls(unrecorded, CandidatePublicationEvidence(attempts))
+
+    def refuses_issue(
+        self,
+        label_manager: "LabelManager",
+        labels: Sequence[str],
+        *,
+        issue_number: int,
+    ) -> bool:
+        """Whether a refusal stands against this issue (recorded or lost)."""
+        return publication_gate_failed(
+            label_manager,
+            labels,
+            issue_number=issue_number,
+            unrecorded=self.unrecorded,
+        )
+
+    def certifies_candidate(
+        self,
+        *,
+        issue_key: "IssueKey | None",
+        head_sha: str | None,
+        profiles: "ValidationProfileRegistry",
+    ) -> PublicationCertification:
+        """Whether this exact candidate proved it cleared the gate."""
+        return self.candidate_evidence.certification(
+            issue_key=issue_key,
+            head_sha=head_sha,
+            profiles=profiles,
+        )
+
+
 class PublicationAuthority:
     """The one owner of an issue's publication-gate verdict.
 
@@ -278,6 +355,7 @@ class PublicationAuthority:
 
 __all__ = [
     "PublicationAuthority",
+    "PublicationVerdictReader",
     "UnrecordedRefusals",
     "publication_gate_failed",
 ]

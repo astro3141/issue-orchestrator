@@ -14,6 +14,7 @@ from issue_orchestrator.domain.models import Session, SessionStatus
 from tests.callback_endpoint_helpers import ready_callback_endpoint
 from issue_orchestrator.ports import NullBoardSnapshotProvider
 from tests.unit.session_run_helpers import make_session_run_assets
+from tests.unit.publication_evidence_helpers import verdict_with_no_evidence
 
 
 class MockClaimManager:
@@ -120,6 +121,7 @@ class TestSessionLauncherClaimAcquisition:
             claim_manager=mock_claim_manager,
             board_snapshot_provider=NullBoardSnapshotProvider(),
             agent_callback_endpoint=ready_callback_endpoint(),
+            publication_verdict=verdict_with_no_evidence(),
         )
 
         claim = launcher._acquire_issue_claim(MockIssue())  # noqa: SLF001
@@ -238,6 +240,7 @@ class TestSessionLauncherClaimAcquisition:
                     board_snapshot_provider=NullBoardSnapshotProvider(),
                     agent_callback_endpoint=ready_callback_endpoint(),
                     coder_prompt_addendum=prompt_provider,
+                    publication_verdict=verdict_with_no_evidence(),
                 )
 
                 issue = MockIssue()
@@ -299,6 +302,7 @@ class TestSessionLauncherClaimAcquisition:
             claim_manager=mock_claim_manager,
             board_snapshot_provider=NullBoardSnapshotProvider(),
             agent_callback_endpoint=ready_callback_endpoint(),
+            publication_verdict=verdict_with_no_evidence(),
         )
 
         issue = MockIssue()
@@ -349,6 +353,7 @@ class TestSessionLauncherClaimAcquisition:
             claim_manager=mock_claim_manager,
             board_snapshot_provider=NullBoardSnapshotProvider(),
             agent_callback_endpoint=ready_callback_endpoint(),
+            publication_verdict=verdict_with_no_evidence(),
         )
 
         issue = MockIssue()

@@ -371,13 +371,13 @@ class TestBuildOrchestratorForTesting:
             before = build_orchestrator_for_testing(
                 config=minimal_config, github=mock_github
             )
-            before.deps.services.unrecorded_refusals.hold(41)
+            before.deps.publication_verdict.unrecorded.hold(41)
 
             after = build_orchestrator_for_testing(
                 config=minimal_config, github=mock_github
             )
 
-        assert after.deps.services.unrecorded_refusals.holds(41), (
+        assert after.deps.publication_verdict.unrecorded.holds(41), (
             "a publication-gate refusal that could not be recorded remotely "
             "must keep withholding review after a restart"
         )

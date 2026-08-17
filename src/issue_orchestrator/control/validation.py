@@ -441,31 +441,23 @@ class ValidationGate:
         # it: the agent gate runs the same quick contract as this gate, so its
         # record is reusable, while a record from the *other* contract never
         # is — that reuse is exactly how a quick result could satisfy a
-        # publish request (#25).
-        if not self.contract.kind.produced(record.suite):
+        # publish request (#25). Asked of the contract itself so review
+        # admission, which asks the same question of a durable receipt, cannot
+        # answer it differently (#45).
+        mismatch = self.contract.result_mismatch(
+            suite=record.suite,
+            command=record.command,
+            profile=record.profile,
+        )
+        if mismatch is not None:
             logger.debug(
-                "%s: %s cache miss for %s: contract mismatch (cached suite=%s)",
+                "%s: %s cache miss for %s: %s mismatch "
+                "(cached suite=%s profile='%s', requested profile='%s')",
                 self.suite,
                 cache_source,
                 head_sha[:8],
+                mismatch,
                 record.suite,
-            )
-            return False
-        if self.command and record.command != self.command:
-            logger.debug(
-                "%s: %s cache miss for %s: command mismatch",
-                self.suite,
-                cache_source,
-                head_sha[:8],
-            )
-            return False
-        if record.profile != self.profile:
-            logger.debug(
-                "%s: %s cache miss for %s: profile mismatch "
-                "(cached='%s', requested='%s')",
-                self.suite,
-                cache_source,
-                head_sha[:8],
                 record.profile,
                 self.profile,
             )

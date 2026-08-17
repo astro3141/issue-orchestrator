@@ -67,6 +67,7 @@ from issue_orchestrator.ports.working_copy import (
 )
 from issue_orchestrator.domain.events import EventBus, SessionEvent
 from issue_orchestrator.infra.issue_diagnostics import DiagnosticReference
+from tests.unit.publication_evidence_helpers import verdict_with_no_evidence
 from tests.unit.session_run_helpers import make_session_run_assets
 
 
@@ -4294,7 +4295,7 @@ class TestCompletionProcessorPublishGate:
             config=config,
             label_manager=LabelManager(config),
             issue=SimpleNamespace(number=123, labels=["agent:backend"]),
-            unrecorded_refusals=unrecorded,
+            publication_verdict=verdict_with_no_evidence(unrecorded=unrecorded),
             pr=PRInfo(
                 number=41,
                 title="PR",

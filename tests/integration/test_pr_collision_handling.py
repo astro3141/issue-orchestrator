@@ -14,6 +14,7 @@ from pathlib import Path
 from unittest.mock import Mock, MagicMock, patch
 
 from issue_orchestrator.infra.config import Config, DangerousConfig
+from tests.unit.publication_evidence_helpers import verdict_with_no_evidence
 from issue_orchestrator.domain.models import (
     Issue,
     Session,
@@ -286,6 +287,7 @@ class TestPRScannerSessionFiltering:
             config=test_config,
             repository=mock_repository_scanner,
             events=mock_event_sink,
+            publication_verdict=verdict_with_no_evidence(),
         )
 
         # When review-42 is in active_sessions, PR #42 should be skipped
@@ -310,6 +312,7 @@ class TestPRScannerSessionFiltering:
             config=test_config,
             repository=mock_repository_scanner,
             events=mock_event_sink,
+            publication_verdict=verdict_with_no_evidence(),
         )
 
         # No active sessions - PR should be found as orphaned
@@ -335,6 +338,7 @@ class TestPRScannerSessionFiltering:
             config=test_config,
             repository=mock_repository_scanner,
             events=mock_event_sink,
+            publication_verdict=verdict_with_no_evidence(),
         )
 
         # issue-123 session exists but review-42 doesn't - PR should still be found
@@ -394,6 +398,7 @@ class TestReviewLaunchLoopPrevention:
             config=test_config,
             repository=mock_repository_scanner,
             events=mock_event_sink,
+            publication_verdict=verdict_with_no_evidence(),
         )
 
         # First scan: no active sessions
@@ -426,6 +431,7 @@ class TestReviewLaunchLoopPrevention:
             config=test_config,
             repository=mock_repository_scanner,
             events=mock_event_sink,
+            publication_verdict=verdict_with_no_evidence(),
         )
 
         # First scan: finds the PR
