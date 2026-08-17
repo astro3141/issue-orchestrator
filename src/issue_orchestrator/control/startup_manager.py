@@ -354,17 +354,16 @@ class StartupManager:
         filters in-progress issues from cache — zero GitHub calls.
         Falls back to per-agent GitHub fetch only when no cache exists.
         """
+        queue_cache = QueueCache(self.config, state, self._queue_cache_store)
         if state.cached_queue_issues:
             # Warm path: filter in-progress from cache (0 GitHub calls)
             stale_in_progress = self._recover_stale_in_progress_from_label_store(state.cached_queue_issues)
-            queue_cache = QueueCache(self.config, state, self._queue_cache_store)
             for issue in stale_in_progress:
                 outcome = queue_cache.upsert_refreshed_issue(issue)
                 if outcome.status != QueueMutationStatus.ACCEPTED:
                     logger.warning(
                         "[startup] Recovered locally in-progress issue is out of dashboard queue scope: issue=%d status=%s",
-                        issue.number,
-                        outcome.status.value,
+                        issue.number, outcome.status.value,
                     )
             if stale_in_progress and self._queue_cache_store is not None:
                 queue_cache.save_snapshot()
@@ -375,16 +374,25 @@ class StartupManager:
             }
             for issue in stale_in_progress:
                 issues_by_number.setdefault(issue.number, issue)
-            issues = list(issues_by_number.values())
-            logger.info("[startup] Found %d in-progress issues from cache", len(issues))
-            for issue in issues:
-                self._analyze_and_handle_issue(state, issue, issue_branches, issues_to_resume, agent_label="")
+            candidates = [(issue, "") for issue in issues_by_number.values()]
+            logger.info("[startup] Found %d in-progress issues from cache", len(candidates))
         else:
             # Cold fallback: per-agent fetch (only when cache is empty)
-            for agent_label in self.config.agents.keys():
-                issues = self._fetch_in_progress_issues_for_agent(state, agent_label)
-                for issue in issues:
-                    self._analyze_and_handle_issue(state, issue, issue_branches, issues_to_resume, agent_label)
+            candidates = [
+                (issue, agent_label)
+                for agent_label in self.config.agents.keys()
+                for issue in self._fetch_in_progress_issues_for_agent(state, agent_label)
+            ]
+        # Both paths take the queue owner's verdict before analysis, so the engine's
+        # configured scope binds recovery: a rejected issue is reported, never resumed.
+        # REJECTED_EXCLUDED is kept — in scope, already claimed by history or a session.
+        out_of_scope = {issue.number for issue, _ in candidates
+                        if queue_cache.evaluate_issue(issue) is QueueMutationStatus.REJECTED_OUT_OF_SCOPE}
+        for issue, agent_label in candidates:
+            if issue.number in out_of_scope:
+                logger.info("[startup] Skipping in-progress recovery for out-of-scope issue=%d", issue.number)
+                continue
+            self._analyze_and_handle_issue(state, issue, issue_branches, issues_to_resume, agent_label)
 
     def _recover_stale_in_progress_from_label_store(self, cached_issues: list[Issue]) -> list[Issue]:
         """Recover locally in-progress issues omitted from the warm cache snapshot."""
