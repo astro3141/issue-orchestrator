@@ -10,6 +10,12 @@ allowed a record to read ``suite=publish_gate`` while executing the quick
 selector (#25); with the contract as the single input, the suite a record
 claims and the command it ran are two projections of one value.
 
+A run's stdout and stderr are written into the session run directory, which
+lives inside the worktree and dies with it. A gate given a
+``failure_diagnostics`` destination therefore writes a *failed* run's output to
+that durable destination too, at the moment it has the bytes in hand — see
+:mod:`.publish_gate_diagnostics` for why it is not copied out afterwards (#94).
+
 Record storage and cache-reuse rules live in
 :mod:`.validation_record_cache`; ``ValidationRecordStore``,
 ``ValidationCache`` and ``VALIDATION_SCHEMA_VERSION`` are re-exported here so
@@ -43,6 +49,11 @@ from ..ports import CommandRunner, CommandResult, WorkingCopy
 from ..ports.attempt_store import AttemptStore
 from ..ports.session_output import ValidationRecord
 from .isolation import build_runtime_tool_env
+from .publish_gate_diagnostics import (
+    CandidateGateDiagnostics,
+    GateFailureOutput,
+    needs_durable_diagnostic,
+)
 from .validation_record_cache import (
     VALIDATION_SCHEMA_VERSION as VALIDATION_SCHEMA_VERSION,
     ValidationCache as ValidationCache,
@@ -103,15 +114,26 @@ class ValidationResult:
 class ValidationRunner:
     """Runs validation commands and produces records."""
 
-    def __init__(self, store: ValidationRecordStore, command_runner: CommandRunner):
+    def __init__(
+        self,
+        store: ValidationRecordStore,
+        command_runner: CommandRunner,
+        failure_diagnostics: CandidateGateDiagnostics | None = None,
+    ):
         """Initialize runner with a record store.
 
         Args:
             store: Store for writing validation records
             command_runner: Adapter for running commands
+            failure_diagnostics: Where a failed run's output is kept so it
+                outlives the worktree (#94). ``None`` for gates whose evidence
+                is not candidate-bound — the agent gate has no canonical issue
+                identity to file under, and prepush runs outside a managed
+                candidate entirely. The publication gate always supplies one.
         """
         self.store = store
         self.command_runner = command_runner
+        self.failure_diagnostics = failure_diagnostics
 
     def run(
         self,
@@ -220,6 +242,12 @@ class ValidationRunner:
             profile=profile,
         )
 
+        # A failure's output is written to its durable destination here, from
+        # the same in-memory bytes the run directory just received — not copied
+        # out of the worktree later (#94). Every path in the record above dies
+        # with the worktree, and cleanup has twice won that race.
+        self._keep_failure_output(record, stdout, stderr)
+
         # Write record
         self.store.write(record)
         # Persist run-scoped validation record only for real session run dirs.
@@ -254,6 +282,21 @@ class ValidationRunner:
         timings.record_gate_timings(suite, self.store.worktree, command, stdout, stderr)
 
         return record
+
+    def _keep_failure_output(
+        self,
+        record: ValidationRecord,
+        stdout: str,
+        stderr: str,
+    ) -> None:
+        """Hand a failed run's output to the durable destination, if there is one."""
+        if self.failure_diagnostics is None:
+            return
+        if not needs_durable_diagnostic(record):
+            return
+        self.failure_diagnostics.record_failure(
+            GateFailureOutput(record=record, stdout=stdout, stderr=stderr)
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -303,6 +346,7 @@ class ValidationGate:
         contract: ValidationGateContract,
         attempt_store: AttemptStore | None = None,
         attempt_key: AttemptKey | None = None,
+        failure_diagnostics: CandidateGateDiagnostics | None = None,
     ):
         """Initialize a gate for a worktree and one profile contract.
 
@@ -314,6 +358,10 @@ class ValidationGate:
                 attempt_key, validation cache hits are scoped by issue identity
                 plus HEAD SHA rather than by SHA alone.
             attempt_key: Stable issue-at-HEAD identity for cache lookup.
+            failure_diagnostics: Durable destination for a failed run's output
+                (#94), passed straight through to the runner that produces it.
+                The gate does not consult it: an artefact this gate wrote is
+                evidence for a human, never an input to a later decision.
         """
         if attempt_key is not None and attempt_store is None:
             raise ValueError("attempt_key requires attempt_store")
@@ -325,7 +373,9 @@ class ValidationGate:
         self.attempt_key = attempt_key
         self.store = ValidationRecordStore(worktree, contract.kind)
         self.cache = ValidationCache(self.store)
-        self.runner = ValidationRunner(self.store, command_runner)
+        self.runner = ValidationRunner(
+            self.store, command_runner, failure_diagnostics=failure_diagnostics
+        )
 
     @property
     def suite(self) -> str:

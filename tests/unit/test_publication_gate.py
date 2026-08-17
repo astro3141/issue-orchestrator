@@ -26,6 +26,9 @@ from issue_orchestrator.control.publication_gate import (
     publish_gate_output_dir,
 )
 from issue_orchestrator.control.publication_verdict import PublicationVerdictReceipts
+from issue_orchestrator.control.publish_gate_diagnostics import (
+    PublishGateDiagnostics,
+)
 from issue_orchestrator.domain.attempt import AttemptKey
 from issue_orchestrator.control.validation import ValidationGate
 from issue_orchestrator.domain.validation_profile import ValidationGateKind
@@ -87,6 +90,13 @@ def verdict_receipts(worktree: Path) -> PublicationVerdictReceipts:
     )
 
 
+def failure_diagnostics(worktree: Path) -> PublishGateDiagnostics:
+    """Durable failure diagnostics, rooted outside the worktree for the same
+    reason ``verdict_receipts`` is: what has to survive cleanup cannot live in
+    the thing being cleaned up (#94)."""
+    return PublishGateDiagnostics(worktree.parent)
+
+
 def sentinel_registry(profile_name: str = "default") -> ValidationProfileRegistry:
     """A registry whose quick and publish contracts are distinguishable."""
     quick = ValidationCommandConfig(cmd=QUICK_SENTINEL, timeout_seconds=111)
@@ -140,6 +150,7 @@ class TestThePublishGateRunsThePublishContract:
             command_runner=runner,
             working_copy=StubWorkingCopy(),
             verdicts=verdict_receipts(worktree),
+            diagnostics=failure_diagnostics(worktree),
         )
 
         # A stale QUICK_SENTINEL result for this exact HEAD and profile must
@@ -212,6 +223,7 @@ class TestThePublishGateRunsThePublishContract:
             command_runner=runner,
             working_copy=StubWorkingCopy(),
             verdicts=verdict_receipts(worktree),
+            diagnostics=failure_diagnostics(worktree),
         )
 
         result = gate.check(worktree=worktree, run_assets=run, issue_key=None)
@@ -384,6 +396,7 @@ class TestTheRunsFrozenProfileSelectsTheContract:
             command_runner=runner,
             working_copy=StubWorkingCopy(),
             verdicts=verdict_receipts(worktree),
+            diagnostics=failure_diagnostics(worktree),
         ).check(worktree=worktree, run_assets=run, issue_key=None)
 
         assert runner.commands == [PUBLISH_SENTINEL]
@@ -403,6 +416,7 @@ class TestTheRunsFrozenProfileSelectsTheContract:
             command_runner=runner,
             working_copy=StubWorkingCopy(),
             verdicts=verdict_receipts(worktree),
+            diagnostics=failure_diagnostics(worktree),
         ).check(worktree=worktree, run_assets=run, issue_key=None)
 
         assert runner.commands == [PUBLISH_SENTINEL]
@@ -428,6 +442,7 @@ class TestTheRunsFrozenProfileSelectsTheContract:
             command_runner=runner,
             working_copy=StubWorkingCopy(),
             verdicts=verdict_receipts(worktree),
+            diagnostics=failure_diagnostics(worktree),
         ).check(worktree=worktree, run_assets=run, issue_key=None)
 
         assert runner.commands == []
@@ -472,6 +487,7 @@ class TestAProfileThatCouldNeverCertifyItsCandidate:
             command_runner=runner,
             working_copy=StubWorkingCopy(),
             verdicts=verdict_receipts(worktree),
+            diagnostics=failure_diagnostics(worktree),
         ).check(worktree=worktree, run_assets=run, issue_key=None)
         return result, runner
 
@@ -501,6 +517,7 @@ class TestAProfileThatCouldNeverCertifyItsCandidate:
             command_runner=RecordingCommandRunner(),
             working_copy=StubWorkingCopy(),
             verdicts=verdict_receipts(worktree),
+            diagnostics=failure_diagnostics(worktree),
         ).check(worktree=worktree, run_assets=run, issue_key=None)
 
         assert result.evidence.paths.record_path.parent == publish_gate_output_dir(
@@ -549,6 +566,7 @@ class TestTheGateReportsWhereItsEvidenceLives:
             command_runner=runner,
             working_copy=StubWorkingCopy(),
             verdicts=verdict_receipts(worktree),
+            diagnostics=failure_diagnostics(worktree),
         )
 
     def test_evidence_paths_are_the_files_the_gate_actually_wrote(

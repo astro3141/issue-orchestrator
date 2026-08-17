@@ -107,6 +107,53 @@ key nothing else uses is worse than no receipt at all. That is why resume asks
 the repository instead of reusing the display-title lookup, which answers with
 the placeholder `Issue #<n>` when nothing responds.
 
+### A failed verdict also has to leave its explanation
+
+The receipt says *what* the gate decided. It deliberately carries no output, so
+after cleanup a FAILED verdict named a candidate nobody could diagnose: the
+run's stdout and stderr were in the run directory, inside the worktree, and
+ordinary cleanup reaped them seconds after the verdict was reached. Issue [#94]
+is that loss, observed twice on one issue — once 14 s after the verdict, once
+4 s after — where the second failure did not reproduce in a clean detached
+environment, so the deleted output was the only thing that could ever have
+explained it.
+
+So a publish run that does **not** pass also writes its output to a durable
+destination in the primary checkout:
+
+```
+.issue-orchestrator/diagnostics/publish-gate-failures/
+    <issue-scope>--<issue-id>--<HEAD_SHA>--<timestamp>/
+        failure.json     # issue key, verdict receipt fields, exit code, timings
+        stdout.log       # the run's stdout, verbatim
+        stderr.log       # the run's stderr, verbatim
+```
+
+Three properties are the whole design:
+
+- **Written at gate-execution time**, from the bytes the runner already holds
+  in memory, in the same step that writes them into the run directory. It is
+  *not* copied out of the worktree afterwards: that copy is a race against
+  cleanup, and the race has been lost twice, including once by a human trying
+  to win it by hand.
+- **Bound to exactly one candidate**, under the same `(issue, HEAD_SHA)`
+  identity in the same spelling the attempt sidecar uses — so the directory
+  name for a candidate's diagnostic and the filename of its attempt sidecar
+  share a stem, and a reader holding the receipt can find the explanation
+  without following a pointer. There is no pointer by design; see below.
+- **Diagnostic, never authority.** Nothing points at it from the attempt
+  record, and no predicate takes its path or its existence as input.
+  `Attempt.publication_verdict` remains the only thing that decides what the
+  gate decided. A losing gate run must not be able to write anything that
+  admits work.
+
+A pass writes no such artefact — its output stays where every passing run's
+output has always stayed — and the trigger is the *verdict* rather than the exit
+code alone, so a timeout is covered by the same seam with no timeout-specific
+rule. A candidate with no canonical issue key (the manual-reprocess route)
+files no diagnostic, for the same reason it files no receipt, and says so in the
+log rather than skipping silently.
+
 ### What the receipt authorizes
 
 The receipt exists to be read, and [#45] is what reads it: review admission

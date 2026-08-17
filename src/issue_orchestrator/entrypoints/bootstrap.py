@@ -1127,6 +1127,7 @@ def build_orchestrator_for_testing(
             working_copy=working_copy,
             attempt_store=attempt_store,
             attempt_keys=_validation_attempt_key_factory(config),
+            repo_root=config.repo_root,
         ),
         pre_publish_gate=PrePublishGate(command_runner) if config.enforce_hooks else None,
         config=config,

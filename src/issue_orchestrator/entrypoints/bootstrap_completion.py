@@ -192,6 +192,11 @@ def create_completion_components(
         # about one candidate lands under one identity.
         attempt_store=attempt_store,
         attempt_keys=_validation_attempt_key_factory(config),
+        # A FAILED verdict says which candidate failed; the run's own output is
+        # the only thing that says why, and it is written into the worktree that
+        # cleanup reaps. The primary checkout is where it is kept instead (#94)
+        # — the same root the attempt sidecars above survive in.
+        repo_root=config.repo_root,
     )
 
     completion_processor = CompletionProcessor(

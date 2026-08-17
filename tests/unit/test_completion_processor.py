@@ -3553,6 +3553,7 @@ class TestPushRetryRepublicationGate:
         label_adapter,
         pr_adapter,
         attempt_store,
+        repo_root,
     ):
         from issue_orchestrator.control.publication_gate import (
             build_publication_gate,
@@ -3568,6 +3569,7 @@ class TestPushRetryRepublicationGate:
             working_copy=head,
             attempt_store=attempt_store,
             attempt_keys=_validation_attempt_key_factory(Config()),
+            repo_root=repo_root,
         )
         return CompletionProcessor(
             agent_callback_endpoint=ready_callback_endpoint(),
@@ -3625,6 +3627,7 @@ class TestPushRetryRepublicationGate:
             label_adapter=mock_label_adapter,
             pr_adapter=mock_pr_adapter,
             attempt_store=attempt_store,
+            repo_root=worktree.parent,
         )
 
         result = processor.process(
@@ -3683,6 +3686,7 @@ class TestPushRetryRepublicationGate:
             label_adapter=mock_label_adapter,
             pr_adapter=mock_pr_adapter,
             attempt_store=attempt_store,
+            repo_root=worktree.parent,
         )
 
         result = processor.process(
