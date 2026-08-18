@@ -26,32 +26,18 @@ Policy summary:
   the session's history outcome is FAILED, not a quiet success; the action
   planner re-reads the same validation for its planning effects (#6761
   finding 3).
-* Decision proposals may only target the session's immutable launch scope:
-  a failure investigation targets its focus issue only; a batch review
-  targets manifest PRs plus the anchor tracking issue
-  (``create_issue``/``flag_pattern`` are scope-free — that is where a health
-  review's board-wide findings land) — out-of-scope targets are contract
-  violations (#6761 re-review finding 2). A failure investigation must
-  additionally publish its diagnosis: >=1 ``post_comment`` targeting the
-  focus issue (#6761 finding 2).
-* A health review's scope SPLITS by tier (#6780): ``post_comment`` /
-  ``escalate_to_human`` stay anchor-scoped (the report's home, ADR-0031 §4),
-  while act-level ``reset_retry`` / ``kill_hung_session`` target ONLY the
-  immutable ``problem_cohort`` the review was launched owning
-  (``allowed_act_level_targets``). A periodic review owns no cohort and so
-  owns no act-level targets at all. The cohort comes from the launch grant
-  recorded in ``TechLeadLaunchAuthority``, never from the board snapshot's
-  ``recent_failures`` — that list is deliberately broader context, and
-  reading authority out of it let a review act on issues it did not own.
+* What makes a decision ADMISSIBLE — role action-kind capability (#133),
+  target scope (#6761 re-review F2, #6764 rr F1, #6780), the failure
+  investigation's diagnosis duty (#6761 F2), and protected-label truth
+  (#6761 F4) — belongs to ``tech_lead_decision_contract``, which this module
+  calls through ``load_validated_tech_lead_pair``. Effects planned here never
+  re-decide admissibility.
 * Health reviews close their anchor issue on success: the anchor is a
   walk-the-floor log entry, closed when the review lands. A rejected or
   missing pair leaves the anchor open for operator visibility; a
   FAILED/TIMED_OUT health session closes it through the terminal-failure
   path (like batch, no manifest labels) so the next interval re-fires
   instead of deduping against a dead anchor.
-* ``create_issue`` proposals may not carry protected workflow labels
-  (``tech_lead_issue_policy`` owns the protected set, case-insensitively) —
-  contract violation (#6761 finding 4).
 """
 
 from __future__ import annotations
@@ -63,7 +49,6 @@ from typing import TYPE_CHECKING, Callable
 
 from ..domain.models import Session
 from ..domain.board_snapshot import BOARD_SNAPSHOT_FILENAME, BoardSnapshot
-from ..domain.tech_lead_artifacts import ACT_LEVEL_TECH_LEAD_ACTIONS
 from ..domain.tech_lead_manifest import TechLeadManifest
 from ..domain.tech_lead_session import TechLeadLaunchAuthority, TechLeadSessionFlavor
 from .actions import (
@@ -90,25 +75,17 @@ from .tech_lead_decision_loader import (
     load_tech_lead_artifact_pair_for_run,
 )
 from .tech_lead_case_files import build_pattern_ledger
-from .tech_lead_issue_policy import protected_tech_lead_label_violations
+from .tech_lead_decision_contract import validate_decision_for_authority
 from .tech_lead_proposals import build_op_ledger
 from .tech_lead_session_policy import is_tech_lead_session, read_tech_lead_assignment
 
 if TYPE_CHECKING:
-    from ..domain.tech_lead_artifacts import TechLeadDecision
     from ..infra.config import Config
     from ..ports.tech_lead_authority import TechLeadAuthorityStore
     from .open_issue_corpus import OpenIssueCorpusManager
     from .reconciliation import ExpectedState
 
 logger = logging.getLogger(__name__)
-
-# Comment/routing proposals whose target_number must fall inside the general
-# launch scope (which, for a batch review, includes the audited manifest PRs).
-# create_issue / flag_pattern carry no target and are scope-free. Act-level
-# proposals (reset_retry / kill_hung_session) are validated separately against
-# the STRICTER issue-only scope — see ``allowed_act_level_targets`` (#6764 rr F1).
-_TARGET_SCOPED_ACTION_TYPES = frozenset(("post_comment", "escalate_to_human"))
 
 
 def read_tech_lead_manifest(run_dir: Path) -> TechLeadManifest | None:
@@ -227,136 +204,6 @@ def resolve_tech_lead_launch_authority(
         if error := _health_snapshot_scope_error(run_dir, authority):
             return authority, error
     return authority, None
-
-
-def _launch_scope_description(
-    authority: TechLeadLaunchAuthority, allowed: frozenset[int]
-) -> str:
-    """Human-readable launch scope for out-of-scope violation messages."""
-    if authority.flavor is TechLeadSessionFlavor.FAILURE_INVESTIGATION:
-        return f"the originating issue #{authority.focus_issue_number}"
-    if authority.flavor is TechLeadSessionFlavor.HEALTH_REVIEW:
-        return (
-            f"the health-review anchor issue #{authority.anchor_issue_number}"
-            " (board-wide comments/escalations belong on the anchor; act-level"
-            " proposals instead use the cohort this review owns, published as"
-            " problem_cohort in board-snapshot.json)"
-        )
-    return (
-        "the audited manifest PRs and the tracking issue"
-        f" ({', '.join(f'#{n}' for n in sorted(allowed))})"
-    )
-
-
-def _act_level_scope_description(authority: TechLeadLaunchAuthority) -> str:
-    """Human-readable ISSUE-only scope for an out-of-scope act-level violation."""
-    if authority.flavor is TechLeadSessionFlavor.FAILURE_INVESTIGATION:
-        return f"the originating work issue #{authority.focus_issue_number}"
-    if authority.flavor is TechLeadSessionFlavor.HEALTH_REVIEW:
-        cohort = ", ".join(f"#{n}" for n in authority.problem_issue_numbers)
-        return (
-            "the health review's immutable problem cohort, published as"
-            " problem_cohort in board-snapshot.json"
-            f" ({cohort or 'empty — a periodic review owns no act-level target'})"
-        )
-    return (
-        "no work issue is in scope for an act-level reset/kill from this"
-        " session — that intent applies only to a failure investigation's"
-        " focus issue; batch manifest entries are PRs and tech_lead anchors are"
-        " bookkeeping issues, so route board findings through the scope-free"
-        " create_issue/flag_pattern proposals instead"
-    )
-
-
-def _target_scope_violation(
-    decision: "TechLeadDecision", authority: TechLeadLaunchAuthority
-) -> str | None:
-    """Out-of-scope target detail for any targeted proposal, or None.
-
-    Two scopes (#6764 re-review F1): comment/routing proposals may target the
-    general launch scope (manifest PRs included for a batch), while act-level
-    reset/kill proposals are held to the STRICTER issue-only scope so a
-    manifest PR number never reaches the issue reset owner as an ``issue_number``.
-    """
-    allowed = authority.allowed_targets()
-    act_allowed = authority.allowed_act_level_targets()
-    for action in decision.proposed_actions:
-        if action.action_type in ACT_LEVEL_TECH_LEAD_ACTIONS:
-            if action.target_number not in act_allowed:
-                return (
-                    f"proposed action {action.id} ({action.action_type}) targets"
-                    f" #{action.target_number}, outside this session's launch"
-                    f" scope for an act-level reset/kill:"
-                    f" {_act_level_scope_description(authority)}"
-                )
-            continue
-        if action.action_type not in _TARGET_SCOPED_ACTION_TYPES:
-            continue
-        if action.target_number not in allowed:
-            return (
-                f"proposed action {action.id} ({action.action_type}) targets"
-                f" #{action.target_number}, outside this session's launch"
-                f" scope: {_launch_scope_description(authority, allowed)}"
-            )
-    return None
-
-
-def validate_decision_for_authority(
-    decision: "TechLeadDecision",
-    authority: TechLeadLaunchAuthority,
-    *,
-    config: "Config",
-    labels: LabelManager,
-) -> str | None:
-    """Authority/policy validation beyond the structural artifact contract.
-
-    Returns a human-readable contract-violation detail, or None when valid.
-    Enforced here (the completion owner) against the immutable launch
-    authority, never against the agent-writable worktree copies:
-
-    * Every targeted comment/routing proposal must stay inside the launch
-      scope — a failure investigation may only address its focus issue; a
-      batch review may only address manifest PRs and the anchor tracking
-      issue (#6761 re-review finding 2).
-    * An ACT-LEVEL proposal (reset_retry/kill_hung_session) is held to the
-      STRICTER issue-only scope (``allowed_act_level_targets``): its target is
-      handed to the issue reset owner as an ``issue_number``, so a batch
-      manifest PR number — or a tech_lead bookkeeping anchor — is a confused
-      deputy that would reset the wrong entity (#6764 re-review F1).
-    * Failure investigations must publish their diagnosis to the originating
-      issue — >=1 ``post_comment`` targeting the focus issue (#6761 F2).
-    * ``create_issue`` proposals may not carry protected workflow labels
-      (#6761 F4). Checked at mapping time so the domain contract stays
-      config-free.
-    """
-    target_violation = _target_scope_violation(decision, authority)
-    if target_violation is not None:
-        return target_violation
-    if authority.flavor is TechLeadSessionFlavor.FAILURE_INVESTIGATION:
-        focus = authority.focus_issue_number
-        has_focus_comment = any(
-            action.action_type == "post_comment" and action.target_number == focus
-            for action in decision.proposed_actions
-        )
-        if not has_focus_comment:
-            return (
-                "failure investigation decision must propose at least one"
-                f" post_comment targeting the originating issue #{focus}"
-                " (the diagnosis has no channel otherwise)"
-            )
-    for action in decision.proposed_actions:
-        if action.action_type != "create_issue":
-            continue
-        violations = protected_tech_lead_label_violations(
-            action.labels, config=config, labels=labels
-        )
-        if violations:
-            return (
-                f"proposed action {action.id} (create_issue) carries protected"
-                f" workflow labels: {', '.join(violations)}; agent-proposed"
-                " labels may not touch orchestrator label truth"
-            )
-    return None
 
 
 def load_validated_tech_lead_pair(

@@ -6,6 +6,22 @@ budget; these are pure text builders with no wizard-state dependencies.
 
 from __future__ import annotations
 
+from ..domain.tech_lead_capabilities import TECH_LEAD_ACTION_CAPABILITIES
+
+
+def _tech_lead_capability_rows() -> str:
+    """Render the flavor -> allowed action kinds table for the agent (#133).
+
+    Derived from the one owner in ``domain.tech_lead_capabilities`` rather than
+    restated, so a role whose row omits a kind is never handed a prompt
+    advertising that kind as valid.
+    """
+    return "\n".join(
+        f"  - `{flavor.value}`: " + ", ".join(f"`{kind}`" for kind in kinds)
+        for flavor, kinds in TECH_LEAD_ACTION_CAPABILITIES.describe_by_flavor()
+    )
+
+
 def build_starter_prompt_text(agent_short: str) -> str:
     """Build the canonical work-agent prompt text."""
     return f"""# {agent_short.title()} Agent Prompt
@@ -216,8 +232,9 @@ reviewer-done changes_requested \\
 
 
 # Shared artifact-contract text for the tech_lead prompt (plain string, NOT an
-# f-string: the JSON example's braces must survive interpolation below).
-_TECH_LEAD_ARTIFACTS_SECTION = """## Required Output Artifacts (MANDATORY)
+# f-string: the JSON example's braces must survive interpolation below). The
+# `__CAPABILITY_ROWS__` marker is filled from the capability owner below.
+_TECH_LEAD_ARTIFACTS_TEMPLATE = """## Required Output Artifacts (MANDATORY)
 
 Before running `coding-done`, write BOTH files into your tech-lead-data
 directory (next to the manifest; the directory exists even when there is
@@ -326,8 +343,16 @@ Compact `tech-lead-decision.json` example:
   in-scope duplicate receives your observation; otherwise the proposal is gated
   with the candidate preserved for a human to reconcile. Always still provide
   `title` and `body`. `duplicate_of` is only valid on `create_issue`.
-- Valid `action_type` values: `post_comment`, `create_issue`,
-  `escalate_to_human`, `flag_pattern`, `reset_retry`, `kill_hung_session`.
+- Which `action_type` values you may propose is set by your ROLE - the
+  `flavor` in your assignment - and is a separate rule from the target scope
+  above:
+__CAPABILITY_ROWS__
+  A kind outside your own row is a contract violation, not a downgrade: it
+  rejects the WHOLE decision, every sibling action included, so one forbidden
+  proposal costs you all of your findings. Nothing recovers it - not the
+  orchestrator's configured authority, not a different target, not a prompt
+  edit - so propose only from your row and route anything else through
+  `escalate_to_human`, which every role may propose.
 - Proposals are intent, not execution: the orchestrator decides what to
   execute per its configured authority. Act-level proposals (`reset_retry`,
   `kill_hung_session`) under `propose` authority become reviewable GitHub
@@ -341,6 +366,15 @@ Compact `tech-lead-decision.json` example:
 - A completed session missing either artifact — or violating any rule
   above — is recorded as FAILED and marked tech-lead-failed.
 """
+
+
+# The agent-facing statement of the capability table is RENDERED from its owner
+# (#133), never restated: a row change reaches the prompt automatically, and
+# tests/unit/test_tech_lead_prompt_contract.py pins the rendered text back to
+# TECH_LEAD_ACTION_CAPABILITIES so the two cannot drift.
+_TECH_LEAD_ARTIFACTS_SECTION = _TECH_LEAD_ARTIFACTS_TEMPLATE.replace(
+    "__CAPABILITY_ROWS__", _tech_lead_capability_rows()
+)
 
 
 # Shared minimal empty-audit pair for the no-manifest path (plain string; the

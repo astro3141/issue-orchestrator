@@ -13,7 +13,10 @@ from issue_orchestrator.domain.tech_lead_session import (
 from issue_orchestrator.infra.config import Config
 
 
-def _write_pair(run_dir: Path, *, title: str) -> None:
+def _write_pair(
+    run_dir: Path, *, title: str, proposed_actions: list[dict] | None = None
+) -> None:
+    proposed_actions = proposed_actions or []
     data_dir = run_dir / "tech-lead-data"
     data_dir.mkdir(parents=True, exist_ok=True)
     (data_dir / "tech-lead-decision.json").write_text(
@@ -29,13 +32,14 @@ def _write_pair(run_dir: Path, *, title: str) -> None:
                         "evidence": ["board-snapshot.json"],
                     }
                 ],
-                "proposed_actions": [],
+                "proposed_actions": proposed_actions,
             }
         ),
         encoding="utf-8",
     )
+    action_ids = "".join(f" {action['id']}" for action in proposed_actions)
     (data_dir / "tech-lead-report.md").write_text(
-        "# Tech Lead Report\n\nT1 is documented here.\n",
+        f"# Tech Lead Report\n\nT1 is documented here.{action_ids}\n",
         encoding="utf-8",
     )
 
@@ -61,3 +65,46 @@ def test_gate_rechecks_current_pair_and_accepts_repair(tmp_path: Path) -> None:
     _write_pair(run_dir, title="Concise health-review finding")
 
     assert gate.rejection_reason() is None
+
+
+def test_gate_rejects_an_action_kind_the_launched_role_may_not_propose(
+    tmp_path: Path,
+) -> None:
+    """The role capability is re-judged here too (#133).
+
+    Reviewer approval is a second entry into the same contract, so a decision
+    rewritten to smuggle in a forbidden kind cannot ride an earlier pass.
+    """
+    run_dir = tmp_path / "run"
+    _write_pair(run_dir, title="Batch audit finding")
+    gate = TechLeadDecisionApprovalGate(
+        run_dir=run_dir,
+        authority=TechLeadLaunchAuthority(
+            flavor=TechLeadSessionFlavor.BATCH_REVIEW,
+            anchor_issue_number=34,
+            manifest_pr_numbers=(101,),
+        ),
+        config=Config(),
+    )
+
+    assert gate.rejection_reason() is None
+
+    _write_pair(
+        run_dir,
+        title="Batch audit finding",
+        proposed_actions=[
+            {
+                "id": "A1",
+                "action_type": "reset_retry",
+                "target_number": 34,
+                "body": "Recovery a batch review may not propose.",
+                "finding_ids": ["T1"],
+            }
+        ],
+    )
+
+    rejection = gate.rejection_reason()
+
+    assert rejection is not None
+    assert "A1 (reset_retry) is not an action kind" in rejection
+    assert "batch_review" in rejection

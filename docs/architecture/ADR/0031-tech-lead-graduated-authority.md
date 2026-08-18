@@ -173,6 +173,49 @@ Semantics:
   wrote the decision); otherwise they downgrade to surfaced proposals with an
   event.
 
+### 2a. Role capability is a second, independent axis (#133 amendment)
+
+Configuration graduates an action type the whole tech lead may take. It cannot
+say that one *kind of session* has no business taking it at all. Those are two
+axes:
+
+```text
+flavor/role   -> allowed action kinds     # capability boundary
+allowed kind  -> execute | propose        # graduated authority (§2)
+```
+
+A kind outside the launched flavor's capability is a **contract violation of
+the decision artifact**, not a downgrade: it is rejected at the completion
+boundary before authority translation or effect planning, so no sibling action
+in that decision produces an effect either. It cannot be recovered by changing
+`tech_lead.authority.*`, by relaxing `--advise-only`, or by editing a prompt —
+none of them touch the capability table.
+
+Properties:
+
+- **One owner, two reads.** `domain/tech_lead_capabilities.py` holds the
+  flavor -> allowed kinds table, and a new flavor cannot ship without declaring
+  its set. Nothing restates the table: `control/tech_lead_decision_contract.py`
+  takes the JUDGING read (`violation`) and is the single enforcement point,
+  while `execution/setup_wizard_prompts.py` takes the TELLING read
+  (`describe_by_flavor`) to render the agent's per-role list, pinned by
+  `tests/unit/test_tech_lead_prompt_contract.py`. The action planner and the
+  reviewer approval gate honour the table transitively, through the one
+  validated decision read they share; they do not re-check it themselves.
+- **Launch authority selects the role.** The capability set is keyed by the
+  orchestrator-owned `TechLeadLaunchAuthority` flavor, never the agent-writable
+  assignment copy in the worktree.
+- **Independent of target scope.** An action must pass both: the capability
+  says whether the role may do this kind of thing, §4's scope rules say which
+  issue/PR it may do it to.
+- **`escalate_to_human` stays a floor** for every role, as in §2.
+
+Shipped consequence: a batch review does no recovery — `reset_retry` and
+`kill_hung_session` are not kinds it may propose. That matches what the
+contract already enforced (its act-level target scope has always been empty,
+so such a proposal was never accepted); stating it as a capability reports the
+role rather than a missing target. The other flavors are unchanged.
+
 ### 3. Observation surface: the board-snapshot manifest
 
 The manifest pattern extends beyond PR diffs. Tech Lead sessions receive, in

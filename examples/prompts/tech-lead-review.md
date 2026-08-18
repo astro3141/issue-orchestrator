@@ -361,8 +361,18 @@ Compact `tech-lead-decision.json` example:
   in-scope duplicate receives your observation; otherwise the proposal is gated
   with the candidate preserved for a human to reconcile. Always still provide
   `title` and `body`. `duplicate_of` is only valid on `create_issue`.
-- Valid `action_type` values: `post_comment`, `create_issue`,
-  `escalate_to_human`, `flag_pattern`, `reset_retry`, `kill_hung_session`.
+- Which `action_type` values you may propose is set by your ROLE - the
+  `flavor` in your assignment - and is a separate rule from the target scope
+  above:
+  - `batch_review`: `create_issue`, `escalate_to_human`, `flag_pattern`, `post_comment`
+  - `failure_investigation`: `create_issue`, `escalate_to_human`, `flag_pattern`, `kill_hung_session`, `post_comment`, `reset_retry`
+  - `health_review`: `create_issue`, `escalate_to_human`, `flag_pattern`, `kill_hung_session`, `post_comment`, `reset_retry`
+  A kind outside your own row is a contract violation, not a downgrade: it
+  rejects the WHOLE decision, every sibling action included, so one forbidden
+  proposal costs you all of your findings. Nothing recovers it - not the
+  orchestrator's configured authority, not a different target, not a prompt
+  edit - so propose only from your row and route anything else through
+  `escalate_to_human`, which every role may propose.
 - Proposals are intent, not execution: the orchestrator decides what to
   execute per its configured authority. Act-level proposals (`reset_retry`,
   `kill_hung_session`) under `propose` authority become reviewable GitHub

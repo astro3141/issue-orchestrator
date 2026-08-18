@@ -372,6 +372,73 @@ def test_generic_rule_act_level_verbs_match_the_domain_contract() -> None:
             )
 
 
+def _normalized(text: str) -> str:
+    """Whitespace-collapsed text, so a re-wrapped prompt line still matches."""
+    return " ".join(text.split())
+
+
+@pytest.mark.parametrize("variant", sorted(PROMPT_VARIANTS))
+def test_generic_rule_teaches_the_role_capability_axis(variant: str) -> None:
+    """#133: the agent must be told the axis its decision is rejected on.
+
+    Capability is a SECOND axis, independent of target scope: a kind outside
+    the launched flavor's row is rejected before authority translation, taking
+    every sibling action in the decision with it. The prompt used to state a
+    single flat ``Valid action_type values`` list for all three flavors, which
+    would advertise `reset_retry`/`kill_hung_session` to a role that may not
+    propose them at all.
+    """
+    section = _flow_section(
+        PROMPT_VARIANTS[variant], "Required Output Artifacts (MANDATORY)"
+    )
+    normalized = _normalized(section)
+
+    # The superseded flat list must be gone: it told every role the same set.
+    assert "Valid `action_type` values: `post_comment`" not in normalized, (
+        f"{variant} still states one flat action_type list for every role"
+    )
+    # The rule keys off the role, named as the assignment field the
+    # orchestrator actually reads.
+    assert "set by your ROLE" in normalized and "`flavor` in your assignment" in (
+        normalized
+    ), f"{variant} does not key the valid action kinds off the session's flavor"
+    # It is a separate axis from the target scope rule above it.
+    assert "separate rule from the target scope" in normalized, (
+        f"{variant} does not distinguish capability from target scope"
+    )
+    # A forbidden kind costs the agent the whole decision, not just the action.
+    assert "rejects the WHOLE decision, every sibling action included" in (
+        normalized
+    ), f"{variant} does not teach that one forbidden kind rejects everything"
+
+
+def test_capability_rows_match_the_domain_table() -> None:
+    """The per-role rows ARE the shipped capability table, not a restatement.
+
+    Pins each prompt variant's rendered row to
+    ``TECH_LEAD_ACTION_CAPABILITIES`` the way the act-level verbs are pinned to
+    ``ACT_LEVEL_TECH_LEAD_ACTIONS``: narrowing a role's row in the domain owner
+    without updating the prompt (or vice versa) fails here, so the agent can
+    never be handed a kind the completion contract rejects.
+    """
+    from issue_orchestrator.domain.tech_lead_capabilities import (
+        TECH_LEAD_ACTION_CAPABILITIES,
+    )
+
+    table = TECH_LEAD_ACTION_CAPABILITIES.describe_by_flavor()
+    assert table, "capability table is empty"
+
+    for variant, text in sorted(PROMPT_VARIANTS.items()):
+        section = _flow_section(text, "Required Output Artifacts (MANDATORY)")
+        normalized = _normalized(section)
+        for flavor, kinds in table:
+            row = f"- `{flavor.value}`: " + ", ".join(f"`{kind}`" for kind in kinds)
+            assert row in normalized, (
+                f"{variant} does not state {flavor.value}'s capability row"
+                f" exactly as the domain table declares it: expected {row!r}"
+            )
+
+
 @pytest.mark.parametrize("variant", sorted(PROMPT_VARIANTS))
 def test_board_snapshot_fields_document_the_cohort_surface(variant: str) -> None:
     """The snapshot field list must distinguish context from authority."""
