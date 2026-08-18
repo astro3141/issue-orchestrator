@@ -45,6 +45,9 @@ from issue_orchestrator.domain.tech_lead_session import (
 from issue_orchestrator.infra.tech_lead_authority_store import (
     SqliteTechLeadAuthorityStore,
 )
+from issue_orchestrator.domain.tech_lead_capabilities import (
+    TECH_LEAD_ACTION_CAPABILITIES,
+)
 from issue_orchestrator.infra.open_issue_corpus_store import (
     SqliteOpenIssueCorpusStore,
 )
@@ -1219,10 +1222,11 @@ class TestDecisionTargetScope:
 
         The PR number is inside the general launch scope (comments/escalations
         may target manifest PRs), but the issue reset owner would treat it as
-        an ``issue_number`` and reset the wrong entity. Act-level targets are
-        held to the stricter issue-only scope, which is EMPTY for a batch
-        review, so the proposal is rejected — never planned or executed
-        (#6764 re-review F1).
+        an ``issue_number`` and reset the wrong entity. It is rejected — never
+        planned or executed — by both independent axes (#6764 re-review F1,
+        #133): a batch review's ROLE may not propose recovery kinds at all,
+        which is why the recorded detail names the capability rather than the
+        empty act-level target scope that stands behind it.
         """
         config, session = self._batch(tmp_path)
         # Even with execute authority the confused deputy must be blocked.
@@ -1249,8 +1253,8 @@ class TestDecisionTargetScope:
             session_name=session.run_assets.session_name,
         )
         assert error is not None
-        assert "#101" in error
-        assert "outside this session's launch scope" in error
+        assert "A1 (reset_retry) is not an action kind" in error
+        assert "batch_review" in error
 
         # Planning surfaces the rejection and plans NO reset / NO success
         # terminalization (no close, no tech-lead-reviewed labels).
@@ -1258,7 +1262,7 @@ class TestDecisionTargetScope:
             session, SessionStatus.COMPLETED
         )
         [rejection] = _rejections(actions)
-        assert "#101" in rejection.body_preview
+        assert "is not an action kind" in rejection.body_preview
         assert not any(isinstance(a, ResetRetryIssueAction) for a in actions)
         assert not any(isinstance(a, CloseIssueAction) for a in actions)
         assert "tech-lead-reviewed" not in added_labels(actions)
@@ -1517,6 +1521,311 @@ class TestDecisionTargetScope:
         )
         assert not any(isinstance(action, prohibited_effects) for action in actions)
         assert removed_labels(actions) == {"in-progress"}
+
+
+def _capability_probe_actions(
+    flavor: TechLeadSessionFlavor, action_type: str
+) -> list[dict]:
+    """A one-kind decision body valid for *flavor*, with its required company.
+
+    Targets come from what the flavor was armed with below: anchor #1 for every
+    flavor, focus #1 for an investigation, cohort member #41 for a health
+    review. A failure investigation must always publish its diagnosis, so the
+    focus comment rides along when it is not itself the probed kind.
+    """
+    act_level_target = (
+        41 if flavor is TechLeadSessionFlavor.HEALTH_REVIEW else 1
+    )
+    fields: dict[str, dict] = {
+        "post_comment": {"target_number": 1, "body": "Diagnosis."},
+        "create_issue": {"title": "Follow-up", "body": "Do the thing."},
+        "escalate_to_human": {"target_number": 1, "body": "A human must decide."},
+        "flag_pattern": {"body": "Recurring seam.", "pattern_signature": "flaky-ci"},
+        "reset_retry": {
+            "target_number": act_level_target,
+            "body": "Reset the scratch.",
+        },
+        "kill_hung_session": {
+            "target_number": act_level_target,
+            "body": "It is genuinely stuck.",
+        },
+    }
+    probe = {"id": "A2", "action_type": action_type, **fields[action_type]}
+    if (
+        flavor is TechLeadSessionFlavor.FAILURE_INVESTIGATION
+        and action_type != "post_comment"
+    ):
+        return [
+            {
+                "id": "A1",
+                "action_type": "post_comment",
+                "target_number": 1,
+                "body": "Diagnosis for the originating issue.",
+            },
+            probe,
+        ]
+    return [probe]
+
+
+class TestFlavorActionKindCapabilities:
+    """A role may propose only the action kinds its FLAVOR allows (#133).
+
+    The capability axis is checked at the completion contract boundary against
+    the orchestrator-owned launch authority, before authority translation or
+    effect planning, and independently of target scope.
+    """
+
+    def _armed(
+        self, tmp_path: Path, flavor: TechLeadSessionFlavor
+    ) -> tuple[Config, Session]:
+        config = make_tech_lead_config(tmp_path)
+        session = make_tech_lead_session(tmp_path)
+        if flavor is TechLeadSessionFlavor.BATCH_REVIEW:
+            arm_batch_session(config, session, tmp_path)
+        elif flavor is TechLeadSessionFlavor.FAILURE_INVESTIGATION:
+            arm_investigation_session(config, session)
+        else:
+            arm_health_review_session(
+                config, session, problem_issue_numbers=(41, 42, 43)
+            )
+        return config, session
+
+    def _processing_error(self, config: Config, session: Session) -> str | None:
+        return tech_lead_decision_processing_error(
+            config,
+            tech_lead_authority=SqliteTechLeadAuthorityStore.for_repo(config.repo_root),
+            run_dir=session.run_dir,
+            run_id=session.run_assets.run_id,
+            session_name=session.run_assets.session_name,
+        )
+
+    @pytest.mark.parametrize(
+        ("flavor", "action_type"),
+        sorted(
+            (flavor, action_type)
+            for flavor, kinds in (
+                TECH_LEAD_ACTION_CAPABILITIES.allowed_kinds_by_flavor.items()
+            )
+            for action_type in kinds
+        ),
+    )
+    def test_each_flavor_accepts_every_kind_it_currently_supports(
+        self, tmp_path: Path, flavor: TechLeadSessionFlavor, action_type: str
+    ) -> None:
+        """Regression floor: this leaf narrows nothing that works today.
+
+        Driven off the shipped table (whose contents are pinned against the
+        measured semantics in ``tests/unit/domain/test_tech_lead_capabilities``)
+        so every granted kind has to survive the real completion boundary, not
+        just the policy lookup.
+        """
+        config, session = self._armed(tmp_path, flavor)
+        _plant_decision_with_actions(
+            session, _capability_probe_actions(flavor, action_type)
+        )
+
+        assert self._processing_error(config, session) is None
+
+    @pytest.mark.parametrize("action_type", ["reset_retry", "kill_hung_session"])
+    def test_batch_review_may_not_propose_recovery_kinds(
+        self, tmp_path: Path, action_type: str
+    ) -> None:
+        """A batch review does no recovery — and never had a valid target for it.
+
+        Its act-level scope has always been empty, so no such proposal has ever
+        been accepted; the capability gate now says so by role, one step before
+        the target scope it also fails.
+        """
+        config, session = self._armed(tmp_path, TechLeadSessionFlavor.BATCH_REVIEW)
+        # Execute authority for the kind must not recover a forbidden kind.
+        config.tech_lead.authority.reset_retry = "execute"
+        _plant_decision_with_actions(
+            session,
+            _capability_probe_actions(TechLeadSessionFlavor.BATCH_REVIEW, action_type),
+        )
+
+        error = self._processing_error(config, session)
+
+        assert error is not None
+        assert f"A2 ({action_type}) is not an action kind" in error
+        assert "batch_review" in error
+
+    def test_forbidden_kind_produces_zero_sibling_effects(
+        self, tmp_path: Path
+    ) -> None:
+        """One forbidden action invalidates the decision, siblings included."""
+        config, session = self._armed(tmp_path, TechLeadSessionFlavor.BATCH_REVIEW)
+        config.tech_lead.authority.reset_retry = "execute"
+        _plant_decision_with_actions(
+            session,
+            [
+                {
+                    "id": "A1",
+                    "action_type": "post_comment",
+                    "target_number": 102,  # a manifest PR: perfectly in scope
+                    "body": "Audit note the batch review may publish.",
+                    "finding_ids": ["T1"],
+                },
+                {
+                    "id": "A2",
+                    "action_type": "reset_retry",
+                    "target_number": 1,
+                    "body": "Recovery this role may not propose.",
+                    "finding_ids": ["T1"],
+                },
+            ],
+        )
+
+        assert self._processing_error(config, session) is not None
+
+        actions = make_planner(config).generate_completion_actions(
+            session, SessionStatus.COMPLETED
+        )
+
+        [rejection] = _rejections(actions)
+        assert "A2 (reset_retry) is not an action kind" in rejection.body_preview
+        # The allowed sibling published nothing, no reset was planned, and the
+        # batch was not terminalized as a success.
+        assert not any(isinstance(action, AddCommentAction) for action in actions)
+        assert not any(isinstance(action, ResetRetryIssueAction) for action in actions)
+        assert not any(isinstance(action, CloseIssueAction) for action in actions)
+        assert "tech-lead-reviewed" not in added_labels(actions)
+
+    def test_assignment_claiming_a_wider_role_cannot_widen_allowed_kinds(
+        self, tmp_path: Path
+    ) -> None:
+        """The allowlist is keyed by the ORCHESTRATOR-owned launch flavor.
+
+        The agent rewrites its worktree assignment to a role that may propose
+        recovery kinds. That copy never selects the capability set: it is
+        tamper evidence against the launch authority, so the completion is
+        rejected outright and the reset is never planned.
+        """
+        config, session = self._armed(tmp_path, TechLeadSessionFlavor.BATCH_REVIEW)
+        config.tech_lead.authority.reset_retry = "execute"
+        plant_tech_lead_assignment(
+            session,
+            TechLeadAssignment(
+                flavor=TechLeadSessionFlavor.FAILURE_INVESTIGATION,
+                focus_issue_number=1,
+                focus_reason="Claimed by the agent, granted by nobody",
+            ),
+        )
+        _plant_decision_with_actions(
+            session,
+            [
+                {
+                    "id": "A1",
+                    "action_type": "reset_retry",
+                    "target_number": 1,
+                    "body": "Recovery the launched role may not propose.",
+                    "finding_ids": ["T1"],
+                }
+            ],
+        )
+
+        error = self._processing_error(config, session)
+
+        assert error is not None
+        assert error.startswith("tech_lead_authority: scope_tampered")
+
+        actions = make_planner(config).generate_completion_actions(
+            session, SessionStatus.COMPLETED
+        )
+
+        assert not any(isinstance(action, ResetRetryIssueAction) for action in actions)
+
+    def test_allowed_kind_with_out_of_scope_target_still_fails_target_scope(
+        self, tmp_path: Path
+    ) -> None:
+        """The two axes are independent: passing one does not satisfy the other."""
+        config, session = self._armed(
+            tmp_path, TechLeadSessionFlavor.FAILURE_INVESTIGATION
+        )
+        _plant_decision_with_actions(
+            session,
+            [
+                {
+                    "id": "A1",
+                    "action_type": "post_comment",
+                    "target_number": 1,
+                    "body": "Diagnosis for the originating issue.",
+                    "finding_ids": ["T1"],
+                },
+                {
+                    "id": "A2",
+                    "action_type": "reset_retry",  # a kind this role MAY propose
+                    "target_number": 777,  # but not on this issue
+                    "body": "Reset something out of scope.",
+                    "finding_ids": ["T1"],
+                },
+            ],
+        )
+
+        error = self._processing_error(config, session)
+
+        assert error is not None
+        assert "is not an action kind" not in error
+        assert "outside this session's launch scope" in error
+
+    def test_allowed_kind_still_flows_into_graduated_authority(
+        self, tmp_path: Path
+    ) -> None:
+        """An allowed kind reaches the existing execute|propose translation."""
+        config, session = self._armed(
+            tmp_path, TechLeadSessionFlavor.FAILURE_INVESTIGATION
+        )
+        config.tech_lead.authority.reset_retry = "execute"
+        _plant_decision_with_actions(
+            session,
+            _capability_probe_actions(
+                TechLeadSessionFlavor.FAILURE_INVESTIGATION, "reset_retry"
+            ),
+        )
+
+        actions = make_planner(config).generate_completion_actions(
+            session, SessionStatus.COMPLETED
+        )
+
+        assert _rejections(actions) == []
+        [reset] = [a for a in actions if isinstance(a, ResetRetryIssueAction)]
+        assert reset.issue_number == 1
+        assert reset.proposal_id == "A2"
+
+    def test_replayed_decision_is_rechecked_at_the_completion_boundary(
+        self, tmp_path: Path
+    ) -> None:
+        """Passing once buys nothing: every entry re-reads the artifact.
+
+        A publish-failure retry re-enters completion processing for the same
+        run, so a decision rewritten after its first accepted validation must
+        be re-judged, not remembered.
+        """
+        config, session = self._armed(tmp_path, TechLeadSessionFlavor.BATCH_REVIEW)
+        valid_actions = _capability_probe_actions(
+            TechLeadSessionFlavor.BATCH_REVIEW, "post_comment"
+        )
+        _plant_decision_with_actions(session, valid_actions)
+
+        assert self._processing_error(config, session) is None
+
+        _plant_decision_with_actions(
+            session,
+            [
+                *valid_actions,
+                {
+                    "id": "A3",
+                    "action_type": "kill_hung_session",
+                    "target_number": 1,
+                    "body": "Smuggled in after the first pass.",
+                },
+            ],
+        )
+
+        error = self._processing_error(config, session)
+
+        assert error is not None
+        assert "A3 (kill_hung_session) is not an action kind" in error
 
 
 class TestResetRetryExecutionPipeline:
