@@ -5,12 +5,23 @@ Two independent axes govern what a tech_lead decision may do::
     flavor/role   -> allowed action kinds     # capability boundary (HERE)
     allowed kind  -> execute | propose        # graduated authority (ADR-0031)
 
-This module owns the FIRST axis, and is its single owner: the prompt, the
-planner, the CLI, completion, and the tests all read the mapping from here
-rather than restating it. A kind that a role may not propose is a contract
-violation of the decision artifact — it cannot be recovered by changing
-``tech_lead.authority.*``, by omitting ``--advise-only``, or by editing a
-prompt, because none of those touch this table.
+This module owns the FIRST axis, and the table lives here once. Two reads
+carry it everywhere it is needed, so nothing restates it:
+
+* :meth:`TechLeadActionCapabilityPolicy.violation` — the JUDGING read, used by
+  ``control.tech_lead_decision_contract``, which is the single enforcement
+  point. The planner and the reviewer approval gate honour the table
+  transitively, through that one validated read; neither imports this module.
+* :meth:`TechLeadActionCapabilityPolicy.describe_by_flavor` — the TELLING
+  read, used by ``execution.setup_wizard_prompts`` to render the agent-facing
+  per-role list, so the prompt cannot advertise a kind the runtime rejects
+  (``tests/unit/test_tech_lead_prompt_contract.py`` pins the rendered text to
+  this table).
+
+A kind that a role may not propose is a contract violation of the decision
+artifact — it cannot be recovered by changing ``tech_lead.authority.*``, by
+omitting ``--advise-only``, or by editing a prompt, because none of those
+touch this table.
 
 Capability is checked against the ORCHESTRATOR-OWNED launch authority's flavor
 (:class:`~.tech_lead_session.TechLeadLaunchAuthority`), never the agent-writable
@@ -135,6 +146,22 @@ class TechLeadActionCapabilityPolicy:
     def permits(self, flavor: TechLeadSessionFlavor, action_type: str) -> bool:
         """True when a *flavor* session may propose *action_type* at all."""
         return action_type in self.allowed_kinds_by_flavor[flavor]
+
+    def describe_by_flavor(
+        self,
+    ) -> tuple[tuple[TechLeadSessionFlavor, tuple[str, ...]], ...]:
+        """The whole table as an ordered, agent-facing read.
+
+        The rejection path needs only :meth:`violation`; the INSTRUCTION path
+        needs the table itself, and without this read the prompt would have to
+        restate it by hand — the drift this leaf exists to prevent. Flavors and
+        kinds are both sorted so the rendered prompt text is deterministic and
+        a contract test can pin it.
+        """
+        return tuple(
+            (flavor, tuple(sorted(self.allowed_kinds(flavor))))
+            for flavor in sorted(TechLeadSessionFlavor, key=lambda f: f.value)
+        )
 
     def violation(
         self, decision: "TechLeadDecision", flavor: TechLeadSessionFlavor

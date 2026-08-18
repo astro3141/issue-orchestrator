@@ -75,7 +75,12 @@ def _act_level_scope_description(authority: TechLeadLaunchAuthority) -> str:
     The batch branch is the independent second guard on the target axis (#133):
     a batch review's act-level proposal is now rejected one step earlier by the
     role capability gate, and this text stands behind it so the scope rule
-    keeps stating its own conclusion.
+    keeps stating its own conclusion. Under the SHIPPED capability table that
+    branch is therefore unreachable — no test exercises this string, and none
+    should; it becomes reachable only if a future table grants a batch review
+    an act-level kind. The invariant it describes is covered directly by
+    ``tests/unit/test_tech_lead_authority_store.py::
+    test_allowed_act_level_targets_are_issue_only``.
     """
     if authority.flavor is TechLeadSessionFlavor.FAILURE_INVESTIGATION:
         return f"the originating work issue #{authority.focus_issue_number}"

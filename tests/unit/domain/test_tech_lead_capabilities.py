@@ -115,6 +115,50 @@ class TestShippedCapabilities:
             assert TECH_LEAD_ACTION_CAPABILITIES.permits(flavor, "escalate_to_human")
 
 
+class TestAgentFacingDescription:
+    """``describe_by_flavor`` is the TELLING read the prompt renders from.
+
+    Without it the prompt would have to restate the table by hand, which is
+    exactly the drift this leaf exists to prevent: an agent advertised a kind
+    its role may not propose loses its whole decision to a rule it was never
+    told about. ``tests/unit/test_tech_lead_prompt_contract.py`` pins the
+    rendered prompt text to this read.
+    """
+
+    def test_description_covers_every_flavor_once(self) -> None:
+        described = [
+            flavor
+            for flavor, _ in TECH_LEAD_ACTION_CAPABILITIES.describe_by_flavor()
+        ]
+
+        assert described == sorted(TechLeadSessionFlavor, key=lambda f: f.value)
+
+    def test_description_states_each_role_s_shipped_kinds(self) -> None:
+        described = dict(TECH_LEAD_ACTION_CAPABILITIES.describe_by_flavor())
+
+        assert {flavor: set(kinds) for flavor, kinds in described.items()} == (
+            EXPECTED_SHIPPED_CAPABILITIES
+        )
+
+    def test_description_is_deterministically_ordered(self) -> None:
+        """Rendered prompt text must not churn between runs."""
+        for _, kinds in TECH_LEAD_ACTION_CAPABILITIES.describe_by_flavor():
+            assert list(kinds) == sorted(kinds)
+
+    def test_description_follows_a_narrowed_table(self) -> None:
+        """Failure direction: the read reports the policy, not a constant."""
+        narrowed = TechLeadActionCapabilityPolicy(
+            {
+                flavor: frozenset({"escalate_to_human"})
+                for flavor in TechLeadSessionFlavor
+            }
+        )
+
+        assert dict(narrowed.describe_by_flavor()) == {
+            flavor: ("escalate_to_human",) for flavor in TechLeadSessionFlavor
+        }
+
+
 class TestCapabilityMutationDirection:
     """Failure-direction proof: the acceptance above is load-bearing.
 

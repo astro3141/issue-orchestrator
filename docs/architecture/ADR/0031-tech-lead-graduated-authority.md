@@ -193,9 +193,15 @@ none of them touch the capability table.
 
 Properties:
 
-- **One owner.** `domain/tech_lead_capabilities.py` holds the flavor -> allowed
-  kinds table; the prompt, planner, CLI, and completion read it rather than
-  restating it, and a new flavor cannot ship without declaring its set.
+- **One owner, two reads.** `domain/tech_lead_capabilities.py` holds the
+  flavor -> allowed kinds table, and a new flavor cannot ship without declaring
+  its set. Nothing restates the table: `control/tech_lead_decision_contract.py`
+  takes the JUDGING read (`violation`) and is the single enforcement point,
+  while `execution/setup_wizard_prompts.py` takes the TELLING read
+  (`describe_by_flavor`) to render the agent's per-role list, pinned by
+  `tests/unit/test_tech_lead_prompt_contract.py`. The action planner and the
+  reviewer approval gate honour the table transitively, through the one
+  validated decision read they share; they do not re-check it themselves.
 - **Launch authority selects the role.** The capability set is keyed by the
   orchestrator-owned `TechLeadLaunchAuthority` flavor, never the agent-writable
   assignment copy in the worktree.

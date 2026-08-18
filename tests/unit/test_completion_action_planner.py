@@ -42,11 +42,11 @@ from issue_orchestrator.domain.tech_lead_session import (
     TechLeadLaunchAuthority,
     TechLeadSessionFlavor,
 )
-from issue_orchestrator.infra.tech_lead_authority_store import (
-    SqliteTechLeadAuthorityStore,
-)
 from issue_orchestrator.domain.tech_lead_capabilities import (
     TECH_LEAD_ACTION_CAPABILITIES,
+)
+from issue_orchestrator.infra.tech_lead_authority_store import (
+    SqliteTechLeadAuthorityStore,
 )
 from issue_orchestrator.infra.open_issue_corpus_store import (
     SqliteOpenIssueCorpusStore,
