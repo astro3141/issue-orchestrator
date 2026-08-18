@@ -272,11 +272,19 @@ def test_recovered_awaiting_merge_entry_reconciles_when_pr_is_merged() -> None:
     repository_host.read_pr_closing_issue_references.assert_not_called()
 
 
-def test_merged_pr_with_open_issue_flags_close_on_merge_fallback() -> None:
-    """A merged PR whose issue is open AND was never closed since the merge
-    means GitHub's closing-keyword auto-close did not fire (word-boundary-
-    defeated reference or none at all). The fact must carry issue_open=True so
-    the planner orders the close-on-merge fallback (porchpin case file #81)."""
+def test_registered_closing_pr_with_open_issue_flags_fallback() -> None:
+    """A merged PR that DID register this issue as a closing reference, whose
+    issue is nonetheless open AND was never closed since the merge, proves
+    GitHub's auto-close did not fire. The fact must carry issue_open=True so
+    the planner orders the close-on-merge fallback (porchpin case file #81).
+
+    Since #113 the registration is required, not incidental: a merge that
+    registered nothing is read as a deliberate non-closing merge and is
+    covered by ``test_merged_pr_not_registered_as_closing_sheds_without_
+    closing`` instead. This test therefore no longer covers the
+    "reference defeated before GitHub parsed it" case — nothing does, by
+    design; see the ``close_on_merge`` module docstring.
+    """
     entry = _history_entry()
     state = OrchestratorState(session_history=[entry])
     repository_host = MagicMock()

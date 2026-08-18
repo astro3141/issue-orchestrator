@@ -16,15 +16,40 @@ MERGED PR earns the fallback: closed-unmerged PRs keep their drift-path
 behavior, and intentionally reopened issues (porchpin case file #59) are never
 touched — their history entries are already terminal and cannot re-fire.
 
-``merged + issue OPEN`` was then found to describe two opposite situations —
+WHY THIS MODULE'S ANSWER CHANGED (#113)
+=======================================
+
+``merged + issue OPEN`` was then found to describe two OPPOSITE situations —
 the failed auto-close above, and a merge that deliberately did not close its
-issue (a PR that says ``Refs #45``, landing partial work) — with no field
-telling them apart. The second one had no owner at all: it never reached this
-module, so its issue stayed parked on a stale ``pr-pending`` forever and needed
-a human to strip the label (#113). GitHub's REGISTERED closing linkage
-(``PullRequest.closingIssuesReferences`` — GitHub's own resolution of the
-closing keywords, not a text parse of ours) is the disambiguator, and it routes
-the outcome here so both cases share one owner.
+issue (a PR that says ``Refs #45``, landing partial work) — identical on every
+field this owner read. The commit above (#6956) could not tell them apart and
+resolved every one of them the same way: close the issue. So the deliberate
+merge had no honest owner. Its issue was either closed against the author's
+intent, or — when it never reached this module at all — left parked on a stale
+``pr-pending`` forever, needing a human to strip the label (#113).
+
+GitHub's REGISTERED closing linkage (``PullRequest.closingIssuesReferences`` —
+GitHub's own resolution of the closing keywords, not a text parse of ours) is
+the disambiguator, and it routes the outcome here so both cases share one
+owner. It is not a perfect one: an EMPTY registration still means either "the
+author never asked for a close" or "the author asked in a form GitHub failed
+to parse", and no field separates those. A choice had to be made.
+
+**#113 resolves an empty registration as a deliberate continuation, and this
+SUPERSEDES #6956's opposite resolution of the same condition.** No close; the
+ordinary terminal recovery sheds the stale ``pr-pending`` so the still-open
+issue rejoins selection. The fallback close now fires ONLY when the PR did
+register this issue — i.e. only on a genuinely failed auto-close.
+
+Residual exposure, stated deliberately: the literal-``\\n`` PR at the top of
+this docstring registers nothing, so under the new rule it lands on the
+continuation side. It is no longer closed; ``pr-pending`` is shed and the
+already-merged issue returns to ordinary selection, where a planning pass may
+relaunch a coding session on it — porchpin #81's symptom, reached by a
+different route and no longer wedged behind a permanent stale label. That
+trade was taken because #6956's failure mode was worse and silent: it closed
+issues whose authors had deliberately left them open. The repair for a
+defeated keyword belongs on the PR, where GitHub can parse it.
 """
 
 from __future__ import annotations
@@ -84,10 +109,16 @@ def close_on_merge_evidence(
     - answered, but this issue is not in the set → a deliberate non-closing
       merge. Return False: no close, and the caller's ordinary terminal
       recovery sheds the stale ``pr-pending`` so the still-open issue rejoins
-      selection instead of parking forever;
+      selection instead of parking forever. This branch REVERSES #6956, which
+      closed the issue on exactly this condition; the module docstring records
+      why the ambiguity is resolved this way and what it costs;
     - unreadable → return None. Fail closed: no close AND no shed. Treating an
       unreadable relation as an empty one would shed a queue-gating label on a
       guess.
+
+    Net effect on the destructive write: it is strictly NARROWER than before.
+    The close now requires a registered reference on top of every pre-existing
+    condition, so no issue closes today that would not have closed before.
 
     Called from BOTH phases: discovery (to plan the close attempt) and the
     apply-time owner command, which revalidates immediately before the
@@ -278,13 +309,20 @@ def run_close_on_merge_fallback(
 
 
 def close_on_merge_comment(pr_url: str, pr_number: int) -> str:
-    """Explanatory comment posted when the fallback closes an issue."""
+    """Explanatory comment posted when the fallback closes an issue.
+
+    Must describe the ONLY condition that reaches it: the PR registered this
+    issue as a closing reference and merged, yet GitHub's auto-close did not
+    fire. A merge that registered nothing is a deliberate non-closing merge
+    under #113 and never reaches this comment — see the module docstring.
+    ``test_close_on_merge_comment_states_the_surviving_trigger`` pins the text
+    to that trigger so it cannot drift back to the pre-#113 wording.
+    """
     return (
-        f"Closing: {pr_url or f'PR #{pr_number}'} merged this issue's work, "
-        "but the PR registered no closing reference, so GitHub did not "
-        "auto-close the issue. The orchestrator closed it during "
-        "awaiting-merge reconciliation. If this issue was intentionally left "
-        "open for remaining scope, reopen it."
+        f"Closing: {pr_url or f'PR #{pr_number}'} registered this issue as a "
+        "closing reference and merged, but GitHub's auto-close did not fire. "
+        "The orchestrator closed it during awaiting-merge reconciliation. If "
+        "this issue still has remaining scope, reopen it."
     )
 
 

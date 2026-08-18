@@ -8,6 +8,7 @@ from pathlib import Path
 from issue_orchestrator.domain.tech_lead_session import TechLeadCreationOrigin
 from issue_orchestrator.control.action_applier import ActionApplier
 from issue_orchestrator.control.claim_gate import ClaimGate, ClaimLostError
+from issue_orchestrator.control.close_on_merge import close_on_merge_comment
 from issue_orchestrator.control.actions import (
     ActionType,
     ActionResultType,
@@ -2316,7 +2317,9 @@ class TestRecoverTerminalIssueAction:
         assert "shed" in order and order.index("shed") > 1
         comment_body = mock_repository_host.add_comment.call_args.args[1]
         assert "https://github.com/test/repo/pull/318" in comment_body
-        assert "no closing reference" in comment_body
+        assert comment_body == close_on_merge_comment(
+            "https://github.com/test/repo/pull/318", 318,
+        )
         assert entry.status == "merged"
 
     def test_close_on_merge_failure_leaves_labels_and_history_untouched(

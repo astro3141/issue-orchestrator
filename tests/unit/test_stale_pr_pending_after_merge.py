@@ -23,6 +23,7 @@ from issue_orchestrator.control.actions import ActionType, RecoverTerminalIssueA
 from issue_orchestrator.control.awaiting_merge_reconciler import (
     AwaitingMergeReconciler,
 )
+from issue_orchestrator.control.close_on_merge import close_on_merge_comment
 from issue_orchestrator.control.label_manager import LabelManager
 from issue_orchestrator.control.planner import Planner
 from issue_orchestrator.control.planner_types import OrchestratorSnapshot
@@ -164,6 +165,31 @@ def test_known_linked_merge_still_closes_the_issue() -> None:
     assert isinstance(action, RecoverTerminalIssueAction)
     assert action.close_issue is True
     assert action.merged_at == _MERGED_AT
+
+
+def test_close_on_merge_comment_states_the_surviving_trigger() -> None:
+    """The comment is orchestrator-authored text on a public issue, so it must
+    describe the only condition that now reaches it.
+
+    Before #113 the close fired when the PR registered NO closing reference,
+    and the comment said so. #113 inverted that: the close now fires only when
+    the PR DID register one. The old sentence would assert, on a PR whose own
+    sidebar shows the linkage, that no linkage exists — actively misdirecting
+    whoever investigates. Pinned here so it cannot drift back.
+    """
+    body = close_on_merge_comment(_PR_URL, 49)
+
+    assert _PR_URL in body
+    assert "registered this issue as a closing reference" in body
+    assert "auto-close did not fire" in body
+    assert "no closing reference" not in body
+
+
+def test_close_on_merge_comment_falls_back_to_the_pr_number() -> None:
+    """An empty ``pr_url`` must still name the PR, not render a bare colon."""
+    body = close_on_merge_comment("", 49)
+
+    assert "PR #49" in body
 
 
 def test_known_linked_but_reopened_issue_is_not_reclosed() -> None:

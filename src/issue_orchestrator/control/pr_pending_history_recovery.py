@@ -71,6 +71,7 @@ class PrPendingRecoverySource:
 def resolve_pr_pending_recovery_source(
     *,
     issue_number: int,
+    has_open_pr: bool,
     open_pr_url: str | None,
     get_prs_for_issue: "Callable[[int], list[PRInfo]]",
 ) -> PrPendingRecoverySource:
@@ -81,12 +82,24 @@ def resolve_pr_pending_recovery_source(
     pay one PR-set read, and it defers to ``classify_pr_set`` so the
     "latest terminal PR decides" precedence stays owned in one place.
 
+    The two facts the analysis holds are taken separately, and deliberately.
+    Collapsing them (``pr_url if has_open_pr else None``) would send the
+    "open PR, URL unknown" shape down the no-open-PR branch, where it pays a
+    PR-set read it cannot use and comes back with the self-contradicting
+    reason "no open or merged PR (PR set resolves to open)". That shape is a
+    caller-side gap in the analysis, not a stale-PR case: it is named as such
+    and costs no read.
+
     A merged PR is recovered rather than skipped: its issue is still open and
     still labelled ``pr-pending``, and only the awaiting-merge reconciler can
     decide whether that means a failed auto-close or a deliberate non-closing
     merge. Skipping it, as this used to, left nobody to decide at all (#113).
     """
-    if open_pr_url:
+    if has_open_pr:
+        if not open_pr_url:
+            return PrPendingRecoverySource.skip(
+                "issue analysis reports an open PR but carries no PR URL"
+            )
         return PrPendingRecoverySource.recover(open_pr_url)
     try:
         prs = get_prs_for_issue(issue_number)
@@ -174,7 +187,8 @@ class PrPendingHistoryRecovery:
         )
         source = resolve_pr_pending_recovery_source(
             issue_number=issue_number,
-            open_pr_url=analysis.pr_url if analysis.has_open_pr else None,
+            has_open_pr=analysis.has_open_pr,
+            open_pr_url=analysis.pr_url,
             get_prs_for_issue=self._prs_for_issue,
         )
         if source.outcome == "skip":

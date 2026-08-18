@@ -1723,6 +1723,44 @@ class TestStartupManagerAwaitingMergeRecovery:
         for call in mock_repository_host.get_prs_for_issue.call_args_list:
             assert call.kwargs.get("state") != "all"
 
+    @pytest.mark.asyncio
+    @patch("issue_orchestrator.control.pr_pending_history_recovery.analyze_issue")
+    async def test_open_pr_without_a_url_skips_honestly_and_pays_no_read(
+        self,
+        mock_analyze,
+        startup_manager,
+        sample_state,
+        mock_repository_host,
+        mock_label_store,
+        caplog,
+    ):
+        """N1: an analysis reporting an open PR but no URL is a gap in the
+        caller's facts, not a stale-PR case.
+
+        It must not fall through to the stale branch, where it would pay a
+        state="all" read it cannot use and report the self-contradicting
+        "no open or merged PR (PR set resolves to open)".
+        """
+        issue = Issue(number=4057, title="URL-less open PR", labels=["agent:backend", "pr-pending"])
+        mock_label_store.load_all.return_value = {
+            4057: {"agent:backend", "pr-pending"},
+        }
+        mock_repository_host.get_issue.return_value = issue
+
+        mock_state = MagicMock()
+        mock_state.has_open_pr = True
+        mock_state.pr_url = None
+        mock_analyze.return_value = mock_state
+
+        with caplog.at_level("INFO"):
+            await startup_manager.run_startup(sample_state)
+
+        assert sample_state.session_history == []
+        assert "reports an open PR but carries no PR URL" in caplog.text
+        assert "PR set resolves to" not in caplog.text
+        for call in mock_repository_host.get_prs_for_issue.call_args_list:
+            assert call.kwargs.get("state") != "all"
+
 
 class TestStartupManagerTechLeadRecovery:
     """Tests for tech_lead review recovery."""
