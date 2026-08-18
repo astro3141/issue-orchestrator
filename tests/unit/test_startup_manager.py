@@ -1761,6 +1761,51 @@ class TestStartupManagerAwaitingMergeRecovery:
         for call in mock_repository_host.get_prs_for_issue.call_args_list:
             assert call.kwargs.get("state") != "all"
 
+    @pytest.mark.asyncio
+    @patch("issue_orchestrator.control.pr_pending_history_recovery.analyze_issue")
+    async def test_merged_pr_without_a_url_skips_like_its_open_sibling(
+        self,
+        mock_analyze,
+        startup_manager,
+        sample_state,
+        mock_repository_host,
+        mock_label_store,
+        caplog,
+    ):
+        """N3: both branches handle a URL-less PR the same way.
+
+        The rehydrated entry keys on that URL, so there is nothing to build
+        without one — and the recovery loop already tolerates a per-issue skip,
+        whereas raising would abort the whole of startup over one issue.
+        """
+        from issue_orchestrator.ports import PRInfo
+
+        issue = Issue(number=45, title="URL-less merge", labels=["agent:backend", "pr-pending"])
+        mock_label_store.load_all.return_value = {45: {"agent:backend", "pr-pending"}}
+        mock_repository_host.get_issue.return_value = issue
+        mock_repository_host.get_prs_for_issue.return_value = [
+            PRInfo(
+                number=49,
+                url="",
+                title="PR #49",
+                branch="49-branch",
+                body="",
+                state="merged",
+                labels=[],
+            ),
+        ]
+
+        mock_state = MagicMock()
+        mock_state.has_open_pr = False
+        mock_state.pr_url = None
+        mock_analyze.return_value = mock_state
+
+        with caplog.at_level("INFO"):
+            await startup_manager.run_startup(sample_state)
+
+        assert sample_state.session_history == []
+        assert "merged PR #49 carries no PR URL" in caplog.text
+
 
 class TestStartupManagerTechLeadRecovery:
     """Tests for tech_lead review recovery."""

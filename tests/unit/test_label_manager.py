@@ -417,8 +417,20 @@ class TestPublishFailCount:
 
 
 # ===================================================================
-# recovered_workflow_labels() — clear-on-merge policy
+# RECOVERED_WORKFLOW scope — clear-on-merge policy
 # ===================================================================
+
+def _recovered(lm: LabelManager, labels: list[str]) -> list[str]:
+    """The full recovered-workflow shed, reached only through its scope.
+
+    ``labels_to_shed`` is the single resolver for both authorities (#113), so
+    these policy tests go through it rather than through a second entry point
+    that could drift from the scope table.
+    """
+    return lm.labels_to_shed(
+        TerminalRecoveryLabelScope.RECOVERED_WORKFLOW, labels
+    )
+
 
 class TestRecoveredWorkflowLabels:
     def test_sheds_transient_and_blocking_labels(self, lm: LabelManager) -> None:
@@ -431,15 +443,15 @@ class TestRecoveredWorkflowLabels:
             "needs-human",
             "tech-lead-needs-human",
         ]
-        assert lm.recovered_workflow_labels(labels) == labels
+        assert _recovered(lm, labels) == labels
 
     def test_leaves_non_transient_labels(self, lm: LabelManager) -> None:
         labels = ["agent:backend", "bug", "in-progress", "code-reviewed", "rework-cycle-1"]
-        assert lm.recovered_workflow_labels(labels) == []
+        assert _recovered(lm, labels) == []
 
     def test_mixed_returns_only_transient(self, lm: LabelManager) -> None:
         labels = ["bug", "pr-pending", "agent:web", "publish-fail-count-3", "blocked-failed"]
-        assert lm.recovered_workflow_labels(labels) == [
+        assert _recovered(lm, labels) == [
             "pr-pending",
             "publish-fail-count-3",
             "blocked-failed",
@@ -447,7 +459,7 @@ class TestRecoveredWorkflowLabels:
 
     def test_order_preserving_and_deduped(self, lm: LabelManager) -> None:
         labels = ["pr-pending", "pr-pending", "blocked"]
-        assert lm.recovered_workflow_labels(labels) == ["pr-pending", "blocked"]
+        assert _recovered(lm, labels) == ["pr-pending", "blocked"]
 
     def test_prefixed(self, plm: LabelManager) -> None:
         labels = [
@@ -456,7 +468,7 @@ class TestRecoveredWorkflowLabels:
             "bot:blocked:pr-closed",
             "bug",
         ]
-        assert plm.recovered_workflow_labels(labels) == [
+        assert _recovered(plm, labels) == [
             "bot:pr-pending",
             "bot:publish-fail-count-1",
             "bot:blocked:pr-closed",
@@ -499,7 +511,13 @@ class TestLabelsToShedScope:
     ) -> None:
         assert lm.labels_to_shed(
             TerminalRecoveryLabelScope.RECOVERED_WORKFLOW, self._MIXED
-        ) == lm.recovered_workflow_labels(self._MIXED)
+        ) == [
+            "pr-pending",
+            "publish-failed",
+            "publish-fail-count-2",
+            "blocked:claim-lost",
+            "tech-lead-needs-human",
+        ]
 
     def test_stale_pr_pending_scope_is_exactly_pr_pending(
         self, lm: LabelManager

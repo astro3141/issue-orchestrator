@@ -38,6 +38,7 @@ from issue_orchestrator.control.planner_types import OrchestratorSnapshot
 from issue_orchestrator.control.scheduler import Scheduler
 from issue_orchestrator.control.session_history import SessionHistoryOwner
 from issue_orchestrator.domain.models import (
+    ORCHESTRATOR_PR_MARKER,
     DiscoveredAwaitingMergeReconciliation,
     Issue,
     MergedIssueDisposition,
@@ -85,23 +86,39 @@ def _history_entry() -> SessionHistoryEntry:
     )
 
 
-def _merged_pr() -> PRInfo:
+# A hand-authored merge that deliberately lands partial work, and the
+# orchestrator's own PR body — which ALWAYS opens with a closing keyword and
+# always carries the marker, because build_pr_body writes both.
+_HAND_AUTHORED_BODY = "Refs #45"
+_ORCHESTRATOR_BODY = f"Closes #45\n\n## Implementation\nDone.\n\n---\n*{ORCHESTRATOR_PR_MARKER}*"
+
+
+def _merged_pr(body: str = _HAND_AUTHORED_BODY) -> PRInfo:
     return PRInfo(
         number=49,
         title="Land partial work (Refs #45)",
         url=_PR_URL,
         branch="45-partial",
-        body="Refs #45",
+        body=body,
         state="merged",
         labels=[],
         merged_at=_MERGED_AT,
     )
 
 
-def _host(*, closes: tuple[int, ...] | None) -> MagicMock:
-    """A repository host whose merged PR registers ``closes`` (None = UNKNOWN)."""
+def _host(
+    *,
+    closes: tuple[int, ...] | None,
+    pr_body: str = _HAND_AUTHORED_BODY,
+) -> MagicMock:
+    """A repository host whose merged PR registers ``closes`` (None = UNKNOWN).
+
+    ``pr_body`` decides authorship, which is what settles an EMPTY
+    registration: the orchestrator's own body asked for the close, so an empty
+    registration on it can only be a defeated keyword.
+    """
     host = MagicMock()
-    host.get_pr.return_value = _merged_pr()
+    host.get_pr.return_value = _merged_pr(pr_body)
     host.get_issue.return_value = _issue()
     host.issue_closed_on_or_after.return_value = False
     host.read_pr_closing_issue_references.return_value = (
@@ -196,20 +213,23 @@ def test_known_linked_merge_still_closes_the_issue() -> None:
     assert action.label_scope is TerminalRecoveryLabelScope.RECOVERED_WORKFLOW
 
 
-def test_close_on_merge_comment_states_the_surviving_trigger() -> None:
+def test_close_on_merge_comment_states_the_surviving_triggers() -> None:
     """The comment is orchestrator-authored text on a public issue, so it must
-    describe the only condition that now reaches it.
+    describe the conditions that now reach it, and only those.
 
     Before #113 the close fired when the PR registered NO closing reference,
-    and the comment said so. #113 inverted that: the close now fires only when
-    the PR DID register one. The old sentence would assert, on a PR whose own
-    sidebar shows the linkage, that no linkage exists — actively misdirecting
-    whoever investigates. Pinned here so it cannot drift back.
+    and the comment said so. #113 inverted that: the close fires when the PR
+    registered one, or when the orchestrator authored it (its body always asks
+    for the close, so an empty registration is a defeated keyword). The old
+    sentence would assert, on a PR whose own sidebar shows the linkage, that no
+    linkage exists — actively misdirecting whoever investigates. Pinned here so
+    it cannot drift back.
     """
     body = close_on_merge_comment(_PR_URL, 49)
 
     assert _PR_URL in body
-    assert "registered this issue as a closing reference" in body
+    assert "registered it as a closing reference" in body
+    assert "authored by the orchestrator" in body
     assert "auto-close did not fire" in body
     assert "no closing reference" not in body
 
@@ -383,12 +403,14 @@ def _applier_for(host: MagicMock, entry: SessionHistoryEntry) -> ActionApplier:
 
 def _apply_and_report(
     action: RecoverTerminalIssueAction,
+    *,
+    pr_body: str = _HAND_AUTHORED_BODY,
 ) -> tuple[set[str], list[str], MagicMock]:
     """Apply *action* against the continuing issue.
 
     Returns (labels surviving on the issue, labels removed, repository host).
     """
-    host = _host(closes=())
+    host = _host(closes=(), pr_body=pr_body)
     host.get_issue.return_value = _issue(labels=_CONTINUING_ISSUE_LABELS[1:])
     entry = _history_entry()
     applier = _applier_for(host, entry)
@@ -472,3 +494,116 @@ def test_routing_the_continuation_back_through_the_full_shed_fails_it() -> None:
         [_issue(labels=[])], check_dependencies=False,
     )[0]
     assert decision.available is True
+
+
+# ---------------------------------------------------------------------------
+# An EMPTY registration is settled by authorship (#113 review round 3)
+# ---------------------------------------------------------------------------
+
+
+def test_orchestrator_authored_unregistered_merge_is_a_failed_auto_close() -> None:
+    """The porchpin #81 shape, which the continuation branch must NOT swallow.
+
+    ``build_pr_body`` opens every orchestrator PR with ``Closes #45`` and
+    signs it with the marker. So on a marked PR, "GitHub registered nothing"
+    cannot mean the author left the issue open deliberately — the author asked
+    for the close and GitHub's word-boundary-sensitive parse was defeated.
+    That is a failed auto-close, and it still closes.
+    """
+    host = _host(closes=(), pr_body=_ORCHESTRATOR_BODY)
+
+    result, plan = _plan_for(host)
+
+    assert (
+        result.reconciliations[0].merged_disposition
+        is MergedIssueDisposition.CLOSE_AND_RECOVER
+    )
+    action = plan.actions_of_type(ActionType.RECOVER_TERMINAL_ISSUE)[0]
+    assert isinstance(action, RecoverTerminalIssueAction)
+    assert action.close_issue is True
+    # The work landed, so this carries the full terminal authority — not the
+    # continuation merge's narrow one.
+    assert action.label_scope is TerminalRecoveryLabelScope.RECOVERED_WORKFLOW
+
+
+def test_the_authorship_branch_closes_instead_of_relaunching() -> None:
+    """The regression F1 names, walked to its consequence on both sides.
+
+    Same merged PR, same empty registration, same open issue — only the body
+    differs. Marked: the issue is CLOSED, so no planning pass can relaunch a
+    coding session on already-merged work. Unmarked: no close, the stale label
+    sheds, and the still-open issue rejoins selection, which is correct for a
+    deliberate ``Refs`` merge and is exactly why authorship has to decide.
+    """
+    _, marked_plan = _plan_for(_host(closes=(), pr_body=_ORCHESTRATOR_BODY))
+    marked = marked_plan.actions_of_type(ActionType.RECOVER_TERMINAL_ISSUE)[0]
+    assert isinstance(marked, RecoverTerminalIssueAction)
+
+    _surviving, _removed, host = _apply_and_report(
+        marked, pr_body=_ORCHESTRATOR_BODY
+    )
+
+    host.update_issue_state.assert_called_once_with(45, "closed")
+    comment_body = host.add_comment.call_args.args[1]
+    assert comment_body == close_on_merge_comment(_PR_URL, 49)
+
+    # The hand-authored counterpart: no close at all, and the shed issue is
+    # available again — the outcome that would be a silent relaunch if it were
+    # ever reached by an orchestrator-authored merge.
+    _, plain_plan = _plan_for(_host(closes=()))
+    plain = plain_plan.actions_of_type(ActionType.RECOVER_TERMINAL_ISSUE)[0]
+    assert isinstance(plain, RecoverTerminalIssueAction)
+    _s, _r, plain_host = _apply_and_report(plain)
+    plain_host.update_issue_state.assert_not_called()
+
+
+def test_a_registered_set_that_omits_this_issue_ignores_authorship() -> None:
+    """Authorship only settles an EMPTY registration.
+
+    A non-empty set proves GitHub parsed this body and registered what it
+    asked for, so this issue's absence is a positive fact about intent — even
+    on a marked PR whose body a human rewrote before merging. Consulting the
+    marker here would re-close issues someone deliberately retargeted.
+    """
+    host = _host(closes=(46,), pr_body=_ORCHESTRATOR_BODY)
+
+    result, plan = _plan_for(host)
+
+    assert (
+        result.reconciliations[0].merged_disposition
+        is MergedIssueDisposition.CONTINUE
+    )
+    action = plan.actions_of_type(ActionType.RECOVER_TERMINAL_ISSUE)[0]
+    assert isinstance(action, RecoverTerminalIssueAction)
+    assert action.close_issue is False
+    assert action.label_scope is TerminalRecoveryLabelScope.STALE_PR_PENDING
+
+
+def test_authorship_does_not_override_a_deliberate_reopen() -> None:
+    """An orchestrator-authored merge whose issue was auto-closed and then
+    reopened by a human is still never re-closed (porchpin #59). Authorship
+    only decides what the empty registration MEANS; the reopen guard still
+    decides whether the close may fire."""
+    host = _host(closes=(), pr_body=_ORCHESTRATOR_BODY)
+    host.issue_closed_on_or_after.return_value = True
+
+    result, plan = _plan_for(host)
+
+    assert (
+        result.reconciliations[0].merged_disposition
+        is MergedIssueDisposition.RECOVER
+    )
+    action = plan.actions_of_type(ActionType.RECOVER_TERMINAL_ISSUE)[0]
+    assert isinstance(action, RecoverTerminalIssueAction)
+    assert action.close_issue is False
+
+
+def test_discovery_pays_no_extra_read_for_the_authorship_check() -> None:
+    """Cost discipline: discovery already holds the merged PR, so deciding
+    authorship costs no additional GitHub call — the reconciler's single
+    ``get_pr`` is the same one it needed to see the merge at all."""
+    host = _host(closes=(), pr_body=_ORCHESTRATOR_BODY)
+
+    _plan_for(host)
+
+    assert host.get_pr.call_count == 1

@@ -39,6 +39,7 @@ from issue_orchestrator.control.orchestrator_support import (
 from issue_orchestrator.control.session_history import SessionHistoryOwner
 from issue_orchestrator.control.session_manager import SessionType
 from issue_orchestrator.domain.models import (
+    ORCHESTRATOR_PR_MARKER,
     AgentConfig,
     DiscoveredFailure,
     Issue,
@@ -2298,16 +2299,21 @@ class TestRecoverTerminalIssueAction:
         issue_state="open",
         auto_close_fired=False,
         closing_linkage=(228,),
+        pr_body="Refs #228 — landing partial work by hand.",
     ):
         """Wire the apply-time revalidation reads (F4/A2, #113): the live
-        issue state, the PR's registered closing linkage, and the close-event
+        issue state, the PR's registered closing linkage, the merged PR's body
+        (read only when that linkage registered nothing), and the close-event
         evidence since the merge.
 
-        ``closing_linkage=None`` makes the relation unreadable.
+        ``closing_linkage=None`` makes the relation unreadable. ``pr_body``
+        defaults to a hand-authored body carrying no orchestrator marker, so a
+        test that does not care about authorship gets the continuation side.
         """
         mock_repository_host.get_issue.return_value = MagicMock(
             state=issue_state,
         )
+        mock_repository_host.get_pr.return_value = MagicMock(body=pr_body)
         mock_repository_host.read_pr_closing_issue_references.return_value = (
             ClosingIssueReferencesRead.unknown()
             if closing_linkage is None
@@ -2423,8 +2429,9 @@ class TestRecoverTerminalIssueAction:
         real_label_manager,
     ):
         """#113: discovery planned the close, but the PR's registered linkage
-        no longer names this issue. No close — and recovery still completes,
-        so the stale pr-pending is shed and the issue rejoins selection."""
+        no longer names this issue and its body is hand-authored. No close —
+        and recovery still completes, so the stale pr-pending is shed and the
+        issue rejoins selection."""
         self._stub_close_evidence(mock_repository_host, closing_linkage=())
         entry = self._awaiting_merge_entry()
         applier = self._make_applier(
@@ -2442,6 +2449,145 @@ class TestRecoverTerminalIssueAction:
         removed = {call.args[1] for call in mock_labels.remove_label.call_args_list}
         assert "pr-pending" in removed
         assert entry.status == "merged"
+
+    def test_apply_time_orchestrator_authored_unregistered_merge_closes(
+        self, mock_labels, mock_sessions, mock_events, mock_repository_host,
+        real_label_manager,
+    ):
+        """#113 round 3: same empty linkage, orchestrator-authored body.
+
+        ``build_pr_body`` always writes ``Closes #<issue>``, so an empty
+        registration on a marked PR is a defeated keyword — a failed
+        auto-close. The apply-time owner reads the body live and closes."""
+        self._stub_close_evidence(
+            mock_repository_host,
+            closing_linkage=(),
+            pr_body=f"Closes #228\n\n---\n*{ORCHESTRATOR_PR_MARKER}*",
+        )
+        entry = self._awaiting_merge_entry()
+        applier = self._make_applier(
+            mock_labels, mock_sessions, mock_events, mock_repository_host,
+            real_label_manager,
+            github_labels=["pr-pending", "agent:backend"],
+            history_entry=entry,
+        )
+
+        result = applier.apply(self._close_on_merge_action())
+
+        assert result.success
+        assert result.details["closed_issue"] is True
+        mock_repository_host.update_issue_state.assert_called_once_with(
+            228, "closed",
+        )
+        # The reopen guard still ran on top of authorship.
+        mock_repository_host.issue_closed_on_or_after.assert_called_once_with(
+            228, self._CLOSE_MERGED_AT,
+        )
+        assert entry.status == "merged"
+
+    def test_apply_time_orchestrator_authored_reopen_is_still_not_reclosed(
+        self, mock_labels, mock_sessions, mock_events, mock_repository_host,
+        real_label_manager,
+    ):
+        """Authorship does not bypass the reopen guard: a close event at/after
+        the merge still means the auto-close fired and a human reopened
+        deliberately (porchpin #59). Recovery completes without a close."""
+        self._stub_close_evidence(
+            mock_repository_host,
+            closing_linkage=(),
+            auto_close_fired=True,
+            pr_body=f"Closes #228\n\n---\n*{ORCHESTRATOR_PR_MARKER}*",
+        )
+        entry = self._awaiting_merge_entry()
+        applier = self._make_applier(
+            mock_labels, mock_sessions, mock_events, mock_repository_host,
+            real_label_manager,
+            github_labels=["pr-pending", "agent:backend"],
+            history_entry=entry,
+        )
+
+        result = applier.apply(self._close_on_merge_action())
+
+        assert result.success
+        assert result.details["closed_issue"] is False
+        mock_repository_host.update_issue_state.assert_not_called()
+        assert entry.status == "merged"
+
+    def test_apply_time_unreadable_pr_body_blocks_close_and_shed(
+        self, mock_labels, mock_sessions, mock_events, mock_repository_host,
+        real_label_manager,
+    ):
+        """An unread body is never read as "someone else wrote it".
+
+        With an empty registration, authorship is what decides between a
+        failed auto-close and a deliberate continuation — so a body the host
+        cannot produce is UNREADABLE and fails closed, exactly as an
+        unreadable linkage does. No close, no shed, entry stays reconcilable.
+        """
+        self._stub_close_evidence(mock_repository_host, closing_linkage=())
+        mock_repository_host.get_pr.return_value = None
+        entry = self._awaiting_merge_entry()
+        applier = self._make_applier(
+            mock_labels, mock_sessions, mock_events, mock_repository_host,
+            real_label_manager,
+            github_labels=["pr-pending", "agent:backend"],
+            history_entry=entry,
+        )
+
+        result = applier.apply(self._close_on_merge_action())
+
+        assert not result.success
+        assert "revalidation unreadable" in (result.error or "")
+        mock_repository_host.update_issue_state.assert_not_called()
+        mock_labels.remove_label.assert_not_called()
+        assert entry.status == "completed"
+
+    def test_apply_time_pr_body_read_failure_blocks_close_and_shed(
+        self, mock_labels, mock_sessions, mock_events, mock_repository_host,
+        real_label_manager,
+    ):
+        """Same fail-closed outcome when the body read raises rather than
+        coming back empty-handed."""
+        from issue_orchestrator.ports.repository_host import (
+            RepositoryHostError,
+        )
+        self._stub_close_evidence(mock_repository_host, closing_linkage=())
+        mock_repository_host.get_pr.side_effect = RepositoryHostError("502")
+        entry = self._awaiting_merge_entry()
+        applier = self._make_applier(
+            mock_labels, mock_sessions, mock_events, mock_repository_host,
+            real_label_manager,
+            github_labels=["pr-pending", "agent:backend"],
+            history_entry=entry,
+        )
+
+        result = applier.apply(self._close_on_merge_action())
+
+        assert not result.success
+        mock_repository_host.update_issue_state.assert_not_called()
+        mock_labels.remove_label.assert_not_called()
+        assert entry.status == "completed"
+
+    def test_apply_time_registered_close_pays_no_pr_body_read(
+        self, mock_labels, mock_sessions, mock_events, mock_repository_host,
+        real_label_manager,
+    ):
+        """Cost discipline: the ordinary registered-linkage close is decided
+        without the authorship read, so the common path pays no extra call."""
+        self._stub_close_evidence(mock_repository_host)
+        entry = self._awaiting_merge_entry()
+        applier = self._make_applier(
+            mock_labels, mock_sessions, mock_events, mock_repository_host,
+            real_label_manager,
+            github_labels=["pr-pending", "agent:backend"],
+            history_entry=entry,
+        )
+
+        result = applier.apply(self._close_on_merge_action())
+
+        assert result.success
+        assert result.details["closed_issue"] is True
+        mock_repository_host.get_pr.assert_not_called()
 
     def test_apply_time_revalidation_preserves_human_reopen(
         self, mock_labels, mock_sessions, mock_events, mock_repository_host,

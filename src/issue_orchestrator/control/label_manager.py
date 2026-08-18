@@ -473,15 +473,6 @@ class LabelManager:
             or self.is_publish_fail_count(label)
         )
 
-    def recovered_workflow_labels(self, labels: Sequence[str]) -> list[str]:
-        """Return the subset of *labels* to shed when an issue recovers/completes.
-
-        Order-preserving and de-duplicated. This is the single policy owner for
-        the clear-on-merge transition: callers feed it the issue's current
-        labels and remove whatever it returns.
-        """
-        return self._select(labels, self.is_recovered_workflow_label)
-
     def is_stale_after_continuation_merge(self, label: str) -> bool:
         """Return True if a merge that did NOT close its issue proves *label*
         stale.
@@ -499,7 +490,9 @@ class LabelManager:
 
         The single owner of how much label state a recovery may clear, as a
         decision table over the scope so the two authorities cannot drift apart
-        across call sites. An unmapped scope raises rather than defaulting to
+        across call sites — and the ONLY way to resolve either set, so no
+        caller can reach one authority's label list without naming the scope
+        that entitles it. An unmapped scope raises rather than defaulting to
         either authority. Order-preserving and de-duplicated.
         """
         predicate = {

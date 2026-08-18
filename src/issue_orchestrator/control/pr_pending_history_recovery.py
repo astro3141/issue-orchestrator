@@ -94,6 +94,11 @@ def resolve_pr_pending_recovery_source(
     still labelled ``pr-pending``, and only the awaiting-merge reconciler can
     decide whether that means a failed auto-close or a deliberate non-closing
     merge. Skipping it, as this used to, left nobody to decide at all (#113).
+
+    A URL-less PR is skipped with a reason on BOTH branches. The rehydrated
+    entry keys on that URL — there is no entry to build without one — and the
+    recovery loop tolerates a per-issue skip, whereas raising would abort the
+    whole of startup over one unrecoverable issue.
     """
     if has_open_pr:
         if not open_pr_url:
@@ -107,6 +112,10 @@ def resolve_pr_pending_recovery_source(
         return PrPendingRecoverySource.skip(f"associated PRs unreadable: {exc}")
     classification = classify_pr_set(prs)
     if classification.outcome == "merged" and classification.pr is not None:
+        if not classification.pr.url:
+            return PrPendingRecoverySource.skip(
+                f"merged PR #{classification.pr.number} carries no PR URL"
+            )
         return PrPendingRecoverySource.recover(classification.pr.url)
     return PrPendingRecoverySource.skip(
         f"no open or merged PR (PR set resolves to {classification.outcome})"

@@ -287,16 +287,16 @@ class AwaitingMergeReconciler:
                 else:
                     # PR merged: a failed auto-close, or a merge that deliberately
                     # did not close its issue? close_on_merge routes both on the
-                    # registered closing linkage (porchpin #81, #113), and its typed
-                    # answer also bounds how much label state the recovery may shed.
-                    # UNREADABLE = fail closed, leave the entry reconcilable.
+                    # registered closing linkage — and, where it registered nothing,
+                    # on the in-hand PR body's authorship (porchpin #81, #113). Its
+                    # answer also bounds the shed; UNREADABLE = leave reconcilable.
                     host = self.repository_host
                     disposition = merged_issue_disposition(
                         get_issue=self._get_issue,
                         closed_on_or_after=host.issue_closed_on_or_after,
                         closing_issue_references=host.read_pr_closing_issue_references,
                         state=state, entry=entry, pr_number=pr_number,
-                        merged_at=pr.merged_at, now=self.clock(),
+                        merged_at=pr.merged_at, pr_body=pr.body, now=self.clock(),
                     )
                     if disposition is MergedIssueDisposition.UNREADABLE:
                         return AwaitingMergeEntryDiscovery("skipped")
