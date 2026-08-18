@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import nullcontext
+from dataclasses import dataclass
 import inspect
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
@@ -113,29 +114,40 @@ class TestDeclareNoControlApi:
         assert orchestrator.deps.agent_callback_endpoint.is_ready() is False
 
 
-def test_locked_cli_start_persists_exact_selection_after_lock_publication(
-    tmp_path: Path,
-    orchestrator,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+@dataclass
+class _LockedCliEngineEnv:
+    """The collaborators ``run_locked_cli_engine`` reaches for, all faked."""
+
+    selection: RepositoryLaunchSelection
+    config: MagicMock
+    acquire: MagicMock
+    release: MagicMock
+    record: MagicMock
+
+
+@pytest.fixture
+def locked_cli_engine(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Fake ownership, the repo lock, and launch recording for CLI start."""
     selection = RepositoryLaunchSelection.parse(
         mode="codex",
         config_name="main.yaml",
     )
-    config = MagicMock(
-        repo_root=tmp_path,
-        launch_selection=selection,
-        configuration_mode="codex",
-        config_name="main.yaml",
-        config_fingerprint="effective-fingerprint",
-        control_api_port=None,
-        web_port=8080,
-        ui_mode="web",
+    env = _LockedCliEngineEnv(
+        selection=selection,
+        config=MagicMock(
+            repo_root=tmp_path,
+            launch_selection=selection,
+            configuration_mode="codex",
+            config_name="main.yaml",
+            config_fingerprint="effective-fingerprint",
+            control_api_port=None,
+            web_port=8080,
+            ui_mode="web",
+        ),
+        acquire=MagicMock(),
+        release=MagicMock(),
+        record=MagicMock(),
     )
-    args = MagicMock(no_dashboard=True, api_port=None, port=8080)
-    acquire = MagicMock()
-    release = MagicMock()
-    record = MagicMock()
     monkeypatch.setattr(
         "issue_orchestrator.execution.control_center_runtime."
         "inspect_repository_orchestrator_ownership",
@@ -146,8 +158,9 @@ def test_locked_cli_start_persists_exact_selection_after_lock_publication(
         ),
     )
     monkeypatch.setattr("issue_orchestrator.infra.repo_lock.is_locked", lambda _: False)
-    monkeypatch.setattr("issue_orchestrator.infra.repo_lock.acquire_lock", acquire)
-    monkeypatch.setattr("issue_orchestrator.infra.repo_lock.release_lock", release)
+    monkeypatch.setattr("issue_orchestrator.infra.repo_lock.acquire_lock", env.acquire)
+    monkeypatch.setattr("issue_orchestrator.infra.repo_lock.release_lock", env.release)
+    monkeypatch.setattr("issue_orchestrator.infra.repo_lock.touch_lock", MagicMock())
     monkeypatch.setattr(
         "issue_orchestrator.infra.repo_lock.repository_lifecycle_mutation",
         lambda _repo: nullcontext(),
@@ -155,26 +168,116 @@ def test_locked_cli_start_persists_exact_selection_after_lock_publication(
     monkeypatch.setattr(
         "issue_orchestrator.execution.repository_engine_start."
         "record_repository_engine_launch",
-        record,
+        env.record,
+    )
+    return env
+
+
+def test_locked_cli_start_persists_exact_selection_after_lock_publication(
+    tmp_path: Path,
+    orchestrator,
+    locked_cli_engine: _LockedCliEngineEnv,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    args = MagicMock(
+        no_dashboard=True, api_port=None, port=8080, start_paused=False
     )
     monkeypatch.setattr(cli_run_modes.asyncio, "run", _close_coroutine)
 
     result = cli_run_modes.run_locked_cli_engine(
         args,
-        config,
+        locked_cli_engine.config,
         MagicMock(return_value=orchestrator),
     )
 
     assert result == 0
-    acquire.assert_called_once_with(
+    locked_cli_engine.acquire.assert_called_once_with(
         tmp_path,
         None,
         configuration_mode="codex",
         config_name="main.yaml",
         config_fingerprint="effective-fingerprint",
     )
-    record.assert_called_once_with(tmp_path, selection)
-    release.assert_called_once_with(tmp_path)
+    locked_cli_engine.record.assert_called_once_with(
+        tmp_path, locked_cli_engine.selection
+    )
+    locked_cli_engine.release.assert_called_once_with(tmp_path)
+
+
+class _StartPauseRecorder:
+    """Orchestrator stub that records the pause call and guards state.
+
+    ``--start-paused`` has one owner, ``Orchestrator.set_start_paused()``,
+    which also requests the read-model refresh the dashboard needs. Reading
+    or writing ``state`` from the CLI would duplicate that policy, so this
+    stub fails loudly rather than quietly allowing it (#105).
+    """
+
+    def __init__(self, calls: list[str]) -> None:
+        self._calls = calls
+
+    def set_start_paused(self) -> None:
+        self._calls.append("set_start_paused")
+
+    @property
+    def state(self) -> object:
+        raise AssertionError(
+            "CLI start must delegate to set_start_paused(), not touch state"
+        )
+
+
+class TestStartPausedBinding:
+    """``--start-paused`` must reach the orchestrator before any run mode.
+
+    The flag was parsed and documented but never bound in ``cli.py`` or
+    ``cli_run_modes.py``, so a CLI engine asked to start paused launched
+    sessions immediately (#105). ``run_orchestrator`` bound it correctly
+    for the supervisor path all along.
+    """
+
+    def _run(
+        self,
+        env: _LockedCliEngineEnv,
+        monkeypatch: pytest.MonkeyPatch,
+        *,
+        start_paused: bool,
+    ) -> list[str]:
+        calls: list[str] = []
+
+        async def _run_mode(_orchestrator: object, _api_port: int | None) -> None:
+            calls.append("run_mode")
+
+        monkeypatch.setattr(cli_run_modes, "run_no_dashboard", _run_mode)
+        args = MagicMock(
+            no_dashboard=True,
+            api_port=None,
+            port=8080,
+            start_paused=start_paused,
+        )
+
+        result = cli_run_modes.run_locked_cli_engine(
+            args,
+            env.config,
+            lambda config: _StartPauseRecorder(calls),
+        )
+
+        assert result == 0
+        return calls
+
+    def test_flag_pauses_before_run_mode_entry(
+        self, locked_cli_engine: _LockedCliEngineEnv, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Ordering is the whole point: pausing after launch is not pausing."""
+        calls = self._run(locked_cli_engine, monkeypatch, start_paused=True)
+
+        assert calls == ["set_start_paused", "run_mode"]
+
+    def test_no_flag_leaves_the_engine_running(
+        self, locked_cli_engine: _LockedCliEngineEnv, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        calls = self._run(locked_cli_engine, monkeypatch, start_paused=False)
+
+        assert calls == ["run_mode"]
 
 
 class TestNoDashboardMode:
