@@ -296,6 +296,20 @@ def _cli_engine_operation(
     return lambda: run_tui_dashboard(orchestrator, config, ports.api)
 
 
+def _apply_cli_start_pause(args: argparse.Namespace, orchestrator: Any) -> None:
+    """Hand ``--start-paused`` to the orchestrator's startup-pause owner.
+
+    ``run_orchestrator`` already does this for the supervisor path; the CLI
+    engine parsed the flag, documented it, and then dropped it (#105). The
+    owner both holds execution and requests the one read-only refresh the
+    dashboard needs before it first renders, so the CLI must call it rather
+    than write ``state.paused`` itself.
+    """
+    if args.start_paused:
+        orchestrator.set_start_paused()
+        logging.info("Initial paused state applied before run mode entry")
+
+
 def run_locked_cli_engine(
     args: argparse.Namespace,
     config: "Config",
@@ -317,6 +331,7 @@ def run_locked_cli_engine(
         _publish_cli_engine_ownership(config, ports.advertised)
         lock_acquired = True
         orchestrator = build_orchestrator(config=config)
+        _apply_cli_start_pause(args, orchestrator)
         operation = _cli_engine_operation(args, config, orchestrator, ports)
         asyncio.run(_run_with_repo_lock_heartbeat(config.repo_root, operation))
     except KeyboardInterrupt:
