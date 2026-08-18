@@ -39,6 +39,21 @@ from tests.unit.publication_evidence_helpers import (
 )
 
 
+def _pr_info(number: int, state: str):
+    """A minimal PR for the pr-pending history rehydration tests."""
+    from issue_orchestrator.ports import PRInfo
+
+    return PRInfo(
+        number=number,
+        url=f"https://github.com/owner/repo/pull/{number}",
+        title=f"PR #{number}",
+        branch=f"{number}-branch",
+        body="",
+        state=state,
+        labels=[],
+    )
+
+
 def _startup_worktree_reconciler() -> MagicMock:
     reconciler = MagicMock()
     reconciler.recover.return_value = WorktreeRecoverySummary(0, 0, 0)
@@ -1536,7 +1551,7 @@ class TestStartupManagerAwaitingMergeRecovery:
         assert "Recovered 1 pr-pending issue(s) into dashboard history" in caplog.text
 
     @pytest.mark.asyncio
-    @patch("issue_orchestrator.control.startup_manager.analyze_issue")
+    @patch("issue_orchestrator.control.pr_pending_history_recovery.analyze_issue")
     async def test_recovers_pr_pending_issue_into_session_history(
         self,
         mock_analyze,
@@ -1574,8 +1589,8 @@ class TestStartupManagerAwaitingMergeRecovery:
         assert "Recovered 1 pr-pending issue(s) into dashboard history" in caplog.text
 
     @pytest.mark.asyncio
-    @patch("issue_orchestrator.control.startup_manager.analyze_issue")
-    async def test_skips_pr_pending_history_recovery_without_open_pr(
+    @patch("issue_orchestrator.control.pr_pending_history_recovery.analyze_issue")
+    async def test_skips_pr_pending_history_recovery_without_open_or_merged_pr(
         self,
         mock_analyze,
         startup_manager,
@@ -1589,6 +1604,10 @@ class TestStartupManagerAwaitingMergeRecovery:
             4057: {"agent:backend", "pr-pending"},
         }
         mock_repository_host.get_issue.return_value = issue
+        # Closed unmerged: the drift path owns this, not history rehydration.
+        mock_repository_host.get_prs_for_issue.return_value = [
+            _pr_info(4901, "closed"),
+        ]
 
         mock_state = MagicMock()
         mock_state.has_open_pr = False
@@ -1599,7 +1618,193 @@ class TestStartupManagerAwaitingMergeRecovery:
             await startup_manager.run_startup(sample_state)
 
         assert sample_state.session_history == []
-        assert "Skipping pr-pending dashboard recovery without open PR: issue=4057" in caplog.text
+        assert (
+            "Skipping pr-pending dashboard recovery without open or merged "
+            "PR: issue=4057"
+        ) in caplog.text
+
+    @pytest.mark.asyncio
+    @patch("issue_orchestrator.control.pr_pending_history_recovery.analyze_issue")
+    async def test_recovers_pr_pending_issue_whose_pr_already_merged(
+        self,
+        mock_analyze,
+        startup_manager,
+        sample_state,
+        mock_repository_host,
+        mock_label_store,
+        caplog,
+    ):
+        """D18: a PR that merged while the orchestrator was down.
+
+        The issue is still open and still carries pr-pending, but there is no
+        OPEN PR, so this used to be skipped — leaving the awaiting-merge
+        reconciler with no candidate and the issue parked on pr-pending
+        forever (#113). The merged PR must rehydrate history so the
+        reconciler can decide what the merge meant.
+        """
+        issue = Issue(number=45, title="Merged while down", labels=["agent:backend", "pr-pending"])
+        mock_label_store.load_all.return_value = {45: {"agent:backend", "pr-pending"}}
+        mock_repository_host.get_issue.return_value = issue
+        mock_repository_host.get_prs_for_issue.return_value = [
+            _pr_info(49, "merged"),
+        ]
+
+        mock_state = MagicMock()
+        mock_state.has_open_pr = False
+        mock_state.pr_url = None
+        mock_analyze.return_value = mock_state
+
+        with caplog.at_level("INFO"):
+            await startup_manager.run_startup(sample_state)
+
+        assert len(sample_state.session_history) == 1
+        entry = sample_state.session_history[0]
+        assert entry.issue_number == 45
+        assert entry.status == "completed"
+        assert entry.pr_url == "https://github.com/owner/repo/pull/49"
+        mock_repository_host.get_prs_for_issue.assert_called_with(45, state="all")
+
+    @pytest.mark.asyncio
+    @patch("issue_orchestrator.control.pr_pending_history_recovery.analyze_issue")
+    async def test_unreadable_pr_set_skips_recovery_without_raising(
+        self,
+        mock_analyze,
+        startup_manager,
+        sample_state,
+        mock_repository_host,
+        mock_label_store,
+        caplog,
+    ):
+        """A failed PR-set read must not abort startup; the issue is simply
+        left for a later pass to rehydrate."""
+        issue = Issue(number=45, title="Unreadable", labels=["agent:backend", "pr-pending"])
+        mock_label_store.load_all.return_value = {45: {"agent:backend", "pr-pending"}}
+        mock_repository_host.get_issue.return_value = issue
+        mock_repository_host.get_prs_for_issue.side_effect = RepositoryHostError(
+            "boom"
+        )
+
+        mock_state = MagicMock()
+        mock_state.has_open_pr = False
+        mock_state.pr_url = None
+        mock_analyze.return_value = mock_state
+
+        with caplog.at_level("INFO"):
+            await startup_manager.run_startup(sample_state)
+
+        assert sample_state.session_history == []
+        assert "associated PRs unreadable" in caplog.text
+
+    @pytest.mark.asyncio
+    @patch("issue_orchestrator.control.pr_pending_history_recovery.analyze_issue")
+    async def test_open_pr_recovery_never_pays_the_pr_set_read(
+        self,
+        mock_analyze,
+        startup_manager,
+        sample_state,
+        mock_repository_host,
+        mock_label_store,
+    ):
+        """The stale-case read is paid only when there is no open PR."""
+        issue = Issue(number=4057, title="Open PR", labels=["agent:backend", "pr-pending"])
+        mock_label_store.load_all.return_value = {
+            4057: {"agent:backend", "pr-pending"},
+        }
+        mock_repository_host.get_issue.return_value = issue
+
+        mock_state = MagicMock()
+        mock_state.has_open_pr = True
+        mock_state.pr_url = "https://github.com/owner/repo/pull/5337"
+        mock_analyze.return_value = mock_state
+
+        await startup_manager.run_startup(sample_state)
+
+        assert len(sample_state.session_history) == 1
+        for call in mock_repository_host.get_prs_for_issue.call_args_list:
+            assert call.kwargs.get("state") != "all"
+
+    @pytest.mark.asyncio
+    @patch("issue_orchestrator.control.pr_pending_history_recovery.analyze_issue")
+    async def test_open_pr_without_a_url_skips_honestly_and_pays_no_read(
+        self,
+        mock_analyze,
+        startup_manager,
+        sample_state,
+        mock_repository_host,
+        mock_label_store,
+        caplog,
+    ):
+        """N1: an analysis reporting an open PR but no URL is a gap in the
+        caller's facts, not a stale-PR case.
+
+        It must not fall through to the stale branch, where it would pay a
+        state="all" read it cannot use and report the self-contradicting
+        "no open or merged PR (PR set resolves to open)".
+        """
+        issue = Issue(number=4057, title="URL-less open PR", labels=["agent:backend", "pr-pending"])
+        mock_label_store.load_all.return_value = {
+            4057: {"agent:backend", "pr-pending"},
+        }
+        mock_repository_host.get_issue.return_value = issue
+
+        mock_state = MagicMock()
+        mock_state.has_open_pr = True
+        mock_state.pr_url = None
+        mock_analyze.return_value = mock_state
+
+        with caplog.at_level("INFO"):
+            await startup_manager.run_startup(sample_state)
+
+        assert sample_state.session_history == []
+        assert "reports an open PR but carries no PR URL" in caplog.text
+        assert "PR set resolves to" not in caplog.text
+        for call in mock_repository_host.get_prs_for_issue.call_args_list:
+            assert call.kwargs.get("state") != "all"
+
+    @pytest.mark.asyncio
+    @patch("issue_orchestrator.control.pr_pending_history_recovery.analyze_issue")
+    async def test_merged_pr_without_a_url_skips_like_its_open_sibling(
+        self,
+        mock_analyze,
+        startup_manager,
+        sample_state,
+        mock_repository_host,
+        mock_label_store,
+        caplog,
+    ):
+        """N3: both branches handle a URL-less PR the same way.
+
+        The rehydrated entry keys on that URL, so there is nothing to build
+        without one — and the recovery loop already tolerates a per-issue skip,
+        whereas raising would abort the whole of startup over one issue.
+        """
+        from issue_orchestrator.ports import PRInfo
+
+        issue = Issue(number=45, title="URL-less merge", labels=["agent:backend", "pr-pending"])
+        mock_label_store.load_all.return_value = {45: {"agent:backend", "pr-pending"}}
+        mock_repository_host.get_issue.return_value = issue
+        mock_repository_host.get_prs_for_issue.return_value = [
+            PRInfo(
+                number=49,
+                url="",
+                title="PR #49",
+                branch="49-branch",
+                body="",
+                state="merged",
+                labels=[],
+            ),
+        ]
+
+        mock_state = MagicMock()
+        mock_state.has_open_pr = False
+        mock_state.pr_url = None
+        mock_analyze.return_value = mock_state
+
+        with caplog.at_level("INFO"):
+            await startup_manager.run_startup(sample_state)
+
+        assert sample_state.session_history == []
+        assert "merged PR #49 carries no PR URL" in caplog.text
 
 
 class TestStartupManagerTechLeadRecovery:

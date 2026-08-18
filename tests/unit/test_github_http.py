@@ -2547,3 +2547,116 @@ def test_graphql_pr_list_leaves_an_absent_head_sha_empty() -> None:
     prs = client.get_prs_with_label_graphql("needs-code-review")
 
     assert prs[0]["head"]["sha"] == ""
+
+
+# ---------------------------------------------------------------------------
+# closingIssuesReferences — the registered closing linkage (#113)
+# ---------------------------------------------------------------------------
+
+
+def _closing_refs_transport(
+    pages: list[dict[str, object]],
+    seen_queries: list[str] | None = None,
+) -> httpx.MockTransport:
+    """Serve one GraphQL page per call from ``pages``."""
+    remaining = list(pages)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode())
+        if seen_queries is not None:
+            seen_queries.append(body["query"])
+        return httpx.Response(200, json=remaining.pop(0))
+
+    return httpx.MockTransport(handler)
+
+
+def _refs_page(
+    numbers: list[int],
+    *,
+    has_next: bool = False,
+    cursor: str | None = None,
+) -> dict[str, object]:
+    return {
+        "data": {
+            "repository": {
+                "pullRequest": {
+                    "closingIssuesReferences": {
+                        "pageInfo": {
+                            "hasNextPage": has_next,
+                            "endCursor": cursor,
+                        },
+                        "nodes": [{"number": n} for n in numbers],
+                    }
+                }
+            }
+        }
+    }
+
+
+def test_closing_issue_references_reads_the_registered_set() -> None:
+    """`Closes #45` is registered by GitHub; we read the registration."""
+    seen: list[str] = []
+    client = _client_with_transport(_closing_refs_transport([_refs_page([45])], seen))
+
+    assert client.get_pr_closing_issue_references(87) == [45]
+    assert "closingIssuesReferences" in seen[0]
+
+
+def test_closing_issue_references_empty_set_is_an_answer_not_a_gap() -> None:
+    """`Refs #45` registers nothing. That is GitHub answering "closes
+    nothing" — distinct from an unreadable relation, which returns None."""
+    client = _client_with_transport(_closing_refs_transport([_refs_page([])]))
+
+    assert client.get_pr_closing_issue_references(49) == []
+
+
+def test_closing_issue_references_unknown_when_pr_is_not_visible() -> None:
+    """A null pullRequest is "we could not read the relation", never []."""
+    client = _client_with_transport(
+        _closing_refs_transport([{"data": {"repository": {"pullRequest": None}}}])
+    )
+
+    assert client.get_pr_closing_issue_references(9999) is None
+
+
+def test_closing_issue_references_unknown_when_the_field_is_absent() -> None:
+    """A payload without the linkage field cannot be reported as empty."""
+    client = _client_with_transport(
+        _closing_refs_transport(
+            [{"data": {"repository": {"pullRequest": {"number": 87}}}}]
+        )
+    )
+
+    assert client.get_pr_closing_issue_references(87) is None
+
+
+def test_closing_issue_references_follows_pagination() -> None:
+    client = _client_with_transport(
+        _closing_refs_transport([
+            _refs_page([45], has_next=True, cursor="c1"),
+            _refs_page([93]),
+        ])
+    )
+
+    assert client.get_pr_closing_issue_references(87) == [45, 93]
+
+
+def test_closing_issue_references_unknown_when_more_pages_have_no_cursor() -> None:
+    """A truncated set must not read as "this issue is not linked"."""
+    client = _client_with_transport(
+        _closing_refs_transport([_refs_page([45], has_next=True, cursor=None)])
+    )
+
+    assert client.get_pr_closing_issue_references(87) is None
+
+
+def test_closing_issue_references_raises_on_graphql_error() -> None:
+    """A failed read propagates; the caller fails closed on the error."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"errors": [{"message": "no access"}]})
+
+    client = _client_with_transport(httpx.MockTransport(handler))
+
+    with pytest.raises(GitHubHttpError):
+        client.get_pr_closing_issue_references(87)

@@ -11,12 +11,13 @@ from issue_orchestrator.control.awaiting_merge_reconciler import (
     POST_PUBLISH_VALIDATION_SOURCE,
     AwaitingMergeReconciler,
     classify_post_approval_state,
-    classify_pr_set_drift,
+    classify_pr_set,
 )
 from issue_orchestrator.control.label_manager import LabelManager
 from issue_orchestrator.control.session_history import SessionHistoryOwner
 from issue_orchestrator.domain.models import (
     Issue,
+    MergedIssueDisposition,
     OrchestratorState,
     SessionHistoryEntry,
 )
@@ -24,6 +25,7 @@ from issue_orchestrator.events import EventName
 from issue_orchestrator.infra.config import Config
 from issue_orchestrator.ports import InMemoryEventSink
 from issue_orchestrator.ports.pull_request_tracker import (
+    ClosingIssueReferencesRead,
     MergeQueueEntry,
     MergeQueueRead,
     PRInfo,
@@ -96,6 +98,19 @@ def _pr(
         mergeable_state=mergeable_state,
         status_check_rollup=status_check_rollup,  # type: ignore[arg-type]
         merged_at=_MERGED_AT if state == "merged" else None,
+    )
+
+
+def _wire_closing_linkage(
+    repository_host: MagicMock, *, closes: tuple[int, ...] = ()
+) -> None:
+    """Declare what GitHub registered the merged PR as closing.
+
+    ``merged + issue OPEN`` describes two opposite situations and only this
+    registration tells them apart, so every merged-PR test states it (#113).
+    """
+    repository_host.read_pr_closing_issue_references.return_value = (
+        ClosingIssueReferencesRead.known(closes)
     )
 
 
@@ -240,7 +255,10 @@ def test_recovered_awaiting_merge_entry_reconciles_when_pr_is_merged() -> None:
     assert result.reconciliations[0].status_reason == "PR merged; awaiting merge reconciled"
     assert result.reconciliations[0].source == "pull_request"
     # GitHub's closing keyword auto-closed the issue — no fallback needed.
-    assert result.reconciliations[0].issue_open is False
+    assert (
+        result.reconciliations[0].merged_disposition
+        is MergedIssueDisposition.RECOVER
+    )
     assert entry.pr_url == "https://github.com/owner/repo/pull/318"
     repository_host.get_pr.assert_called_once_with(318)
     # A terminal PR must NOT be status-rollup-polled — that GraphQL round-trip
@@ -253,19 +271,31 @@ def test_recovered_awaiting_merge_entry_reconciles_when_pr_is_merged() -> None:
     repository_host.get_issue.assert_called_once_with(228)
     # A closed issue needs no transition evidence — the events read is skipped.
     repository_host.issue_closed_on_or_after.assert_not_called()
+    # ...and neither is the closing-linkage read: the common merged-and-
+    # auto-closed path pays nothing extra for the #113 routing.
+    repository_host.read_pr_closing_issue_references.assert_not_called()
 
 
-def test_merged_pr_with_open_issue_flags_close_on_merge_fallback() -> None:
-    """A merged PR whose issue is open AND was never closed since the merge
-    means GitHub's closing-keyword auto-close did not fire (word-boundary-
-    defeated reference or none at all). The fact must carry issue_open=True so
-    the planner orders the close-on-merge fallback (porchpin case file #81)."""
+def test_registered_closing_pr_with_open_issue_flags_fallback() -> None:
+    """A merged PR that DID register this issue as a closing reference, whose
+    issue is nonetheless open AND was never closed since the merge, proves
+    GitHub's auto-close did not fire. The fact must carry CLOSE_AND_RECOVER so
+    the planner orders the close-on-merge fallback (porchpin case file #81).
+
+    Since #113 the registration is required, not incidental: a merge that
+    registered nothing is read as a deliberate non-closing merge and is
+    covered by ``test_merged_pr_not_registered_as_closing_sheds_without_
+    closing`` instead. This test therefore no longer covers the
+    "reference defeated before GitHub parsed it" case — nothing does, by
+    design; see the ``close_on_merge`` module docstring.
+    """
     entry = _history_entry()
     state = OrchestratorState(session_history=[entry])
     repository_host = MagicMock()
     repository_host.get_pr.return_value = _pr("merged")
     repository_host.get_issue.return_value = _issue("open")
     repository_host.issue_closed_on_or_after.return_value = False
+    _wire_closing_linkage(repository_host, closes=(228,))
 
     result = AwaitingMergeReconciler(
         repository_host,
@@ -274,7 +304,10 @@ def test_merged_pr_with_open_issue_flags_close_on_merge_fallback() -> None:
 
     assert result.discovered == 1
     assert result.reconciliations[0].status == "merged"
-    assert result.reconciliations[0].issue_open is True
+    assert (
+        result.reconciliations[0].merged_disposition
+        is MergedIssueDisposition.CLOSE_AND_RECOVER
+    )
     repository_host.issue_closed_on_or_after.assert_called_once_with(
         228, _MERGED_AT,
     )
@@ -291,6 +324,7 @@ def test_merged_then_reopened_issue_is_never_reclosed() -> None:
     repository_host.get_pr.return_value = _pr("merged")
     repository_host.get_issue.return_value = _issue("open")
     repository_host.issue_closed_on_or_after.return_value = True
+    _wire_closing_linkage(repository_host, closes=(228,))
 
     result = AwaitingMergeReconciler(
         repository_host,
@@ -299,7 +333,13 @@ def test_merged_then_reopened_issue_is_never_reclosed() -> None:
 
     assert result.discovered == 1
     assert result.reconciliations[0].status == "merged"
-    assert result.reconciliations[0].issue_open is False
+    # Deliberately reopened after a successful auto-close: the issue's work HAS
+    # landed, so the full recovered-workflow shed still applies — this is not
+    # the narrow continuation case.
+    assert (
+        result.reconciliations[0].merged_disposition
+        is MergedIssueDisposition.RECOVER
+    )
 
 
 def test_merged_pr_events_read_error_leaves_entry_reconcilable() -> None:
@@ -310,6 +350,7 @@ def test_merged_pr_events_read_error_leaves_entry_reconcilable() -> None:
     repository_host = MagicMock()
     repository_host.get_pr.return_value = _pr("merged")
     repository_host.get_issue.return_value = _issue("open")
+    _wire_closing_linkage(repository_host, closes=(228,))
     repository_host.issue_closed_on_or_after.side_effect = RepositoryHostError(
         "boom"
     )
@@ -331,6 +372,7 @@ def test_merged_pr_without_merged_at_never_closes() -> None:
     repository_host = MagicMock()
     repository_host.get_pr.return_value = replace(_pr("merged"), merged_at=None)
     repository_host.get_issue.return_value = _issue("open")
+    _wire_closing_linkage(repository_host, closes=(228,))
 
     result = AwaitingMergeReconciler(
         repository_host,
@@ -338,8 +380,112 @@ def test_merged_pr_without_merged_at_never_closes() -> None:
     ).discover(state)
 
     assert result.discovered == 1
-    assert result.reconciliations[0].issue_open is False
+    assert (
+        result.reconciliations[0].merged_disposition
+        is MergedIssueDisposition.RECOVER
+    )
     repository_host.issue_closed_on_or_after.assert_not_called()
+
+
+def test_merged_pr_not_registered_as_closing_sheds_without_closing() -> None:
+    """D18: a merge that deliberately did not close its issue.
+
+    GitHub answered — the PR closes nothing — so this is an intentional
+    non-closing merge, not a failed auto-close. The entry becomes terminal
+    (which is what sheds the stale pr-pending) and the disposition is CONTINUE:
+    no close is ordered, and the recovery's label authority narrows to
+    pr-pending alone (#113).
+    """
+    entry = _history_entry()
+    state = OrchestratorState(session_history=[entry])
+    repository_host = MagicMock()
+    repository_host.get_pr.return_value = _pr("merged")
+    repository_host.get_issue.return_value = _issue("open")
+    _wire_closing_linkage(repository_host, closes=())
+
+    result = AwaitingMergeReconciler(
+        repository_host,
+        clock=lambda: 1234.5,
+    ).discover(state)
+
+    assert result.discovered == 1
+    assert result.reconciliations[0].status == "merged"
+    assert (
+        result.reconciliations[0].merged_disposition
+        is MergedIssueDisposition.CONTINUE
+    )
+    # No close means no need for close-event evidence at all.
+    repository_host.issue_closed_on_or_after.assert_not_called()
+
+
+def test_merged_pr_closing_another_issue_only_still_sheds() -> None:
+    """The registration is per-issue: a PR that closes #999 has no closing
+    relation to #228, so #228 is a deliberate continuation."""
+    entry = _history_entry()
+    state = OrchestratorState(session_history=[entry])
+    repository_host = MagicMock()
+    repository_host.get_pr.return_value = _pr("merged")
+    repository_host.get_issue.return_value = _issue("open")
+    _wire_closing_linkage(repository_host, closes=(999,))
+
+    result = AwaitingMergeReconciler(
+        repository_host,
+        clock=lambda: 1234.5,
+    ).discover(state)
+
+    assert result.discovered == 1
+    assert (
+        result.reconciliations[0].merged_disposition
+        is MergedIssueDisposition.CONTINUE
+    )
+    repository_host.issue_closed_on_or_after.assert_not_called()
+
+
+def test_unknown_closing_linkage_neither_closes_nor_sheds() -> None:
+    """Fail closed. An unreadable relation is not an empty one: shedding
+    pr-pending off a guess would be a new authority bug in the class this
+    routing exists to remove (#113)."""
+    entry = _history_entry()
+    state = OrchestratorState(session_history=[entry])
+    repository_host = MagicMock()
+    repository_host.get_pr.return_value = _pr("merged")
+    repository_host.get_issue.return_value = _issue("open")
+    repository_host.read_pr_closing_issue_references.return_value = (
+        ClosingIssueReferencesRead.unknown()
+    )
+
+    result = AwaitingMergeReconciler(
+        repository_host,
+        clock=lambda: 1234.5,
+    ).discover(state)
+
+    # Skipped, not terminal: the entry stays reconcilable for a later retry.
+    assert result.discovered == 0
+    assert result.skipped == 1
+    assert result.reconciliations == ()
+    repository_host.issue_closed_on_or_after.assert_not_called()
+
+
+def test_closing_linkage_read_error_neither_closes_nor_sheds() -> None:
+    """A transient read failure is also 'we do not know' — same fail-closed
+    outcome, and it must not abort the gather tick."""
+    entry = _history_entry()
+    state = OrchestratorState(session_history=[entry])
+    repository_host = MagicMock()
+    repository_host.get_pr.return_value = _pr("merged")
+    repository_host.get_issue.return_value = _issue("open")
+    repository_host.read_pr_closing_issue_references.side_effect = (
+        RepositoryHostError("boom")
+    )
+
+    result = AwaitingMergeReconciler(
+        repository_host,
+        clock=lambda: 1234.5,
+    ).discover(state)
+
+    assert result.discovered == 0
+    assert result.skipped == 1
+    assert result.reconciliations == ()
 
 
 def test_merged_pr_issue_fetch_error_leaves_entry_reconcilable() -> None:
@@ -378,7 +524,12 @@ def test_merged_pr_with_missing_issue_reconciles_without_close() -> None:
 
     assert result.discovered == 1
     assert result.reconciliations[0].status == "merged"
-    assert result.reconciliations[0].issue_open is False
+    # Nothing survives on a missing issue, so there is no narrow-scope case:
+    # the ordinary recovery disposition applies.
+    assert (
+        result.reconciliations[0].merged_disposition
+        is MergedIssueDisposition.RECOVER
+    )
 
 
 def test_recovered_entry_reconciles_when_linked_issue_is_closed() -> None:
@@ -1169,38 +1320,43 @@ def test_classify_post_approval_state(
 
 
 # ---------------------------------------------------------------------------
-# classify_pr_set_drift — owner of the blocked:pr-closed precedence policy
+# classify_pr_set — owner of the PR-set precedence policy
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize(
-    "prs,expected_drifting,expected_pr_number",
+    "prs,expected_outcome,expected_pr_number",
     [
         # No associated PR at all → "PR missing" drift with no PR reference.
-        ([], True, None),
+        ([], "missing", None),
         # Single terminal PR: the leaf predicate decides.
-        ([("closed", 318)], True, 318),
-        ([("merged", 318)], False, None),
+        ([("closed", 318)], "closed_unmerged", 318),
+        # A merged PR is NOT drift; it keys the awaiting-merge terminal path,
+        # and the classification names the PR it keys on (#113).
+        ([("merged", 318)], "merged", 318),
         # Any open PR suppresses drift regardless of older terminal PRs.
-        ([("merged", 428), ("open", 437)], False, None),
-        ([("closed", 428), ("open", 437)], False, None),
+        ([("merged", 428), ("open", 437)], "open", None),
+        ([("closed", 428), ("open", 437)], "open", None),
         # Latest terminal PR decides: a newer merge beats an older close.
-        ([("closed", 428), ("merged", 437)], False, None),
+        ([("closed", 428), ("merged", 437)], "merged", 437),
         # ...and a newer close beats an older merge, keying on the newer PR.
-        ([("merged", 428), ("closed", 437)], True, 437),
+        ([("merged", 428), ("closed", 437)], "closed_unmerged", 437),
         # Multiple closed PRs → the latest closed one.
-        ([("closed", 428), ("closed", 437)], True, 437),
+        ([("closed", 428), ("closed", 437)], "closed_unmerged", 437),
     ],
 )
-def test_classify_pr_set_drift(
+def test_classify_pr_set(
     prs: list[tuple[str, int]],
-    expected_drifting: bool,
+    expected_outcome: str,
     expected_pr_number: int | None,
 ) -> None:
-    decision = classify_pr_set_drift(
+    decision = classify_pr_set(
         [_pr(state, number=number) for state, number in prs]
     )
-    assert decision.drifting is expected_drifting
+    assert decision.outcome == expected_outcome
+    assert decision.drifting is (
+        expected_outcome in ("closed_unmerged", "missing")
+    )
     if expected_pr_number is None:
         assert decision.pr is None
     else:

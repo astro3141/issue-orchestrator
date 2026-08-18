@@ -29,7 +29,9 @@ from ..infra.config import Config
 from ..infra.logging_config import issue_log
 from ..ports.issue import Issue
 from ..domain.models import (
+    MergedIssueDisposition,
     PendingTechLeadReview,
+    TerminalRecoveryLabelScope,
     active_retrospective_review_issue_numbers,
 )
 from ..domain.post_publish_escalation import build_post_publish_escalation_comment
@@ -701,13 +703,26 @@ class Planner:
                     reason=reconciliation.status_reason,
                 ))
                 continue
-            # Terminal recovery: the issue's work has landed (PR merged/closed
-            # or parent issue closed). One owner command sheds every stale
-            # transient workflow label (pr-pending, publish-failed,
-            # publish-fail-count-N, blocking) then finalizes awaiting-merge
-            # history; the applier picks the set from live labels and gates the
-            # history transition on the shed (and close) succeeding, so a
-            # transient failure leaves the entry reconcilable, not stranded.
+            # Terminal recovery: the PR is terminal (merged/closed) or the
+            # parent issue closed. One owner command sheds the stale labels
+            # then finalizes awaiting-merge history; the applier picks the set
+            # from live labels and gates the history transition on the shed
+            # (and close) succeeding, so a transient failure leaves the entry
+            # reconcilable, not stranded.
+            #
+            # How much it may shed comes from the close-on-merge owner's typed
+            # disposition (#113). Normally the issue's work has landed and
+            # every transient workflow label is stale. A CONTINUE disposition —
+            # a merge GitHub did not register as closing this issue — is
+            # different in kind: the issue is intentionally still OPEN, so the
+            # merge establishes only that `pr-pending` is stale and the scope
+            # narrows to exactly that label. Anything else on the issue is
+            # current state this evidence never spoke to.
+            continuation = (
+                reconciliation.status == "merged"
+                and reconciliation.merged_disposition
+                is MergedIssueDisposition.CONTINUE
+            )
             actions.append(RecoverTerminalIssueAction(
                 issue_number=reconciliation.issue_number,
                 pr_number=reconciliation.pr_number,
@@ -718,10 +733,20 @@ class Planner:
                 issue_key=issue_key,
                 reason=f"awaiting-merge terminal: {reconciliation.status}",
                 # Close-on-merge fallback (close_on_merge module, porchpin
-                # #81): merged PR + still-open issue; advisory — the applier
-                # revalidates live evidence. Never on closed status (drift's job).
-                close_issue=reconciliation.status == "merged" and reconciliation.issue_open,
+                # #81): merged PR + still-open issue GitHub registered as
+                # closed by it; advisory — the applier revalidates live
+                # evidence. Never on closed status (drift's job).
+                close_issue=(
+                    reconciliation.status == "merged"
+                    and reconciliation.merged_disposition
+                    is MergedIssueDisposition.CLOSE_AND_RECOVER
+                ),
                 merged_at=reconciliation.merged_at or "",
+                label_scope=(
+                    TerminalRecoveryLabelScope.STALE_PR_PENDING
+                    if continuation
+                    else TerminalRecoveryLabelScope.RECOVERED_WORKFLOW
+                ),
                 # Carry the reconciliation pause guard the old terminal-cleanup
                 # RemoveLabelAction used to carry: an issue paused for
                 # reconciliation (io:needs-reconcile) must not have its labels

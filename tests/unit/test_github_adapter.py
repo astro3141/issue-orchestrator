@@ -1974,6 +1974,54 @@ class TestRepositoryOperations:
             45, "2026-08-03T13:52:09Z"
         )
 
+    def test_closing_issue_references_known_set_forwards_to_client(
+        self, adapter, mock_http_client
+    ):
+        """#113: the registered linkage is read on the existing PR seam."""
+        mock_http_client.get_pr_closing_issue_references.return_value = [45]
+
+        read = adapter.read_pr_closing_issue_references(87)
+
+        assert read.is_known is True
+        assert read.closes(45) is True
+        assert read.closes(93) is False
+        mock_http_client.get_pr_closing_issue_references.assert_called_once_with(87)
+
+    def test_closing_issue_references_empty_set_stays_known(
+        self, adapter, mock_http_client
+    ):
+        """`Refs #45` registers nothing: GitHub answered, the set is empty."""
+        mock_http_client.get_pr_closing_issue_references.return_value = []
+
+        read = adapter.read_pr_closing_issue_references(49)
+
+        assert read.is_known is True
+        assert read.closes(45) is False
+
+    def test_unreadable_closing_linkage_is_unknown_not_empty(
+        self, adapter, mock_http_client
+    ):
+        """The load-bearing distinction: an unreadable relation must never
+        arrive as a KNOWN empty set, which would shed a label on a guess."""
+        mock_http_client.get_pr_closing_issue_references.return_value = None
+
+        read = adapter.read_pr_closing_issue_references(87)
+
+        assert read.is_known is False
+        with pytest.raises(ValueError):
+            read.closes(45)
+
+    def test_closing_linkage_read_failure_propagates(
+        self, adapter, mock_http_client
+    ):
+        """A failed read raises so the caller can fail closed on it."""
+        mock_http_client.get_pr_closing_issue_references.side_effect = (
+            GitHubHttpError("boom")
+        )
+
+        with pytest.raises(GitHubHttpError):
+            adapter.read_pr_closing_issue_references(87)
+
     def test_list_labels(self, adapter, mock_http_client):
         """Test listing repository labels."""
         mock_http_client.list_labels.return_value = [

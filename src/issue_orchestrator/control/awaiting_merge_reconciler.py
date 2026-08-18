@@ -13,16 +13,17 @@ from ..domain.models import (
     DiscoveredAwaitingMergeEscalation,
     DiscoveredAwaitingMergeReconciliation,
     DiscoveredRework,
+    MergedIssueDisposition,
     RECONCILABLE_HISTORY_STATUSES,
     TERMINAL_AWAITING_MERGE_HISTORY_STATUSES,
 )
 from ..history import latest_history_entries_by_issue
 from ..ports.repository_host import RepositoryHostError
-from .awaiting_merge_drift_policy import classify_pr_set_drift
+from .awaiting_merge_drift_policy import classify_pr_set
 from .close_on_merge import (
+    merged_issue_disposition,
     pr_terminal_reason,
     reconciliation_fact,
-    should_close_merged_issue,
 )
 from .awaiting_merge_post_publish_policy import (
     POST_PUBLISH_VALIDATION_COMMENT_MARKER,
@@ -275,7 +276,7 @@ class AwaitingMergeReconciler:
                 )
                 state.awaiting_merge_rollup_scan_timestamps.pop(pr_number, None)
                 drift = None
-                issue_open = False
+                disposition = MergedIssueDisposition.RECOVER
                 if pr.is_closed_unmerged:
                     drift = self._discover_terminal_pr_issue_drift(
                         state=state,
@@ -284,20 +285,21 @@ class AwaitingMergeReconciler:
                         pr_number=pr_number,
                     )
                 else:
-                    # PR merged: did GitHub's auto-close actually fire for
-                    # this merge? See close_on_merge module (porchpin #81).
-                    # None = evidence unreadable; leave the entry reconcilable.
-                    close_check = should_close_merged_issue(
+                    # PR merged: a failed auto-close, or a merge that deliberately
+                    # did not close its issue? close_on_merge routes both on the
+                    # registered closing linkage — and, where it registered nothing,
+                    # on the in-hand PR body's authorship (porchpin #81, #113). Its
+                    # answer also bounds the shed; UNREADABLE = leave reconcilable.
+                    host = self.repository_host
+                    disposition = merged_issue_disposition(
                         get_issue=self._get_issue,
-                        closed_on_or_after=(
-                            self.repository_host.issue_closed_on_or_after
-                        ),
-                        state=state, entry=entry,
-                        merged_at=pr.merged_at, now=self.clock(),
+                        closed_on_or_after=host.issue_closed_on_or_after,
+                        closing_issue_references=host.read_pr_closing_issue_references,
+                        state=state, entry=entry, pr_number=pr_number,
+                        merged_at=pr.merged_at, pr_body=pr.body, now=self.clock(),
                     )
-                    if close_check is None:
+                    if disposition is MergedIssueDisposition.UNREADABLE:
                         return AwaitingMergeEntryDiscovery("skipped")
-                    issue_open = close_check
                 return AwaitingMergeEntryDiscovery(
                     "terminal",
                     reconciliation=reconciliation_fact(
@@ -306,7 +308,7 @@ class AwaitingMergeReconciler:
                         status=pr_state,
                         reason=pr_terminal_reason(pr_state),
                         source="pull_request",
-                        issue_open=issue_open,
+                        merged_disposition=disposition,
                         merged_at=pr.merged_at,
                     ),
                     drift=drift,
@@ -479,9 +481,9 @@ class AwaitingMergeReconciler:
         except RepositoryHostError:
             return None
 
-        # `classify_pr_set_drift` owns the open/merged/closed precedence so the
+        # `classify_pr_set` owns the open/merged/closed precedence so the
         # "latest terminal PR decides" rule lives in exactly one place.
-        decision = classify_pr_set_drift(prs)
+        decision = classify_pr_set(prs)
         if not decision.drifting:
             return None
         if decision.pr is None:

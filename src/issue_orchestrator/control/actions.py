@@ -27,6 +27,7 @@ from ..domain.models import (
     AwaitingMergeReconciliationSource,
     AwaitingMergeTerminalStatus,
     DiscoveredFailure,
+    TerminalRecoveryLabelScope,
 )
 from .needs_human_block import NeedsHumanCause
 from .action_base import Action as Action, ActionType as ActionType
@@ -117,16 +118,24 @@ class SyncLabelsAction(Action):
 
 @dataclass(frozen=True)
 class ShedRecoveredWorkflowLabelsAction(Action):
-    """Shed an issue's transient workflow labels after its work has landed.
+    """Shed an issue's stale workflow labels, bounded by ``label_scope``.
 
-    The set of labels to remove (``pr-pending``, ``publish-failed``,
-    ``publish-fail-count-N``, blocking labels) is decided at apply time from the
-    issue's live labels, so the planner does not need to know the issue's
-    current labels (which it usually lacks for already-closed/merged issues).
+    Which labels those are is decided at apply time from the issue's live
+    labels, so the planner does not need to know the issue's current labels
+    (which it usually lacks for already-closed/merged issues). ``label_scope``
+    decides how much authority the shed carries: the full recovered-workflow
+    set (``pr-pending``, ``publish-failed``, ``publish-fail-count-N``, blocking
+    labels) when the issue's work has landed, or ``pr-pending`` alone for a
+    continuation merge whose issue is deliberately still open (#113).
+
+    Private sub-step of ``RecoverTerminalIssueAction`` — see the applier.
     """
 
     issue_number: int = 0
     issue_key: str = ""  # stable_id for SSE events; falls back to str(issue_number) when empty
+    label_scope: TerminalRecoveryLabelScope = (
+        TerminalRecoveryLabelScope.RECOVERED_WORKFLOW
+    )
     action_type: ActionType = field(
         default=ActionType.SHED_RECOVERED_WORKFLOW_LABELS, init=False
     )
@@ -390,6 +399,12 @@ class RecoverTerminalIssueAction(Action):
     (#6431). The label set is decided at apply time from live labels. The
     inherited ``reason`` is the audit/shed reason; ``status_reason`` is
     persisted to history.
+
+    ``label_scope`` bounds that shed to what the triggering evidence actually
+    established. It defaults to the full ``RECOVERED_WORKFLOW`` set — the
+    pre-existing semantics, unchanged — and narrows to ``STALE_PR_PENDING``
+    only for a continuation merge, where the issue is deliberately still open
+    and the merge proves nothing about its other labels (#113).
     """
 
     issue_number: int = 0
@@ -404,6 +419,9 @@ class RecoverTerminalIssueAction(Action):
     # live state (close_on_merge module) using ``merged_at`` as the evidence.
     close_issue: bool = False
     merged_at: str = ""
+    label_scope: TerminalRecoveryLabelScope = (
+        TerminalRecoveryLabelScope.RECOVERED_WORKFLOW
+    )
     action_type: ActionType = field(
         default=ActionType.RECOVER_TERMINAL_ISSUE, init=False
     )

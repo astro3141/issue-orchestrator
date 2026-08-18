@@ -893,31 +893,28 @@ class ActionApplier:
         )
 
     def _apply_shed_recovered_workflow_labels(self, action: Action) -> ActionResult:
-        """Shed transient workflow labels after an issue's work has landed.
+        """Shed an issue's stale workflow labels, bounded by the action's scope.
 
         Private sub-step of the RECOVER_TERMINAL_ISSUE owner command — it is not
         registered in the dispatch table, so it can only be reached through
         ``_apply_recover_terminal_issue`` after that command has enforced the
-        reconciliation pause gate. This keeps the gate the single enforcement
-        point and makes an independent, gate-bypassing shed impossible (#6431).
+        reconciliation pause gate, keeping that gate the single enforcement point
+        so an independent, gate-bypassing shed is impossible (#6431).
 
-        Reads the issue's live labels, asks the LabelManager which are
-        recovered-workflow labels (pr-pending, publish-failed,
-        publish-fail-count-N, blocking labels), and removes each from both
-        GitHub and the local label_store. GitHub is the source of truth for
-        which labels exist; the label_store is folded in too so a row stranded
-        there by past drift is also cleaned in the same pass.
+        Reads the issue's live labels and removes those the action's ``label_scope``
+        authorizes — resolved by ``LabelManager.labels_to_shed`` rather than filtered
+        here, so that policy keeps one owner — from both GitHub and the local
+        label_store. GitHub is the source of truth for which labels exist; the store
+        is folded in so a row stranded by past drift is cleaned in the same pass.
         """
         assert isinstance(action, ShedRecoveredWorkflowLabelsAction)
-        assert self.label_manager is not None, (
-            "label_manager is required to shed recovered workflow labels"
-        )
+        assert self.label_manager is not None, "label_manager is required to shed labels"
 
         # Verify claim ownership before write (raises ClaimLostError)
         self._verify_claim_before_write(action, action.issue_number)
 
         current = self._labels_for_recovery_shed(action.issue_number)
-        to_remove = self.label_manager.recovered_workflow_labels(sorted(current))
+        to_remove = self.label_manager.labels_to_shed(action.label_scope, sorted(current))
 
         removed: list[str] = []
         errors: list[str] = []
@@ -1339,18 +1336,19 @@ class ActionApplier:
         )
 
     def _apply_recover_terminal_issue(self, action: Action) -> ActionResult:
-        """Shed recovered-workflow labels, then finalize awaiting-merge history.
+        """Shed the action's in-scope stale labels, then finalize history.
 
         Owns the terminal-recovery ordering invariant in one place: the history
         entry only transitions to its terminal status after the label cleanup
         has succeeded. The shed is a best-effort GitHub write; finalizing the
         history first and shedding second would take the entry out of the
         reconcilable awaiting-merge statuses, so a later shed failure would
-        never be retried and would strand the pr-pending / publish-failed /
-        publish-fail-count-* labels this recovery removes.
-
-        On shed failure we return failure WITHOUT touching history, leaving the
-        entry reconcilable for the next awaiting-merge discovery pass to retry.
+        never be retried and would strand the labels this recovery removes. On shed
+        failure we return failure WITHOUT touching history, leaving the entry
+        reconcilable for the next awaiting-merge discovery pass to retry. That
+        invariant is scope-independent — one command owns both scopes rather than a
+        second applier path duplicating it; ``label_scope`` changes only WHICH labels
+        the shed may remove (#113).
         """
         assert isinstance(action, RecoverTerminalIssueAction)
 
@@ -1396,6 +1394,7 @@ class ActionApplier:
                 issue_number=action.issue_number,
                 issue_key=action.issue_key,
                 reason=action.reason,
+                label_scope=action.label_scope,
             )
         )
         if not shed_result.success:

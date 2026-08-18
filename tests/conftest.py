@@ -19,6 +19,7 @@ from issue_orchestrator.domain.models import AgentConfig, Issue, Session
 from issue_orchestrator.infra.config import Config, DangerousConfig
 from issue_orchestrator.infra.hooks.hookspec import hookimpl
 from issue_orchestrator.ports.pull_request_tracker import (
+    ClosingIssueReferencesRead,
     MergeQueueEntry,
     MergeQueueRead,
     PRInfo,
@@ -259,6 +260,16 @@ class MockGitHubAdapter:
         self.close_pr_calls: list[int] = []
         # pr_number -> current merge queue entry (None/absent = not enqueued)
         self.merge_queue_entries: dict[int, "MergeQueueEntry"] = {}
+        # pr_number -> issue numbers GitHub registered the PR as CLOSING.
+        # Absent means GitHub answered "this PR closes nothing" (KNOWN empty),
+        # matching the mock's other GitHub-side automations: it does not
+        # simulate the closing-keyword parse, so a PR whose linkage was never
+        # registered genuinely closes nothing — and so also never auto-closes
+        # its issue. Tests that need the linkage register it explicitly.
+        self.pr_closing_issue_numbers: dict[int, tuple[int, ...]] = {}
+        # PRs whose closing linkage cannot be read at all. Distinct from an
+        # empty registration: callers must fail closed on these (#113).
+        self.unreadable_pr_closing_linkage: set[int] = set()
 
         # Call tracking for assertions
         self.add_label_calls: list[tuple] = []
@@ -445,6 +456,21 @@ class MockGitHubAdapter:
             MergeQueueRead.present(entry)
             if entry is not None
             else MergeQueueRead.absent()
+        )
+
+    def read_pr_closing_issue_references(
+        self, pr_number: int
+    ) -> ClosingIssueReferencesRead:
+        """Return the PR's registered closing-issue linkage (mock).
+
+        KNOWN with whatever ``pr_closing_issue_numbers`` records (empty when
+        unregistered — GitHub answering "closes nothing"), or UNKNOWN for a PR
+        the test marked unreadable. The mock never collapses the two.
+        """
+        if pr_number in self.unreadable_pr_closing_linkage:
+            return ClosingIssueReferencesRead.unknown()
+        return ClosingIssueReferencesRead.known(
+            self.pr_closing_issue_numbers.get(pr_number, ())
         )
 
     def create_pr(self, title: str, body: str, head: str, base: str = "main", draft: bool | None = None) -> PRInfo:
