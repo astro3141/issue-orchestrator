@@ -735,6 +735,104 @@ class TestStartupManagerIssueScopeBindsRecovery:
         assert "Skipping in-progress recovery for out-of-scope issue=60" in caplog.text
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "drift,drifted_issue",
+        [
+            ("lost the filter label", Issue(number=60, title="Drifted", labels=["in-progress"])),
+            (
+                "was closed",
+                Issue(number=60, title="Drifted", labels=["agent:backend", "in-progress"], state="closed"),
+            ),
+            (
+                "left the milestone",
+                Issue(
+                    number=60, title="Drifted", labels=["agent:backend", "in-progress"], milestone="M9",
+                ),
+            ),
+        ],
+    )
+    @patch("issue_orchestrator.control.startup_manager.analyze_issue")
+    async def test_label_store_recovery_survives_a_drifted_github_snapshot(
+        self,
+        mock_analyze,
+        drift,
+        drifted_issue,
+        sample_state,
+        mock_config,
+        mock_events,
+        mock_runner,
+        mock_repository_host,
+        mock_action_applier,
+        mock_issue_branches_fn,
+        mock_label_store,
+    ):
+        """The recovery gate binds `--issue`, and deliberately nothing wider.
+
+        `_recover_stale_in_progress_from_label_store` exists to force analysis
+        for a locally in-progress issue *even when the freshly fetched GitHub
+        labels disagree* — dropping the issue is the bug it prevents. #60 holds
+        a worktree with partial work and an orphaned `in-progress` label; if
+        recovery asked the full scope question, GitHub's drifted snapshot would
+        drop it again and nothing would ever reconcile it.
+        """
+        mock_config.filtering.label = "agent:backend"
+        mock_config.filtering.milestone = "M1"
+        mock_config.filtering.issue = None
+        mock_config.agents = {"agent:backend": MagicMock()}
+        mock_issue_branches_fn.return_value = {60: "60-drifted"}
+        sample_state.cached_queue_issues = [
+            Issue(number=45, title="Scoped", labels=["agent:backend"], milestone="M1"),
+        ]
+        mock_label_store.load_all.return_value = {60: {"agent:backend", "in-progress"}}
+        mock_repository_host.get_issue.return_value = drifted_issue
+        mock_analyze.return_value = self._partial_work_analysis()
+        manager = self._manager(
+            mock_config, mock_events, mock_runner, mock_repository_host, mock_action_applier,
+            mock_issue_branches_fn, mock_label_store, MagicMock(return_value=MagicMock()),
+        )
+
+        await manager.run_startup(sample_state)
+
+        analyzed = [c.kwargs["issue"].number for c in mock_analyze.call_args_list]
+        assert 60 in analyzed, f"recovery dropped the issue whose GitHub snapshot {drift}"
+
+    @pytest.mark.asyncio
+    @patch("issue_orchestrator.control.startup_manager.analyze_issue")
+    async def test_label_store_recovery_of_a_drifted_issue_still_obeys_issue_scope(
+        self,
+        mock_analyze,
+        sample_state,
+        mock_config,
+        mock_events,
+        mock_runner,
+        mock_repository_host,
+        mock_action_applier,
+        mock_issue_branches_fn,
+        mock_label_store,
+        caplog,
+    ):
+        """`--issue N` is the one gate that still binds the drifted recovery."""
+        mock_config.filtering.label = "agent:backend"
+        mock_config.filtering.issue = 45
+        mock_config.agents = {"agent:backend": MagicMock()}
+        mock_issue_branches_fn.return_value = {45: "45-scoped", 60: "60-drifted"}
+        sample_state.cached_queue_issues = [Issue(number=45, title="Scoped", labels=["agent:backend"])]
+        mock_label_store.load_all.return_value = {60: {"agent:backend", "in-progress"}}
+        mock_repository_host.get_issue.return_value = Issue(number=60, title="Drifted", labels=["in-progress"])
+        mock_analyze.return_value = self._partial_work_analysis()
+        manager = self._manager(
+            mock_config, mock_events, mock_runner, mock_repository_host, mock_action_applier,
+            mock_issue_branches_fn, mock_label_store, MagicMock(return_value=MagicMock()),
+        )
+
+        with caplog.at_level("INFO"):
+            await manager.run_startup(sample_state)
+
+        analyzed = [c.kwargs["issue"].number for c in mock_analyze.call_args_list]
+        assert 60 not in analyzed
+        assert "Skipping in-progress recovery for out-of-scope issue=60" in caplog.text
+
+    @pytest.mark.asyncio
     @patch("issue_orchestrator.control.startup_manager.analyze_issue")
     async def test_pr_pending_recovery_skips_out_of_scope_issue_already_claimed_this_run(
         self,

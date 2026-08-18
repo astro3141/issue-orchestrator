@@ -13,7 +13,7 @@ import time
 import traceback
 from typing import TYPE_CHECKING
 
-from .issue_scope import evaluate_issue_scope, issue_scope_skip_detail
+from .issue_scope import evaluate_issue_scope, issue_scope_skip_detail, outside_single_issue_scope
 
 if TYPE_CHECKING:
     from ..infra.config import Config
@@ -185,6 +185,23 @@ class QueueCache:
         return not evaluate_issue_scope(
             self._config, issue, include_issue_number_filter=True
         ).in_scope
+
+    def is_outside_single_issue_scope(self, issue: "Issue") -> bool:
+        """Whether ``--issue N`` alone excludes the issue, asking nothing else.
+
+        The unshadowed question again — see :meth:`is_outside_engine_scope` for
+        why the queue verdict cannot answer it — but bounded to the operator's
+        single-issue narrowing. For callers that hold local evidence about an
+        issue (a persisted ``in-progress`` label, a worktree with partial work)
+        and must act on it even when GitHub's current snapshot has drifted out
+        of the label, milestone, or open-state gates. Dropping such an issue is
+        the bug those callers exist to prevent; ``--issue N`` is the one gate
+        that still binds them, because the operator asked for it this run.
+
+        Use :meth:`is_outside_engine_scope` instead whenever the fresh GitHub
+        snapshot really is the authority on whether the issue is ours.
+        """
+        return outside_single_issue_scope(self._config, issue)
 
     def reconciliation_only_issues(self) -> list["Issue"]:
         """In-scope issues the duplicate-launch guard keeps out of the queue (#46).

@@ -62,15 +62,27 @@ def evaluate_issue_scope(
     if detail is not None:
         return _outside("excluded_by_label_filter", detail)
 
-    if include_issue_number_filter:
-        target_number = config.filtering.issue
-        if target_number and issue.number != target_number:
-            return _outside(
-                "outside_single_issue_scope",
-                f"engine is scoped to issue #{target_number}",
-            )
+    if include_issue_number_filter and outside_single_issue_scope(config, issue):
+        return _outside(
+            "outside_single_issue_scope",
+            f"engine is scoped to issue #{config.filtering.issue}",
+        )
 
     return IssueScopeDecision(in_scope=True)
+
+
+def outside_single_issue_scope(config: "Config", issue: "Issue") -> bool:
+    """Whether the engine's ``--issue`` filter alone excludes this issue.
+
+    The narrowest scope gate, split out so callers that must ask ONLY the
+    single-issue question share this one definition with the composite
+    :func:`evaluate_issue_scope`. Deliberately says nothing about labels,
+    milestone, or open state: a caller that holds locally recorded state about
+    an issue may need to act on it even when GitHub's current snapshot has
+    drifted out of those gates, while ``--issue N`` still binds absolutely.
+    """
+    target_number = config.filtering.issue
+    return bool(target_number) and issue.number != target_number
 
 
 def issue_scope_skip_detail(

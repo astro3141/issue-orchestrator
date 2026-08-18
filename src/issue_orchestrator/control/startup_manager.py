@@ -375,7 +375,7 @@ class StartupManager:
             for issue in stale_in_progress:
                 issues_by_number.setdefault(issue.number, issue)
             candidates = [(issue, "") for issue in issues_by_number.values()]
-            logger.info("[startup] Found %d in-progress issues from cache", len(candidates))
+            logger.info("[startup] Found %d in-progress candidate(s) from cache", len(candidates))
         else:
             # Cold fallback: per-agent fetch (only when cache is empty)
             candidates = [
@@ -383,13 +383,13 @@ class StartupManager:
                 for agent_label in self.config.agents.keys()
                 for issue in self._fetch_in_progress_issues_for_agent(state, agent_label)
             ]
-        # Both paths ask the queue owner one question before analysis, so the engine's
-        # configured scope binds recovery: an out-of-scope issue is reported, never
-        # resumed, while an in-scope issue that is merely already claimed still
-        # recovers. The scope predicate, and deliberately not the queue verdict — see
-        # QueueCache.is_outside_engine_scope for the precedence that shadows it.
+        # Both paths ask the queue owner one question before analysis, so `--issue N`
+        # binds recovery: out-of-scope is reported and never resumed, while an in-scope
+        # issue merely already claimed still recovers. The scope predicate and not the
+        # queue verdict, which shadows it; the single-issue one and not the whole scope,
+        # which would re-drop the drifted issues recovered below. QueueCache says why.
         for issue, agent_label in candidates:
-            if queue_cache.is_outside_engine_scope(issue):
+            if queue_cache.is_outside_single_issue_scope(issue):
                 logger.info("[startup] Skipping in-progress recovery for out-of-scope issue=%d", issue.number)
                 continue
             self._analyze_and_handle_issue(state, issue, issue_branches, issues_to_resume, agent_label)

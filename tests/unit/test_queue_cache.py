@@ -387,6 +387,46 @@ def test_is_outside_engine_scope_applies_label_scope_without_a_single_issue_filt
     assert cache.is_outside_engine_scope(Issue(number=2, title="Other", labels=["agent:other"])) is True
 
 
+def test_is_outside_single_issue_scope_sees_the_filter_through_the_exclusion_guard():
+    """The narrow predicate is unshadowed too: exclusion never hides `--issue`."""
+    config = _make_config()
+    config.filtering.issue = 45
+    state = OrchestratorState(session_history=[_history_entry(60)])
+    cache = QueueCache(config, state)
+    unscoped = Issue(number=60, title="Unscoped", labels=["agent:web"])
+
+    assert cache.evaluate_issue(unscoped) is QueueMutationStatus.REJECTED_EXCLUDED
+    assert cache.is_outside_single_issue_scope(unscoped) is True
+    assert cache.is_outside_single_issue_scope(Issue(number=45, title="Scoped", labels=[])) is False
+
+
+def test_is_outside_single_issue_scope_ignores_label_milestone_and_open_state():
+    """The whole point of the narrow predicate: a drifted snapshot is still ours.
+
+    Callers holding local evidence (a persisted `in-progress` label, partial
+    work in a worktree) must act on the issue even when GitHub now disagrees
+    about its labels, milestone, or open state. `is_outside_engine_scope` says
+    "not mine" to exactly that issue, which is why they cannot use it.
+    """
+    config = _make_config()
+    config.filtering.label = "agent:web"
+    config.filtering.milestone = "M1"
+    cache = QueueCache(config, OrchestratorState())
+    drifted = Issue(number=60, title="Drifted", labels=["agent:other"], state="closed", milestone="M2")
+
+    assert cache.is_outside_engine_scope(drifted) is True
+    assert cache.is_outside_single_issue_scope(drifted) is False
+
+
+def test_is_outside_single_issue_scope_admits_everything_without_a_filter():
+    config = _make_config()
+    config.filtering.issue = None
+    cache = QueueCache(config, OrchestratorState())
+
+    assert cache.is_outside_single_issue_scope(Issue(number=1, title="A", labels=[])) is False
+    assert cache.is_outside_single_issue_scope(Issue(number=999, title="B", labels=[])) is False
+
+
 def test_prune_refresh_timestamps_keeps_only_tracked_issue_numbers():
     config = _make_config()
     state = OrchestratorState(
