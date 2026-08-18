@@ -684,6 +684,61 @@ SessionHistoryStatus: TypeAlias = Literal[
 ]
 AwaitingMergeTerminalStatus: TypeAlias = Literal["merged", "closed"]
 AwaitingMergeReconciliationSource: TypeAlias = Literal["pull_request", "issue"]
+
+
+class MergedIssueDisposition(Enum):
+    """What a merged PR establishes about the issue behind it (#113).
+
+    ``merged + issue OPEN`` describes two opposite situations that are
+    identical on every other field — a failed auto-close, and a merge that
+    deliberately did not close its issue (``Refs #45``, landing partial work).
+    GitHub's REGISTERED closing linkage separates them, and the answer is
+    carried as this enum rather than a bool so the two *authorities* the
+    outcomes carry can never collapse into one:
+
+    - :attr:`CLOSE_AND_RECOVER` — GitHub registered the PR as closing this
+      issue and the auto-close did not fire. The issue's work has landed:
+      close it, and shed the whole recovered-workflow label set.
+    - :attr:`RECOVER` — the issue is already terminal (closed, or closed and
+      then deliberately reopened). No close; the whole recovered-workflow
+      label set is stale and sheds.
+    - :attr:`CONTINUE` — GitHub answered, and this issue is NOT in the
+      closing set. The issue is intentionally still OPEN, so the merge
+      establishes exactly one thing: ``pr-pending`` is stale. It does NOT
+      authorize clearing unrelated failure/blocking state, which describes
+      the issue's *current* condition and still gates scheduling. The narrow
+      authority is carried through to the label scope
+      (:class:`TerminalRecoveryLabelScope`).
+    - :attr:`UNREADABLE` — the linkage could not be read. Fail closed:
+      neither close nor shed, and the history entry stays reconcilable. Never
+      reaches a :class:`DiscoveredAwaitingMergeReconciliation`.
+    """
+
+    CLOSE_AND_RECOVER = "close_and_recover"
+    RECOVER = "recover"
+    CONTINUE = "continue"
+    UNREADABLE = "unreadable"
+
+
+class TerminalRecoveryLabelScope(Enum):
+    """How much of an issue's label state a terminal recovery may shed.
+
+    The scope is the label-side expression of a
+    :class:`MergedIssueDisposition`: it bounds the recovery's authority so a
+    command cannot clear state its triggering evidence never established.
+
+    - :attr:`RECOVERED_WORKFLOW` — the pre-existing terminal semantics. The
+      issue's work has landed, so every transient workflow label
+      (``pr-pending``, ``publish-failed``, ``publish-fail-count-N``, blocking
+      labels) is stale and sheds.
+    - :attr:`STALE_PR_PENDING` — a continuation merge (#113). The issue is
+      deliberately still open; the ONLY label the merge proves stale is
+      ``pr-pending``. Everything else survives untouched and keeps gating
+      selection.
+    """
+
+    RECOVERED_WORKFLOW = "recovered_workflow"
+    STALE_PR_PENDING = "stale_pr_pending"
 RECONCILABLE_HISTORY_STATUSES: frozenset[SessionHistoryStatus] = frozenset({"completed"})
 TERMINAL_AWAITING_MERGE_HISTORY_STATUSES: frozenset[AwaitingMergeTerminalStatus] = frozenset(
     {"merged", "closed"}
@@ -1455,15 +1510,24 @@ class DiscoveredAwaitingMergeReconciliation:
     status_reason: str
     source: AwaitingMergeReconciliationSource
     issue_key: str = ""  # stable_id; falls back to str(issue_number) when empty
-    # True when the PR merged but the GitHub issue is still open — i.e. no
-    # closing reference registered on the PR (GitHub's closing-keyword parse is
-    # word-boundary sensitive and easily defeated), so auto-close never fired.
-    # The Planner turns this into a close-on-merge fallback so the closing
-    # keyword is a redundancy, not the sole close mechanism. ``merged_at``
-    # carries the merge evidence so the apply-time owner can revalidate the
-    # destructive precondition against live state, not this discovery-time bit.
-    issue_open: bool = False
+    # What the merge established about the issue behind it — the close-on-merge
+    # owner's typed answer (#113). The Planner turns CLOSE_AND_RECOVER into the
+    # close-on-merge fallback (so GitHub's word-boundary-sensitive closing
+    # keyword is a redundancy, not the sole close mechanism) and CONTINUE into
+    # a narrowed label scope. ``merged_at`` carries the merge evidence so the
+    # apply-time owner can revalidate the destructive precondition against live
+    # state, not this discovery-time bit. Only meaningful for ``merged``.
+    merged_disposition: MergedIssueDisposition = MergedIssueDisposition.RECOVER
     merged_at: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.merged_disposition is MergedIssueDisposition.UNREADABLE:
+            # UNREADABLE means "fail closed, mutate nothing" — the reconciler
+            # must skip the entry, never publish it as a discovered fact.
+            raise ValueError(
+                "an UNREADABLE merged disposition must not become a "
+                f"reconciliation fact (issue #{self.issue_number})"
+            )
 
 
 @dataclass(frozen=True)

@@ -12,8 +12,9 @@ from __future__ import annotations
 import enum
 import re
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Sequence
+from typing import TYPE_CHECKING, Callable, Sequence
 
+from ..domain.models import TerminalRecoveryLabelScope
 from ..domain.tech_lead_session import (
     PROPOSED_TECH_LEAD_LABEL,
     TECH_LEAD_AREA_LABEL_PREFIX,
@@ -479,12 +480,46 @@ class LabelManager:
         the clear-on-merge transition: callers feed it the issue's current
         labels and remove whatever it returns.
         """
+        return self._select(labels, self.is_recovered_workflow_label)
+
+    def is_stale_after_continuation_merge(self, label: str) -> bool:
+        """Return True if a merge that did NOT close its issue proves *label*
+        stale.
+
+        Exactly ``pr-pending``, and deliberately nothing else (#113). The issue
+        is intentionally still open, so its failure/blocking labels describe a
+        current condition the merge is no evidence about.
+        """
+        return label == self.pr_pending
+
+    def labels_to_shed(
+        self, scope: TerminalRecoveryLabelScope, labels: Sequence[str]
+    ) -> list[str]:
+        """Return the subset of *labels* a terminal recovery of *scope* may shed.
+
+        The single owner of how much label state a recovery may clear, as a
+        decision table over the scope so the two authorities cannot drift apart
+        across call sites. An unmapped scope raises rather than defaulting to
+        either authority. Order-preserving and de-duplicated.
+        """
+        predicate = {
+            TerminalRecoveryLabelScope.RECOVERED_WORKFLOW:
+                self.is_recovered_workflow_label,
+            TerminalRecoveryLabelScope.STALE_PR_PENDING:
+                self.is_stale_after_continuation_merge,
+        }[scope]
+        return self._select(labels, predicate)
+
+    @staticmethod
+    def _select(
+        labels: Sequence[str], predicate: Callable[[str], bool]
+    ) -> list[str]:
         result: list[str] = []
         seen: set[str] = set()
         for label in labels:
             if label in seen:
                 continue
-            if self.is_recovered_workflow_label(label):
+            if predicate(label):
                 result.append(label)
                 seen.add(label)
         return result

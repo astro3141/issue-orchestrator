@@ -37,9 +37,22 @@ to parse", and no field separates those. A choice had to be made.
 
 **#113 resolves an empty registration as a deliberate continuation, and this
 SUPERSEDES #6956's opposite resolution of the same condition.** No close; the
-ordinary terminal recovery sheds the stale ``pr-pending`` so the still-open
-issue rejoins selection. The fallback close now fires ONLY when the PR did
-register this issue — i.e. only on a genuinely failed auto-close.
+stale ``pr-pending`` is shed so the still-open issue rejoins selection. The
+fallback close now fires ONLY when the PR did register this issue — i.e. only
+on a genuinely failed auto-close.
+
+The continuation shed is deliberately NARROW, and this is a correctness
+property, not a detail (#113 review round 2). A continuation merge proves
+exactly one thing: ``pr-pending`` is stale. The issue is intentionally still
+OPEN, so its other labels — ``publish-failed``, a ``blocked:*`` reason, a
+``publish-fail-count-N`` — describe its *current* condition and are untouched
+by the merge. Routing this branch through the ordinary terminal recovery would
+shed all of them, silently unblocking an issue on evidence that said nothing
+about why it was blocked. So the disposition is carried as a typed
+``MergedIssueDisposition`` and narrows the recovery's label authority to
+``TerminalRecoveryLabelScope.STALE_PR_PENDING``; the terminal full shed is
+reached only by the dispositions that genuinely mean "this issue's work has
+landed".
 
 Residual exposure, stated deliberately: the literal-``\\n`` PR at the top of
 this docstring registers nothing, so under the new rule it lands on the
@@ -61,6 +74,7 @@ from ..domain.models import (
     AwaitingMergeReconciliationSource,
     AwaitingMergeTerminalStatus,
     DiscoveredAwaitingMergeReconciliation,
+    MergedIssueDisposition,
 )
 from ..ports.repository_host import RepositoryHostError
 from .actions import ActionResult, CloseIssueAction
@@ -86,17 +100,18 @@ def close_on_merge_evidence(
     pr_number: int,
     merged_at: str | None,
     on_issue_read: Callable[[], None] | None = None,
-) -> bool | None:
-    """Whether the issue behind a merged PR needs the fallback close — the
-    single owner of the destructive precondition.
+) -> MergedIssueDisposition:
+    """What a merged PR establishes about its issue — the single owner of the
+    destructive precondition, and of how much label authority the merge carries.
 
-    True only on positive evidence of the failure this fallback exists for:
-    GitHub registered the PR as closing the issue, the issue is open, AND no
-    ``closed`` event exists at/after the PR's ``merged_at`` — i.e. the
-    auto-close never fired for this merge. An open issue that HAS a close event
-    since the merge was auto-closed and then deliberately reopened; it is never
-    re-closed. A missing ``merged_at`` means no evidence either way — never
-    infer a destructive close from ``state == open`` alone.
+    :attr:`~MergedIssueDisposition.CLOSE_AND_RECOVER` only on positive evidence
+    of the failure this fallback exists for: GitHub registered the PR as
+    closing the issue, the issue is open, AND no ``closed`` event exists
+    at/after the PR's ``merged_at`` — i.e. the auto-close never fired for this
+    merge. An open issue that HAS a close event since the merge was auto-closed
+    and then deliberately reopened; it is never re-closed. A missing
+    ``merged_at`` means no evidence either way — never infer a destructive
+    close from ``state == open`` alone.
 
     ``merged + issue OPEN`` cannot on its own tell a failed auto-close apart
     from a deliberate non-closing merge (a PR that says ``Refs #45``, landing
@@ -105,30 +120,35 @@ def close_on_merge_evidence(
     here and routes the outcome (#113):
 
     - registered as closing this issue → the pre-existing evidence rule below
-      decides, unchanged;
-    - answered, but this issue is not in the set → a deliberate non-closing
-      merge. Return False: no close, and the caller's ordinary terminal
-      recovery sheds the stale ``pr-pending`` so the still-open issue rejoins
-      selection instead of parking forever. This branch REVERSES #6956, which
-      closed the issue on exactly this condition; the module docstring records
-      why the ambiguity is resolved this way and what it costs;
-    - unreadable → return None. Fail closed: no close AND no shed. Treating an
-      unreadable relation as an empty one would shed a queue-gating label on a
-      guess.
+      decides between ``CLOSE_AND_RECOVER`` and ``RECOVER``, unchanged;
+    - answered, but this issue is not in the set → ``CONTINUE``: a deliberate
+      non-closing merge. No close, and the recovery's label authority narrows
+      to the one label the merge actually proves stale (``pr-pending``), so the
+      still-open issue rejoins selection instead of parking forever WITHOUT
+      losing unrelated failure/blocking state that still describes it. This
+      branch REVERSES #6956, which closed the issue on exactly this condition;
+      the module docstring records why the ambiguity is resolved this way, what
+      it costs, and why the shed is narrow;
+    - unreadable → ``UNREADABLE``. Fail closed: no close AND no shed. Treating
+      an unreadable relation as an empty one would shed a queue-gating label
+      on a guess.
 
-    Net effect on the destructive write: it is strictly NARROWER than before.
-    The close now requires a registered reference on top of every pre-existing
-    condition, so no issue closes today that would not have closed before.
+    Net effect on the destructive writes: both are strictly NARROWER than
+    before. The close now requires a registered reference on top of every
+    pre-existing condition, so no issue closes today that would not have closed
+    before; and the continuation branch removes strictly fewer labels than the
+    terminal recovery it used to route through.
 
     Called from BOTH phases: discovery (to plan the close attempt) and the
     apply-time owner command, which revalidates immediately before the
     destructive write — the planner's bit is advisory and can go stale in the
     discovery→apply gap (a human closing and reopening in between).
 
-    Returns None when the evidence cannot be read (transient repository-host
-    error) so the caller can retry without mutating: fail-open recreates the
-    relaunch bug, and raising aborts the caller's tick. An issue the host
-    reports as missing is treated as not-open — there is nothing to close.
+    Returns ``UNREADABLE`` when the evidence cannot be read (transient
+    repository-host error) so the caller can retry without mutating: fail-open
+    recreates the relaunch bug, and raising aborts the caller's tick. An issue
+    the host reports as missing is treated as not-open — there is nothing to
+    close, and nothing survives that a narrow shed would protect.
     """
     try:
         issue = get_issue(issue_number)
@@ -138,31 +158,31 @@ def close_on_merge_evidence(
             "issue=#%d; retrying without mutation",
             issue_number,
         )
-        return None
+        return MergedIssueDisposition.UNREADABLE
     if issue is None:
-        return False
+        return MergedIssueDisposition.RECOVER
     if on_issue_read is not None:
         on_issue_read()
     if normalized_state(issue.state) == "closed":
         # Terminal already; no linkage read needed, so the common
         # merged-and-auto-closed path pays nothing extra.
-        return False
+        return MergedIssueDisposition.RECOVER
     linkage = _closing_linkage(
         closing_issue_references=closing_issue_references,
         issue_number=issue_number,
         pr_number=pr_number,
     )
     if linkage is None:
-        return None
+        return MergedIssueDisposition.UNREADABLE
     if not linkage.closes(issue_number):
         logger.info(
             "PR #%d merged without registering issue #%d as a closing "
             "reference; treating as a deliberate non-closing merge — no "
-            "close, stale pr-pending shed by terminal recovery",
+            "close, and only the stale pr-pending is shed",
             pr_number,
             issue_number,
         )
-        return False
+        return MergedIssueDisposition.CONTINUE
     if not merged_at:
         logger.warning(
             "Merged PR for issue #%d carries no merged_at; skipping close-on-"
@@ -170,7 +190,7 @@ def close_on_merge_evidence(
             "auto-close",
             issue_number,
         )
-        return False
+        return MergedIssueDisposition.RECOVER
     try:
         auto_close_fired = closed_on_or_after(issue_number, merged_at)
     except RepositoryHostError:
@@ -179,15 +199,15 @@ def close_on_merge_evidence(
             "issue=#%d; retrying without mutation",
             issue_number,
         )
-        return None
+        return MergedIssueDisposition.UNREADABLE
     if auto_close_fired:
         logger.info(
             "Issue #%d was closed at/after its PR merge and deliberately "
             "reopened; close-on-merge fallback will not re-close it",
             issue_number,
         )
-        return False
-    return True
+        return MergedIssueDisposition.RECOVER
+    return MergedIssueDisposition.CLOSE_AND_RECOVER
 
 
 def _closing_linkage(
@@ -224,7 +244,7 @@ def _closing_linkage(
     return linkage
 
 
-def should_close_merged_issue(
+def merged_issue_disposition(
     *,
     get_issue: "Callable[[int], Issue | None]",
     closed_on_or_after: "Callable[[int, str], bool]",
@@ -234,7 +254,7 @@ def should_close_merged_issue(
     pr_number: int,
     merged_at: str | None,
     now: float,
-) -> bool | None:
+) -> MergedIssueDisposition:
     """Discovery-phase wrapper: the shared evidence rule plus queue-cache
     freshness bookkeeping for the issue read."""
     return close_on_merge_evidence(
@@ -278,7 +298,7 @@ def run_close_on_merge_fallback(
     reconcilable for retry.
     """
     host = cast("RepositoryHost", repository_host)
-    evidence = close_on_merge_evidence(
+    disposition = close_on_merge_evidence(
         get_issue=host.get_issue,
         closed_on_or_after=host.issue_closed_on_or_after,
         closing_issue_references=host.read_pr_closing_issue_references,
@@ -286,14 +306,15 @@ def run_close_on_merge_fallback(
         pr_number=action.pr_number,
         merged_at=action.merged_at or None,
     )
-    if evidence is None:
+    if disposition is MergedIssueDisposition.UNREADABLE:
         return False, (
             "close-on-merge revalidation unreadable; awaiting-merge history "
             "left reconcilable for retry"
         )
-    if not evidence:
-        # Already closed, or deliberately reopened after an auto-close — no
-        # destructive write; the caller proceeds with shed + history.
+    if disposition is not MergedIssueDisposition.CLOSE_AND_RECOVER:
+        # Already closed, deliberately reopened after an auto-close, or a
+        # continuation merge — no destructive write; the caller proceeds with
+        # the shed its own (possibly narrowed) label scope authorizes.
         return False, None
     result = close(CloseIssueAction(
         issue_number=action.issue_number,
@@ -333,7 +354,7 @@ def reconciliation_fact(
     status: AwaitingMergeTerminalStatus,
     reason: str,
     source: AwaitingMergeReconciliationSource,
-    issue_open: bool = False,
+    merged_disposition: MergedIssueDisposition = MergedIssueDisposition.RECOVER,
     merged_at: str | None = None,
 ) -> DiscoveredAwaitingMergeReconciliation:
     return DiscoveredAwaitingMergeReconciliation(
@@ -343,7 +364,7 @@ def reconciliation_fact(
         status=status,
         status_reason=reason,
         source=source,
-        issue_open=issue_open,
+        merged_disposition=merged_disposition,
         merged_at=merged_at,
     )
 

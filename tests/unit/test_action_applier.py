@@ -44,6 +44,7 @@ from issue_orchestrator.domain.models import (
     Issue,
     Session,
     SessionHistoryEntry,
+    TerminalRecoveryLabelScope,
 )
 from issue_orchestrator.domain.tech_lead_session import (
     HEALTH_REVIEW_MARKER_LABEL,
@@ -2231,6 +2232,48 @@ class TestRecoverTerminalIssueAction:
         # History finalized only after the shed succeeded.
         assert entry.status == "merged"
         assert entry.status_reason == "PR merged; awaiting merge reconciled"
+
+    def test_stale_pr_pending_scope_sheds_only_pr_pending_but_still_finalizes(
+        self, mock_labels, mock_sessions, mock_events, mock_repository_host,
+        real_label_manager,
+    ):
+        """#113: a continuation merge's narrowed scope must bound the shed and
+        nothing else — the history entry still terminalizes.
+
+        The ordering invariant (shed, then history) belongs to the command and
+        is scope-independent; only the label set changes. Without that second
+        half the continuation issue would be re-discovered every pass.
+        """
+        entry = self._awaiting_merge_entry()
+        applier = self._make_applier(
+            mock_labels, mock_sessions, mock_events, mock_repository_host,
+            real_label_manager,
+            github_labels=[
+                "pr-pending", "publish-failed", "publish-fail-count-2",
+                "blocked:claim-lost", "agent:backend",
+            ],
+            history_entry=entry,
+        )
+        action = RecoverTerminalIssueAction(
+            issue_number=228,
+            pr_number=318,
+            pr_url="https://github.com/test/repo/pull/318",
+            status="merged",
+            source="pull_request",
+            status_reason="PR merged; awaiting merge reconciled",
+            issue_key="M1-228",
+            reason="awaiting-merge terminal: merged",
+            label_scope=TerminalRecoveryLabelScope.STALE_PR_PENDING,
+        )
+
+        result = applier.apply(action)
+
+        assert result.success
+        removed = [call.args[1] for call in mock_labels.remove_label.call_args_list]
+        assert removed == ["pr-pending"]
+        assert result.details["shed_removed"] == ["pr-pending"]
+        # The narrowed scope does not narrow the ordering invariant.
+        assert entry.status == "merged"
 
     _CLOSE_MERGED_AT = "2026-08-03T13:52:09Z"
 

@@ -45,6 +45,8 @@ from issue_orchestrator.domain.models import (
     DiscoveredAwaitingMergeDrift,
     DiscoveredAwaitingMergeReconciliation,
     DiscoveredFailure,
+    MergedIssueDisposition,
+    TerminalRecoveryLabelScope,
     DiscoveredMergeQueueEnqueue,
     DiscoveredRetrospectiveReview,
 )
@@ -1084,10 +1086,10 @@ class TestPlanAwaitingMergeReconciliations:
         assert "merged" in action.reason
 
     def test_merged_open_issue_plans_close_on_merge_fallback(self):
-        """A merged PR whose issue is still open (issue_open=True) means
-        GitHub's closing-keyword auto-close did not fire; the owner command
-        must carry close_issue=True so the applier closes the issue before
-        finalizing history (porchpin case file #81)."""
+        """A merged PR GitHub registered as closing its still-open issue
+        (CLOSE_AND_RECOVER) means the closing-keyword auto-close did not fire;
+        the owner command must carry close_issue=True so the applier closes the
+        issue before finalizing history (porchpin case file #81)."""
         config = make_config()
         scheduler = Scheduler(config)
         planner = Planner(config=config, scheduler=scheduler)
@@ -1099,7 +1101,7 @@ class TestPlanAwaitingMergeReconciliations:
             status_reason="PR merged; awaiting merge reconciled",
             source="pull_request",
             issue_key="M1-228",
-            issue_open=True,
+            merged_disposition=MergedIssueDisposition.CLOSE_AND_RECOVER,
             merged_at="2026-08-03T13:52:09Z",
         )
 
@@ -1117,6 +1119,71 @@ class TestPlanAwaitingMergeReconciliations:
         # The merge evidence rides the owner command so the applier can
         # revalidate the destructive precondition against live state.
         assert action.merged_at == "2026-08-03T13:52:09Z"
+
+    def test_continuation_merge_plans_the_narrow_pr_pending_scope(self):
+        """A CONTINUE disposition — merged, issue deliberately still open —
+        must narrow the owner command's label authority to pr-pending only.
+
+        The merge establishes that pr-pending is stale and nothing else. If the
+        planner handed this the full RECOVERED_WORKFLOW scope, the applier
+        would also clear publish-failed / blocked:* state the merge never spoke
+        to (#113 review round 2).
+        """
+        config = make_config()
+        scheduler = Scheduler(config)
+        planner = Planner(config=config, scheduler=scheduler)
+        discovered = DiscoveredAwaitingMergeReconciliation(
+            issue_number=228,
+            pr_number=318,
+            pr_url="https://github.com/test/repo/pull/318",
+            status="merged",
+            status_reason="PR merged; awaiting merge reconciled",
+            source="pull_request",
+            issue_key="M1-228",
+            merged_disposition=MergedIssueDisposition.CONTINUE,
+            merged_at="2026-08-03T13:52:09Z",
+        )
+
+        plan = planner.plan(make_snapshot(
+            discovered_awaiting_merge_reconciliations=(discovered,),
+        ))
+
+        action = plan.actions_of_type(ActionType.RECOVER_TERMINAL_ISSUE)[0]
+        assert isinstance(action, RecoverTerminalIssueAction)
+        assert action.label_scope is TerminalRecoveryLabelScope.STALE_PR_PENDING
+        assert action.close_issue is False
+
+    def test_landed_dispositions_keep_the_full_terminal_scope(self):
+        """Both dispositions that mean "this issue's work has landed" keep the
+        pre-existing full shed — the narrowing is CONTINUE-only."""
+        config = make_config()
+        planner = Planner(config=config, scheduler=Scheduler(config))
+
+        for disposition in (
+            MergedIssueDisposition.RECOVER,
+            MergedIssueDisposition.CLOSE_AND_RECOVER,
+        ):
+            plan = planner.plan(make_snapshot(
+                discovered_awaiting_merge_reconciliations=(
+                    DiscoveredAwaitingMergeReconciliation(
+                        issue_number=228,
+                        pr_number=318,
+                        pr_url="https://github.com/test/repo/pull/318",
+                        status="merged",
+                        status_reason="PR merged; awaiting merge reconciled",
+                        source="pull_request",
+                        issue_key="M1-228",
+                        merged_disposition=disposition,
+                        merged_at="2026-08-03T13:52:09Z",
+                    ),
+                ),
+            ))
+
+            action = plan.actions_of_type(ActionType.RECOVER_TERMINAL_ISSUE)[0]
+            assert isinstance(action, RecoverTerminalIssueAction)
+            assert action.label_scope is (
+                TerminalRecoveryLabelScope.RECOVERED_WORKFLOW
+            ), disposition
 
     def test_merged_closed_issue_plans_no_close(self):
         """The common case — auto-close fired — must not order a close."""
@@ -1145,7 +1212,7 @@ class TestPlanAwaitingMergeReconciliations:
         assert isinstance(action, RecoverTerminalIssueAction)
         assert action.close_issue is False
 
-    def test_closed_status_never_plans_close_even_if_issue_open(self):
+    def test_closed_status_never_plans_close_even_when_disposition_says_close(self):
         """Only a MERGED PR earns the close fallback: a closed-unmerged PR
         with an open issue is the drift path's territory (blocked:pr-closed),
         and the issue legitimately stays open for rework."""
@@ -1160,7 +1227,7 @@ class TestPlanAwaitingMergeReconciliations:
             status_reason="Issue closed; awaiting merge reconciled",
             source="issue",
             issue_key="M1-228",
-            issue_open=True,
+            merged_disposition=MergedIssueDisposition.CLOSE_AND_RECOVER,
         )
 
         snapshot = make_snapshot(

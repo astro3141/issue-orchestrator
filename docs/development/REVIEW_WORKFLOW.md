@@ -341,15 +341,25 @@ GitHub's **registered closing linkage** (`closingIssuesReferences` — GitHub's
 own resolution of the closing keywords, which the orchestrator reads rather
 than parsing itself) is what tells them apart:
 
-| Registered linkage | Meaning | Orchestrator |
-|---|---|---|
-| Names this issue | Auto-close should have fired but did not | Close-on-merge fallback closes the issue |
-| Answered, does not name it | Deliberate non-closing merge (`Refs #N`) | Sheds `pr-pending`; issue stays open and rejoins selection |
-| Unreadable | Unknown | Fails closed — no close, no shed; retried next pass |
+| Registered linkage | Meaning | Orchestrator | Labels it may clear |
+|---|---|---|---|
+| Names this issue | Auto-close should have fired but did not | Close-on-merge fallback closes the issue | The full recovered-workflow set |
+| Answered, does not name it | Deliberate non-closing merge (`Refs #N`) | Issue stays open and rejoins selection | **Only `pr-pending`** |
+| Unreadable | Unknown | Fails closed — no close, no shed; retried next pass | None |
 
 The middle row matters because `merged + issue open` looks identical in the
 first two cases on every other field. An unreadable linkage is never treated as
 an empty one: that would shed a queue-gating label on a guess.
+
+The last column is a separate rule, and it is deliberately narrow. When the
+issue's work has landed, the whole recovered-workflow set (`pr-pending`,
+`publish-failed`, `publish-fail-count-N`, blocking labels) is stale by
+definition. A **continuation merge is not that case**: the issue is
+intentionally still open, so the merge establishes only that `pr-pending` is
+stale and says nothing about a `blocked:*` reason or a publish failure the
+issue was already carrying. Those survive and keep gating selection, so the
+issue rejoins the queue exactly as far as its remaining state allows — no
+further.
 
 ## Configuration
 

@@ -17,6 +17,7 @@ from issue_orchestrator.control.label_manager import LabelManager
 from issue_orchestrator.control.session_history import SessionHistoryOwner
 from issue_orchestrator.domain.models import (
     Issue,
+    MergedIssueDisposition,
     OrchestratorState,
     SessionHistoryEntry,
 )
@@ -254,7 +255,10 @@ def test_recovered_awaiting_merge_entry_reconciles_when_pr_is_merged() -> None:
     assert result.reconciliations[0].status_reason == "PR merged; awaiting merge reconciled"
     assert result.reconciliations[0].source == "pull_request"
     # GitHub's closing keyword auto-closed the issue — no fallback needed.
-    assert result.reconciliations[0].issue_open is False
+    assert (
+        result.reconciliations[0].merged_disposition
+        is MergedIssueDisposition.RECOVER
+    )
     assert entry.pr_url == "https://github.com/owner/repo/pull/318"
     repository_host.get_pr.assert_called_once_with(318)
     # A terminal PR must NOT be status-rollup-polled — that GraphQL round-trip
@@ -275,7 +279,7 @@ def test_recovered_awaiting_merge_entry_reconciles_when_pr_is_merged() -> None:
 def test_registered_closing_pr_with_open_issue_flags_fallback() -> None:
     """A merged PR that DID register this issue as a closing reference, whose
     issue is nonetheless open AND was never closed since the merge, proves
-    GitHub's auto-close did not fire. The fact must carry issue_open=True so
+    GitHub's auto-close did not fire. The fact must carry CLOSE_AND_RECOVER so
     the planner orders the close-on-merge fallback (porchpin case file #81).
 
     Since #113 the registration is required, not incidental: a merge that
@@ -300,7 +304,10 @@ def test_registered_closing_pr_with_open_issue_flags_fallback() -> None:
 
     assert result.discovered == 1
     assert result.reconciliations[0].status == "merged"
-    assert result.reconciliations[0].issue_open is True
+    assert (
+        result.reconciliations[0].merged_disposition
+        is MergedIssueDisposition.CLOSE_AND_RECOVER
+    )
     repository_host.issue_closed_on_or_after.assert_called_once_with(
         228, _MERGED_AT,
     )
@@ -326,7 +333,13 @@ def test_merged_then_reopened_issue_is_never_reclosed() -> None:
 
     assert result.discovered == 1
     assert result.reconciliations[0].status == "merged"
-    assert result.reconciliations[0].issue_open is False
+    # Deliberately reopened after a successful auto-close: the issue's work HAS
+    # landed, so the full recovered-workflow shed still applies — this is not
+    # the narrow continuation case.
+    assert (
+        result.reconciliations[0].merged_disposition
+        is MergedIssueDisposition.RECOVER
+    )
 
 
 def test_merged_pr_events_read_error_leaves_entry_reconcilable() -> None:
@@ -367,7 +380,10 @@ def test_merged_pr_without_merged_at_never_closes() -> None:
     ).discover(state)
 
     assert result.discovered == 1
-    assert result.reconciliations[0].issue_open is False
+    assert (
+        result.reconciliations[0].merged_disposition
+        is MergedIssueDisposition.RECOVER
+    )
     repository_host.issue_closed_on_or_after.assert_not_called()
 
 
@@ -376,8 +392,9 @@ def test_merged_pr_not_registered_as_closing_sheds_without_closing() -> None:
 
     GitHub answered — the PR closes nothing — so this is an intentional
     non-closing merge, not a failed auto-close. The entry becomes terminal
-    (which is what sheds the stale pr-pending through the existing recovery
-    owner) and issue_open stays False, so no close is ordered (#113).
+    (which is what sheds the stale pr-pending) and the disposition is CONTINUE:
+    no close is ordered, and the recovery's label authority narrows to
+    pr-pending alone (#113).
     """
     entry = _history_entry()
     state = OrchestratorState(session_history=[entry])
@@ -393,7 +410,10 @@ def test_merged_pr_not_registered_as_closing_sheds_without_closing() -> None:
 
     assert result.discovered == 1
     assert result.reconciliations[0].status == "merged"
-    assert result.reconciliations[0].issue_open is False
+    assert (
+        result.reconciliations[0].merged_disposition
+        is MergedIssueDisposition.CONTINUE
+    )
     # No close means no need for close-event evidence at all.
     repository_host.issue_closed_on_or_after.assert_not_called()
 
@@ -414,7 +434,10 @@ def test_merged_pr_closing_another_issue_only_still_sheds() -> None:
     ).discover(state)
 
     assert result.discovered == 1
-    assert result.reconciliations[0].issue_open is False
+    assert (
+        result.reconciliations[0].merged_disposition
+        is MergedIssueDisposition.CONTINUE
+    )
     repository_host.issue_closed_on_or_after.assert_not_called()
 
 
@@ -501,7 +524,12 @@ def test_merged_pr_with_missing_issue_reconciles_without_close() -> None:
 
     assert result.discovered == 1
     assert result.reconciliations[0].status == "merged"
-    assert result.reconciliations[0].issue_open is False
+    # Nothing survives on a missing issue, so there is no narrow-scope case:
+    # the ordinary recovery disposition applies.
+    assert (
+        result.reconciliations[0].merged_disposition
+        is MergedIssueDisposition.RECOVER
+    )
 
 
 def test_recovered_entry_reconciles_when_linked_issue_is_closed() -> None:
