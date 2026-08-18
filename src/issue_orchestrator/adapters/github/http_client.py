@@ -41,6 +41,12 @@ logger = logging.getLogger(__name__)
 # from a truncated read.
 _MARKER_SCAN_PAGE_CAP = 20
 
+# Backstop for the closing-issue-linkage pagination loop. At 100 references per
+# page this covers 500 issues closed by one PR — implausible in practice, so
+# this is a runaway-loop guard. Exceeding it yields "relation unreadable"
+# rather than a truncated set, which would read as "this issue is not linked".
+_CLOSING_ISSUES_PAGE_CAP = 5
+
 
 # Completed check-run conclusions that GitHub treats as acceptable for a
 # required status check: only `success`, `skipped`, and `neutral` clear merge.
@@ -1718,6 +1724,72 @@ class GitHubHttpClient:
         if not entry:
             return None
         return entry
+
+    def get_pr_closing_issue_references(self, pr_number: int) -> list[int] | None:
+        """Issue numbers GitHub has REGISTERED this PR as closing.
+
+        Reads ``PullRequest.closingIssuesReferences`` — GitHub's own resolution
+        of the PR's closing keywords, not a text parse of our own. Measured on
+        this repository: ``Refs #45`` registers ``[]``, ``Closes #45``
+        registers ``[45]``.
+
+        Returns ``None`` when the relation could not be read at all (the PR is
+        not visible, or the response carried no linkage field). ``None`` and
+        ``[]`` are DIFFERENT answers and callers must keep them apart: ``[]``
+        is "GitHub says this PR closes nothing", ``None`` is "we do not know"
+        (#113).
+
+        Pagination is followed to exhaustion within a small cap; a PR that
+        somehow exceeds it yields ``None`` rather than a truncated set that
+        would read as "this issue is not linked".
+        """
+        owner, repo = self._config.repo.split("/", 1)
+        query = """
+        query($owner: String!, $repo: String!, $number: Int!, $after: String) {
+            repository(owner: $owner, name: $repo) {
+                pullRequest(number: $number) {
+                    closingIssuesReferences(first: 100, after: $after) {
+                        pageInfo { hasNextPage endCursor }
+                        nodes { number }
+                    }
+                }
+            }
+        }
+        """
+        numbers: list[int] = []
+        cursor: str | None = None
+        for _ in range(_CLOSING_ISSUES_PAGE_CAP):
+            variables: dict[str, Any] = {
+                "owner": owner,
+                "repo": repo,
+                "number": pr_number,
+                "after": cursor,
+            }
+            result = self._graphql(
+                query, variables, caller="get_pr_closing_issue_references",
+            )
+            pr_data = (
+                (result.get("data") or {}).get("repository") or {}
+            ).get("pullRequest")
+            if not isinstance(pr_data, dict):
+                return None
+            references = pr_data.get("closingIssuesReferences")
+            if not isinstance(references, dict):
+                # The field is absent from the payload — that is an unreadable
+                # relation, never an empty one.
+                return None
+            for node in references.get("nodes") or []:
+                if isinstance(node, dict) and isinstance(node.get("number"), int):
+                    numbers.append(node["number"])
+            page_info = references.get("pageInfo") or {}
+            if not page_info.get("hasNextPage"):
+                return numbers
+            cursor = page_info.get("endCursor")
+            if not cursor:
+                # More pages exist but no cursor to reach them: the set we hold
+                # is truncated and must not be reported as complete.
+                return None
+        return None
 
     def enqueue_pull_request(self, pr_number: int) -> None:
         """Add a PR to the repository's merge queue via GraphQL."""

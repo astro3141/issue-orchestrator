@@ -24,7 +24,6 @@ runtime initialization only:
 import logging
 import time
 from contextlib import contextmanager
-from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Callable, Generator, Optional, Sequence
 
 from ..infra.analysis import analyze_issue, IssueState
@@ -42,7 +41,6 @@ from ..domain.models import (
     OrchestratorState,
     PendingReview,
     PendingValidationRetry,
-    SessionHistoryEntry,
     Session,
     ORCHESTRATOR_PR_MARKER,
 )
@@ -55,7 +53,8 @@ from .health_review_trigger import (
 from .stuck_sweep import hydrate_stuck_sweep_state
 from .action_applier import ActionApplier
 from .issue_fetch_resilience import IssueFetchResilience, TransientIssueFetchError
-from .queue_cache import QueueCache, QueueMutationStatus, record_issue_refreshes
+from .queue_cache import QueueCache, QueueMutationStatus
+from .pr_pending_history_recovery import PrPendingHistoryRecovery
 from .publication_authority import PublicationVerdictReader
 from .review_validity import evaluate_review_validity
 from .review_scope import ReviewScopeChecker, extract_issue_number_from_pr
@@ -458,76 +457,23 @@ class StartupManager:
         state: OrchestratorState,
         issue_branches: dict[int, str],
     ) -> None:
-        """Rehydrate awaiting-merge visibility for locally pr-pending issues."""
+        """Rehydrate awaiting-merge visibility for locally pr-pending issues.
+
+        Delegates to the recovery owner, which decides which PR each issue's
+        rehydrated entry keys on (open or merged) — see
+        :mod:`.pr_pending_history_recovery`.
+        """
         if self._label_store is None:
             return
 
-        tracked_history = {entry.issue_number for entry in state.session_history}
-        queue_cache = QueueCache(self.config, state, self._queue_cache_store)
-        local_pr_pending = sorted(
-            issue_number
-            for issue_number, labels in self._label_store.load_all().items()
-            if self._lm.is_pr_pending(sorted(labels))
-        )
-        if not local_pr_pending:
-            return
-
-        recovered = 0
-        for issue_number in local_pr_pending:
-            if issue_number in tracked_history:
-                continue
-
-            issue = self.repository_host.get_issue(issue_number)
-            if issue is None:
-                logger.warning(
-                    "[startup] Failed to refetch locally pr-pending issue for dashboard recovery: issue=%d",
-                    issue_number,
-                )
-                continue
-
-            if queue_cache.is_outside_engine_scope(issue):
-                logger.info(
-                    "[startup] Skipping pr-pending dashboard recovery for out-of-scope issue=%d",
-                    issue_number,
-                )
-                continue
-
-            analysis = analyze_issue(
-                issue=issue,
-                repo=self.config.repo,
-                issue_branches=issue_branches,
-                check_session_fn=lambda n: self._session_exists(f"issue-{n}"),
-                pr_tracker=self.repository_host,
-            )
-            if not analysis.has_open_pr or not analysis.pr_url:
-                logger.warning(
-                    "[startup] Skipping pr-pending dashboard recovery without open PR: issue=%d",
-                    issue_number,
-                )
-                continue
-
-            state.session_history.append(
-                SessionHistoryEntry(
-                    issue_number=issue.number,
-                    title=issue.title,
-                    agent_type=issue.agent_type or "agent:unknown",
-                    status="completed",
-                    runtime_minutes=0,
-                    pr_url=analysis.pr_url,
-                    status_reason="Recovered awaiting merge state on startup",
-                    completed_at=datetime.now(timezone.utc),
-                    issue_labels=tuple(issue.labels),
-                )
-            )
-            record_issue_refreshes(state, {issue.number}, time.time())
-            tracked_history.add(issue_number)
-            recovered += 1
-
-        if recovered:
-            logger.info(
-                "[startup] Recovered %d pr-pending issue(s) into dashboard history",
-                recovered,
-            )
+        PrPendingHistoryRecovery(
+            repository_host=self.repository_host,
+            label_manager=self._lm,
+            label_store=self._label_store,
+            queue_cache=QueueCache(self.config, state, self._queue_cache_store),
+            session_exists=self._session_exists,
+            repo=self.config.repo,
+        ).recover(state, issue_branches)
 
     def _reconcile_label_store(self, state: OrchestratorState) -> None:
         """Reconcile the local label_store mirror against GitHub labels.

@@ -332,6 +332,25 @@ stateDiagram-v2
   CR --> [*] : human merges (no tech lead configured)
 ```
 
+### When a merge leaves the issue open
+
+`pr-pending` gates the issue out of ordinary selection, so it must always have
+an owner that can remove it. A merge normally closes the issue and the
+awaiting-merge reconciler terminalizes the card. Two other outcomes exist, and
+GitHub's **registered closing linkage** (`closingIssuesReferences` — GitHub's
+own resolution of the closing keywords, which the orchestrator reads rather
+than parsing itself) is what tells them apart:
+
+| Registered linkage | Meaning | Orchestrator |
+|---|---|---|
+| Names this issue | Auto-close should have fired but did not | Close-on-merge fallback closes the issue |
+| Answered, does not name it | Deliberate non-closing merge (`Refs #N`) | Sheds `pr-pending`; issue stays open and rejoins selection |
+| Unreadable | Unknown | Fails closed — no close, no shed; retried next pass |
+
+The middle row matters because `merged + issue open` looks identical in the
+first two cases on every other field. An unreadable linkage is never treated as
+an empty one: that would shed a queue-gating label on a guess.
+
 ## Configuration
 
 ```yaml

@@ -172,6 +172,75 @@ class MergeQueueRead:
         return self.status == "PRESENT"
 
 
+# Outcome kind of reading the issues a PR is REGISTERED as closing. Two values,
+# and they must never collapse: ``KNOWN`` means the provider answered (possibly
+# with an empty set — "this PR closes nothing"), ``UNKNOWN`` means we could not
+# read the relation at all.
+ClosingIssueReferencesStatus = Literal["KNOWN", "UNKNOWN"]
+
+
+@dataclass(frozen=True)
+class ClosingIssueReferencesRead:
+    """Typed outcome of reading a PR's registered closing-issue linkage.
+
+    This is NOT a ``Closes``/``Refs`` text parse. GitHub performs that parse
+    itself and *registers* the resulting relationship; this read reports the
+    registration. It is the only signal that separates a deliberately
+    non-closing merge from a failed auto-close — ``merged + issue OPEN`` looks
+    identical in both cases (#113).
+
+    The distinction the close-on-merge owner decides a destructive write on::
+
+        KNOWN with an empty set  ->  "GitHub answered: no closing relation"
+        UNKNOWN                  ->  "we could not read the relation"
+
+    Defaulting a missing/unreadable field to ``[]`` would silently turn
+    "unreadable" into "deliberate continuation" and shed a queue-gating label
+    on a guess, so the two are kept structurally distinct: an ``UNKNOWN`` read
+    carries no issue numbers (enforced in ``__post_init__``) and answering
+    :meth:`closes` on one raises rather than reporting ``False``.
+    """
+
+    status: ClosingIssueReferencesStatus
+    issue_numbers: tuple[int, ...] = ()
+
+    def __post_init__(self) -> None:
+        if self.status == "UNKNOWN" and self.issue_numbers:
+            raise ValueError(
+                "UNKNOWN closing-linkage read must carry no issue numbers; "
+                f"got {self.issue_numbers!r}"
+            )
+
+    @staticmethod
+    def known(issue_numbers: "tuple[int, ...] | list[int]") -> "ClosingIssueReferencesRead":
+        """The provider answered. An empty tuple means "closes nothing"."""
+        return ClosingIssueReferencesRead("KNOWN", tuple(issue_numbers))
+
+    @staticmethod
+    def unknown() -> "ClosingIssueReferencesRead":
+        """The relation could not be read. Callers must fail closed."""
+        return ClosingIssueReferencesRead("UNKNOWN")
+
+    @property
+    def is_known(self) -> bool:
+        return self.status == "KNOWN"
+
+    def closes(self, issue_number: int) -> bool:
+        """Whether GitHub registered this PR as closing ``issue_number``.
+
+        Raises:
+            ValueError: If the read is ``UNKNOWN``. An unreadable relation has
+                no answer — callers must branch on :attr:`is_known` first
+                rather than letting "unreadable" read as "not registered".
+        """
+        if not self.is_known:
+            raise ValueError(
+                "closing linkage is UNKNOWN; check is_known before asking "
+                "whether a PR closes an issue"
+            )
+        return issue_number in self.issue_numbers
+
+
 @dataclass
 class PRInfo:
     """Information about a pull request.
@@ -402,6 +471,36 @@ class PullRequestTracker(Protocol):
         Returns:
             A :class:`StatusCheckRollupRead` describing the rollup state
             and the read capability.
+        """
+        ...
+
+    def read_pr_closing_issue_references(
+        self, pr_number: int
+    ) -> "ClosingIssueReferencesRead":
+        """Read the issues the provider has REGISTERED this PR as closing.
+
+        Not a text parse: GitHub resolves closing keywords itself and registers
+        the resulting relationship, and this reads that registration. It is the
+        only signal that distinguishes a deliberately non-closing merge from a
+        failed auto-close, because ``merged + issue OPEN`` is identical in both
+        cases (#113).
+
+        Costs one GraphQL round-trip, and only the close-on-merge owner calls
+        it — once per merged-PR terminal transition whose issue is still open,
+        never per tick.
+
+        Returns:
+            A :class:`ClosingIssueReferencesRead`. ``KNOWN`` (possibly with an
+            empty set) means the provider answered; ``UNKNOWN`` means the
+            relation could not be read — for example the PR is not visible, or
+            the response carried no linkage field. Implementations must NEVER
+            report an unreadable relation as ``KNOWN`` with an empty set.
+
+        Raises:
+            RepositoryError: If there's an error reaching the provider.
+                Callers deciding a destructive write (or a queue-gating label
+                shed) on this fact must treat the error as "relation
+                unavailable" and fail closed, not as either answer.
         """
         ...
 

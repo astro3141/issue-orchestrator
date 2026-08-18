@@ -18,7 +18,7 @@ from ..domain.models import (
 )
 from ..history import latest_history_entries_by_issue
 from ..ports.repository_host import RepositoryHostError
-from .awaiting_merge_drift_policy import classify_pr_set_drift
+from .awaiting_merge_drift_policy import classify_pr_set
 from .close_on_merge import (
     pr_terminal_reason,
     reconciliation_fact,
@@ -284,15 +284,16 @@ class AwaitingMergeReconciler:
                         pr_number=pr_number,
                     )
                 else:
-                    # PR merged: did GitHub's auto-close actually fire for
-                    # this merge? See close_on_merge module (porchpin #81).
-                    # None = evidence unreadable; leave the entry reconcilable.
+                    # PR merged: a failed auto-close, or a merge that
+                    # deliberately did not close its issue? close_on_merge
+                    # routes both on the registered closing linkage (porchpin
+                    # #81, #113); None = unreadable, leave it reconcilable.
+                    host = self.repository_host
                     close_check = should_close_merged_issue(
                         get_issue=self._get_issue,
-                        closed_on_or_after=(
-                            self.repository_host.issue_closed_on_or_after
-                        ),
-                        state=state, entry=entry,
+                        closed_on_or_after=host.issue_closed_on_or_after,
+                        closing_issue_references=host.read_pr_closing_issue_references,
+                        state=state, entry=entry, pr_number=pr_number,
                         merged_at=pr.merged_at, now=self.clock(),
                     )
                     if close_check is None:
@@ -479,9 +480,9 @@ class AwaitingMergeReconciler:
         except RepositoryHostError:
             return None
 
-        # `classify_pr_set_drift` owns the open/merged/closed precedence so the
+        # `classify_pr_set` owns the open/merged/closed precedence so the
         # "latest terminal PR decides" rule lives in exactly one place.
-        decision = classify_pr_set_drift(prs)
+        decision = classify_pr_set(prs)
         if not decision.drifting:
             return None
         if decision.pr is None:

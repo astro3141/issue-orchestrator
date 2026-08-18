@@ -50,6 +50,7 @@ from issue_orchestrator.domain.tech_lead_session import (
 )
 from issue_orchestrator.events import EventName
 from issue_orchestrator.ports.claim_manager import ClaimManager
+from issue_orchestrator.ports.pull_request_tracker import ClosingIssueReferencesRead
 from issue_orchestrator.ports.tech_lead_authority import InMemoryTechLeadAuthorityStore
 
 
@@ -2248,12 +2249,25 @@ class TestRecoverTerminalIssueAction:
 
     @staticmethod
     def _stub_close_evidence(
-        mock_repository_host, *, issue_state="open", auto_close_fired=False,
+        mock_repository_host,
+        *,
+        issue_state="open",
+        auto_close_fired=False,
+        closing_linkage=(228,),
     ):
-        """Wire the apply-time revalidation reads (F4/A2): the live issue
-        state and the close-event evidence since the merge."""
+        """Wire the apply-time revalidation reads (F4/A2, #113): the live
+        issue state, the PR's registered closing linkage, and the close-event
+        evidence since the merge.
+
+        ``closing_linkage=None`` makes the relation unreadable.
+        """
         mock_repository_host.get_issue.return_value = MagicMock(
             state=issue_state,
+        )
+        mock_repository_host.read_pr_closing_issue_references.return_value = (
+            ClosingIssueReferencesRead.unknown()
+            if closing_linkage is None
+            else ClosingIssueReferencesRead.known(closing_linkage)
         )
         mock_repository_host.issue_closed_on_or_after.return_value = (
             auto_close_fired
@@ -2334,6 +2348,54 @@ class TestRecoverTerminalIssueAction:
         mock_repository_host.add_comment.assert_not_called()
         # Entry stays in its reconcilable status for the next discovery pass.
         assert entry.status == "completed"
+
+    def test_apply_time_unknown_linkage_blocks_close_and_shed(
+        self, mock_labels, mock_sessions, mock_events, mock_repository_host,
+        real_label_manager,
+    ):
+        """#113 fail-closed at the apply boundary: the linkage that authorized
+        the planned close is now unreadable, so neither the close nor the
+        label shed may proceed. The entry stays reconcilable for retry."""
+        self._stub_close_evidence(mock_repository_host, closing_linkage=None)
+        entry = self._awaiting_merge_entry()
+        applier = self._make_applier(
+            mock_labels, mock_sessions, mock_events, mock_repository_host,
+            real_label_manager,
+            github_labels=["pr-pending", "agent:backend"],
+            history_entry=entry,
+        )
+
+        result = applier.apply(self._close_on_merge_action())
+
+        assert not result.success
+        mock_repository_host.update_issue_state.assert_not_called()
+        mock_labels.remove_label.assert_not_called()
+        assert entry.status == "completed"
+
+    def test_apply_time_revalidation_skips_close_for_non_closing_merge(
+        self, mock_labels, mock_sessions, mock_events, mock_repository_host,
+        real_label_manager,
+    ):
+        """#113: discovery planned the close, but the PR's registered linkage
+        no longer names this issue. No close — and recovery still completes,
+        so the stale pr-pending is shed and the issue rejoins selection."""
+        self._stub_close_evidence(mock_repository_host, closing_linkage=())
+        entry = self._awaiting_merge_entry()
+        applier = self._make_applier(
+            mock_labels, mock_sessions, mock_events, mock_repository_host,
+            real_label_manager,
+            github_labels=["pr-pending", "agent:backend"],
+            history_entry=entry,
+        )
+
+        result = applier.apply(self._close_on_merge_action())
+
+        assert result.success
+        assert result.details["closed_issue"] is False
+        mock_repository_host.update_issue_state.assert_not_called()
+        removed = {call.args[1] for call in mock_labels.remove_label.call_args_list}
+        assert "pr-pending" in removed
+        assert entry.status == "merged"
 
     def test_apply_time_revalidation_preserves_human_reopen(
         self, mock_labels, mock_sessions, mock_events, mock_repository_host,

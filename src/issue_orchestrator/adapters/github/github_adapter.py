@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Any
 
 from ...infra.config import Config
 from ...ports.pull_request_tracker import (
+    ClosingIssueReferencesRead,
     MergeQueueEntry,
     MergeQueueRead,
     PRInfo,
@@ -1100,6 +1101,28 @@ class GitHubAdapter:
             logger.error("Failed to read merge queue entry for PR %s: %s", pr_number, e)
             raise
         return _merge_queue_entry_from_api(raw)
+
+    def read_pr_closing_issue_references(
+        self, pr_number: int
+    ) -> ClosingIssueReferencesRead:
+        """Read the issues GitHub registered this PR as closing (GraphQL).
+
+        Re-raises ``GitHubHttpError`` (a ``RepositoryHostError``) on a read
+        failure; the close-on-merge owner maps that to "relation unavailable"
+        and fails closed. A successful read whose payload carries no linkage
+        field becomes ``UNKNOWN`` — never ``KNOWN`` with an empty set, which
+        would let an unreadable relation shed a queue-gating label (#113).
+        """
+        try:
+            numbers = self._client.get_pr_closing_issue_references(pr_number)
+        except GitHubHttpError as e:
+            logger.error(
+                "Failed to read closing-issue linkage for PR %s: %s", pr_number, e
+            )
+            raise
+        if numbers is None:
+            return ClosingIssueReferencesRead.unknown()
+        return ClosingIssueReferencesRead.known(numbers)
 
     def _read_rollup_via_rest_fallback(
         self,
