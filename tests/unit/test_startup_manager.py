@@ -21,12 +21,16 @@ from issue_orchestrator.domain.models import (
     Issue,
     OrchestratorState,
     Session,
+    SessionKey,
+    TaskKind,
     AgentConfig,
     PendingReview,
     PendingTechLeadReview,
+    SessionHistoryEntry,
     ORCHESTRATOR_PR_MARKER,
 )
 from issue_orchestrator.domain.tech_lead_session import TechLeadSessionFlavor
+from tests.unit.session_run_helpers import make_session_run_assets
 from tests.unit.publication_evidence_helpers import (
     configure_publication_contract,
     verdict_with,
@@ -489,6 +493,405 @@ class TestStartupManagerInProgressIssues:
 
         analyzed_issues = [call.kwargs["issue"].number for call in mock_analyze.call_args_list]
         assert analyzed_issues == [4057]
+
+
+class TestStartupManagerIssueScopeBindsRecovery:
+    """`--issue N` scope binds startup in-progress recovery, both paths (#93).
+
+    ``QueueCache`` already returns the verdict; these pin that startup acts on
+    it, so an issue outside the engine's scope can never be resumed from local
+    partial work.
+    """
+
+    @staticmethod
+    def _manager(
+        mock_config,
+        mock_events,
+        mock_runner,
+        mock_repository_host,
+        mock_action_applier,
+        mock_issue_branches_fn,
+        mock_label_store,
+        launch_session,
+    ) -> StartupManager:
+        return StartupManager(
+            config=mock_config,
+            events=mock_events,
+            runner=mock_runner,
+            repository_host=mock_repository_host,
+            action_applier=mock_action_applier,
+            issue_branches_fn=mock_issue_branches_fn,
+            session_exists_fn=lambda name: False,
+            restore_sessions_fn=MagicMock(),
+            launch_session_fn=launch_session,
+            update_queue_cache_fn=lambda: None,
+            issue_fetch_resilience=IssueFetchResilience("owner/repo"),
+            startup_worktree_reconciler=_startup_worktree_reconciler(),
+            label_store=mock_label_store,
+            publication_verdict=verdict_with_no_evidence(),
+        )
+
+    @staticmethod
+    def _partial_work_analysis() -> MagicMock:
+        return MagicMock(
+            has_session=False,
+            has_open_pr=False,
+            has_partial_work=True,
+            is_orphaned_label=False,
+            branch="branch",
+        )
+
+    @staticmethod
+    def _restored_review_session(issue: Issue, tmp_path: Path) -> Session:
+        """The shape session restoration leaves behind for a live review terminal.
+
+        ``session.issue.number`` puts the issue in the queue's exclusion set,
+        while the terminal is named ``review-<pr>`` — so the ``issue-<n>`` lookup
+        that recovery uses for "already has a session" misses it entirely.
+        """
+        issue_key = MagicMock()
+        issue_key.stable_id.return_value = f"issue-{issue.number}"
+        return Session(
+            key=SessionKey(issue=issue_key, task=TaskKind.REVIEW),
+            issue=issue,
+            agent_config=MagicMock(command="test"),
+            terminal_id="review-7",
+            worktree_path=tmp_path,
+            branch_name=f"{issue.number}-unscoped",
+            run_assets=make_session_run_assets(tmp_path, session_name="review-7"),
+        )
+
+    @pytest.mark.asyncio
+    @patch("issue_orchestrator.control.startup_manager.analyze_issue")
+    async def test_warm_recovery_does_not_resume_partial_work_outside_issue_scope(
+        self,
+        mock_analyze,
+        sample_state,
+        mock_config,
+        mock_events,
+        mock_runner,
+        mock_repository_host,
+        mock_action_applier,
+        mock_issue_branches_fn,
+        mock_label_store,
+        caplog,
+    ):
+        """The locally in-progress out-of-scope issue has real partial work."""
+        mock_config.filtering.issue = 45
+        mock_config.agents = {"agent:backend": MagicMock()}
+        mock_issue_branches_fn.return_value = {45: "45-scoped", 60: "60-unscoped"}
+        scoped = Issue(number=45, title="Scoped", labels=["agent:backend", "in-progress"])
+        unscoped = Issue(number=60, title="Unscoped", labels=["agent:backend", "in-progress"])
+        sample_state.cached_queue_issues = [scoped]
+        mock_label_store.load_all.return_value = {60: {"agent:backend", "in-progress"}}
+        mock_repository_host.get_issue.return_value = unscoped
+        mock_analyze.return_value = self._partial_work_analysis()
+        launch_session = MagicMock(return_value=MagicMock())
+        manager = self._manager(
+            mock_config, mock_events, mock_runner, mock_repository_host,
+            mock_action_applier, mock_issue_branches_fn, mock_label_store, launch_session,
+        )
+
+        with caplog.at_level("INFO"):
+            await manager.run_startup(sample_state)
+
+        assert [c.args[0].number for c in launch_session.call_args_list] == [45]
+        assert sample_state.priority_queue == []
+        analyzed = [c.kwargs["issue"].number for c in mock_analyze.call_args_list]
+        assert 60 not in analyzed
+        assert "Skipping in-progress recovery for out-of-scope issue=60" in caplog.text
+
+    @pytest.mark.asyncio
+    @patch("issue_orchestrator.control.startup_manager.analyze_issue")
+    async def test_cold_recovery_does_not_resume_partial_work_outside_issue_scope(
+        self,
+        mock_analyze,
+        sample_state,
+        mock_config,
+        mock_events,
+        mock_runner,
+        mock_repository_host,
+        mock_action_applier,
+        mock_issue_branches_fn,
+        mock_label_store,
+        caplog,
+    ):
+        """Cold fallback (empty queue cache) binds the same verdict."""
+        mock_config.filtering.issue = 45
+        mock_config.agents = {"agent:backend": MagicMock()}
+        mock_issue_branches_fn.return_value = {45: "45-scoped", 60: "60-unscoped"}
+        scoped = Issue(number=45, title="Scoped", labels=["agent:backend", "in-progress"])
+        unscoped = Issue(number=60, title="Unscoped", labels=["agent:backend", "in-progress"])
+        mock_repository_host.list_issues.return_value = [scoped, unscoped]
+        mock_analyze.return_value = self._partial_work_analysis()
+        launch_session = MagicMock(return_value=MagicMock())
+        manager = self._manager(
+            mock_config, mock_events, mock_runner, mock_repository_host,
+            mock_action_applier, mock_issue_branches_fn, mock_label_store, launch_session,
+        )
+
+        with caplog.at_level("INFO"):
+            await manager.run_startup(sample_state)
+
+        assert sample_state.cached_queue_issues == []
+        assert [c.args[0].number for c in launch_session.call_args_list] == [45]
+        assert sample_state.priority_queue == []
+        analyzed = [c.kwargs["issue"].number for c in mock_analyze.call_args_list]
+        assert 60 not in analyzed
+        assert "Skipping in-progress recovery for out-of-scope issue=60" in caplog.text
+
+    @pytest.mark.asyncio
+    @patch("issue_orchestrator.control.startup_manager.analyze_issue")
+    async def test_recovery_still_analyzes_in_scope_issue_excluded_from_the_queue(
+        self,
+        mock_analyze,
+        sample_state,
+        mock_config,
+        mock_events,
+        mock_runner,
+        mock_repository_host,
+        mock_action_applier,
+        mock_issue_branches_fn,
+        mock_label_store,
+    ):
+        """REJECTED_EXCLUDED is not out-of-scope: that recovery path is unchanged."""
+        from datetime import datetime, timezone
+
+        mock_config.filtering.issue = 45
+        mock_config.agents = {"agent:backend": MagicMock()}
+        mock_issue_branches_fn.return_value = {45: "45-scoped"}
+        scoped = Issue(number=45, title="Scoped", labels=["agent:backend", "in-progress"])
+        sample_state.cached_queue_issues = [scoped]
+        sample_state.session_history = [
+            SessionHistoryEntry(
+                issue_number=45,
+                title="Scoped",
+                agent_type="agent:backend",
+                status="completed",
+                runtime_minutes=0,
+                pr_url=None,
+                completed_at=datetime.now(timezone.utc),
+            )
+        ]
+        mock_analyze.return_value = self._partial_work_analysis()
+        launch_session = MagicMock(return_value=MagicMock())
+        manager = self._manager(
+            mock_config, mock_events, mock_runner, mock_repository_host,
+            mock_action_applier, mock_issue_branches_fn, mock_label_store, launch_session,
+        )
+
+        await manager.run_startup(sample_state)
+
+        analyzed = [c.kwargs["issue"].number for c in mock_analyze.call_args_list]
+        assert 45 in analyzed
+        assert [c.args[0].number for c in launch_session.call_args_list] == [45]
+
+    @pytest.mark.asyncio
+    @patch("issue_orchestrator.control.startup_manager.analyze_issue")
+    async def test_recovery_does_not_resume_out_of_scope_issue_already_claimed_this_run(
+        self,
+        mock_analyze,
+        sample_state,
+        mock_config,
+        mock_events,
+        mock_runner,
+        mock_repository_host,
+        mock_action_applier,
+        mock_issue_branches_fn,
+        mock_label_store,
+        tmp_path,
+        caplog,
+    ):
+        """Exclusion must not shadow scope (#93).
+
+        The queue verdict reports the duplicate-launch guard first, so an issue
+        that is BOTH outside `--issue` scope and already claimed by a restored
+        session reads `REJECTED_EXCLUDED`, not `REJECTED_OUT_OF_SCOPE`. Recovery
+        asks the scope question directly, so #60 is still refused.
+        """
+        mock_config.filtering.issue = 45
+        mock_config.agents = {"agent:backend": MagicMock()}
+        mock_issue_branches_fn.return_value = {45: "45-scoped", 60: "60-unscoped"}
+        scoped = Issue(number=45, title="Scoped", labels=["agent:backend", "in-progress"])
+        unscoped = Issue(number=60, title="Unscoped", labels=["agent:backend", "in-progress"])
+        sample_state.cached_queue_issues = [scoped]
+        sample_state.active_sessions = [self._restored_review_session(unscoped, tmp_path)]
+        mock_label_store.load_all.return_value = {60: {"agent:backend", "in-progress"}}
+        mock_repository_host.get_issue.return_value = unscoped
+        mock_analyze.return_value = self._partial_work_analysis()
+        launch_session = MagicMock(return_value=MagicMock())
+        manager = self._manager(
+            mock_config, mock_events, mock_runner, mock_repository_host,
+            mock_action_applier, mock_issue_branches_fn, mock_label_store, launch_session,
+        )
+
+        with caplog.at_level("INFO"):
+            await manager.run_startup(sample_state)
+
+        assert [c.args[0].number for c in launch_session.call_args_list] == [45]
+        assert sample_state.priority_queue == []
+        analyzed = [c.kwargs["issue"].number for c in mock_analyze.call_args_list]
+        assert 60 not in analyzed
+        assert "Skipping in-progress recovery for out-of-scope issue=60" in caplog.text
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "drift,drifted_issue",
+        [
+            ("lost the filter label", Issue(number=60, title="Drifted", labels=["in-progress"])),
+            (
+                "was closed",
+                Issue(number=60, title="Drifted", labels=["agent:backend", "in-progress"], state="closed"),
+            ),
+            (
+                "left the milestone",
+                Issue(
+                    number=60, title="Drifted", labels=["agent:backend", "in-progress"], milestone="M9",
+                ),
+            ),
+        ],
+    )
+    @patch("issue_orchestrator.control.startup_manager.analyze_issue")
+    async def test_label_store_recovery_survives_a_drifted_github_snapshot(
+        self,
+        mock_analyze,
+        drift,
+        drifted_issue,
+        sample_state,
+        mock_config,
+        mock_events,
+        mock_runner,
+        mock_repository_host,
+        mock_action_applier,
+        mock_issue_branches_fn,
+        mock_label_store,
+    ):
+        """The recovery gate binds `--issue`, and deliberately nothing wider.
+
+        `_recover_stale_in_progress_from_label_store` exists to force analysis
+        for a locally in-progress issue *even when the freshly fetched GitHub
+        labels disagree* — dropping the issue is the bug it prevents. #60 holds
+        a worktree with partial work and an orphaned `in-progress` label; if
+        recovery asked the full scope question, GitHub's drifted snapshot would
+        drop it again and nothing would ever reconcile it.
+        """
+        mock_config.filtering.label = "agent:backend"
+        mock_config.filtering.milestone = "M1"
+        mock_config.filtering.issue = None
+        mock_config.agents = {"agent:backend": MagicMock()}
+        mock_issue_branches_fn.return_value = {60: "60-drifted"}
+        sample_state.cached_queue_issues = [
+            Issue(number=45, title="Scoped", labels=["agent:backend"], milestone="M1"),
+        ]
+        mock_label_store.load_all.return_value = {60: {"agent:backend", "in-progress"}}
+        mock_repository_host.get_issue.return_value = drifted_issue
+        mock_analyze.return_value = self._partial_work_analysis()
+        manager = self._manager(
+            mock_config, mock_events, mock_runner, mock_repository_host, mock_action_applier,
+            mock_issue_branches_fn, mock_label_store, MagicMock(return_value=MagicMock()),
+        )
+
+        await manager.run_startup(sample_state)
+
+        analyzed = [c.kwargs["issue"].number for c in mock_analyze.call_args_list]
+        assert 60 in analyzed, f"recovery dropped the issue whose GitHub snapshot {drift}"
+
+    @pytest.mark.asyncio
+    @patch("issue_orchestrator.control.startup_manager.analyze_issue")
+    async def test_label_store_recovery_of_a_drifted_issue_still_obeys_issue_scope(
+        self,
+        mock_analyze,
+        sample_state,
+        mock_config,
+        mock_events,
+        mock_runner,
+        mock_repository_host,
+        mock_action_applier,
+        mock_issue_branches_fn,
+        mock_label_store,
+        caplog,
+    ):
+        """`--issue N` is the one gate that still binds the drifted recovery."""
+        mock_config.filtering.label = "agent:backend"
+        mock_config.filtering.issue = 45
+        mock_config.agents = {"agent:backend": MagicMock()}
+        mock_issue_branches_fn.return_value = {45: "45-scoped", 60: "60-drifted"}
+        sample_state.cached_queue_issues = [Issue(number=45, title="Scoped", labels=["agent:backend"])]
+        mock_label_store.load_all.return_value = {60: {"agent:backend", "in-progress"}}
+        mock_repository_host.get_issue.return_value = Issue(number=60, title="Drifted", labels=["in-progress"])
+        mock_analyze.return_value = self._partial_work_analysis()
+        manager = self._manager(
+            mock_config, mock_events, mock_runner, mock_repository_host, mock_action_applier,
+            mock_issue_branches_fn, mock_label_store, MagicMock(return_value=MagicMock()),
+        )
+
+        with caplog.at_level("INFO"):
+            await manager.run_startup(sample_state)
+
+        analyzed = [c.kwargs["issue"].number for c in mock_analyze.call_args_list]
+        assert 60 not in analyzed
+        assert "Skipping in-progress recovery for out-of-scope issue=60" in caplog.text
+
+    @pytest.mark.asyncio
+    @patch("issue_orchestrator.control.startup_manager.analyze_issue")
+    async def test_pr_pending_recovery_skips_out_of_scope_issue_already_claimed_this_run(
+        self,
+        mock_analyze,
+        startup_manager,
+        sample_state,
+        mock_config,
+        mock_repository_host,
+        mock_label_store,
+        tmp_path,
+        caplog,
+    ):
+        """The neighbouring path asks the same unshadowed question (#93).
+
+        `tracked_history` pre-guards the `session_history` half of the exclusion
+        set, but not `active_sessions` — so this is the case where reading scope
+        off the queue verdict would have rehydrated an out-of-scope issue.
+        """
+        mock_config.filtering.issue = 45
+        unscoped = Issue(number=60, title="Unscoped", labels=["agent:backend", "pr-pending"])
+        sample_state.active_sessions = [self._restored_review_session(unscoped, tmp_path)]
+        mock_label_store.load_all.return_value = {60: {"agent:backend", "pr-pending"}}
+        mock_repository_host.get_issue.return_value = unscoped
+        mock_analyze.return_value = MagicMock(
+            has_open_pr=True, pr_url="https://github.com/owner/repo/pull/1",
+        )
+
+        with caplog.at_level("INFO"):
+            await startup_manager.run_startup(sample_state)
+
+        assert sample_state.session_history == []
+        assert "Skipping pr-pending dashboard recovery for out-of-scope issue=60" in caplog.text
+
+    @pytest.mark.asyncio
+    @patch("issue_orchestrator.control.startup_manager.analyze_issue")
+    async def test_pr_pending_history_recovery_still_skips_out_of_scope_issue(
+        self,
+        mock_analyze,
+        startup_manager,
+        sample_state,
+        mock_config,
+        mock_repository_host,
+        mock_label_store,
+        caplog,
+    ):
+        """The neighbouring pr-pending recovery keeps its existing behaviour."""
+        mock_config.filtering.issue = 45
+        unscoped = Issue(number=60, title="Unscoped", labels=["agent:backend", "pr-pending"])
+        mock_label_store.load_all.return_value = {60: {"agent:backend", "pr-pending"}}
+        mock_repository_host.get_issue.return_value = unscoped
+        mock_analyze.return_value = MagicMock(
+            has_open_pr=True, pr_url="https://github.com/owner/repo/pull/1",
+        )
+
+        with caplog.at_level("INFO"):
+            await startup_manager.run_startup(sample_state)
+
+        assert sample_state.session_history == []
+        assert "Skipping pr-pending dashboard recovery for out-of-scope issue=60" in caplog.text
 
 
 class TestStartupManagerLabelStoreReconcile:
