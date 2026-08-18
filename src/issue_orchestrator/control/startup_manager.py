@@ -386,7 +386,7 @@ class StartupManager:
         # Both paths ask the queue owner one question before analysis, so the engine's
         # configured scope binds recovery: an out-of-scope issue is reported, never
         # resumed, while an in-scope issue that is merely already claimed still
-        # recovers. The scope predicate and deliberately not the queue verdict — see
+        # recovers. The scope predicate, and deliberately not the queue verdict — see
         # QueueCache.is_outside_engine_scope for the precedence that shadows it.
         for issue, agent_label in candidates:
             if queue_cache.is_outside_engine_scope(issue):
