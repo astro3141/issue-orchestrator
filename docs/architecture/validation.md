@@ -401,6 +401,26 @@ board signal that could not be applied leaves the operation retryable rather
 than terminating it while the issue's lane reopens with an approved PR already
 open.
 
+### A paused engine reconciles but starts nothing
+
+Pause is a barrier to new work, not a cancellation ([#161]). A paused engine
+still hydrates from a refreshed board, still reads durable continuation truth,
+still reconciles control-operation ownership and still publishes the exclusion
+projection — without those, pausing would hand a running control operation's
+issue back to ordinary rework. What it does not do is *start*: while
+`state.paused` is established, `control/continuation_runner.py` submits no
+continuation job, reserves no [#139] revalidation or [#149] run allowance, cuts
+no checkout and opens no reviewer exchange or pull request. The barrier sits
+there — the one place a control operation's work begins — rather than in
+`control/continuation_scheduling.py`, precisely so the read side keeps running.
+
+Withholding is not undoing. An operation stays owned, its recorded intent and
+allowances are untouched, and a run already open stays open; a job submitted
+before the pause is neither cancelled nor duplicated and settles on its own
+terms, as does an ordinary agent session, which `Orchestrator.tick()` processes
+before it consults the paused health gate at all. After a resume, the next
+reconciliation starts whatever is still live.
+
 ## Worktree readiness is a precondition of a meaningful verdict
 
 Every gate above runs *inside a worktree*. A worktree that lacks the

@@ -2789,6 +2789,41 @@ class TestRunTick:
         event_names = [e.name for e in mock_event_sink.events]
         assert EventName.PLAN_NOOP not in event_names
 
+    def test_active_sessions_are_still_processed_while_paused(
+        self, sample_orchestrator_state, mock_event_sink, sample_event_context
+    ):
+        """Pause is a new-work barrier, not a freeze of running work (#161).
+
+        Active-session processing runs BEFORE the paused health gate is even
+        consulted, which is what lets an agent session that was already running
+        when the operator paused be observed, completed and cleaned up
+        normally. Planning is the part that stops.
+        """
+        sample_orchestrator_state.paused = True
+        sample_orchestrator_state.active_sessions.append(MagicMock())
+        active_fn = Mock()
+        planning_fn = Mock()
+        health_gate = HealthGate()
+
+        run_tick(
+            loop_iteration=1,
+            event_context=sample_event_context,
+            inflight_stable_ids={},
+            state=sample_orchestrator_state,
+            events=mock_event_sink,
+            shutdown_requested=False,
+            process_active_sessions_fn=active_fn,
+            check_health_fn=lambda: check_health(
+                health_gate=health_gate,
+                paused=sample_orchestrator_state.paused,
+            ),
+            run_planning_cycle_fn=planning_fn,
+            emit_heartbeat_fn=Mock(),
+        )
+
+        active_fn.assert_called_once_with()
+        planning_fn.assert_not_called()
+
     def test_prunes_expired_inflight_ids(
         self, sample_orchestrator_state, mock_event_sink, sample_event_context
     ):

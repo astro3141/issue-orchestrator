@@ -39,6 +39,7 @@ from issue_orchestrator.control.continuation_scheduling import (
     build_control_continuation,
 )
 from issue_orchestrator.control.publication_revalidation import RevalidationOutcome
+from issue_orchestrator.control.queue_cache import QueueCache
 from issue_orchestrator.control.worktree_runnability import WorktreeRunnability
 from issue_orchestrator.entrypoints.bootstrap import build_orchestrator_for_testing
 from issue_orchestrator.domain.attempt import (
@@ -1666,6 +1667,305 @@ class TestAnUnrunnableWorktreeOpensNoRun:
 
 
 # ======================================================================
+# The pause barrier (#161)
+# ======================================================================
+
+
+def _paused(harness: Harness) -> None:
+    """Establish the engine pause the runtime's ``pause()`` establishes."""
+    harness.state.paused = True
+
+
+def _approved(attempt: Attempt) -> Attempt:
+    """The candidate after its exact-``A`` review round approved it."""
+    return attempt.with_continuation_review_verdict(
+        BoundReviewVerdict(
+            verdict=ReviewVerdictOutcome.APPROVED,
+            reviewed_sha=attempt.key.head_sha,
+            decided_at="2026-08-19T01:00:00Z",
+            completed_rounds=1,
+        )
+    )
+
+
+class TestPauseWithholdsNewExecution:
+    """A paused engine starts nothing, in every live phase (#161 F1-F3).
+
+    One assertion block per phase rather than a parametrisation, because the
+    phases do not fail the same way: ``RETRY_PENDING`` would spend a #139
+    allowance through the revalidation route, while the two review phases would
+    spend a #149 run allowance and cut a checkout. Naming both directions is
+    the point.
+    """
+
+    def test_retry_pending_reaches_no_revalidation_and_spends_no_allowance(
+        self, harness: Harness
+    ) -> None:
+        attempt = _attempt(
+            RequestedAction.CREATE_PR, verdict=ValidationVerdict.FAILED
+        )
+        harness.attempts.update(attempt.key, lambda _current: attempt)
+        _paused(harness)
+
+        harness.runner.advance(
+            _owned(_operation(attempt, ContinuationPhase.RETRY_PENDING))
+        )
+
+        assert harness.jobs.submitted == []
+        # The route is #139's single admission owner, so not reaching it is
+        # exactly "no revalidation was started and no allowance reserved".
+        assert harness.revalidation.candidates == []
+        stored = harness.attempts.for_key(attempt.key)
+        assert stored is not None
+        assert stored.revalidation_budget_used == 0
+
+    def test_pass_pending_review_opens_no_run_worktree_or_exchange(
+        self, harness: Harness
+    ) -> None:
+        attempt = _attempt(RequestedAction.CREATE_PR)
+        harness.attempts.update(attempt.key, lambda _current: attempt)
+        _paused(harness)
+
+        harness.runner.advance(
+            _owned(_operation(attempt, ContinuationPhase.PASS_PENDING_REVIEW))
+        )
+
+        assert harness.jobs.submitted == []
+        assert harness.worktrees.created == []
+        assert harness.setup.commands == []
+        assert harness.session_output.runs == []
+        assert harness.completion.calls == []
+        stored = harness.attempts.for_key(attempt.key)
+        assert stored is not None
+        assert stored.continuation_runs_used == 0
+
+    def test_approved_pending_pr_starts_no_pull_request_side_work(
+        self, harness: Harness
+    ) -> None:
+        """The phase whose run exists to CREATE a pull request starts none."""
+        attempt = _approved(_attempt(RequestedAction.CREATE_PR))
+        harness.attempts.update(attempt.key, lambda _current: attempt)
+        _paused(harness)
+
+        harness.runner.advance(
+            _owned(_operation(attempt, ContinuationPhase.APPROVED_PENDING_PR))
+        )
+
+        assert harness.jobs.submitted == []
+        assert harness.worktrees.created == []
+        assert harness.completion.calls == []
+        assert harness.labels.applied == []
+        stored = harness.attempts.for_key(attempt.key)
+        assert stored is not None
+        assert stored.continuation_settlement is None
+        assert stored.continuation_runs_used == 0
+
+
+class TestPauseChangesNoAuthority:
+    """Withholding a start rewrites nothing the record already says (#161 F10)."""
+
+    def test_a_paused_pass_leaves_the_durable_record_untouched(
+        self, harness: Harness
+    ) -> None:
+        attempt = _attempt(RequestedAction.CREATE_PR)
+        stored_before = harness.attempts.update(
+            attempt.key, lambda _current: attempt
+        )
+        _paused(harness)
+
+        harness.runner.advance(
+            _owned(_operation(attempt, ContinuationPhase.PASS_PENDING_REVIEW))
+        )
+
+        assert harness.attempts.for_key(attempt.key) == stored_before
+
+    def test_the_recorded_intent_survives_the_pause(
+        self, harness: Harness
+    ) -> None:
+        """Not retired: a withheld start is not a supersession."""
+        attempt = _attempt(RequestedAction.CREATE_PR)
+        harness.attempts.update(attempt.key, lambda _current: attempt)
+        _paused(harness)
+
+        harness.runner.advance(
+            _owned(_operation(attempt, ContinuationPhase.PASS_PENDING_REVIEW))
+        )
+
+        stored = harness.attempts.for_key(attempt.key)
+        assert stored is not None
+        assert stored.continuation_descriptor == attempt.continuation_descriptor
+        assert stored.completed_evaluations == attempt.completed_evaluations
+
+    def test_nothing_this_engine_is_executing_is_invented(
+        self, harness: Harness
+    ) -> None:
+        """No claim is taken for work that never started."""
+        attempt = _attempt(RequestedAction.CREATE_PR)
+        harness.attempts.update(attempt.key, lambda _current: attempt)
+        operation = _operation(attempt, ContinuationPhase.PASS_PENDING_REVIEW)
+        _paused(harness)
+
+        harness.runner.advance(_owned(operation))
+
+        assert harness.in_flight.is_executing(operation.key) is False
+        assert harness.runs.holds(operation.key) is False
+
+
+class TestPauseIsNotCancellation:
+    """An operation already in flight when the pause lands is left alone (F6).
+
+    The pause is established from INSIDE the completion pipeline, which is the
+    only deterministic way to be mid-run: the inline job runner is executing
+    the operation's job at that moment, exactly as a background supervisor
+    would be when an operator presses pause.
+    """
+
+    def _pause_mid_run(self, harness: Harness) -> None:
+        harness.completion.during_process = lambda: _paused(harness)
+
+    def test_a_run_in_flight_when_the_pause_lands_settles_normally(
+        self, harness: Harness
+    ) -> None:
+        attempt = _attempt(RequestedAction.CREATE_PR)
+        harness.attempts.update(attempt.key, lambda _current: attempt)
+        harness.completion.outcome = ProcessingOutcome(pr_url=PR_URL)
+        self._pause_mid_run(harness)
+
+        harness.runner.advance(
+            _owned(_operation(attempt, ContinuationPhase.PASS_PENDING_REVIEW))
+        )
+
+        stored = harness.attempts.for_key(attempt.key)
+        assert stored is not None
+        assert stored.continuation_settlement is not None
+        assert (
+            stored.continuation_settlement.kind
+            == ContinuationSettlementKind.PULL_REQUEST_OPENED
+        )
+        assert harness.state.paused is True
+
+    def test_an_unfinished_run_keeps_its_worktree_and_stays_resumable(
+        self, harness: Harness
+    ) -> None:
+        """Withheld, not killed: the exchange's working directory survives."""
+        attempt = _attempt(RequestedAction.CREATE_PR)
+        harness.attempts.update(attempt.key, lambda _current: attempt)
+        harness.completion.outcome = ProcessingOutcome(review_exchange_deferred=True)
+        operation = _operation(attempt, ContinuationPhase.PASS_PENDING_REVIEW)
+        self._pause_mid_run(harness)
+
+        harness.runner.advance(_owned(operation))
+
+        assert harness.worktrees.removed == []
+        assert harness.runs.holds(operation.key) is True
+
+    def test_a_paused_pass_does_not_re_enter_or_duplicate_that_run(
+        self, harness: Harness
+    ) -> None:
+        attempt = _attempt(RequestedAction.CREATE_PR)
+        harness.attempts.update(attempt.key, lambda _current: attempt)
+        harness.completion.outcome = ProcessingOutcome(review_exchange_deferred=True)
+        operation = _operation(attempt, ContinuationPhase.PASS_PENDING_REVIEW)
+        self._pause_mid_run(harness)
+        harness.runner.advance(_owned(operation))
+
+        harness.runner.advance(_owned(operation))
+
+        assert len(harness.jobs.submitted) == 1
+        assert len(harness.session_output.runs) == 1
+        assert len(harness.completion.calls) == 1
+        assert harness.runs.holds(operation.key) is True
+
+    def test_a_resume_re_enters_the_same_run_rather_than_a_new_one(
+        self, harness: Harness
+    ) -> None:
+        """Nothing was lost while the barrier stood: same worktree, same run id.
+
+        A resumed pass that minted a fresh ``run_id`` would be a second review
+        exchange no dedupe could recognise, which is the cost a pause must not
+        impose on an operation that was mid-run when it landed.
+        """
+        attempt = _attempt(RequestedAction.CREATE_PR)
+        harness.attempts.update(attempt.key, lambda _current: attempt)
+        harness.completion.outcome = ProcessingOutcome(review_exchange_deferred=True)
+        operation = _operation(attempt, ContinuationPhase.PASS_PENDING_REVIEW)
+        self._pause_mid_run(harness)
+        harness.runner.advance(_owned(operation))
+        harness.completion.during_process = None
+
+        harness.state.paused = False
+        harness.runner.advance(_owned(operation))
+
+        assert len(harness.session_output.runs) == 1
+        run_ids = [call["run_assets"].run_id for call in harness.completion.calls]
+        assert run_ids == ["run-1", "run-1"]
+        stored = harness.attempts.for_key(attempt.key)
+        assert stored is not None
+        assert stored.continuation_runs_used == 1
+
+    def test_a_run_whose_operation_left_live_truth_is_still_swept(
+        self, harness: Harness
+    ) -> None:
+        """The sweep is disposal, not a start, so a pause does not leak it."""
+        attempt = _attempt(RequestedAction.CREATE_PR)
+        harness.attempts.update(attempt.key, lambda _current: attempt)
+        harness.completion.outcome = ProcessingOutcome(review_exchange_deferred=True)
+        operation = _operation(attempt, ContinuationPhase.PASS_PENDING_REVIEW)
+        harness.runner.advance(_owned(operation))
+        _paused(harness)
+
+        harness.runner.advance(
+            ContinuationReconciliation(
+                exclusions=ControlOperationExclusions(()), operations=()
+            )
+        )
+
+        assert harness.worktrees.removed == [
+            harness.session_output.runs[0].worktree_path
+        ]
+        assert harness.runs.holds(operation.key) is False
+
+
+class TestResumeStartsWhatIsStillLive:
+    """The barrier is a barrier, not a decision the record remembers (F8)."""
+
+    def test_the_first_pass_after_a_resume_opens_the_withheld_run(
+        self, harness: Harness
+    ) -> None:
+        attempt = _attempt(RequestedAction.CREATE_PR)
+        harness.attempts.update(attempt.key, lambda _current: attempt)
+        operation = _operation(attempt, ContinuationPhase.PASS_PENDING_REVIEW)
+        _paused(harness)
+        harness.runner.advance(_owned(operation))
+        assert harness.completion.calls == []
+
+        harness.state.paused = False
+        harness.runner.advance(_owned(operation))
+
+        assert len(harness.jobs.submitted) == 1
+        assert harness.journal == ["materialize", "setup", "start_run", "process"]
+        stored = harness.attempts.for_key(attempt.key)
+        assert stored is not None
+        assert stored.continuation_runs_used == 1
+
+    def test_a_withheld_retry_reaches_the_route_after_a_resume(
+        self, harness: Harness
+    ) -> None:
+        attempt = _attempt(
+            RequestedAction.CREATE_PR, verdict=ValidationVerdict.FAILED
+        )
+        harness.attempts.update(attempt.key, lambda _current: attempt)
+        operation = _operation(attempt, ContinuationPhase.RETRY_PENDING)
+        _paused(harness)
+        harness.runner.advance(_owned(operation))
+
+        harness.state.paused = False
+        harness.runner.advance(_owned(operation))
+
+        assert harness.revalidation.candidates == [attempt]
+
+
+# ======================================================================
 # The production assembly
 # ======================================================================
 
@@ -1696,10 +1996,28 @@ class BuiltEngine:
     completion: FakeCompletionOwner
     journal: list[str]
     issue: Issue
+    config: Config
 
     def reconcile(self) -> ContinuationReconciliation:
         """One tick's hydration over a board holding just this issue."""
         return self.continuation.reconcile([self.issue])
+
+    def refresh_queue(self) -> list[Issue]:
+        """The refresh path: reconcile over the board, then replace the queue."""
+        return self.continuation.hydrate_queue(
+            QueueCache(self.config, self.state), [self.issue]
+        )
+
+    def hydrate_in_progress(self) -> None:
+        """The startup path: reconcile over the board, upserting what it found.
+
+        Nothing to re-add, which is precisely the startup this direction is
+        about: a lease written before the restart is then the only surviving
+        record that a control operation is still live.
+        """
+        self.continuation.hydrate_issues(
+            QueueCache(self.config, self.state), [], board=[self.issue]
+        )
 
     def file(self, attempt: Attempt) -> Attempt:
         return self.attempts.update(attempt.key, lambda _current: attempt)
@@ -1752,7 +2070,7 @@ def _orchestrator_for(config: Config, board: list[Issue]) -> "Orchestrator":
 
 def _built(tmp_path: Path) -> BuiltEngine:
     """The continuation this repository's own configuration assembles."""
-    config = _config_for(tmp_path / "primary")
+    config = _config_for(tmp_path / "primary", agents=True)
     issue = _issue(AGENT)
     orchestrator = _orchestrator_for(config, [issue])
 
@@ -1791,6 +2109,7 @@ def _built(tmp_path: Path) -> BuiltEngine:
         completion=completion,
         journal=journal,
         issue=issue,
+        config=config,
     )
 
 
@@ -1927,3 +2246,156 @@ class TestTheEngineHydratesThroughTheOwnerItBuilt:
         assert orchestrator.state.control_operation_exclusions.excludes_issue(
             issue.key
         )
+
+    def test_a_paused_queue_refresh_hydrates_without_starting_anything(
+        self, tmp_path: Path
+    ) -> None:
+        """#161 F4, read side: a pause does not cost the read model anything.
+
+        Through the SAME facade entry point as the direction above, with the
+        engine paused first. The exclusion a paused refresh publishes is what
+        keeps ordinary rework off an issue whose control operation is still
+        live; that a paused refresh also STARTS nothing is proved against the
+        assembly that wires a job runner, in
+        :class:`TestAPausedAssemblyHydratesButStartsNothing`.
+        """
+        config = _config_for(tmp_path / "primary", agents=True)
+        issue = _issue(AGENT)
+        orchestrator = _orchestrator_for(config, [issue])
+        attempt = _attempt(RequestedAction.CREATE_PR)
+        orchestrator.deps.attempt_store.update(attempt.key, lambda _current: attempt)
+        orchestrator.pause()
+
+        orchestrator.update_queue_cache()
+
+        assert orchestrator.state.paused is True
+        assert [i.number for i in orchestrator.state.cached_scope_issues] == [
+            ISSUE_NUMBER
+        ]
+        assert orchestrator.state.cached_queue_issues == []
+        assert orchestrator.state.control_operation_exclusions.excludes_issue(
+            issue.key
+        )
+        # Nothing the run would have written exists: no allowance spent, no
+        # verdict, no settlement.
+        stored = orchestrator.deps.attempt_store.for_key(attempt.key)
+        assert stored is not None
+        assert stored.continuation_runs_used == 0
+        assert stored.continuation_review_verdict is None
+        assert stored.continuation_settlement is None
+
+
+class TestAPausedAssemblyHydratesButStartsNothing:
+    """#161 F4/F5/F9, against the assembly the composition root builds.
+
+    The hand-wired suites above prove what the runner does with a
+    reconciliation it is handed. These drive the two PUBLIC hydration entry
+    points — the refresh path and the startup path — through the production
+    builder, whose job runner executes inline. So a hydration that advanced a
+    live continuation while paused would materialise a checkout, spend an
+    allowance and re-enter the completion pipeline right here.
+    """
+
+    def test_a_refresh_while_paused_publishes_the_exclusion_and_starts_nothing(
+        self, tmp_path: Path
+    ) -> None:
+        engine = _built(tmp_path)
+        engine.file(_attempt(RequestedAction.CREATE_PR))
+        engine.state.paused = True
+
+        queue = engine.refresh_queue()
+
+        assert engine.state.control_operation_exclusions.excludes_issue(
+            engine.issue.key
+        )
+        assert [issue.number for issue in engine.state.cached_scope_issues] == [
+            ISSUE_NUMBER
+        ]
+        assert queue == []
+        assert engine.journal == []
+        assert engine.session_output.runs == []
+
+    def test_a_paused_retry_candidate_is_excluded_but_never_revalidated(
+        self, tmp_path: Path
+    ) -> None:
+        """#161 F1 through the wiring that holds the real #139 route.
+
+        The retry phase is the one whose execution is somebody else's allowance
+        to spend, so the claim worth making about the production assembly is
+        that the route is not reached at all while paused.
+        """
+        engine = _built(tmp_path)
+        attempt = engine.file(
+            _attempt(RequestedAction.CREATE_PR, verdict=ValidationVerdict.FAILED)
+        )
+        engine.state.paused = True
+
+        reconciliation = engine.reconcile()
+
+        assert [operation.phase for operation in reconciliation.owned] == [
+            ContinuationPhase.RETRY_PENDING
+        ]
+        assert reconciliation.exclusions.excludes_issue(engine.issue.key)
+        assert engine.journal == []
+        stored = engine.attempts.for_key(attempt.key)
+        assert stored is not None
+        assert stored.revalidation_budget_used == 0
+        assert stored.completed_evaluations == attempt.completed_evaluations
+
+    def test_startup_hydration_while_paused_reconciles_and_starts_nothing(
+        self, tmp_path: Path
+    ) -> None:
+        """#161 F5: startup-pause requests a refresh, so this path runs paused."""
+        engine = _built(tmp_path)
+        engine.file(_attempt(RequestedAction.CREATE_PR))
+        engine.state.paused = True
+
+        engine.hydrate_in_progress()
+
+        assert engine.state.control_operation_exclusions.excludes_issue(
+            engine.issue.key
+        )
+        assert engine.worktrees.created == []
+        assert engine.completion.calls == []
+
+    def test_the_exclusion_survives_every_paused_reconciliation(
+        self, tmp_path: Path
+    ) -> None:
+        """#161 F9: withholding execution never releases what is still live.
+
+        Repeated because release is what reconciliation does to an operation
+        the derived live set does not name: an engine that stopped deriving
+        while paused would keep the FIRST projection and drop it on the pass
+        after that.
+        """
+        engine = _built(tmp_path)
+        engine.file(_attempt(RequestedAction.CREATE_PR))
+        engine.state.paused = True
+
+        for _ in range(3):
+            engine.refresh_queue()
+        reconciliation = engine.reconcile()
+
+        assert [operation.phase for operation in reconciliation.owned] == [
+            ContinuationPhase.PASS_PENDING_REVIEW
+        ]
+        assert reconciliation.exclusions.excludes_issue(engine.issue.key)
+        assert engine.journal == []
+
+    def test_the_first_refresh_after_a_resume_starts_the_withheld_run(
+        self, tmp_path: Path
+    ) -> None:
+        """#161 F8, through the production assembly and a public entry point."""
+        engine = _built(tmp_path)
+        attempt = engine.file(_attempt(RequestedAction.CREATE_PR))
+        engine.state.paused = True
+        engine.refresh_queue()
+        assert engine.journal == []
+
+        engine.state.paused = False
+        engine.refresh_queue()
+
+        assert engine.journal == ["materialize", "setup", "start_run", "process"]
+        stored = engine.attempts.for_key(attempt.key)
+        assert stored is not None
+        assert stored.continuation_runs_used == 1
