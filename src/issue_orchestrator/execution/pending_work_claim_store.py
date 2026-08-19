@@ -25,8 +25,8 @@ Two things follow from that boundary and are easy to get wrong:
 The quarantine table shares this database because it shares its trust boundary
 and its lifetime, but not its lifecycle: a quarantine outlives the claim it
 could not read and is cleared by a human, never by a session outcome. The
-shared-needs-human causes and the publication-refusal latch (#51) are here on
-the same terms — same boundary, same lifetime, their own lifecycles.
+shared-needs-human causes, the publication-refusal latch (#51) and #146's
+control-operation leases (own module, this database) are here on those terms.
 
 The latch was measured against the other durable owners before landing here,
 and each was ruled out on what it is allowed to hold rather than on

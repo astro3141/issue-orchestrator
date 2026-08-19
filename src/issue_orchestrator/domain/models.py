@@ -10,6 +10,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Iterable, Literal, Optional, TYPE_CHECKING, TypeAlias
 from unittest.mock import Mock
 
+from .control_operation import ControlOperationExclusions
 from .dependency_gates import DependencyGateSnapshot
 from .issue_key import IssueKey, github_issue_key
 from .session_key import SessionKey, TaskKind  # re-exported for callers
@@ -2018,6 +2019,17 @@ class OrchestratorState:
     # carrying. A terminal whose stored claim cannot be read is quarantined
     # rather than restored, so it can never appear here as claimless (F6).
     in_flight_work: list["InFlightWork"] = field(default_factory=list)
+    # #146: control-owned operations that are running with no terminal and no
+    # dequeued queue request. Owned exclusively by ControlOperationOwnership -
+    # never written directly. In-memory like ``in_flight_work``'s list view:
+    # the durable leases live in the orchestrator-owned claim store, and this
+    # holds only what reconciliation has already matched against the caller's
+    # live-operation truth. A lease that survived a crash therefore excludes
+    # nothing until it is reconciled, which is what stops a settled operation's
+    # stray row from blocking its issue forever.
+    control_operation_exclusions: ControlOperationExclusions = field(
+        default_factory=ControlOperationExclusions
+    )
     startup_status: str = "pending"  # "pending", "running", "complete"
     startup_message: str = ""  # Current startup task description
     cached_scope_issues: list["IssueProtocol"] = field(default_factory=list)  # Cached full in-scope issue snapshot for dashboard/runtime recovery
