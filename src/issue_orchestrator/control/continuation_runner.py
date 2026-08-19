@@ -503,10 +503,25 @@ class ControlContinuationRunner:
                 operation.key,
                 (head or "unknown")[:12],
             )
-            self._worktrees.remove_checkout(info.path, force=True)
+            self._discard_checkout(info.path)
             self._retire(operation)
             return None
         return info.path, agent_lane
+
+    def _discard_checkout(self, worktree: Path) -> None:
+        """Dispose of a checkout no run owns yet.
+
+        Every pre-run refusal disposes HERE rather than through
+        :class:`~.continuation_runs.ContinuationRuns`, because the run does not
+        exist: nothing else knows this checkout is there, and the name is
+        deterministic per candidate, so one left behind would block every later
+        pass at ``git worktree add``.
+
+        After a run is opened the rule inverts — the run owner disposes, and
+        only when the completion pipeline says the work is finished — so this is
+        reachable only from the refusals above ``_open_run``'s registration.
+        """
+        self._worktrees.remove_checkout(worktree, force=True)
 
     def _make_runnable(self, operation: LiveContinuation, worktree: Path) -> bool:
         """Make the continuation's CODER worktree runnable, or open no run.
@@ -530,15 +545,15 @@ class ControlContinuationRunner:
         (:mod:`~..execution.reviewer_worktree`): deliberately unprovisioned,
         guarded where the provider supports it. Nothing here reaches it.
 
-        Failure opens no run at all. The checkout is removed HERE rather than
-        through :class:`~.continuation_runs.ContinuationRuns`, because the run
-        does not exist yet — the same disposal the moved-branch refusal above
-        does, and for the same reason. The reservation stays spent: it is a
-        start budget, and refunding it would turn a repeatably broken
-        environment into an unbounded supply of continuation runs. A later pass
-        may open another run only while #149's existing allowance lasts, and
-        once it is gone the ordinary ``RUNS_EXHAUSTED`` derivation hands the
-        candidate back to rework. There is no second counter and no escalation.
+        Failure opens no run at all, and the checkout is discarded through the
+        one pre-run disposal (:meth:`_discard_checkout`). The reservation stays
+        spent: it is a start budget, and refunding it would turn a repeatably
+        broken environment into an unbounded supply of continuation runs. A
+        later pass may open another run only while #149's existing allowance
+        lasts, and once it is gone the ordinary ``RUNS_EXHAUSTED`` derivation
+        hands the candidate back to rework — where the launch provisioner
+        escalates the same broken environment to ``needs-human``. There is no
+        second counter and no escalation of its own.
 
         Returns:
             Whether the worktree is runnable and the run may be opened.
@@ -552,7 +567,7 @@ class ControlContinuationRunner:
             operation.key,
             unrunnable,
         )
-        self._worktrees.remove_checkout(worktree, force=True)
+        self._discard_checkout(worktree)
         return False
 
     def _process(self, operation: LiveContinuation, run: ContinuationRun) -> bool:

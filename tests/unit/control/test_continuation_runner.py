@@ -16,9 +16,10 @@ from __future__ import annotations
 import inspect
 import json
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -33,8 +34,13 @@ from issue_orchestrator.control.continuation_live_truth import (
     LiveContinuation,
 )
 from issue_orchestrator.control.continuation_runner import ControlContinuationRunner
+from issue_orchestrator.control.continuation_scheduling import (
+    ControlContinuation,
+    build_control_continuation,
+)
 from issue_orchestrator.control.publication_revalidation import RevalidationOutcome
 from issue_orchestrator.control.worktree_runnability import WorktreeRunnability
+from issue_orchestrator.entrypoints.bootstrap import build_orchestrator_for_testing
 from issue_orchestrator.domain.attempt import (
     CONTINUATION_RUN_ALLOWANCE,
     Attempt,
@@ -66,9 +72,13 @@ from issue_orchestrator.domain.validation_verdict_receipt import (
     ValidationVerdict,
     ValidationVerdictReceipt,
 )
-from issue_orchestrator.infra.config import Config
+from issue_orchestrator.infra.config import AgentConfig, Config
 from issue_orchestrator.ports.command_runner import CommandResult
 from issue_orchestrator.ports.worktree_manager import WorktreeInfo
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from issue_orchestrator.infra.orchestrator import Orchestrator
+    from issue_orchestrator.ports.attempt_store import AttemptStore
 
 REPO = "owner/repo"
 ISSUE_NUMBER = 149
@@ -161,9 +171,11 @@ class SetupCommands:
 
     Records what ran and where, so "the configured recipe ran in the
     continuation's own checkout" is a claim the tests can make rather than
-    infer. ``alters`` is how a recipe misbehaves in a fake worktree the way a
-    real one misbehaves in a real one: it changes what the working copy reports
-    about the candidate while the commands are running.
+    infer. ``while_running`` is the only window a test has into the middle of a
+    recipe, and two directions need one: a recipe that misbehaves in a fake
+    worktree the way a real one misbehaves in a real one (changing what the
+    working copy reports about the candidate), and a reconciliation landing
+    while a run is open but no run assets exist yet.
     """
 
     journal: list[str] = field(default_factory=list)
@@ -171,15 +183,15 @@ class SetupCommands:
     cwds: list[Path | None] = field(default_factory=list)
     failing: bool = False
     timing_out: bool = False
-    alters: Callable[[], None] | None = None
+    while_running: Callable[[], None] | None = None
 
     def run(self, command: str | list[str], **kwargs: Any) -> CommandResult:
         self.journal.append("setup")
         self.commands.append(str(command))
         cwd = kwargs.get("cwd")
         self.cwds.append(Path(cwd) if cwd is not None else None)
-        if self.alters is not None:
-            self.alters()
+        if self.while_running is not None:
+            self.while_running()
         if self.timing_out:
             return CommandResult(
                 returncode=137, stdout="", stderr="killed", timed_out=True
@@ -1546,7 +1558,7 @@ class TestAnUnrunnableWorktreeOpensNoRun:
         self, harness: Harness
     ) -> None:
         """Provisioning installs tooling; it does not get to move the candidate."""
-        harness.setup.alters = lambda: setattr(
+        harness.setup.while_running = lambda: setattr(
             harness.working_copy, "head", SHA_A_PRIME
         )
 
@@ -1555,7 +1567,9 @@ class TestAnUnrunnableWorktreeOpensNoRun:
     def test_setup_that_dirties_the_candidates_tracked_content_starts_no_run(
         self, harness: Harness
     ) -> None:
-        harness.setup.alters = lambda: setattr(harness.working_copy, "dirty", True)
+        harness.setup.while_running = lambda: setattr(
+            harness.working_copy, "dirty", True
+        )
 
         self._unrunnable(harness)
 
@@ -1649,3 +1663,267 @@ class TestAnUnrunnableWorktreeOpensNoRun:
         assert stored is not None
         assert stored.continuation_runs_used == CONTINUATION_RUN_ALLOWANCE
         assert stored.continuation_run_allowance_available is False
+
+
+# ======================================================================
+# The production assembly
+# ======================================================================
+
+
+@dataclass
+class BuiltEngine:
+    """One engine's continuation stack, as the PRODUCTION builder makes it.
+
+    Everything above hand-wires the runner, which is the right shape for asking
+    what the runner does and the wrong shape for asking what it is made of: a
+    suite that supplies its own ``WorktreeRunnability`` cannot tell a builder
+    that wires one correctly from a builder that wires one from the wrong
+    ``Config``, and it cannot tell one registry from two.
+
+    So nothing here is assembled locally. The container comes from the real
+    composition root and the owner from :func:`build_control_continuation`; the
+    only substitutions are the ports at the edge of the process — the checkout,
+    the shell, the run directory, the completion pipeline and the job runner —
+    because a unit test may not create git worktrees or run installers.
+    """
+
+    continuation: ControlContinuation
+    state: OrchestratorState
+    attempts: "AttemptStore"
+    worktrees: FakeWorktrees
+    setup: SetupCommands
+    session_output: FakeSessionOutput
+    completion: FakeCompletionOwner
+    journal: list[str]
+    issue: Issue
+
+    def reconcile(self) -> ContinuationReconciliation:
+        """One tick's hydration over a board holding just this issue."""
+        return self.continuation.reconcile([self.issue])
+
+    def file(self, attempt: Attempt) -> Attempt:
+        return self.attempts.update(attempt.key, lambda _current: attempt)
+
+    def spend_all_but_one_run(self) -> None:
+        """Burn every continuation run but the last on a broken environment.
+
+        Both non-durable facts — a job in flight, a run held open — only decide
+        anything once the durable allowance is spent: while one remains, the
+        candidate derives ``PASS_PENDING_REVIEW`` from the record alone and a
+        duplicated registry is invisible. A worktree that could not be made
+        runnable spends an allowance and opens no run, which is exactly the way
+        to arrive at the last one with nothing else changed.
+        """
+        self.setup.failing = True
+        for _ in range(CONTINUATION_RUN_ALLOWANCE - 1):
+            self.reconcile()
+        self.setup.failing = False
+
+
+def _config_for(root: Path, *, agents: bool = False) -> Config:
+    """A repository configured the way an operator configures one."""
+    config = Config()
+    config.repo = REPO
+    config.repo_root = root
+    root.mkdir(parents=True, exist_ok=True)
+    config.worktree_base = root / "worktrees"
+    config.setup_worktree = [SETUP_SENTINEL]
+    if agents:
+        config.agents = {
+            AGENT: AgentConfig(
+                prompt_path=root / "prompt.md", model="sonnet", timeout_minutes=45
+            )
+        }
+    return config
+
+
+def _orchestrator_for(config: Config, board: list[Issue]) -> "Orchestrator":
+    """The real composition root, over a repository host that returns ``board``."""
+    github = MagicMock()
+    github.list_issues.return_value = board
+    github.get_issue_labels.return_value = list(board[0].labels) if board else []
+    github.get_issue_labels_fresh.return_value = (
+        list(board[0].labels) if board else []
+    )
+
+    with patch("issue_orchestrator.entrypoints.bootstrap.install_gh_guard"):
+        return build_orchestrator_for_testing(config=config, github=github)
+
+
+def _built(tmp_path: Path) -> BuiltEngine:
+    """The continuation this repository's own configuration assembles."""
+    config = _config_for(tmp_path / "primary")
+    issue = _issue(AGENT)
+    orchestrator = _orchestrator_for(config, [issue])
+
+    journal: list[str] = []
+    worktrees = FakeWorktrees(root=tmp_path / "checkouts", journal=journal)
+    setup = SetupCommands(journal=journal)
+    session_output = FakeSessionOutput(journal=journal)
+    # Deferred, because that is what a wired background supervisor produces:
+    # the exchange becomes its own job, the run stays open across passes, and
+    # "the engine still knows it holds that run" becomes observable.
+    completion = FakeCompletionOwner(
+        journal=journal, outcome=ProcessingOutcome(review_exchange_deferred=True)
+    )
+    deps = replace(
+        orchestrator.deps,
+        worktree_manager=worktrees,  # type: ignore[arg-type]
+        working_copy=FakeWorkingCopy(),  # type: ignore[arg-type]
+        command_runner=setup,  # type: ignore[arg-type]
+        session_output=session_output,  # type: ignore[arg-type]
+        completion_processor=completion,  # type: ignore[arg-type]
+        action_applier=FakeActionApplier(),  # type: ignore[arg-type]
+        services=replace(
+            orchestrator.deps.services,
+            background_job_supervisor=InlineJobs(),  # type: ignore[arg-type]
+        ),
+    )
+    return BuiltEngine(
+        continuation=build_control_continuation(
+            state=orchestrator.state, config=config, deps=deps
+        ),
+        state=orchestrator.state,
+        attempts=orchestrator.deps.attempt_store,
+        worktrees=worktrees,
+        setup=setup,
+        session_output=session_output,
+        completion=completion,
+        journal=journal,
+        issue=issue,
+    )
+
+
+class TestTheBuilderAssemblesWhatProductionRuns:
+    """#160: the wiring is where this change's contract actually lives.
+
+    The runner consumes a ``WorktreeRunnability`` it is handed, so every claim
+    the suites above make is a claim about a core THIS module wired. Two ways
+    the builder can diverge from them are exactly the failures #160 exists to
+    close, and neither is visible from a hand-wired runner: a runnability built
+    from the wrong ``Config`` (an empty recipe provisions nothing and returns
+    success, so the exchange dies on a missing toolchain and the candidate is
+    blamed — #48), and registries duplicated by the very refactor that moved
+    this assembly out of the facade.
+    """
+
+    def test_the_recipe_is_the_one_this_repository_configured(
+        self, tmp_path: Path
+    ) -> None:
+        """Not a recipe the test supplied: the operator's ``setup_worktree``.
+
+        The sentinel appears in no production file, so a builder reading the
+        commands from anywhere but the ``Config`` it was handed cannot pass.
+        """
+        engine = _built(tmp_path)
+        engine.file(_attempt(RequestedAction.CREATE_PR))
+
+        engine.reconcile()
+
+        assert engine.setup.commands == [SETUP_SENTINEL]
+
+    def test_the_configured_recipe_runs_before_any_run_asset_exists(
+        self, tmp_path: Path
+    ) -> None:
+        """The ordering the runner is tested on, proved through the real wiring."""
+        engine = _built(tmp_path)
+        engine.file(_attempt(RequestedAction.CREATE_PR))
+
+        engine.reconcile()
+
+        assert engine.journal == ["materialize", "setup", "start_run", "process"]
+        assert engine.setup.cwds == [engine.session_output.runs[0].worktree_path]
+
+    def test_live_truth_reads_the_open_runs_the_runner_holds(
+        self, tmp_path: Path
+    ) -> None:
+        """One ``ContinuationRuns``, or a mid-exchange pass forgets the run.
+
+        Read on the LAST allowance, because that is the only reading in which
+        the registry decides anything: the durable record then says the
+        allowance is spent with nothing to show for it — ``RUNS_EXHAUSTED``,
+        which is not live — and the open run the RUNNER holds is the single fact
+        that keeps the operation live, and resumable. A second registry would
+        drop it from live truth, release the lease, and close the run out from
+        under the exchange still working in that checkout.
+        """
+        engine = _built(tmp_path)
+        engine.file(_attempt(RequestedAction.CREATE_PR))
+        engine.spend_all_but_one_run()
+        engine.reconcile()
+
+        second = engine.reconcile()
+
+        assert [operation.phase for operation in second.owned] == [
+            ContinuationPhase.PASS_PENDING_REVIEW
+        ]
+        # Resumed, not reopened: the same run the runner is already carrying,
+        # so the exchange keeps its identity across the pass.
+        assert len(engine.session_output.runs) == 1
+        assert len(engine.completion.calls) == 2
+        # The one disposal is of the checkout whose provisioning failed above.
+        # A second would be this run's, closed by a pass that had forgotten it.
+        assert len(engine.worktrees.removed) == 1
+
+    def test_live_truth_reads_the_in_flight_registry_the_runner_claims_into(
+        self, tmp_path: Path
+    ) -> None:
+        """One ``ContinuationsInFlight``, or a tick mid-run frees the issue.
+
+        The probe runs while the recipe does, on the last allowance: it is spent
+        and no run is open yet, so the claim the runner took is the ONLY thing
+        keeping the operation live. A second registry reads "nothing is
+        executing", derives ``RUNS_EXHAUSTED``, and drops the exclusion that is
+        the whole reason ordinary rework cannot race a control operation (#148).
+        """
+        engine = _built(tmp_path)
+        engine.file(_attempt(RequestedAction.CREATE_PR))
+        engine.spend_all_but_one_run()
+        mid_run: list[ContinuationReconciliation] = []
+        engine.setup.while_running = lambda: mid_run.append(engine.reconcile())
+
+        engine.reconcile()
+
+        assert [operation.phase for operation in mid_run[0].owned] == [
+            ContinuationPhase.EXECUTING
+        ]
+        assert mid_run[0].exclusions.excludes_issue(engine.issue.key)
+        # The probe is a tick, not a second run: one run opened, one checkout.
+        assert len(engine.session_output.runs) == 1
+
+
+class TestTheEngineHydratesThroughTheOwnerItBuilt:
+    """A builder nothing at the composition root calls is unreachable.
+
+    So this drives the REAL orchestrator through a PUBLIC hydration point,
+    rather than asserting that a factory exists: the facade's ``cached_property``
+    is on the tested path only if a queue refresh reconciles through it.
+    """
+
+    def test_a_queue_refresh_excludes_the_issue_a_continuation_owns(
+        self, tmp_path: Path
+    ) -> None:
+        """Reconcile-then-hydrate, through the owner the facade assembled.
+
+        The issue is in scope and fetched — it reaches the scope snapshot — and
+        it is out of the queue for exactly one reason: the exclusion this
+        engine's own continuation owner published for a live control operation.
+
+        No run is started: the test composition wires no background runner, and
+        the runner refuses to execute without one.
+        """
+        config = _config_for(tmp_path / "primary", agents=True)
+        issue = _issue(AGENT)
+        orchestrator = _orchestrator_for(config, [issue])
+        attempt = _attempt(RequestedAction.CREATE_PR)
+        orchestrator.deps.attempt_store.update(attempt.key, lambda _current: attempt)
+
+        orchestrator.update_queue_cache()
+
+        assert [i.number for i in orchestrator.state.cached_scope_issues] == [
+            ISSUE_NUMBER
+        ]
+        assert orchestrator.state.cached_queue_issues == []
+        assert orchestrator.state.control_operation_exclusions.excludes_issue(
+            issue.key
+        )

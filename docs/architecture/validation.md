@@ -434,7 +434,12 @@ own start budget and a launch ledger over it would be a second bound:
   and validate in it. It is provisioned after the run allowance is reserved and
   before any run asset exists, and a checkout that cannot be made runnable
   opens no run, records no verdict or settlement, leaves the durable PASS
-  latest, is removed, and gets no refund.
+  latest, is removed, and gets no refund. A *persistently* broken environment
+  therefore spends that allowance one run at a time with only a warning per
+  pass — no escalation of its own, by design. It still reaches a human, one hop
+  later: exhaustion derives `RUNS_EXHAUSTED`, the candidate returns to ordinary
+  rework, and the launch provisioner escalates the same broken environment to
+  `needs-human` there.
 
 The provisioner is the single owner of provisioning for launches, and **every
 session launch path** goes through it: coding, validation retry, rework, review
