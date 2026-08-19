@@ -280,7 +280,7 @@ class PublicationGate:
         # could name a different one.
         output_dir = publish_gate_output_dir(run_assets.run_dir)
         result = gate.check(session_output_dir=output_dir)
-        self._record_verdict(result.record, issue_key)
+        self._record_verdict(result.record, issue_key, completed=not result.cache_hit)
         return PublicationGateOutcome(
             allowed=result.allowed,
             reason=result.reason,
@@ -385,8 +385,16 @@ class PublicationGate:
         self,
         record: ValidationRecord | None,
         issue_key: IssueKey | None,
+        *,
+        completed: bool,
     ) -> None:
         """File this run's verdict on the attempt, when there is one to file.
+
+        ``completed`` distinguishes a verdict this run *reached* from one it
+        reused out of the publish record store (#139). Only the first is a
+        completed evaluation; the history is append-only, so recording reuse
+        would state that the publish contract executed twice on a candidate it
+        executed on once.
 
         A run with no record executed no contract, and "never gated" is the
         *absence* of a receipt, not a receipt saying nothing. Writing one here
@@ -409,12 +417,19 @@ class PublicationGate:
         if record is None:
             return
         if issue_key is None:
-            logger.warning(
-                "Publish verdict not durably recorded: no canonical issue "
-                "identity for %s@%s; Attempt(issue, A) keeps no receipt for "
-                "this run",
-                record.suite,
-                record.head_sha[:12],
-            )
+            if completed:
+                # Only a verdict this run *reached* is lost by having nowhere
+                # to file it. A reused one is already on the record it was
+                # reused from, so warning about it would report a loss that
+                # did not happen.
+                logger.warning(
+                    "Publish verdict not durably recorded: no canonical issue "
+                    "identity for %s@%s; Attempt(issue, A) keeps no receipt for "
+                    "this run",
+                    record.suite,
+                    record.head_sha[:12],
+                )
             return
-        self._verdicts.record(issue_key=issue_key, record=record)
+        self._verdicts.record(
+            issue_key=issue_key, record=record, completed=completed
+        )

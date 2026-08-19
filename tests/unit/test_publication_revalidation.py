@@ -88,6 +88,37 @@ class StubAttemptKeys:
         return AttemptKey(issue_key, head_sha)
 
 
+class ForeignAppendingGate:
+    """A publication run during which some *other* contract files a verdict.
+
+    The evaluation history is shared: every attempt-keyed gate run that reaches
+    a verdict appends to it, and a rework or review session can run the quick
+    gate against this candidate while a revalidation of it is in flight. This
+    stands in for that window, and reaches no publication verdict of its own —
+    so the only thing that grew the history is a receipt this run did not
+    produce.
+    """
+
+    def __init__(
+        self,
+        attempts: SidecarAttemptStore,
+        key: AttemptKey,
+        receipt: ValidationVerdictReceipt,
+    ) -> None:
+        self._attempts = attempts
+        self._key = key
+        self._receipt = receipt
+
+    def check(self, *, worktree, run_assets, issue_key):
+        self._attempts.update(
+            self._key,
+            lambda attempt: attempt.with_completed_evaluation(self._receipt),
+        )
+        return SimpleNamespace(
+            allowed=True, reason="publish contract not configured", cache_hit=False
+        )
+
+
 class ExplodingCheckouts:
     """Materialization that dies after the allowance has been reserved.
 
@@ -218,6 +249,7 @@ def _route(
     *,
     registry: ValidationProfileRegistry | None = None,
     checkouts=None,
+    gate=None,
 ) -> PublicationRevalidation:
     """The route, assembled exactly as ``build_publication_revalidation`` does."""
     profiles = registry or _registry()
@@ -229,7 +261,9 @@ def _route(
         if checkouts is not None
         else _checkouts(repo),
         session_output=FileSystemSessionOutput(),
-        publication_gate=PublicationGate(
+        publication_gate=gate
+        if gate is not None
+        else PublicationGate(
             contracts=RunValidationContracts(FileSystemSessionOutput(), profiles),
             command_runner=runner,
             # The real working copy: the SHA the receipt claims is the SHA the
@@ -400,6 +434,38 @@ class TestTheCompositionRootAssemblesTheRoute:
         assert outcome.started is True
         assert outcome.evaluation is not None
         assert outcome.evaluation.head_sha == repo.candidate_sha
+
+    def test_a_built_orchestrator_holds_the_route(self, tmp_path: Path) -> None:
+        """The factory above is only wiring until the root actually calls it.
+
+        A route nothing at the composition root builds is unreachable from the
+        running system however carefully it is assembled, so this drives the
+        REAL builder and asks the orchestrator for it, rather than asserting
+        that a function exists.
+        """
+        from unittest.mock import MagicMock, patch
+
+        from issue_orchestrator.entrypoints.bootstrap import (
+            build_orchestrator_for_testing,
+        )
+        from issue_orchestrator.infra.config import Config
+
+        config = Config()
+        config.repo = "acme/repo"
+        config.repo_root = tmp_path
+        config.worktree_base = tmp_path / "worktrees"
+        github = MagicMock()
+        github.get_issue_labels.return_value = []
+        github.get_issue_labels_fresh.return_value = []
+
+        with patch("issue_orchestrator.entrypoints.bootstrap.install_gh_guard"):
+            orchestrator = build_orchestrator_for_testing(
+                config=config, github=github
+            )
+
+        assert isinstance(
+            orchestrator.deps.publication_revalidation, PublicationRevalidation
+        )
 
 
 class TestOnlyADurableCanonicalCandidateAdmits:
@@ -599,6 +665,39 @@ class TestDiagnosticExecutionsNeverBecomeAuthority:
         attempt = _read(repo, key)
         assert attempt is not None
         assert attempt.completed_evaluations == (prior,)
+        assert attempt.publication_validation_passed is False
+
+    def test_a_quick_gate_append_is_not_reported_as_this_runs_verdict(
+        self, repo: SimpleNamespace
+    ) -> None:
+        """"The history grew" is not "the publication gate filed a verdict".
+
+        A revalidation that reached no publication verdict must say so, even
+        when another contract appended to the shared history while it ran.
+        Reporting the newest entry instead would tell a caller that publication
+        passed on the strength of a quick-gate receipt.
+        """
+        prior = _receipt(repo.candidate_sha)
+        key = _file(repo, prior)
+        quick = _receipt(
+            repo.candidate_sha,
+            verdict=ValidationVerdict.PASSED,
+            suite="agent_gate",
+            command=QUICK_SENTINEL,
+        )
+        gate = ForeignAppendingGate(SidecarAttemptStore(repo.root), key, quick)
+
+        outcome = _route(repo, StubCommandRunner(), gate=gate).revalidate(Attempt(key))
+
+        assert outcome == RevalidationOutcome(
+            started=True, reason="revalidation_verdict_not_recorded"
+        )
+        attempt = _read(repo, key)
+        assert attempt is not None
+        # The foreign receipt is kept — nothing here drops evidence — it just
+        # answers for its own contract and no other.
+        assert attempt.completed_evaluations == (prior, quick)
+        assert attempt.latest_publication_evaluation == prior
         assert attempt.publication_validation_passed is False
 
     def test_a_quick_gate_pass_never_satisfies_publication_authority(

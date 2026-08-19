@@ -3,31 +3,34 @@
 Extracted from ``bootstrap`` so the composition root stays navigable — the same
 split as ``bootstrap_completion`` and ``bootstrap_tech_lead``. Owns nothing but
 the wiring: every collaborator it assembles is built by the function that
-already owns building it.
+already owns building it, and ``bootstrap`` is its only caller. A factory
+nothing at the root calls would be unreachable production code however
+carefully it were assembled, so the route is held on ``OrchestratorDeps``
+beside the other owners an execution-plane consumer reaches for.
 """
 
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from ..execution.command_runner import LocalCommandRunner
-from ..execution.git_working_copy import GitWorkingCopy
-from ..execution.session_output_adapter import FileSystemSessionOutput
 from ..infra.config import Config
 from .bootstrap_completion import _validation_attempt_key_factory
 
 if TYPE_CHECKING:
     from ..control.publication_revalidation import PublicationRevalidation
     from ..ports.attempt_store import AttemptStore
+    from ..ports.command_runner import CommandRunner
+    from ..ports.session_output import SessionOutput
+    from ..ports.working_copy import WorkingCopy
 
 
 def build_publication_revalidation(
     config: Config,
     *,
     attempt_store: "AttemptStore",
-    session_output: FileSystemSessionOutput,
-    command_runner: LocalCommandRunner,
-    working_copy: GitWorkingCopy,
+    session_output: "SessionOutput",
+    command_runner: "CommandRunner",
+    working_copy: "WorkingCopy",
 ) -> "PublicationRevalidation":
     """The one way to assemble the same-SHA revalidation route (#139).
 

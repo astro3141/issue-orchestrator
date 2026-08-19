@@ -1590,6 +1590,19 @@ class SessionController:
             # and inventing a record from it would claim exit codes and
             # timestamps no gate reported.
             self._materialize_cached_validation_record(target_run_dir, result.record)
+        elif result.cache_hit:
+            # ...but the operator-facing consequence must not be silent: this
+            # run's manifest will carry no validation_record_path, no stdout and
+            # no stderr, and nothing else in the run says why.
+            logger.info(
+                issue_log(
+                    issue_number,
+                    "Validation cache hit for %s from a durable verdict whose "
+                    "run directory is gone: this run records no validation "
+                    "evidence of its own",
+                ),
+                sha_display,
+            )
         self._record_validation_evidence(
             worktree_path=worktree_path,
             run_dir=target_run_dir,

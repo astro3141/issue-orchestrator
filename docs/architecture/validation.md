@@ -229,8 +229,16 @@ re-evaluation instead, and every part of it is a bound:
 The gate itself is untouched: the route composes `PublicationGate.check`
 whole, through the same `build_publication_gate` every other composition
 calls, and the verdict reaches the history through the gate's own receipt
-writer — appended beside the failure it re-ran. `entrypoints/
-bootstrap_revalidation.py` is the only wiring.
+writer — appended beside the failure it re-ran. Appended only when the gate
+*reached* that verdict: a run that reused an earlier passing record executed
+nothing, and an append-only history that recorded reuse would claim the
+contract ran more times than it did.
+
+`entrypoints/bootstrap.py` composes the route — through
+`entrypoints/bootstrap_revalidation.py`, which holds the wiring itself — and
+holds it on `OrchestratorDeps.publication_revalidation`, where a consumer
+reaches it as it reaches the other owners there. The field is required, so
+neither composition root can build an orchestrator without one.
 
 ## Worktree readiness is a precondition of a meaningful verdict
 

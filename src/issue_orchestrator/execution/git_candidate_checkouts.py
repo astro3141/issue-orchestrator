@@ -101,7 +101,25 @@ class GitCandidateCheckouts:
         return MaterializedCandidate(path=path, head_sha=commit)
 
     def _remove(self, path: Path) -> None:
-        self._git.worktree_remove(self._repo_root, path)
+        """Dispose of a checkout, reporting rather than raising on failure.
+
+        Removal is always the *second* thing happening: either a verification
+        that already failed is being cleaned up after, or a run that is already
+        over is being released. Letting git's failure out of here would replace
+        the real reason with a cleanup error on the first path, and turn a
+        finished revalidation into an exception on the second — the route
+        promises an outcome, and only ``CandidateCheckoutError`` is shaped to
+        become one. A checkout left behind is visible, named after its commit,
+        and refused by :meth:`materialize` rather than silently adopted.
+        """
+        try:
+            self._git.worktree_remove(self._repo_root, path)
+        except GitError as exc:
+            logger.warning(
+                "[REVALIDATION] could not remove revalidation checkout at %s: %s",
+                path,
+                exc,
+            )
 
 
 __all__ = [

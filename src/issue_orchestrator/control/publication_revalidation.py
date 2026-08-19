@@ -244,7 +244,14 @@ class PublicationRevalidation:
             key_part=issue_key_path_part(key.issue_key),
             profile=prior.profile,
         )
-        before = len(durable.completed_evaluations)
+        # Counted over the *publication* evaluations, not the whole history:
+        # the history is shared. Every attempt-keyed gate run that reaches a
+        # verdict appends to it, including the quick gate, which a rework or
+        # review session can run against this same candidate while this is in
+        # flight. "The history grew" is therefore not the same fact as "the
+        # publication gate filed a verdict", and "the last entry" is not the
+        # same value as "the entry this run produced".
+        before = len(durable.publication_evaluations)
         outcome = self._publication_gate.check(
             worktree=materialized.path,
             run_assets=run_assets,
@@ -253,10 +260,12 @@ class PublicationRevalidation:
         # The gate files its own verdict through its existing receipt writer,
         # so what this reads back is whether one was actually appended. A run
         # that reached no verdict — an unconfigured contract, a HEAD the gate
-        # could not determine — appends nothing, and "never gated" must stay
-        # the absence of a receipt rather than a receipt saying nothing.
+        # could not determine, an evaluation it reused rather than executed —
+        # appends nothing, and "never gated" must stay the absence of a receipt
+        # rather than a receipt saying nothing.
         after = self._durable_candidate(key)
-        if after is None or len(after.completed_evaluations) <= before:
+        evaluations = None if after is None else after.publication_evaluations
+        if evaluations is None or len(evaluations) <= before:
             logger.warning(
                 "[REVALIDATION] %s@%s reached no recordable verdict: %s",
                 key.issue_key,
@@ -266,13 +275,14 @@ class PublicationRevalidation:
             return RevalidationOutcome(
                 started=True, reason="revalidation_verdict_not_recorded"
             )
-        appended = after.completed_evaluations[-1]
+        appended = evaluations[-1]
         logger.info(
-            "[REVALIDATION] %s@%s re-evaluated: %s (%d evaluation(s) on record)",
+            "[REVALIDATION] %s@%s re-evaluated: %s (%d publication evaluation(s) "
+            "on record)",
             key.issue_key,
             key.head_sha[:12],
             appended.verdict.value,
-            len(after.completed_evaluations),
+            len(evaluations),
         )
         return RevalidationOutcome(
             started=True, reason="revalidation_completed", evaluation=appended

@@ -53,6 +53,15 @@ REVALIDATION_ALLOWANCE = 1
 Exactly one, and stated here rather than at the route that spends it: the
 counter is durable, so the ceiling it is compared against has to be a property
 of the record, not of whichever caller happens to read it.
+
+The policy asks for the allowance per ``(candidate, validation contract)``,
+and this counter is per *candidate*. The two are the same thing today because
+publication is the only revalidatable contract — a quick-gate result is not
+authority, and a candidate whose contract has drifted is refused by admission
+rather than re-run. They stop being the same thing the moment a second
+contract becomes revalidatable, and at that point this must become a
+per-contract counter rather than one allowance both contracts draw from; see
+:attr:`Attempt.revalidation_budget_used`.
 """
 
 
@@ -118,11 +127,23 @@ class Attempt:
     # contract it cares about rather than trusting whichever entry is last: the
     # quick gate runs again after every completion, and a shared *slot* is
     # exactly how a later quick verdict used to erase the publication one.
+    #
+    # Unbounded by design, and bounded in practice by what may append: only a
+    # gate run that *reached* a verdict does, and reuse of an earlier
+    # evaluation appends nothing. The ceiling is therefore the number of times
+    # a contract actually executes against one commit — one publication
+    # evaluation plus its one revalidation, and one quick evaluation per
+    # session that re-runs the quick gate at that commit. If a future contract
+    # can execute unboundedly at a fixed SHA, this is where a cap belongs; a
+    # cap today would have to drop evidence, which is the one thing #139
+    # exists to stop.
     completed_evaluations: tuple[ValidationVerdictReceipt, ...] = ()
     # How much of the one-revalidation allowance this candidate has spent
     # (#139). Durable in the primary-checkout sidecar, so it survives restart by
     # construction — the in-memory reroute counters cannot, which is why the
-    # policy forbids reusing them here.
+    # policy forbids reusing them here. One counter for the candidate, not one
+    # per contract: see REVALIDATION_ALLOWANCE for why those coincide today and
+    # what has to change when they stop.
     revalidation_budget_used: int = 0
 
     def __post_init__(self) -> None:
@@ -157,19 +178,36 @@ class Attempt:
             )
 
     @property
+    def publication_evaluations(self) -> tuple[ValidationVerdictReceipt, ...]:
+        """Every evaluation the *publication* contract produced, oldest first.
+
+        The history holds whatever contract actually ran, so a reader that
+        wants publication has to select rather than count or index: the quick
+        gate runs again after every completion and appends beside the
+        publication entries. Selecting here, once, is what lets callers ask
+        "did publication decide anything new" without either re-deriving the
+        predicate or reaching into
+        :attr:`completed_evaluations` and mistaking someone else's receipt for
+        their own.
+        """
+        return tuple(
+            receipt
+            for receipt in self.completed_evaluations
+            if receipt.from_publication_contract
+        )
+
+    @property
     def latest_publication_evaluation(self) -> ValidationVerdictReceipt | None:
         """The most recent evaluation produced by the *publication* contract.
 
-        Newest-first over the history rather than "the last entry": the history
-        holds whatever contract actually ran, and an ``agent_gate`` or
-        ``quick_gate`` receipt appended after a publication one says nothing
-        about publication. ``None`` means no publication gate has reported on
-        this candidate — never-run, which is not a failure and not a pass.
+        The last *publication* entry rather than the last entry: an
+        ``agent_gate`` or ``quick_gate`` receipt appended after a publication
+        one says nothing about publication. ``None`` means no publication gate
+        has reported on this candidate — never-run, which is not a failure and
+        not a pass.
         """
-        for receipt in reversed(self.completed_evaluations):
-            if receipt.from_publication_contract:
-                return receipt
-        return None
+        evaluations = self.publication_evaluations
+        return evaluations[-1] if evaluations else None
 
     @property
     def publication_validation_passed(self) -> bool:

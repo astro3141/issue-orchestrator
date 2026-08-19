@@ -47,6 +47,7 @@ from .bootstrap_completion import (
     build_completion_handler_factory,
     create_completion_components,
 )
+from .bootstrap_revalidation import build_publication_revalidation
 from ..infra.config import Config
 from ..infra.env import ENV_PREFIX
 from ..adapters.github.repo import get_repo_from_git, GitRepoError
@@ -867,22 +868,16 @@ def build_orchestrator(
         agent_callback_endpoint=agent_callback_endpoint,
         session_launcher_factory=session_launcher_factory,
         completion_handler_factory=completion_handler_factory,
-        operator_issue_command_factory=build_operator_issue_command_factory(
-            config,
-            repository_host=github,
-            label_manager=label_manager,
-            needs_human_block=pending_work.needs_human_block,
-            fresh_issue_reader=fresh_issue_reader,
-            queue_cache_store=queue_cache_store,
-        ),
-        board_snapshot_builder=create_board_snapshot_builder(
-            config, timeline_store, tech_lead_board_publisher, working_copy
-        ),
+        operator_issue_command_factory=build_operator_issue_command_factory(config, repository_host=github, label_manager=label_manager, needs_human_block=pending_work.needs_human_block, fresh_issue_reader=fresh_issue_reader, queue_cache_store=queue_cache_store),
+        board_snapshot_builder=create_board_snapshot_builder(config, timeline_store, tech_lead_board_publisher, working_copy),
         claim_manager=claim_manager,
         claim_gate=claim_gate,
         lease_renewer=lease_renewer,
         run_ownership=run_ownership,
         publish_recovery=publish_recovery,
+        # Assembled at the root (#139 §6): a factory the root never calls is
+        # unreachable production code, however carefully it is assembled.
+        publication_revalidation=build_publication_revalidation(config, attempt_store=attempt_store, session_output=session_output, command_runner=command_runner, working_copy=working_copy),
         services=infra_services,
     )
 
@@ -1298,22 +1293,16 @@ def build_orchestrator_for_testing(
         agent_callback_endpoint=agent_callback_endpoint,
         session_launcher_factory=session_launcher_factory,
         completion_handler_factory=completion_handler_factory,
-        operator_issue_command_factory=build_operator_issue_command_factory(
-            config,
-            repository_host=github,
-            label_manager=label_manager,
-            needs_human_block=pending_work.needs_human_block,
-            fresh_issue_reader=fresh_issue_reader,
-            queue_cache_store=queue_cache_store,
-        ),
-        board_snapshot_builder=create_board_snapshot_builder(
-            config, timeline_store, tech_lead_board_publisher_for_testing, working_copy
-        ),
+        operator_issue_command_factory=build_operator_issue_command_factory(config, repository_host=github, label_manager=label_manager, needs_human_block=pending_work.needs_human_block, fresh_issue_reader=fresh_issue_reader, queue_cache_store=queue_cache_store),
+        board_snapshot_builder=create_board_snapshot_builder(config, timeline_store, tech_lead_board_publisher_for_testing, working_copy),
         claim_manager=claim_manager,
         claim_gate=claim_gate,
         lease_renewer=lease_renewer,
         run_ownership=run_ownership,
         publish_recovery=publish_recovery,
+        # The same factory the production root calls: a testing root assembling
+        # its own could build a differently-shaped route (#25, one layer up).
+        publication_revalidation=build_publication_revalidation(config, attempt_store=attempt_store, session_output=session_output, command_runner=command_runner, working_copy=working_copy),
         services=infra_services,
     )
 

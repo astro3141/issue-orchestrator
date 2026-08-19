@@ -504,6 +504,59 @@ class TestFailureAndTimeoutAreDistinguishable:
         )
 
 
+class TestReuseIsNotASecondCompletedEvaluation:
+    """The history states what *executed*, and a cache hit executed nothing (#139).
+
+    Under the single-slot shape this was an idempotent overwrite, so nothing
+    depended on the distinction. Under an append-only history it decides
+    whether a republish, a reprocessed completion or a retried tick makes the
+    record claim the publish contract ran twice on a candidate it ran on once.
+    """
+
+    def test_a_reused_publish_verdict_appends_no_second_receipt(
+        self, repo_root: Path, worktree: Path
+    ) -> None:
+        runner = StubCommandRunner()
+        gate = _gate(repo_root=repo_root, runner=runner)
+
+        first = gate.check(
+            worktree=worktree, run_assets=_run(worktree), issue_key=ISSUE
+        )
+        second = gate.check(
+            worktree=worktree, run_assets=_run(worktree), issue_key=ISSUE
+        )
+
+        assert first.cache_hit is False
+        assert second.cache_hit is True
+        # The command really did not run a second time: the second receipt, if
+        # one were appended, would describe an execution that never happened.
+        assert runner.commands == [PUBLISH_SENTINEL]
+        assert second.allowed is True
+        attempt = _read(repo_root)
+        assert attempt is not None
+        assert len(attempt.publication_evaluations) == 1
+        assert attempt.publication_validation_passed is True
+
+    def test_the_rule_matches_the_other_writer_of_the_same_history(self) -> None:
+        """Both writers of the history answer "was this reached?" explicitly.
+
+        The attempt-scoped path already refused to append on reuse. A publish
+        path that quietly appended anyway would be the same rule enforced
+        differently by path — the drift ``CandidateEvaluations.file`` documents
+        as the thing not to do.
+        """
+        import inspect
+
+        from issue_orchestrator.control.candidate_evaluations import (
+            CandidateEvaluations,
+        )
+
+        for method in (PublicationVerdictReceipts.record, CandidateEvaluations.file):
+            completed = inspect.signature(method).parameters["completed"]
+            assert completed.kind is inspect.Parameter.KEYWORD_ONLY
+            assert completed.default is inspect.Parameter.empty
+
+
 class TestRemovingTheBindingBreaksThesePins:
     """Proof 9: each binding is load-bearing, shown by removing it.
 
@@ -519,7 +572,7 @@ class TestRemovingTheBindingBreaksThesePins:
         monkeypatch.setattr(
             PublicationGate,
             "_record_verdict",
-            lambda self, record, issue_key: None,
+            lambda self, record, issue_key, *, completed: None,
         )
 
         _gate(repo_root=repo_root, runner=StubCommandRunner()).check(
