@@ -1,4 +1,11 @@
-"""Owner for recording cleanup facts at the completion handoff."""
+"""Owner for the cleanup-fact queues a session completion writes.
+
+Recording is one half: the completion handoff files the cleanup a finished
+session earned. Consumption is the other: once that cleanup has actually been
+carried out, the fact must leave the queue or it is replanned forever. Both
+halves mutate the same two collections, so they share one owner rather than
+letting callers reach into ``state.pending_cleanups`` / ``state.immediate_cleanups``.
+"""
 
 from collections.abc import MutableSequence
 
@@ -13,7 +20,7 @@ from .completion_handler import CleanupDecision, CleanupDisposition
 
 
 class CompletionCleanupStateOwner:
-    """Own cleanup-queue mutation for one completion handoff."""
+    """Own cleanup-queue mutation for the facts a completion produces."""
 
     def __init__(self, state: OrchestratorState) -> None:
         self._pending: MutableSequence[PendingCleanup] = state.pending_cleanups
@@ -43,6 +50,27 @@ class CompletionCleanupStateOwner:
             return
 
         raise ValueError(f"Unhandled cleanup disposition: {decision.disposition!r}")
+
+    def discard_immediate(self, issue_number: int, worktree_path: str) -> None:
+        """Drop the immediate cleanup whose disposal has already been carried out.
+
+        Ordinary planning ticks consume these facts wholesale at end of tick
+        (see ``tech_lead_artifact_retention.clear_discovered_facts``), but a
+        paused tick clears nothing — it consumes exactly what it disposed, or
+        the same disposal would be re-attempted every tick and would reappear
+        as a duplicate the moment the engine resumed (#167).
+        """
+        remaining = [
+            cleanup
+            for cleanup in self._immediate
+            if not (
+                cleanup.issue_number == issue_number
+                and cleanup.worktree_path == worktree_path
+            )
+        ]
+        # In place: the collection is shared live state, and other owners hold
+        # references to the same list.
+        self._immediate[:] = remaining
 
     def _record_immediate(
         self,

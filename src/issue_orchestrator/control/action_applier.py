@@ -37,7 +37,7 @@ from ..ports.label_set import LabelSet
 from ..ports.fresh_issue_reader import FreshIssueReader
 from ..ports.repository_host import RepositoryHost
 from ..ports.worktree_manager import WorktreeManager
-from ..domain.models import RETROSPECTIVE_REVIEW_TERMINAL_PREFIX, Session
+from ..domain.models import Session
 
 if TYPE_CHECKING:
     from .background_job_supervisor import BackgroundJobSupervisor
@@ -75,6 +75,7 @@ from .review_exchange_lifecycle import (
     cancel_issue_review_exchange,
     terminate_issue_runtime,
 )
+from .terminal_disposal import SessionDisposal
 from .close_on_merge import run_close_on_merge_fallback
 from .actions import (
     Action,
@@ -1570,121 +1571,36 @@ class ActionApplier:
             ops=self.tech_lead_ops,
         )
 
+    @property
+    def _disposal(self) -> SessionDisposal:
+        """The owner that carries out one finished session's disposal.
+
+        Built per call rather than at construction: the runtime owners it needs
+        (``pair_registry``, ``on_worktree_removed``) are wired onto this applier
+        post-construction by the composition root, and a disposal must act on
+        whatever is wired NOW, not on whatever was wired first.
+        """
+        return SessionDisposal(
+            sessions=self.sessions,
+            events=self.events,
+            worktree_manager=self.worktree_manager,
+            pair_registry=self.pair_registry,
+            job_supervisor=self.background_job_supervisor,
+            on_worktree_removed=self.on_worktree_removed,
+        )
+
+    def dispose_terminal_session(self, action: CleanupSessionAction) -> ActionResult:
+        """Terminal disposal for a PAUSED engine — the one action it may run (#167).
+
+        Typed to the cleanup action rather than to ``Action``: the paused pass
+        can hand this nothing else.
+        """
+        return self._disposal.while_paused(action)
+
     def _apply_cleanup_session(self, action: Action) -> ActionResult:
         """Clean up a completed session."""
         assert isinstance(action, CleanupSessionAction)
-
-        errors = []
-        cancellation = self._cancel_review_exchange_for_cleanup(action)
-        self._cleanup_terminal_session(action, errors)
-        self._cleanup_worktree(action, errors)
-
-        self.events.publish(make_trace_event(EventName.CLEANUP_COMPLETED, {"issue_number": action.issue_number, "pr_number": action.pr_number}))
-
-        details = {
-            "issue_number": action.issue_number,
-            "pr_number": action.pr_number,
-            "review_exchange_lifecycle_checked": cancellation is not None,
-            "cancelled_review_exchange_jobs": list(cancellation.cancelled_job_ids)
-            if cancellation is not None
-            else [],
-        }
-        if errors:
-            return ActionResult.fail(action, "; ".join(errors), **details)
-
-        return ActionResult.ok(action, **details)
-
-    def _cancel_review_exchange_for_cleanup(
-        self,
-        action: "CleanupSessionAction",
-    ) -> "ReviewExchangeCancellation | None":
-        ref = self._cleanup_review_exchange_session_ref(action)
-        return self._cancel_review_exchange_for_session_ref(
-            ref,
-            reason="session-cleanup",
-        )
-
-    def _cleanup_review_exchange_session_ref(
-        self,
-        action: "CleanupSessionAction",
-    ) -> SessionRef:
-        if action.terminal_id:
-            return SessionRef(
-                session_type=self._determine_session_type(action.terminal_id),
-                number=action.issue_number,
-            )
-        logger.warning(
-            "[APPLIER] CleanupSessionAction missing terminal_id; assuming "
-            "issue session for review-exchange cleanup issue=%s pr=%s worktree=%s",
-            action.issue_number,
-            action.pr_number,
-            action.worktree_path or "(none)",
-        )
-        return SessionRef(session_type=SessionType.ISSUE, number=action.issue_number)
-
-    def _cleanup_terminal_session(self, action: "CleanupSessionAction", errors: list[str]) -> None:
-        """Close terminal session if configured."""
-        if not (action.close_tabs and action.terminal_id):
-            return
-
-        try:
-            session_type = self._determine_session_type(action.terminal_id)
-            ref = SessionRef(session_type=session_type, number=action.issue_number)
-            if self.sessions.exists(ref):
-                self.sessions.stop(ref)
-                logger.info(issue_log(action.issue_number, "Closed terminal session"))
-        except Exception as e:
-            errors.append(f"close session: {e}")
-            logger.warning(issue_log(action.issue_number, "Failed to close session: %s"), e)
-
-    def _determine_session_type(self, session_name: str) -> SessionType:
-        """Determine session type from session name."""
-        if session_name.startswith(RETROSPECTIVE_REVIEW_TERMINAL_PREFIX):
-            return SessionType.RETROSPECTIVE_REVIEW
-        if session_name.startswith("review-"):
-            return SessionType.REVIEW
-        if session_name.startswith("rework-"):
-            return SessionType.REWORK
-        if session_name.startswith("tech-lead-"):
-            return SessionType.TECH_LEAD
-        return SessionType.ISSUE
-
-    def _cleanup_worktree(self, action: "CleanupSessionAction", errors: list[str]) -> None:
-        """Remove worktree if configured."""
-        if not (action.remove_worktrees and action.worktree_path):
-            return
-
-        if not self.worktree_manager:
-            errors.append("no worktree_manager configured")
-            return
-
-        try:
-            # Force removal ONLY for a disposable scratch worktree: it holds
-            # throwaway agent artifacts, so a leftover untracked file must not
-            # make ``git worktree remove`` fail (exit 128) and leak it. A normal
-            # coding worktree stays non-forced so user work is never discarded
-            # (#6824 F8).
-            remove_worktree = self.worktree_manager.remove_checkout
-            if action.disposable_worktree:
-                remove_worktree = self.worktree_manager.remove_checkout_and_branch
-            remove_worktree(Path(action.worktree_path), force=action.disposable_worktree)
-            logger.info(issue_log(action.issue_number, "Removed worktree: %s"), action.worktree_path)
-        except Exception as e:
-            errors.append(f"remove worktree: {e}")
-            logger.warning(issue_log(action.issue_number, "Failed to remove worktree: %s"), e)
-            return
-        # Removal SUCCEEDED (or the path was already gone). The "worktree is gone"
-        # notification is a distinct concern: a callback failure must NOT re-fail
-        # an already-completed removal, or the disposable cleanup would be retained
-        # and retried forever against a now-absent path (#6824 R3).
-        if self.on_worktree_removed:
-            try:
-                self.on_worktree_removed(action.worktree_path)
-            except Exception as e:
-                logger.warning(
-                    issue_log(action.issue_number, "worktree-removed callback failed (worktree already gone): %s"),
-                    e,
-                )
+        return self._disposal.apply(action)
 
     def _apply_remove_worktree(self, action: Action) -> ActionResult:
         """Remove a git worktree."""

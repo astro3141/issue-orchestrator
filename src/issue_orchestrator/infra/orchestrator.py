@@ -11,6 +11,7 @@ if TYPE_CHECKING:
     from ..control.planner_types import OrchestratorSnapshot, Plan
     from ..control.session_manager import SessionRef, SessionType
     from ..control.tech_lead_trigger import TechLeadTerminationOutcome
+    from ..control.terminal_disposal import PausedDisposal
     from ..domain.tech_lead_session import TechLeadLaunchScope
     from ..ports.operator_issue_commands import OperatorIssueCommands
     from ..ports.session_runner import DiscoveredSession
@@ -464,6 +465,7 @@ class Orchestrator:
                 self._process_active_sessions,
                 self._check_health,
                 self._run_planning_cycle,
+                self._dispose_terminal_sessions_while_paused,
                 self._emit_heartbeat_if_needed,
             )
         # Check if we should auto-trigger E2E tests
@@ -797,6 +799,9 @@ class Orchestrator:
         if (applier := self.deps.action_applier) and applier.expedite_lane:
             applier.expedite_lane.promote_ungated()
         self._last_network_sync, _ = _run_planning_cycle_impl(self.config, self.deps.events, self._event_context, self.state, self.deps.fact_gatherer, self.deps.planner, self.deps.repository_host, self.scheduler, self._github_workflow, self._apply_plan, self._clear_discovered_facts, self._last_network_sync, refresh_to_process, self._inflight_stable_ids, self._issue_fetch_resilience, self._control_continuation, self.observer, self.deps.claim_manager, queue_cache_store=self.deps.queue_cache_store, io_claimed_label=self.deps.label_manager.io_claimed, open_issue_corpus=self.deps.open_issue_corpus, provider_launch_sampler=self.deps.services.provider_launch_sampler)
+
+    def _dispose_terminal_sessions_while_paused(self) -> "PausedDisposal":
+        return self._plan_applier.dispose_terminal_sessions_while_paused()
 
     def _clear_discovered_facts(self, tick: "OrchestratorSnapshot") -> None: self._plan_applier.clear_discovered_facts(tick)
     def _emit_heartbeat_if_needed(self) -> None: self._plan_applier.emit_heartbeat_if_needed()

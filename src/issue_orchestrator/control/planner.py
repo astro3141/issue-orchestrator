@@ -90,6 +90,7 @@ from .worker_budget import (
 from .reactive_tech_lead_planning import plan_tech_lead_launch_queue
 from .reconciliation import build_expected_for_mutation
 from .stuck_sweep import build_stuck_sweep_escalation_actions
+from .terminal_disposal import immediate_disposal_actions
 from .planner_types import OrchestratorSnapshot, Plan, PlanContext, SkippedItem
 from .tech_lead_issue_policy import (
     plan_batch_review_issue,
@@ -1046,37 +1047,14 @@ class Planner:
                 logger.info("Planner: deferred cleanup for issue #%d (PR #%d reviewed)",
                            issue_number, pr_number)
 
-        # 2. Immediate cleanups - ready to execute now, EXCEPT run assets that
-        # pending/active tech_lead work still references (#6771, #6780):
-        # cleaning those up before the investigation or health review
-        # launches deletes the artifact hints it was queued to read. The hold
-        # set comes from the tech-lead-problem-artifact owner in the fact
-        # gatherer, which is also what retains these entries across the
-        # end-of-tick fact clear; they are re-planned once the hold releases.
-        for cleanup in facts.immediate_cleanups:
-            if cleanup.issue_number in facts.held_issue_numbers:
-                logger.info(
-                    "Planner: holding cleanup for issue #%d — pending or active "
-                    "tech_lead work still references its run assets",
-                    cleanup.issue_number,
-                )
-                continue
-            actions.append(CleanupSessionAction(
-                issue_number=cleanup.issue_number,
-                pr_number=0,  # No PR for immediate cleanups
-                terminal_id=cleanup.terminal_id,
-                worktree_path=cleanup.worktree_path,
-                close_tabs=facts.close_tabs,
-                # A disposable tech-lead-investigation scratch worktree is always
-                # removed, even when the config keeps worktrees (#6823).
-                remove_worktrees=facts.remove_worktrees or cleanup.scratch_worktree,
-                # Carry disposable identity so the applier force-removes ONLY the
-                # scratch worktree (leftover artifacts must not leak it) (#6824 F8).
-                disposable_worktree=cleanup.scratch_worktree,
-                reason=f"session {cleanup.reason}",
-            ))
+        # 2. Immediate cleanups - the terminal disposal a finished session has
+        # already earned. Owned by terminal_disposal so a paused tick, where
+        # this planner does not run at all, disposes on exactly the same terms
+        # (#167).
+        for action in immediate_disposal_actions(facts):
+            actions.append(action)
             logger.info("Planner: immediate cleanup for issue #%d (%s)",
-                       cleanup.issue_number, cleanup.reason)
+                       action.issue_number, action.reason)
 
         return actions
 
