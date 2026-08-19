@@ -52,7 +52,9 @@ def _facts(
     review_verdict: ReviewVerdictOutcome | None = None,
     board_shows_pr_pending: bool = False,
     settlement: ContinuationSettlement | None = None,
+    continuation_run_allowance_available: bool = True,
     engine_is_executing: bool = False,
+    engine_holds_open_run: bool = False,
 ) -> ContinuationFacts:
     return ContinuationFacts(
         descriptor=(
@@ -66,7 +68,9 @@ def _facts(
         review_verdict=review_verdict,
         board_shows_pr_pending=board_shows_pr_pending,
         settlement=settlement,
+        continuation_run_allowance_available=continuation_run_allowance_available,
         engine_is_executing=engine_is_executing,
+        engine_holds_open_run=engine_holds_open_run,
     )
 
 
@@ -317,3 +321,107 @@ class TestExecutionOutranksEveryDurableFact:
         )
 
         assert phase is ContinuationPhase.EXECUTING
+
+
+class TestTheContinuationsOwnRunAllowance:
+    """The re-entry re-runs the most expensive thing here; it needs a bound (F4).
+
+    A terminal run that discharged nothing leaves every durable fact as it found
+    them, so the same phase is derived again and another reviewer/coder pair is
+    spawned. The exchange's own no-progress budget cannot catch it: that budget
+    lives in the worktree each closed run removes.
+    """
+
+    def test_a_pass_with_no_allowance_left_returns_to_ordinary_rework(self) -> None:
+        phase = derive_continuation_phase(
+            _facts(
+                latest_publication_passed=True,
+                continuation_run_allowance_available=False,
+            )
+        )
+
+        assert phase is ContinuationPhase.RUNS_EXHAUSTED
+        assert phase.live is False
+
+    def test_an_approval_with_no_allowance_left_returns_to_ordinary_rework(
+        self,
+    ) -> None:
+        phase = derive_continuation_phase(
+            _facts(
+                latest_publication_passed=True,
+                review_verdict=ReviewVerdictOutcome.APPROVED,
+                continuation_run_allowance_available=False,
+            )
+        )
+
+        assert phase is ContinuationPhase.RUNS_EXHAUSTED
+
+    @pytest.mark.parametrize(
+        "overrides",
+        [
+            {"latest_publication_passed": True},
+            {
+                "latest_publication_passed": True,
+                "review_verdict": ReviewVerdictOutcome.APPROVED,
+            },
+        ],
+    )
+    def test_a_run_this_engine_already_holds_is_not_a_new_run(
+        self, overrides: dict
+    ) -> None:
+        """The allowance is spent when a run OPENS, so mid-run it reads spent.
+
+        Dropping the operation there would release the lease under a deferred
+        exchange and sweep away the worktree it is working in.
+        """
+        phase = derive_continuation_phase(
+            _facts(
+                continuation_run_allowance_available=False,
+                engine_holds_open_run=True,
+                **overrides,
+            )
+        )
+
+        assert phase.live is True
+        assert phase is not ContinuationPhase.RUNS_EXHAUSTED
+
+    def test_the_same_facts_without_the_run_are_exhausted(self) -> None:
+        """A crash leaves the allowance spent and the engine holding nothing."""
+        phase = derive_continuation_phase(
+            _facts(
+                latest_publication_passed=True,
+                continuation_run_allowance_available=False,
+                engine_holds_open_run=False,
+            )
+        )
+
+        assert phase is ContinuationPhase.RUNS_EXHAUSTED
+
+    def test_a_settled_continuation_is_never_re_derived_as_exhausted(self) -> None:
+        """Settlement outranks it: the intent WAS discharged."""
+        phase = derive_continuation_phase(
+            _facts(
+                latest_publication_passed=True,
+                continuation_run_allowance_available=False,
+                settlement=_settlement(
+                    ContinuationSettlementKind.PULL_REQUEST_OPENED,
+                    pr_url="https://example.test/pr/1",
+                ),
+            )
+        )
+
+        assert phase is ContinuationPhase.SETTLED_PR
+
+    def test_the_retry_half_is_bounded_by_its_own_allowance_not_this_one(
+        self,
+    ) -> None:
+        """#139 materialises its own checkout; this allowance is not its bound."""
+        phase = derive_continuation_phase(
+            _facts(
+                latest_publication_passed=False,
+                revalidation_allowance_available=True,
+                continuation_run_allowance_available=False,
+            )
+        )
+
+        assert phase is ContinuationPhase.RETRY_PENDING

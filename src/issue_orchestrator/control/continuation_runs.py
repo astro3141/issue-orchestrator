@@ -100,6 +100,17 @@ class ContinuationRuns:
         with self._lock:
             return self._open.get(key)
 
+    def holds(self, key: "ControlOperationKey") -> bool:
+        """Whether this engine is carrying an already-open run for ``key``.
+
+        Asked by liveness derivation, which needs to tell "the continuation's
+        run allowance is spent and the run that spent it is still going" from
+        "it is spent and nothing came of it". The first must stay live; the
+        second must return the candidate to ordinary rework.
+        """
+        with self._lock:
+            return key in self._open
+
     def opened(self, key: "ControlOperationKey", run: ContinuationRun) -> None:
         """Record ``run`` as the run ``key`` now has open."""
         with self._lock:
@@ -136,6 +147,24 @@ class ContinuationRuns:
         could not tell what is live" is not "nothing is live", and closing on
         the strength of a broken instrument would delete the runs of every
         operation still going.
+
+        **This can delete a worktree a review exchange is still working in.**
+        The window is narrow — a newer candidate must file its own intent, which
+        supersedes this one's, on an issue whose lane this very operation is
+        excluding from ordinary work — but it is real, because the continuation
+        releases its in-flight claim between passes by design and so
+        ``EXECUTING`` does not cover a deferred exchange. It is accepted rather
+        than closed: the operation is superseded, so its exchange is working on
+        a candidate the issue no longer offers, and the alternative is a
+        checkout no code path will ever dispose of. The exchange thread fails
+        when its directory disappears, which is a loud end to obsolete work
+        rather than a silent one.
+
+        A removal that fails is caught PER KEY. This runs on the tick thread,
+        inside ``advance``, ahead of every ``_start`` for the reconciliation: one
+        undisposable checkout must not abort the sweep or stop other operations
+        from being advanced, and there is nothing the tick could do about it
+        anyway. The entry is already forgotten, so the failure cannot repeat.
         """
         with self._lock:
             dropped = [key for key in self._open if key not in live]
@@ -144,7 +173,14 @@ class ContinuationRuns:
                 "[CONTINUATION] %s is no longer live; closing the run it held",
                 key,
             )
-            self.close(key)
+            try:
+                self.close(key)
+            except Exception as exc:
+                logger.warning(
+                    "[CONTINUATION] the run held for %s could not be closed: %s",
+                    key,
+                    exc,
+                )
 
 
 __all__ = ["ContinuationRun", "ContinuationRuns"]

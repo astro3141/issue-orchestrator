@@ -327,12 +327,18 @@ class Orchestrator:
         # above is: it is what this engine is executing, so it must live exactly
         # as long as the engine, and two instances would agree about nothing.
         in_flight = ContinuationsInFlight()
+        # Engine-lifetime for the same reason: a run stays open across passes
+        # while the completion pipeline reports it unfinished, so a container
+        # rebuilt per call would forget every open run — deriving "the allowance
+        # is spent and nothing came of it" while an exchange was still running.
+        runs = ContinuationRuns(self.deps.worktree_manager)
         return ControlContinuation(
             ownership,
             ContinuationLiveTruth(
                 self.deps.attempt_store,
                 pr_pending_label=self.deps.label_manager.pr_pending,
                 in_flight=in_flight,
+                runs=runs,
             ),
             ControlContinuationRunner(
                 state=self.state,
@@ -349,11 +355,7 @@ class Orchestrator:
                     pr_pending_label=self.deps.label_manager.pr_pending,
                 ),
                 in_flight=in_flight,
-                # Also engine-lifetime: a run stays open across passes while
-                # the completion pipeline reports it unfinished, so a container
-                # rebuilt per call would forget every open run and mint a
-                # second one for work already in flight.
-                runs=ContinuationRuns(self.deps.worktree_manager),
+                runs=runs,
                 jobs=self.deps.services.background_job_supervisor
                 or NullBackgroundJobRunner(),
                 repo_root=self.config.repo_root,

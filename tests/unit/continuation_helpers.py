@@ -17,6 +17,7 @@ real reconciliation path.
 from __future__ import annotations
 
 from issue_orchestrator.control.continuation_in_flight import ContinuationsInFlight
+from issue_orchestrator.control.continuation_runs import ContinuationRuns
 from issue_orchestrator.control.continuation_live_truth import ContinuationLiveTruth
 from issue_orchestrator.control.continuation_scheduling import ControlContinuation
 from issue_orchestrator.control.control_operation_ownership import (
@@ -117,6 +118,18 @@ class NoAttempts:
         return 0
 
 
+class NoWorktrees:
+    """A worktree manager for a composition that never opens a run.
+
+    Nothing here derives a live operation, so no run is ever opened and none can
+    be closed. Refusing rather than passing keeps it that way: a suite that
+    started materialising checkouts through the inert stack would say so.
+    """
+
+    def remove_checkout(self, worktree_path: object, *, force: bool = False) -> None:
+        raise AssertionError("this suite must not close continuation runs")
+
+
 class NoContinuationRunner:
     """A runner with nothing to advance, because nothing is ever live here."""
 
@@ -137,6 +150,7 @@ def inert_control_continuation(
             NoAttempts(),  # type: ignore[arg-type]
             pr_pending_label=PR_PENDING_LABEL,
             in_flight=ContinuationsInFlight(),
+            runs=ContinuationRuns(NoWorktrees()),  # type: ignore[arg-type]
         ),
         NoContinuationRunner(),  # type: ignore[arg-type]
     )
@@ -156,5 +170,6 @@ __all__ = [
     "InMemoryControlOperationOwnershipStore",
     "NoAttempts",
     "NoContinuationRunner",
+    "NoWorktrees",
     "inert_control_continuation",
 ]

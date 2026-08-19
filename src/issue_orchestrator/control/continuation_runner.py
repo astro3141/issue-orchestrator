@@ -350,12 +350,20 @@ class ControlContinuationRunner:
         moment the checkout exists there is exactly one place that knows about
         it and exactly one place that will dispose of it.
 
+        The allowance is spent FIRST, before the checkout and long before the
+        exchange, in the start-budget style #139 chose and for the reason it
+        gives: a run interrupted anywhere leaves the allowance spent rather than
+        refunding itself. Refunding would make the bound mean "one per crash",
+        and this is the bound on the most expensive work in the system.
+
         The run scaffold freezes the profile *the descriptor recorded*, for the
         reason #139's does: a candidate evaluated under one contract is
         continued under that contract, whatever the current default is bound to
         today. The publication gate therefore reuses the passing record for this
         exact HEAD/command/profile instead of re-running it.
         """
+        if not self._reserve_run(operation):
+            return None
         materialized = self._materialize(operation)
         if materialized is None:
             return None
@@ -386,6 +394,41 @@ class ControlContinuationRunner:
         )
         self._runs.opened(operation.key, run)
         return run
+
+    def _reserve_run(self, operation: LiveContinuation) -> bool:
+        """Spend one of this candidate's continuation-run allowances.
+
+        The ceiling itself belongs to :class:`~..domain.attempt.Attempt`, which
+        re-asserts it on the write — so this neither reads the counter nor
+        compares it, exactly as the retry path leaves admission to #139. A
+        refusal here means the phase predicate and the durable record disagreed
+        about the allowance, which is the interleaving the store settles.
+
+        Returns:
+            Whether a run may now be opened. ``False`` is a refusal to start,
+            never a degraded start: the next reconciliation derives
+            ``RUNS_EXHAUSTED`` from the same counter and hands the candidate
+            back to ordinary rework.
+        """
+        try:
+            reserved = self._attempts.update(
+                operation.attempt.key,
+                lambda attempt: attempt.with_continuation_run_reserved(),
+            )
+        except (OSError, ValueError) as exc:
+            logger.warning(
+                "[CONTINUATION] %s opens no run: allowance could not be"
+                " reserved: %s",
+                operation.key,
+                exc,
+            )
+            return False
+        logger.info(
+            "[CONTINUATION] %s reserved continuation run %d",
+            operation.key,
+            reserved.continuation_runs_used,
+        )
+        return True
 
     def _materialize(self, operation: LiveContinuation) -> tuple[Path, str] | None:
         """A disposable worktree standing at exactly this candidate's commit.

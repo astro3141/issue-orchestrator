@@ -4,7 +4,11 @@ from dataclasses import FrozenInstanceError
 
 import pytest
 
-from issue_orchestrator.domain.attempt import Attempt, AttemptKey
+from issue_orchestrator.domain.attempt import (
+    CONTINUATION_RUN_ALLOWANCE,
+    Attempt,
+    AttemptKey,
+)
 from issue_orchestrator.domain.continuation_settlement import (
     ContinuationSettlement,
     ContinuationSettlementKind,
@@ -279,3 +283,38 @@ def test_retiring_the_recorded_intent_keeps_the_settlement() -> None:
     assert attempt.without_continuation_descriptor().continuation_settlement == (
         settlement
     )
+
+
+def test_the_continuation_run_allowance_is_bounded_and_durable() -> None:
+    attempt = Attempt(key=AttemptKey(GitHubIssueKey("owner/repo", "149"), SHA))
+    assert attempt.continuation_run_allowance_available is True
+
+    spent = attempt
+    for _ in range(CONTINUATION_RUN_ALLOWANCE):
+        spent = spent.with_continuation_run_reserved()
+
+    assert spent.continuation_runs_used == CONTINUATION_RUN_ALLOWANCE
+    assert spent.continuation_run_allowance_available is False
+    assert (
+        Attempt.from_dict(spent.to_dict()).continuation_runs_used
+        == CONTINUATION_RUN_ALLOWANCE
+    )
+    with pytest.raises(ValueError, match="allowance is already spent"):
+        spent.with_continuation_run_reserved()
+
+
+def test_a_sidecar_written_before_the_run_allowance_existed_reads_as_unspent() -> None:
+    payload = Attempt(
+        key=AttemptKey(GitHubIssueKey("owner/repo", "149"), SHA)
+    ).to_dict()
+    del payload["continuation_runs_used"]
+
+    assert Attempt.from_dict(payload).continuation_runs_used == 0
+
+
+def test_attempt_rejects_a_negative_continuation_run_count() -> None:
+    with pytest.raises(ValueError, match="continuation_runs_used"):
+        Attempt(
+            key=AttemptKey(GitHubIssueKey("owner/repo", "149"), SHA),
+            continuation_runs_used=-1,
+        )

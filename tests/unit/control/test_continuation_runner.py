@@ -32,7 +32,11 @@ from issue_orchestrator.control.continuation_live_truth import (
 )
 from issue_orchestrator.control.continuation_runner import ControlContinuationRunner
 from issue_orchestrator.control.publication_revalidation import RevalidationOutcome
-from issue_orchestrator.domain.attempt import Attempt, AttemptKey
+from issue_orchestrator.domain.attempt import (
+    CONTINUATION_RUN_ALLOWANCE,
+    Attempt,
+    AttemptKey,
+)
 from issue_orchestrator.domain.continuation_descriptor import ContinuationDescriptor
 from issue_orchestrator.domain.continuation_phase import ContinuationPhase
 from issue_orchestrator.domain.continuation_settlement import (
@@ -1156,3 +1160,99 @@ class TestTheRunOutlivesThePass:
         )
 
         assert harness.worktrees.removed == []
+
+
+class TestTheRunAllowanceBoundsTheRetry:
+    """A terminal run that discharged nothing must not retry forever (F4)."""
+
+    def _fruitless(self, harness: Harness) -> Attempt:
+        """A terminal result carrying no pull request for a CREATE_PR intent."""
+        attempt = _attempt(RequestedAction.CREATE_PR)
+        harness.attempts.update(attempt.key, lambda _current: attempt)
+        harness.completion.outcome = ProcessingOutcome(success=False, pr_url=None)
+        return attempt
+
+    def test_opening_a_run_spends_one_allowance(self, harness: Harness) -> None:
+        attempt = self._fruitless(harness)
+
+        harness.runner.advance(
+            _owned(_operation(attempt, ContinuationPhase.PASS_PENDING_REVIEW))
+        )
+
+        stored = harness.attempts.for_key(attempt.key)
+        assert stored is not None
+        assert stored.continuation_runs_used == 1
+
+    def test_the_allowance_is_spent_per_run_not_per_pass(
+        self, harness: Harness
+    ) -> None:
+        """A deferred exchange re-enters every reconciliation; that is one attempt."""
+        attempt = _attempt(RequestedAction.CREATE_PR)
+        harness.attempts.update(attempt.key, lambda _current: attempt)
+        harness.completion.outcome = ProcessingOutcome(review_exchange_deferred=True)
+        operation = _operation(attempt, ContinuationPhase.PASS_PENDING_REVIEW)
+
+        for _ in range(4):
+            harness.runner.advance(_owned(operation))
+
+        stored = harness.attempts.for_key(attempt.key)
+        assert stored is not None
+        assert stored.continuation_runs_used == 1
+        assert len(harness.completion.calls) == 4
+
+    def test_the_retry_stops_when_the_allowance_runs_out(
+        self, harness: Harness
+    ) -> None:
+        attempt = self._fruitless(harness)
+        operation = _operation(attempt, ContinuationPhase.PASS_PENDING_REVIEW)
+
+        for _ in range(CONTINUATION_RUN_ALLOWANCE + 2):
+            harness.runner.advance(_owned(operation))
+
+        assert len(harness.session_output.runs) == CONTINUATION_RUN_ALLOWANCE
+        assert len(harness.completion.calls) == CONTINUATION_RUN_ALLOWANCE
+
+    def test_a_refused_run_leaves_the_evidence_intact(self, harness: Harness) -> None:
+        """Exhaustion is a clean return to rework, not a loss of what was learned."""
+        attempt = self._fruitless(harness)
+        operation = _operation(attempt, ContinuationPhase.PASS_PENDING_REVIEW)
+
+        for _ in range(CONTINUATION_RUN_ALLOWANCE + 1):
+            harness.runner.advance(_owned(operation))
+
+        stored = harness.attempts.for_key(attempt.key)
+        assert stored is not None
+        assert stored.continuation_descriptor is not None
+        assert stored.publication_evaluations
+        assert stored.continuation_settlement is None
+
+    def test_the_allowance_is_spent_before_the_checkout_exists(
+        self, harness: Harness
+    ) -> None:
+        """A start budget: an interrupted run must not refund itself."""
+        attempt = self._fruitless(harness)
+        harness.worktrees.error = RuntimeError("worktree add failed")
+
+        harness.runner.advance(
+            _owned(_operation(attempt, ContinuationPhase.PASS_PENDING_REVIEW))
+        )
+
+        stored = harness.attempts.for_key(attempt.key)
+        assert stored is not None
+        assert stored.continuation_runs_used == 1
+        assert harness.completion.calls == []
+
+    def test_a_settled_run_never_reaches_the_bound(self, harness: Harness) -> None:
+        """The bound is on fruitless retries, not on the work succeeding."""
+        attempt = _attempt(RequestedAction.CREATE_PR)
+        harness.attempts.update(attempt.key, lambda _current: attempt)
+        harness.completion.outcome = ProcessingOutcome(pr_url=PR_URL)
+
+        harness.runner.advance(
+            _owned(_operation(attempt, ContinuationPhase.PASS_PENDING_REVIEW))
+        )
+
+        stored = harness.attempts.for_key(attempt.key)
+        assert stored is not None
+        assert stored.continuation_runs_used == 1
+        assert stored.continuation_settlement is not None

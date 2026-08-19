@@ -55,6 +55,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from ..ports.attempt_store import AttemptStore
     from ..ports.issue import Issue
     from .continuation_in_flight import ContinuationsInFlight
+    from .continuation_runs import ContinuationRuns
 
 logger = logging.getLogger(__name__)
 
@@ -149,14 +150,20 @@ class ContinuationLiveTruth:
         *,
         pr_pending_label: str,
         in_flight: "ContinuationsInFlight",
+        runs: "ContinuationRuns",
     ) -> None:
         self._attempts = attempts
         self._pr_pending_label = pr_pending_label
-        # Required rather than defaulted, and the SAME instance the runner
-        # claims into. A live truth given its own empty registry would derive
-        # correct-looking phases that release running operations, which is the
-        # bug this closes wearing the shape of a working composition.
+        # Both required rather than defaulted, and both the SAME instances the
+        # runner writes into. A live truth given its own empty registries would
+        # derive correct-looking phases that release running operations, which
+        # is the bug this closes wearing the shape of a working composition.
+        #
+        # Two collaborators and not one because they answer different questions
+        # over different lifetimes: a job in flight is one submission, while an
+        # open run spans as many passes as the completion pipeline needs.
         self._in_flight = in_flight
+        self._runs = runs
 
     def read(self, board: Sequence["Issue"]) -> ContinuationLiveReading:
         """Every live continuation across ``board``, or an unreadable answer.
@@ -193,6 +200,7 @@ class ContinuationLiveTruth:
                     attempt,
                     board_shows_pr_pending=board_shows_pr_pending,
                     engine_is_executing=self._in_flight.is_executing(key),
+                    engine_holds_open_run=self._runs.holds(key),
                 )
             )
             if not phase.live:
@@ -210,6 +218,7 @@ def _facts(
     *,
     board_shows_pr_pending: bool,
     engine_is_executing: bool,
+    engine_holds_open_run: bool,
 ) -> ContinuationFacts:
     """The durable facts one attempt states, reduced to the decision's shape."""
     latest = attempt.latest_publication_evaluation
@@ -233,7 +242,11 @@ def _facts(
         ),
         board_shows_pr_pending=board_shows_pr_pending,
         settlement=attempt.continuation_settlement,
+        continuation_run_allowance_available=(
+            attempt.continuation_run_allowance_available
+        ),
         engine_is_executing=engine_is_executing,
+        engine_holds_open_run=engine_holds_open_run,
     )
 
 

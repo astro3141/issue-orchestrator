@@ -82,6 +82,32 @@ per-contract counter rather than one allowance both contracts draw from; see
 """
 
 
+CONTINUATION_RUN_ALLOWANCE = 2
+"""How many runs one candidate's continuation may ever OPEN (#149).
+
+A bound in the shape :data:`REVALIDATION_ALLOWANCE` has, and for the reason
+#139 gives: the continuation's re-entry re-runs the most expensive thing in the
+system — a reviewer/coder exchange — and a terminal run that discharged nothing
+leaves every durable fact exactly as it found them. Without a bound the next
+reconciliation derives the same phase and opens another run, forever, holding
+the issue out of ordinary rework the whole time.
+
+The exchange has a no-progress budget of its own, and it cannot help here: it
+is read from the cache under ``<worktree>/.issue-orchestrator/sessions``, which
+goes with the checkout each closed run removes. Every retry therefore starts
+that budget afresh, which is precisely why the bound has to be durable and live
+beside the candidate rather than inside the run.
+
+Two, and the second is not slack. One run drives the exchange and creates the
+pull request. The second exists for the crash window the continuation is built
+around: a run that recorded ``APPROVED(A)`` and died before the pull request
+existed re-enters as ``APPROVED_PENDING_PR`` and must be able to finish what it
+started. A third would be a second attempt at work that has already failed
+twice with nothing to show, and ordinary rework is the better answer to that
+than a third agent pair.
+"""
+
+
 @dataclass(frozen=True)
 class StoredIssueKey:
     """IssueKey implementation reconstructed from an attempt sidecar."""
@@ -180,12 +206,22 @@ class Attempt:
     # retryable — so absence is permission to run again, and only an explicit
     # settlement ends the operation.
     continuation_settlement: ContinuationSettlement | None = None
+    # How many runs this candidate's continuation has OPENED (#149). A start
+    # budget, like the revalidation allowance above and for the same reason: it
+    # is spent before the run does anything external, so a run interrupted
+    # anywhere leaves the allowance spent rather than refunding itself. Counted
+    # per RUN and not per pass — a deferred review exchange re-enters the
+    # pipeline on every reconciliation until it concludes, and those are one
+    # attempt at the work, not a dozen.
+    continuation_runs_used: int = 0
 
     def __post_init__(self) -> None:
         if self.reroute_budget_used < 0:
             raise ValueError("Attempt.reroute_budget_used must be >= 0")
         if self.revalidation_budget_used < 0:
             raise ValueError("Attempt.revalidation_budget_used must be >= 0")
+        if self.continuation_runs_used < 0:
+            raise ValueError("Attempt.continuation_runs_used must be >= 0")
         object.__setattr__(
             self, "completed_evaluations", tuple(self.completed_evaluations)
         )
@@ -276,6 +312,11 @@ class Attempt:
         """Whether a same-SHA revalidation may still be *started* (#139)."""
         return self.revalidation_budget_used < REVALIDATION_ALLOWANCE
 
+    @property
+    def continuation_run_allowance_available(self) -> bool:
+        """Whether this candidate's continuation may still OPEN a run (#149)."""
+        return self.continuation_runs_used < CONTINUATION_RUN_ALLOWANCE
+
     def with_completed_evaluation(
         self, receipt: ValidationVerdictReceipt
     ) -> "Attempt":
@@ -306,6 +347,22 @@ class Attempt:
             )
         return replace(
             self, revalidation_budget_used=self.revalidation_budget_used + 1
+        )
+
+    def with_continuation_run_reserved(self) -> "Attempt":
+        """This attempt with one continuation-run allowance durably spent (#149).
+
+        The ceiling is re-asserted here rather than trusted from the caller, as
+        :meth:`with_revalidation_reserved` does: the counter is durable, so the
+        bound it is compared against has to be a property of the record.
+        """
+        if not self.continuation_run_allowance_available:
+            raise ValueError(
+                "Attempt continuation run allowance is already spent: "
+                f"{self.continuation_runs_used}/{CONTINUATION_RUN_ALLOWANCE}"
+            )
+        return replace(
+            self, continuation_runs_used=self.continuation_runs_used + 1
         )
 
     def with_continuation_descriptor(
@@ -393,6 +450,7 @@ class Attempt:
                 if self.continuation_settlement is not None
                 else None
             ),
+            "continuation_runs_used": self.continuation_runs_used,
         }
 
     @classmethod
@@ -442,6 +500,9 @@ class Attempt:
             ),
             continuation_settlement=_optional_settlement(
                 data.get("continuation_settlement")
+            ),
+            continuation_runs_used=_int_field(
+                data.get("continuation_runs_used"), "continuation_runs_used"
             ),
         )
 

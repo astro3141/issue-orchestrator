@@ -12,11 +12,13 @@ the publication evaluations      ``Attempt.completed_evaluations`` (#85, #139)
 the same-SHA allowance           ``Attempt.revalidation_budget_used`` (#139)
 the exact-``A`` review outcome   ``Attempt.continuation_review_verdict``
 the run's terminal outcome       ``Attempt.continuation_settlement``
+the continuation's own allowance ``Attempt.continuation_runs_used``
 the board                        labels the tick already fetched
 ===============================  =============================================
 
-Exactly one fact here is NOT durable: whether this engine is executing the
-operation right now. It cannot be, and its absence was a hole. #139's
+Two facts here are NOT durable, and neither can be: whether this engine is
+executing the operation right now, and whether it is carrying a run it has
+already opened. #139's
 allowance is a *start* budget spent before any gate work, so from the instant a
 revalidation begins until the instant it files a verdict the durable facts read
 ``allowance spent, latest evaluation still non-PASS`` — indistinguishable from
@@ -98,6 +100,11 @@ class ContinuationPhase(Enum):
     #: Non-PASS with the allowance spent. No second revalidation exists, so the
     #: candidate returns to ordinary rework with its evidence history intact.
     EXHAUSTED = ("exhausted", False)
+    #: The continuation has opened every run it may (#149's own allowance) and
+    #: none discharged the recorded intent. The same clean return ``EXHAUSTED``
+    #: gives the revalidation half: ordinary rework takes the candidate back,
+    #: with the descriptor, the evaluations and any review verdict intact.
+    RUNS_EXHAUSTED = ("runs_exhausted", False)
 
     def __init__(self, value: str, live: bool) -> None:
         self._value_ = value
@@ -129,11 +136,19 @@ class ContinuationFacts:
     #: What this candidate's continuation run recorded as its terminal outcome,
     #: or ``None`` while the recorded intent is still undischarged.
     settlement: ContinuationSettlement | None = None
-    #: Whether THIS engine has a run in flight for the candidate. The one fact
-    #: here that is not durable, and the only one that cannot be: see the module
-    #: docstring for why it is a fact rather than a lease read, and why it fails
-    #: to ``False`` across a restart instead of pinning an operation forever.
+    #: Whether this candidate's continuation may still OPEN a run (#149).
+    continuation_run_allowance_available: bool = True
+    #: Whether THIS engine has a job in flight for the candidate. One of the two
+    #: facts here that are not durable, and that cannot be: see the module
+    #: docstring for why they are facts rather than lease reads, and why they
+    #: fail to ``False`` across a restart instead of pinning an operation.
     engine_is_executing: bool = False
+    #: Whether this engine is carrying an already-open run for the candidate.
+    #: Distinct from ``engine_is_executing``: a run spans as many passes as the
+    #: completion pipeline needs, while a job in flight is one submission. Only
+    #: this fact can tell "the allowance is spent and the run that spent it is
+    #: still going" from "the allowance is spent and nothing came of it".
+    engine_holds_open_run: bool = False
 
 
 def derive_continuation_phase(facts: ContinuationFacts) -> ContinuationPhase:
@@ -178,20 +193,44 @@ def derive_continuation_phase(facts: ContinuationFacts) -> ContinuationPhase:
     if facts.review_verdict is ReviewVerdictOutcome.CHANGES_REQUESTED:
         return ContinuationPhase.EXIT_TO_REWORK
     if facts.review_verdict is ReviewVerdictOutcome.APPROVED:
-        return (
-            ContinuationPhase.APPROVED_PENDING_PR
-            if descriptor.creates_pr
-            else ContinuationPhase.SETTLED_NO_PR
-        )
+        if not descriptor.creates_pr:
+            return ContinuationPhase.SETTLED_NO_PR
+        return _run_or_exhausted(facts, ContinuationPhase.APPROVED_PENDING_PR)
     if not facts.has_publication_evaluation:
         return ContinuationPhase.NOT_EVALUATED
     if facts.latest_publication_passed:
-        return ContinuationPhase.PASS_PENDING_REVIEW
+        return _run_or_exhausted(facts, ContinuationPhase.PASS_PENDING_REVIEW)
     return (
         ContinuationPhase.RETRY_PENDING
         if facts.revalidation_allowance_available
         else ContinuationPhase.EXHAUSTED
     )
+
+
+def _run_or_exhausted(
+    facts: ContinuationFacts, phase: ContinuationPhase
+) -> ContinuationPhase:
+    """``phase``, unless the continuation may open no further run for it.
+
+    Both phases this guards drive a full reviewer/coder exchange, and both are
+    re-derived unchanged by a run that ended without discharging the intent — so
+    without the bound they are the system's one unbounded retry surface.
+
+    A run this engine already HOLDS is not a new one, and that is the whole
+    reason the second fact exists. The allowance is spent when a run opens, so
+    from that instant the durable counter alone reads "exhausted" for the entire
+    life of the run it just paid for — including every pass on which a deferred
+    review exchange re-enters the pipeline. Dropping the operation there would
+    release the lease under a running exchange and sweep away its worktree.
+
+    After a crash the engine holds nothing, so the same facts read as exhausted
+    and the candidate returns to ordinary rework. That is #139's fail-closed
+    direction, not a gap: the exchange the spent allowance paid for died with
+    the process, and nothing durable records that it accomplished anything.
+    """
+    if facts.continuation_run_allowance_available or facts.engine_holds_open_run:
+        return phase
+    return ContinuationPhase.RUNS_EXHAUSTED
 
 
 __all__ = [

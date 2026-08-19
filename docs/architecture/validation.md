@@ -253,6 +253,7 @@ and nothing about what to do with it, so [#149] adds the missing half:
 | Recorded intent (`requested_actions`, `implementation`, `problems`) plus the contract identity | `Attempt.continuation_descriptor` | `control/continuation_descriptor_writer.py`, at the gate's verdict, **only when the verdict refuses** |
 | The exact-`A` review outcome | `Attempt.continuation_review_verdict` | `control/continuation_runner.py`, promoted from the run's own verdict binding before its worktree is discarded |
 | What the continuation run produced — the pull request, or that none was asked for | `Attempt.continuation_settlement` | `control/continuation_finalize.py`, from the `ProcessingResult` the run's own completion pipeline returned |
+| How many runs the continuation has opened for this candidate | `Attempt.continuation_runs_used` | `control/continuation_runner.py`, spent before a run is opened |
 
 Every field is **copied** from an authoritative producer. Nothing is derived
 from issue text, labels, logs, diagnostics, URLs or branch names, and an
@@ -269,7 +270,7 @@ From those three facts plus the evaluation history, the allowance, and the
 `control/continuation_live_truth.py` turns the live ones into the
 `live_operations` set `ControlOperationOwnership.reconcile` consumes. Four
 phases hold the issue (`EXECUTING`, `RETRY_PENDING`, `PASS_PENDING_REVIEW`,
-`APPROVED_PENDING_PR`); the rest settle it. No lease row is read to decide
+`APPROVED_PENDING_PR`); the rest release it. No lease row is read to decide
 liveness, so a row that outlived its operation can never exclude ordinary work
 on its own authority — and a durable record that cannot be READ keeps the
 projection already standing rather than publishing "nothing is live".
@@ -291,6 +292,20 @@ question:
   of the three writers of `pr-pending` ever observe it. Waiting on the board
   would leave `APPROVED_PENDING_PR` live forever, re-running a full reviewer
   exchange on every reconciliation while holding the issue's lane.
+
+A settlement is not the only way the two run-opening phases end. A run that
+reaches a terminal result *without* discharging the intent — a halted exchange,
+an exhausted no-progress budget, a PR that could not be created — changes no
+durable fact, so the same phase is derived again and another run opens. That
+retry is right for a transient failure and unbounded for a permanent one, and
+the exchange's own no-progress budget cannot bound it: that budget is read from
+the cache under `<worktree>/.issue-orchestrator/sessions`, which goes with the
+checkout each closed run removes, so every retry starts it afresh.
+`Attempt.continuation_runs_used` is therefore the continuation's own allowance,
+in the shape [#139]'s is — durable, beside the candidate, and spent *before* a
+run opens so an interrupted one cannot refund itself. When it is gone the phase
+is `RUNS_EXHAUSTED`, which returns the candidate to ordinary rework with its
+descriptor, its evaluations and any review verdict intact.
 
 `control/continuation_scheduling.py` is the one hydration path: it derives,
 reconciles, publishes, advances what this engine owns, and only then lets

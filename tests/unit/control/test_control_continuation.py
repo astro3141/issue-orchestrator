@@ -31,6 +31,10 @@ from issue_orchestrator.control.continuation_descriptor_writer import (
     ContinuationDescriptorWriter,
 )
 from issue_orchestrator.control.continuation_in_flight import ContinuationsInFlight
+from issue_orchestrator.control.continuation_runs import (
+    ContinuationRun,
+    ContinuationRuns,
+)
 from issue_orchestrator.control.continuation_live_truth import (
     CONTINUATION_KIND,
     ContinuationLiveTruth,
@@ -41,7 +45,11 @@ from issue_orchestrator.control.control_operation_ownership import (
     ControlOperationOwnership,
 )
 from issue_orchestrator.control.queue_cache import QueueCache, QueueMutationStatus
-from issue_orchestrator.domain.attempt import Attempt, AttemptKey
+from issue_orchestrator.domain.attempt import (
+    CONTINUATION_RUN_ALLOWANCE,
+    Attempt,
+    AttemptKey,
+)
 from issue_orchestrator.domain.continuation_descriptor import ContinuationDescriptor
 from issue_orchestrator.domain.continuation_phase import ContinuationPhase
 from issue_orchestrator.domain.continuation_settlement import (
@@ -57,6 +65,7 @@ from issue_orchestrator.domain.models import (
     OrchestratorState,
     RequestedAction,
 )
+from issue_orchestrator.domain.session_run import SessionRunAssets
 from issue_orchestrator.domain.review_verdict_binding import (
     BoundReviewVerdict,
     ReviewVerdictOutcome,
@@ -194,6 +203,18 @@ class RecordingRunner:
         return [key for key, _ in self.advanced]
 
 
+class _NoWorktrees:
+    """A worktree manager for a suite that never opens a run.
+
+    The recording runner stands in for the execution plane here, so no run is
+    ever opened and nothing can be closed. Raising rather than passing keeps it
+    that way: a suite that started materialising checkouts would say so.
+    """
+
+    def remove_checkout(self, worktree_path: Path, *, force: bool = False) -> None:
+        raise AssertionError("this suite must not open or close continuation runs")
+
+
 class _UnreadableOwnershipStore:
     """A lease store that cannot answer, as a sqlite outage cannot say."""
 
@@ -252,6 +273,9 @@ class Engine:
     #: What this engine is executing, as the real runner claims into it. A
     #: restart gets a fresh one, which is exactly what a new process gets.
     in_flight: ContinuationsInFlight
+    #: The runs this engine is carrying, likewise. Also process-local, so a
+    #: restart is an engine that holds none.
+    runs: ContinuationRuns
 
     def queue_cache(self) -> QueueCache:
         return QueueCache(self.config, self.state)
@@ -271,12 +295,14 @@ def _engine(root: Path, *, attempts: object | None = None) -> Engine:
     )
     runner = RecordingRunner()
     in_flight = ContinuationsInFlight()
+    runs = ContinuationRuns(_NoWorktrees())  # type: ignore[arg-type]
     continuation = ControlContinuation(
         ownership,
         ContinuationLiveTruth(
             store,  # type: ignore[arg-type]
             pr_pending_label=PR_PENDING,
             in_flight=in_flight,
+            runs=runs,
         ),
         runner,  # type: ignore[arg-type]
     )
@@ -289,6 +315,7 @@ def _engine(root: Path, *, attempts: object | None = None) -> Engine:
         continuation=continuation,
         config=config,
         in_flight=in_flight,
+        runs=runs,
     )
 
 
@@ -343,6 +370,42 @@ def _settled(
     return engine.attempts.update(
         _attempt_key(head_sha),
         lambda attempt: attempt.with_continuation_settlement(settlement),
+    )
+
+
+def _runs_spent(
+    engine: Engine,
+    count: int = CONTINUATION_RUN_ALLOWANCE,
+    head_sha: str = SHA_A,
+) -> Attempt:
+    """The candidate after its continuation has opened ``count`` runs."""
+    attempt = engine.attempts.update(_attempt_key(head_sha), lambda a: a)
+    for _index in range(count):
+        attempt = engine.attempts.update(
+            _attempt_key(head_sha),
+            lambda a: a.with_continuation_run_reserved(),
+        )
+    return attempt
+
+
+def _stub_run(engine: Engine) -> ContinuationRun:
+    """A run this engine is carrying. Only its presence is under test here."""
+    worktree = engine.root / "continuation-worktree"
+    run_dir = worktree / ".issue-orchestrator" / "sessions" / "run-1"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    return ContinuationRun(
+        worktree=worktree,
+        agent_label="agent:backend",
+        assets=SessionRunAssets.from_paths(
+            session_name=f"continuation-{ISSUE_NUMBER}",
+            run_id="run-1",
+            worktree_path=worktree,
+            run_dir=run_dir,
+            terminal_recording_path=run_dir / "terminal.cast",
+            manifest_path=run_dir / "manifest.json",
+            started_at="2026-08-19T00:00:00Z",
+        ),
+        completion_path=".issue-orchestrator/sessions/run-1/completion.json",
     )
 
 
@@ -803,6 +866,7 @@ class TestStaleSnapshot:
                 engine.attempts,
                 pr_pending_label=PR_PENDING,
                 in_flight=engine.in_flight,
+                runs=engine.runs,
             ).read(board)
             derived.append(tuple(key.head_sha for key in reading.keys))
             return reading.keys
@@ -837,6 +901,7 @@ class TestStoreOutage:
                 UnreadableAttempts(),  # type: ignore[arg-type]
                 pr_pending_label=PR_PENDING,
                 in_flight=ContinuationsInFlight(),
+                runs=ContinuationRuns(_NoWorktrees()),  # type: ignore[arg-type]
             ),
             readable.runner,  # type: ignore[arg-type]
         )
@@ -857,6 +922,7 @@ class TestStoreOutage:
                 UnreadableAttempts(),  # type: ignore[arg-type]
                 pr_pending_label=PR_PENDING,
                 in_flight=ContinuationsInFlight(),
+                runs=ContinuationRuns(_NoWorktrees()),  # type: ignore[arg-type]
             ),
             runner,  # type: ignore[arg-type]
         )
@@ -881,6 +947,7 @@ class TestStoreOutage:
                 engine.attempts,
                 pr_pending_label=PR_PENDING,
                 in_flight=engine.in_flight,
+                runs=engine.runs,
             ),
             engine.runner,  # type: ignore[arg-type]
         )
@@ -909,6 +976,7 @@ class TestStoreOutage:
                 UnreadableAttempts(),  # type: ignore[arg-type]
                 pr_pending_label=PR_PENDING,
                 in_flight=ContinuationsInFlight(),
+                runs=ContinuationRuns(_NoWorktrees()),  # type: ignore[arg-type]
             ),
             readable.runner,  # type: ignore[arg-type]
         )
@@ -1110,6 +1178,100 @@ class TestAnInFlightRevalidationIsNotExhaustion:
         first = _engine(tmp_path)
         self._reserved_but_unreported(first)
         first.in_flight.claim(_operation_key())
+        first.continuation.hydrate_queue(
+            first.queue_cache(), [_issue("agent:backend")]
+        )
+        assert first.ownership.exclusions.owns(_operation_key())
+
+        restarted = _engine(tmp_path)
+        queue = restarted.continuation.hydrate_queue(
+            restarted.queue_cache(), [_issue("agent:backend")]
+        )
+
+        assert [i.number for i in queue] == [ISSUE_NUMBER]
+        assert restarted.ownership.exclusions.entries == ()
+
+
+class TestTheContinuationsRetryIsBounded:
+    """The re-entry re-runs a reviewer/coder pair; it needs a bound (F4).
+
+    A terminal run that discharged nothing changes no durable fact, so the same
+    phase is derived again and another run opens. The exchange's own no-progress
+    budget cannot catch it: that budget lives under the worktree every closed
+    run removes, so each retry starts it afresh.
+    """
+
+    def test_a_candidate_out_of_runs_returns_to_ordinary_rework(
+        self, engine: Engine
+    ) -> None:
+        _failed_candidate(engine, RequestedAction.CREATE_PR)
+        _passed(engine)
+        _runs_spent(engine)
+
+        queue = engine.continuation.hydrate_queue(
+            engine.queue_cache(), [_issue("agent:backend")]
+        )
+
+        assert [i.number for i in queue] == [ISSUE_NUMBER]
+        assert engine.ownership.exclusions.entries == ()
+        assert engine.runner.advanced == []
+
+    def test_the_candidate_returns_with_its_evidence_intact(
+        self, engine: Engine
+    ) -> None:
+        """The clean return ``EXHAUSTED`` gives the revalidation half."""
+        _failed_candidate(engine, RequestedAction.CREATE_PR)
+        _passed(engine)
+        _reviewed(engine, ReviewVerdictOutcome.APPROVED)
+        _runs_spent(engine)
+
+        engine.continuation.reconcile([_issue("agent:backend")])
+
+        attempt = engine.attempts.for_key(_attempt_key())
+        assert attempt is not None
+        assert attempt.continuation_descriptor is not None
+        assert attempt.continuation_review_verdict is not None
+        assert len(attempt.publication_evaluations) == 2
+
+    def test_one_run_left_still_holds_the_lane(self, engine: Engine) -> None:
+        _failed_candidate(engine, RequestedAction.CREATE_PR)
+        _passed(engine)
+        _runs_spent(engine, CONTINUATION_RUN_ALLOWANCE - 1)
+
+        queue = engine.continuation.hydrate_queue(
+            engine.queue_cache(), [_issue("agent:backend")]
+        )
+
+        assert queue == []
+        assert engine.runner.advanced == [
+            (_operation_key(), ContinuationPhase.PASS_PENDING_REVIEW)
+        ]
+
+    def test_a_spent_allowance_whose_run_is_still_open_holds_the_lane(
+        self, engine: Engine
+    ) -> None:
+        """The allowance is spent when a run OPENS, so mid-run it reads spent."""
+        _failed_candidate(engine, RequestedAction.CREATE_PR)
+        _passed(engine)
+        _runs_spent(engine)
+        engine.runs.opened(_operation_key(), _stub_run(engine))
+
+        queue = engine.continuation.hydrate_queue(
+            engine.queue_cache(), [_issue("agent:backend")]
+        )
+
+        assert queue == []
+        assert engine.ownership.exclusions.owns(_operation_key())
+
+    def test_a_crash_mid_run_returns_the_candidate_rather_than_pinning_it(
+        self, tmp_path: Path
+    ) -> None:
+        """The open run died with the engine; the spent allowance did not."""
+        first = _engine(tmp_path)
+        _failed_candidate(first, RequestedAction.CREATE_PR)
+        _passed(first)
+        _runs_spent(first)
+        first.runs.opened(_operation_key(), _stub_run(first))
         first.continuation.hydrate_queue(
             first.queue_cache(), [_issue("agent:backend")]
         )
