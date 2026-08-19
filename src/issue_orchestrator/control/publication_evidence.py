@@ -15,9 +15,14 @@ So the question asked here is not "is this issue currently unrefused" but
 "**did this exact commit pass the publication contract**". It is answered from
 ``Attempt(issue, A)`` — the record already keyed by exactly one candidate,
 already durable in the primary checkout, and since #85 already carrying the
-publication gate's own verdict receipt. Absence is not neutral: no receipt
+publication gate's own verdict receipts. Absence is not neutral: no receipt
 means no publication gate has reported on this candidate, and a candidate that
 was never gated has not cleared a gate.
+
+Since #139 the attempt keeps an ordered history rather than one slot, so the
+question is asked of the *latest* publication evaluation: a bounded same-SHA
+revalidation appends its result beside the failure it re-ran, and admission
+consumes the newer one without the older one being rewritten or dropped.
 
 Freshness is a second question, and the receipt was built to answer it. What a
 run freezes at launch is the profile *name*; the contract body behind that name
@@ -166,9 +171,15 @@ class CandidatePublicationEvidence:
             )
             return _refuse("publication_evidence_unreadable")
 
-        if attempt is None or attempt.publication_verdict is None:
+        if attempt is None:
             return _refuse("publication_receipt_missing")
-        receipt = attempt.publication_verdict
+        # The *latest* publication evaluation, not the last entry in the
+        # history: since #139 the record keeps every completed evaluation, and
+        # a revalidation's result supersedes the one it re-ran without erasing
+        # it. An entry from another contract answers nothing here.
+        receipt = attempt.latest_publication_evaluation
+        if receipt is None:
+            return _refuse("publication_receipt_missing")
         if not attempt.publication_validation_passed:
             # Folds FAIL, timeout, a receipt from the quick contract, and a
             # receipt naming another commit into one refusal, because the

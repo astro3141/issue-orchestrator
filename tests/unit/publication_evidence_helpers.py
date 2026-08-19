@@ -1,6 +1,6 @@
 """Shared doubles for the durable publication verdict (#45).
 
-Review admission reads ``Attempt(issue, A).publication_verdict`` through the
+Review admission reads ``Attempt(issue, A)``'s evaluation history through the
 :class:`~issue_orchestrator.ports.attempt_store.AttemptStore` port, so tests
 mock there rather than around the reader. :class:`InMemoryAttemptStore` is a
 faithful stand-in for that port: it stores whole ``Attempt`` records under the
@@ -111,7 +111,8 @@ def attempt_store_with(
     for issue_key, receipt in receipts:
         key = AttemptKey(issue_key, receipt.head_sha)
         store.update(
-            key, lambda attempt, r=receipt: Attempt(attempt.key, publication_verdict=r)
+            key,
+            lambda attempt, r=receipt: attempt.with_completed_evaluation(r),
         )
     return store
 

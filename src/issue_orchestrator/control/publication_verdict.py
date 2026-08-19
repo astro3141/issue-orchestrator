@@ -28,7 +28,6 @@ evidence about it. One source, one candidate.
 from __future__ import annotations
 
 import logging
-from dataclasses import replace
 
 from ..domain.issue_key import IssueKey
 from ..domain.validation_verdict_receipt import (
@@ -76,8 +75,28 @@ class PublicationVerdictReceipts:
         *,
         issue_key: IssueKey,
         record: ValidationRecord,
-    ) -> ValidationVerdictReceipt:
-        """Persist ``record``'s verdict under the candidate it validated.
+        completed: bool,
+    ) -> ValidationVerdictReceipt | None:
+        """Append ``record``'s verdict to the candidate's evaluation history.
+
+        Appended, never assigned (#139). The previous shape assigned one slot,
+        so a second evaluation of the same candidate destroyed the first — and
+        with it the only account of a candidate that failed for a reason
+        unrelated to the candidate. Nothing here reads, rewrites or drops an
+        earlier entry; :meth:`~..domain.attempt.Attempt.with_completed_evaluation`
+        is the only way one enters the record.
+
+        ``completed`` says whether the gate just *reached* this verdict, and is
+        required rather than defaulted so a caller that reused an earlier
+        evaluation has to say so. Reuse appends nothing and returns ``None``:
+        under the old single-slot shape a reused verdict was an idempotent
+        overwrite, but an append-only history that recorded reuse would grow
+        one entry per lookup and claim the contract executed more times than it
+        did. That is the same rule
+        :meth:`~.candidate_evaluations.CandidateEvaluations.file` enforces on
+        the other writer of this history, and the two must not drift: the
+        history is evidence, and evidence that overstates what ran is the
+        defect this leaf exists to remove.
 
         Both invariants are the store's and the domain's rather than this
         caller's: :meth:`~..ports.attempt_store.AttemptStore.update` hands over
@@ -86,12 +105,23 @@ class PublicationVerdictReceipts:
         key's own commit.
         """
         receipt = receipt_for(record)
+        if not completed:
+            logger.debug(
+                "[PUBLICATION_VERDICT] reused %s suite=%s profile=%s for %s@%s; "
+                "no second evaluation appended",
+                receipt.verdict.value,
+                receipt.suite,
+                receipt.profile,
+                issue_key,
+                receipt.head_sha[:12],
+            )
+            return None
         key = self._attempt_keys.for_validation_attempt(
             issue_key=issue_key,
             head_sha=receipt.head_sha,
         )
         self._attempts.update(
-            key, lambda attempt: replace(attempt, publication_verdict=receipt)
+            key, lambda attempt: attempt.with_completed_evaluation(receipt)
         )
         logger.info(
             "[PUBLICATION_VERDICT] recorded %s suite=%s profile=%s for %s@%s",

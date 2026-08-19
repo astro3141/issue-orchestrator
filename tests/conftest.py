@@ -911,6 +911,9 @@ def build_test_orchestrator_deps(
     from issue_orchestrator.entrypoints.bootstrap_operator_commands import (
         build_operator_issue_command_factory,
     )
+    from issue_orchestrator.entrypoints.bootstrap_revalidation import (
+        build_publication_revalidation,
+    )
     from issue_orchestrator.entrypoints.bootstrap_session_launcher import (
         build_session_launcher_factory,
     )
@@ -1274,6 +1277,15 @@ def build_test_orchestrator_deps(
             renew_before_expiry_seconds=300,
         ),
         publish_recovery=publish_recovery,
+        # Assembled through the same factory bootstrap uses (#139), so a test
+        # orchestrator holds the route production holds.
+        publication_revalidation=build_publication_revalidation(
+            config,
+            attempt_store=attempt_store,
+            session_output=session_output,
+            command_runner=command_runner,
+            working_copy=working_copy,
+        ),
         services=infra_services,
     )
 

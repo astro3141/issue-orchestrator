@@ -153,6 +153,9 @@ class GitCLI(Git):
     def worktree_add(self, repo: Path, path: Path, branch: str) -> None:
         self.run(repo, ["worktree", "add", str(path), branch])
 
+    def worktree_add_detached(self, repo: Path, path: Path, commit_sha: str) -> None:
+        self.run(repo, ["worktree", "add", "--detach", str(path), commit_sha])
+
     def worktree_remove(self, repo: Path, path: Path, force: bool = True, prune: bool = True) -> None:
         argv = ["worktree", "remove"]
         if force:

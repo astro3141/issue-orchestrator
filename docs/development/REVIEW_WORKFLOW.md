@@ -477,6 +477,12 @@ configuring `review.tech_lead_review_agent` enables the workflow.
    while a review sits in the queue is judged as A′: queue history authorizes
    nothing.
 
+   The attempt keeps an ordered, append-only history of every completed
+   evaluation rather than one slot, so admission consumes the **latest**
+   publication evaluation. A bounded same-SHA revalidation appends its result
+   beside the failure it re-ran without rewriting or dropping it — see
+   [Validation](../architecture/validation.md) for the bounds on that route.
+
    Freshness is checked against the contract that is required *now*. A run
    freezes its validation profile's **name**; the contract behind that name is
    re-resolved live, so a receipt is stale if the profile's command has since

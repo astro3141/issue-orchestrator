@@ -58,6 +58,7 @@ if TYPE_CHECKING:
     from .state_machine_manager import StateMachineManager
     from .completion_processor import CompletionProcessor
     from .completion_dispatcher import CompletionDispatcher
+    from .publication_revalidation import PublicationRevalidation
     from .publish_recovery import PublishRecoveryService
     from .session_controller import SessionController
     from .health_gate import HealthGate
@@ -160,6 +161,14 @@ class OrchestratorDeps:
 
     # Manual publish recovery ("Retry publish"): off-thread republish + reconcile
     publish_recovery: "PublishRecoveryService"
+
+    # The bounded same-SHA revalidation route (#139). Held here — required, not
+    # optional — because the whole point of the leaf is that the execution plane
+    # can reach it from a durable canonical candidate identity alone, after the
+    # session that produced the candidate and its worktree are gone. A route
+    # only a factory knew how to build would be unreachable from the running
+    # system; a required field means neither composition root can omit it.
+    publication_revalidation: "PublicationRevalidation"
 
     # Cross-cutting infrastructure services (label mgmt, persistence, etc.)
     services: "InfraServices"

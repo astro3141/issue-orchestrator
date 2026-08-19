@@ -481,8 +481,8 @@ class TestTheExplanationOutlivesItsWorktree:
             AttemptKey(ISSUE, candidate_sha)
         )
         assert attempt is not None
-        assert attempt.publication_verdict is not None
-        assert attempt.publication_verdict.verdict is ValidationVerdict.FAILED
+        assert attempt.latest_publication_evaluation is not None
+        assert attempt.latest_publication_evaluation.verdict is ValidationVerdict.FAILED
 
     def test_a_timeout_is_explainable_too(
         self, repo_root: Path, worktree: Path, durable: DurableDiagnostics

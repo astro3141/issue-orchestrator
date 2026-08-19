@@ -218,7 +218,7 @@ class TestThePublishVerdictIsRecordedDurably:
         assert runner.commands == [PUBLISH_SENTINEL]
         attempt = _read(repo_root)
         assert attempt is not None
-        receipt = attempt.publication_verdict
+        receipt = attempt.latest_publication_evaluation
         assert receipt is not None
         assert receipt.verdict is ValidationVerdict.PASSED
         # Suite, command and profile together: the provenance that identifies
@@ -246,8 +246,8 @@ class TestThePublishVerdictIsRecordedDurably:
 
         attempt = _read(repo_root)
         assert attempt is not None
-        assert attempt.publication_verdict is not None
-        assert attempt.publication_verdict.profile == "foundation"
+        assert attempt.latest_publication_evaluation is not None
+        assert attempt.latest_publication_evaluation.profile == "foundation"
 
     def test_recording_the_verdict_preserves_the_attempts_other_facts(
         self, repo_root: Path, worktree: Path
@@ -327,8 +327,8 @@ class TestTheVerdictOutlivesItsWorktree:
         attempt = _read(repo_root, candidate_sha)
         assert attempt is not None
         assert attempt.publication_validation_passed is True
-        assert attempt.publication_verdict is not None
-        assert attempt.publication_verdict.suite == "publish_gate"
+        assert attempt.latest_publication_evaluation is not None
+        assert attempt.latest_publication_evaluation.suite == "publish_gate"
 
 
 class TestOneCandidatesReceiptCannotAnswerForAnother:
@@ -351,7 +351,7 @@ class TestOneCandidatesReceiptCannotAnswerForAnother:
         with pytest.raises(ValueError, match="must name the attempt's own commit"):
             Attempt(
                 key=AttemptKey(ISSUE, SHA_A),
-                publication_verdict=_receipt(head_sha=SHA_PRIME),
+                completed_evaluations=(_receipt(head_sha=SHA_PRIME),),
             )
 
 
@@ -364,16 +364,16 @@ class TestAQuickPassIsNotAPublicationPass:
         key = AttemptKey(ISSUE, SHA_A)
         SidecarAttemptStore(repo_root).update(
             key,
-            lambda attempt: replace(
-                attempt,
-                publication_verdict=_receipt(suite="agent_gate"),
+            lambda attempt: attempt.with_completed_evaluation(
+                _receipt(suite="agent_gate")
             ),
         )
 
         attempt = _read(repo_root)
         assert attempt is not None
-        assert attempt.publication_verdict is not None
-        assert attempt.publication_verdict.verdict is ValidationVerdict.PASSED
+        assert attempt.completed_evaluations[-1].verdict is ValidationVerdict.PASSED
+        # The history holds it; the *publication* question does not see it.
+        assert attempt.latest_publication_evaluation is None
         assert attempt.publication_validation_passed is False
 
     @pytest.mark.parametrize("suite", ["agent_gate", "quick_gate", "made_up_gate"])
@@ -395,7 +395,7 @@ class TestAbsenceAndDamageAreNotAPass:
 
         attempt = _read(repo_root)
         assert attempt is not None
-        assert attempt.publication_verdict is None
+        assert attempt.completed_evaluations == ()
         assert attempt.publication_validation_passed is False
 
     def test_an_unconfigured_publish_contract_leaves_no_receipt(
@@ -420,7 +420,7 @@ class TestAbsenceAndDamageAreNotAPass:
         )
         sidecar = _sidecar(repo_root)
         payload = json.loads(sidecar.read_text())
-        del payload["publication_verdict"]["suite"]
+        del payload["completed_evaluations"][0]["suite"]
         sidecar.write_text(json.dumps(payload))
 
         with pytest.raises(ValueError, match="suite"):
@@ -434,7 +434,7 @@ class TestAbsenceAndDamageAreNotAPass:
         )
         sidecar = _sidecar(repo_root)
         payload = json.loads(sidecar.read_text())
-        payload["publication_verdict"]["verdict"] = "probably_fine"
+        payload["completed_evaluations"][0]["verdict"] = "probably_fine"
         sidecar.write_text(json.dumps(payload))
 
         with pytest.raises(ValueError, match="unknown validation verdict"):
@@ -448,7 +448,7 @@ class TestAbsenceAndDamageAreNotAPass:
         )
         sidecar = _sidecar(repo_root)
         payload = json.loads(sidecar.read_text())
-        payload["publication_verdict"]["head_sha"] = SHA_PRIME
+        payload["completed_evaluations"][0]["head_sha"] = SHA_PRIME
         sidecar.write_text(json.dumps(payload))
 
         with pytest.raises(ValueError, match="must name the attempt's own commit"):
@@ -475,8 +475,8 @@ class TestFailureAndTimeoutAreDistinguishable:
         assert outcome.allowed is False
         attempt = _read(repo_root)
         assert attempt is not None
-        assert attempt.publication_verdict is not None
-        assert attempt.publication_verdict.verdict is ValidationVerdict.FAILED
+        assert attempt.latest_publication_evaluation is not None
+        assert attempt.latest_publication_evaluation.verdict is ValidationVerdict.FAILED
         assert attempt.publication_validation_passed is False
 
     def test_a_timed_out_publish_contract_records_a_timeout(
@@ -490,8 +490,8 @@ class TestFailureAndTimeoutAreDistinguishable:
         assert outcome.allowed is False
         attempt = _read(repo_root)
         assert attempt is not None
-        assert attempt.publication_verdict is not None
-        assert attempt.publication_verdict.verdict is ValidationVerdict.TIMED_OUT
+        assert attempt.latest_publication_evaluation is not None
+        assert attempt.latest_publication_evaluation.verdict is ValidationVerdict.TIMED_OUT
         assert attempt.publication_validation_passed is False
 
     def test_a_timeout_never_reads_as_a_pass_however_its_exit_code_landed(
@@ -502,6 +502,59 @@ class TestFailureAndTimeoutAreDistinguishable:
             ValidationVerdict.observed(passed=True, timed_out=True)
             is ValidationVerdict.TIMED_OUT
         )
+
+
+class TestReuseIsNotASecondCompletedEvaluation:
+    """The history states what *executed*, and a cache hit executed nothing (#139).
+
+    Under the single-slot shape this was an idempotent overwrite, so nothing
+    depended on the distinction. Under an append-only history it decides
+    whether a republish, a reprocessed completion or a retried tick makes the
+    record claim the publish contract ran twice on a candidate it ran on once.
+    """
+
+    def test_a_reused_publish_verdict_appends_no_second_receipt(
+        self, repo_root: Path, worktree: Path
+    ) -> None:
+        runner = StubCommandRunner()
+        gate = _gate(repo_root=repo_root, runner=runner)
+
+        first = gate.check(
+            worktree=worktree, run_assets=_run(worktree), issue_key=ISSUE
+        )
+        second = gate.check(
+            worktree=worktree, run_assets=_run(worktree), issue_key=ISSUE
+        )
+
+        assert first.cache_hit is False
+        assert second.cache_hit is True
+        # The command really did not run a second time: the second receipt, if
+        # one were appended, would describe an execution that never happened.
+        assert runner.commands == [PUBLISH_SENTINEL]
+        assert second.allowed is True
+        attempt = _read(repo_root)
+        assert attempt is not None
+        assert len(attempt.publication_evaluations) == 1
+        assert attempt.publication_validation_passed is True
+
+    def test_the_rule_matches_the_other_writer_of_the_same_history(self) -> None:
+        """Both writers of the history answer "was this reached?" explicitly.
+
+        The attempt-scoped path already refused to append on reuse. A publish
+        path that quietly appended anyway would be the same rule enforced
+        differently by path — the drift ``CandidateEvaluations.file`` documents
+        as the thing not to do.
+        """
+        import inspect
+
+        from issue_orchestrator.control.candidate_evaluations import (
+            CandidateEvaluations,
+        )
+
+        for method in (PublicationVerdictReceipts.record, CandidateEvaluations.file):
+            completed = inspect.signature(method).parameters["completed"]
+            assert completed.kind is inspect.Parameter.KEYWORD_ONLY
+            assert completed.default is inspect.Parameter.empty
 
 
 class TestRemovingTheBindingBreaksThesePins:
@@ -519,7 +572,7 @@ class TestRemovingTheBindingBreaksThesePins:
         monkeypatch.setattr(
             PublicationGate,
             "_record_verdict",
-            lambda self, record, issue_key: None,
+            lambda self, record, issue_key, *, completed: None,
         )
 
         _gate(repo_root=repo_root, runner=StubCommandRunner()).check(
@@ -591,9 +644,8 @@ class TestRemovingTheBindingBreaksThesePins:
 
         attempt = _read(repo_root)
         assert attempt is not None
-        assert attempt.publication_verdict is not None
-        assert attempt.publication_verdict.command == QUICK_SENTINEL
-        assert attempt.publication_verdict.suite != "publish_gate"
+        assert attempt.completed_evaluations[-1].command == QUICK_SENTINEL
+        assert attempt.completed_evaluations[-1].suite != "publish_gate"
         assert attempt.publication_validation_passed is False
 
 

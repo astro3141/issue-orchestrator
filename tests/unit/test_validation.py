@@ -2,6 +2,7 @@
 
 import json
 import pytest
+import shutil
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
@@ -26,6 +27,23 @@ from issue_orchestrator.control.validation_record_cache import contract_record_p
 from issue_orchestrator.domain.validation_profile import ValidationGateKind
 from tests.validation_contract_helpers import publish_contract, quick_contract
 from issue_orchestrator.control.isolation import GRADLE_USER_HOME_ENV
+
+
+class _CountingRunner:
+    """Reports a fixed outcome and counts how often the contract really ran."""
+
+    def __init__(self, returncode: int = 0) -> None:
+        self.returncode = returncode
+        self.calls = 0
+
+    def run(self, *args, **kwargs):
+        self.calls += 1
+        return CommandResult(
+            returncode=self.returncode,
+            stdout="ok",
+            stderr="",
+            timed_out=False,
+        )
 
 
 def _shared_timing_records(worktree: Path) -> list[dict[str, object]]:
@@ -900,6 +918,114 @@ class TestPublishGate:
         assert first.cache_hit is False
         assert second.cache_hit is False
         assert runner.calls == 2
+
+    def test_attempt_cache_survives_the_run_directory_it_was_written_in(
+        self, temp_worktree, session_output_dir
+    ):
+        """The durable verdict, not a path into the reaped worktree (#139)."""
+        from issue_orchestrator.adapters.sidecar_attempt_store import SidecarAttemptStore
+
+        attempt_store = SidecarAttemptStore(temp_worktree)
+        attempt_key = self._attempt_key(temp_worktree, "139")
+        runner = _CountingRunner()
+
+        def gate(store_dir):
+            return ValidationGate(
+                temp_worktree,
+                command_runner=runner,
+                working_copy=GitWorkingCopy(),
+                attempt_store=attempt_store,
+                attempt_key=attempt_key,
+                contract=publish_contract(cmd="make test", timeout_seconds=10),
+            ).check(session_output_dir=store_dir)
+
+        first = gate(session_output_dir)
+        assert first.cache_hit is False
+
+        # Everything the run wrote is destroyed, exactly as worktree cleanup
+        # destroys it. Only the attempt sidecar in the primary checkout is left.
+        shutil.rmtree(session_output_dir)
+        shutil.rmtree(temp_worktree / ".issue-orchestrator" / "validation")
+
+        second = gate(self._session_dir(temp_worktree, "after-cleanup"))
+
+        assert second.cache_hit is True
+        assert runner.calls == 1
+
+    def test_a_durable_failure_is_re_run_rather_than_reused(
+        self, temp_worktree, session_output_dir
+    ):
+        """Only passes are reusable; a recorded failure still re-runs."""
+        from issue_orchestrator.adapters.sidecar_attempt_store import SidecarAttemptStore
+
+        attempt_store = SidecarAttemptStore(temp_worktree)
+        attempt_key = self._attempt_key(temp_worktree, "139")
+        runner = _CountingRunner(returncode=1)
+
+        def gate(store_dir):
+            return ValidationGate(
+                temp_worktree,
+                command_runner=runner,
+                working_copy=GitWorkingCopy(),
+                attempt_store=attempt_store,
+                attempt_key=attempt_key,
+                contract=publish_contract(cmd="make test", timeout_seconds=10),
+            ).check(session_output_dir=store_dir)
+
+        gate(session_output_dir)
+        second = gate(self._session_dir(temp_worktree, "second"))
+
+        assert second.cache_hit is False
+        assert runner.calls == 2
+        attempt = attempt_store.for_key(attempt_key)
+        assert attempt is not None
+        assert len(attempt.completed_evaluations) == 2
+
+    def test_a_gate_without_attempt_identity_appends_no_evaluation(
+        self, temp_worktree, session_output_dir
+    ):
+        """The prepush shape: nothing it runs may become durable authority."""
+        from issue_orchestrator.adapters.sidecar_attempt_store import SidecarAttemptStore
+
+        attempt_store = SidecarAttemptStore(temp_worktree)
+        attempt_key = self._attempt_key(temp_worktree, "139")
+
+        ValidationGate(
+            temp_worktree,
+            command_runner=_CountingRunner(),
+            working_copy=GitWorkingCopy(),
+            contract=publish_contract(cmd="make test", timeout_seconds=10),
+        ).check(session_output_dir=session_output_dir)
+
+        assert attempt_store.for_key(attempt_key) is None
+
+    def test_reusing_an_evaluation_does_not_append_a_second_one(
+        self, temp_worktree, session_output_dir
+    ):
+        """Reuse is not a completed evaluation, and must not grow the history."""
+        from issue_orchestrator.adapters.sidecar_attempt_store import SidecarAttemptStore
+
+        attempt_store = SidecarAttemptStore(temp_worktree)
+        attempt_key = self._attempt_key(temp_worktree, "139")
+        runner = _CountingRunner()
+
+        def gate(store_dir):
+            return ValidationGate(
+                temp_worktree,
+                command_runner=runner,
+                working_copy=GitWorkingCopy(),
+                attempt_store=attempt_store,
+                attempt_key=attempt_key,
+                contract=publish_contract(cmd="make test", timeout_seconds=10),
+            ).check(session_output_dir=store_dir)
+
+        gate(session_output_dir)
+        second = gate(self._session_dir(temp_worktree, "reuse"))
+
+        assert second.cache_hit is True
+        attempt = attempt_store.for_key(attempt_key)
+        assert attempt is not None
+        assert len(attempt.completed_evaluations) == 1
 
     def test_gate_appends_summary_on_cache_hit(self, temp_worktree, session_output_dir):
         """Publish gate summaries should distinguish cache hits from validation runs."""

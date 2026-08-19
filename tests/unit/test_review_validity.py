@@ -18,6 +18,7 @@ from issue_orchestrator.control.publication_authority import (
     UnrecordedRefusals,
 )
 from issue_orchestrator.control.review_validity import evaluate_review_validity
+from issue_orchestrator.domain.attempt import AttemptKey
 from issue_orchestrator.domain.issue_key import FakeIssueKey
 from issue_orchestrator.domain.validation_profile import ValidationGateKind
 from issue_orchestrator.domain.validation_verdict_receipt import ValidationVerdict
@@ -31,6 +32,7 @@ from issue_orchestrator.ports.pull_request_tracker import PRInfo
 from tests.unit.publication_evidence_helpers import (
     PUBLISH_COMMAND,
     UnreadableAttemptStore,
+    attempt_store_with,
     configure_publication_contract,
     publication_receipt,
     verdict_over,
@@ -264,7 +266,14 @@ def test_a_recorded_failure_or_timeout_does_not_admit(verdict) -> None:
 
 
 def test_a_quick_gate_pass_is_not_a_publication_pass() -> None:
-    """Proof 7: the wrong suite proves the wrong contract ran."""
+    """Proof 7: the wrong suite proves the wrong contract ran.
+
+    Since #139 the attempt keeps every completed evaluation and admission asks
+    for the latest *publication* one, so a candidate whose only evidence is a
+    quick-contract PASS refuses as never-gated rather than as gated-and-failed.
+    Both refuse; the newer reason is the more accurate of the two — no
+    publication gate has reported on this candidate at all.
+    """
     validity = _validity(
         config=_gated_config(),
         issue=_issue(["agent:backend"]),
@@ -277,6 +286,33 @@ def test_a_quick_gate_pass_is_not_a_publication_pass() -> None:
                 ),
             )
         ),
+    )
+
+    assert validity.valid is False
+    assert validity.reason == "publication_receipt_missing"
+
+
+def test_a_quick_gate_pass_beside_a_publication_failure_still_refuses() -> None:
+    """A later quick PASS cannot promote an earlier publication FAIL."""
+    key = AttemptKey(ISSUE_KEY, CANDIDATE_A)
+    store = attempt_store_with(
+        (
+            ISSUE_KEY,
+            publication_receipt(CANDIDATE_A, verdict=ValidationVerdict.FAILED),
+        )
+    )
+    store.update(
+        key,
+        lambda attempt: attempt.with_completed_evaluation(
+            publication_receipt(CANDIDATE_A, suite=ValidationGateKind.QUICK.suite)
+        ),
+    )
+
+    validity = _validity(
+        config=_gated_config(),
+        issue=_issue(["agent:backend"]),
+        pr=_open_pr(["needs-code-review"]),
+        publication_verdict=verdict_over(store),
     )
 
     assert validity.valid is False
