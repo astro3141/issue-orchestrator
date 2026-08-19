@@ -1583,9 +1583,12 @@ class SessionController:
         )
 
         result = gate.check(session_output_dir=target_run_dir)
-        if result.cache_hit:
-            if result.record is None:
-                raise RuntimeError("validation cache hit did not include a record")
+        if result.cache_hit and result.record is not None:
+            # A cache hit backed by a durable verdict whose run directory has
+            # since been reaped carries no record (#139). There is nothing to
+            # materialise in that case — the verdict itself is the authority,
+            # and inventing a record from it would claim exit codes and
+            # timestamps no gate reported.
             self._materialize_cached_validation_record(target_run_dir, result.record)
         self._record_validation_evidence(
             worktree_path=worktree_path,

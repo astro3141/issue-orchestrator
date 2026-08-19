@@ -26,7 +26,7 @@ was actually lost:
 Diagnostic only, deliberately. Nothing here is readable by admission: the
 artefact lives outside the attempt record, nothing points at it from the
 attempt, and no predicate in this codebase takes its path or its existence as
-input. ``Attempt.publication_verdict`` remains the sole authority on what the
+input. ``Attempt.completed_evaluations`` remains the sole authority on what the
 gate decided (:mod:`.publication_evidence` is what reads it). An artefact that
 could admit work would be a second authority, and a second authority written by
 the losing side of a gate is the worst possible one.

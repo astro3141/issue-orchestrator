@@ -218,7 +218,7 @@ class TestThePublishVerdictIsRecordedDurably:
         assert runner.commands == [PUBLISH_SENTINEL]
         attempt = _read(repo_root)
         assert attempt is not None
-        receipt = attempt.publication_verdict
+        receipt = attempt.latest_publication_evaluation
         assert receipt is not None
         assert receipt.verdict is ValidationVerdict.PASSED
         # Suite, command and profile together: the provenance that identifies
@@ -246,8 +246,8 @@ class TestThePublishVerdictIsRecordedDurably:
 
         attempt = _read(repo_root)
         assert attempt is not None
-        assert attempt.publication_verdict is not None
-        assert attempt.publication_verdict.profile == "foundation"
+        assert attempt.latest_publication_evaluation is not None
+        assert attempt.latest_publication_evaluation.profile == "foundation"
 
     def test_recording_the_verdict_preserves_the_attempts_other_facts(
         self, repo_root: Path, worktree: Path
@@ -327,8 +327,8 @@ class TestTheVerdictOutlivesItsWorktree:
         attempt = _read(repo_root, candidate_sha)
         assert attempt is not None
         assert attempt.publication_validation_passed is True
-        assert attempt.publication_verdict is not None
-        assert attempt.publication_verdict.suite == "publish_gate"
+        assert attempt.latest_publication_evaluation is not None
+        assert attempt.latest_publication_evaluation.suite == "publish_gate"
 
 
 class TestOneCandidatesReceiptCannotAnswerForAnother:
@@ -351,7 +351,7 @@ class TestOneCandidatesReceiptCannotAnswerForAnother:
         with pytest.raises(ValueError, match="must name the attempt's own commit"):
             Attempt(
                 key=AttemptKey(ISSUE, SHA_A),
-                publication_verdict=_receipt(head_sha=SHA_PRIME),
+                completed_evaluations=(_receipt(head_sha=SHA_PRIME),),
             )
 
 
@@ -364,16 +364,16 @@ class TestAQuickPassIsNotAPublicationPass:
         key = AttemptKey(ISSUE, SHA_A)
         SidecarAttemptStore(repo_root).update(
             key,
-            lambda attempt: replace(
-                attempt,
-                publication_verdict=_receipt(suite="agent_gate"),
+            lambda attempt: attempt.with_completed_evaluation(
+                _receipt(suite="agent_gate")
             ),
         )
 
         attempt = _read(repo_root)
         assert attempt is not None
-        assert attempt.publication_verdict is not None
-        assert attempt.publication_verdict.verdict is ValidationVerdict.PASSED
+        assert attempt.completed_evaluations[-1].verdict is ValidationVerdict.PASSED
+        # The history holds it; the *publication* question does not see it.
+        assert attempt.latest_publication_evaluation is None
         assert attempt.publication_validation_passed is False
 
     @pytest.mark.parametrize("suite", ["agent_gate", "quick_gate", "made_up_gate"])
@@ -395,7 +395,7 @@ class TestAbsenceAndDamageAreNotAPass:
 
         attempt = _read(repo_root)
         assert attempt is not None
-        assert attempt.publication_verdict is None
+        assert attempt.completed_evaluations == ()
         assert attempt.publication_validation_passed is False
 
     def test_an_unconfigured_publish_contract_leaves_no_receipt(
@@ -420,7 +420,7 @@ class TestAbsenceAndDamageAreNotAPass:
         )
         sidecar = _sidecar(repo_root)
         payload = json.loads(sidecar.read_text())
-        del payload["publication_verdict"]["suite"]
+        del payload["completed_evaluations"][0]["suite"]
         sidecar.write_text(json.dumps(payload))
 
         with pytest.raises(ValueError, match="suite"):
@@ -434,7 +434,7 @@ class TestAbsenceAndDamageAreNotAPass:
         )
         sidecar = _sidecar(repo_root)
         payload = json.loads(sidecar.read_text())
-        payload["publication_verdict"]["verdict"] = "probably_fine"
+        payload["completed_evaluations"][0]["verdict"] = "probably_fine"
         sidecar.write_text(json.dumps(payload))
 
         with pytest.raises(ValueError, match="unknown validation verdict"):
@@ -448,7 +448,7 @@ class TestAbsenceAndDamageAreNotAPass:
         )
         sidecar = _sidecar(repo_root)
         payload = json.loads(sidecar.read_text())
-        payload["publication_verdict"]["head_sha"] = SHA_PRIME
+        payload["completed_evaluations"][0]["head_sha"] = SHA_PRIME
         sidecar.write_text(json.dumps(payload))
 
         with pytest.raises(ValueError, match="must name the attempt's own commit"):
@@ -475,8 +475,8 @@ class TestFailureAndTimeoutAreDistinguishable:
         assert outcome.allowed is False
         attempt = _read(repo_root)
         assert attempt is not None
-        assert attempt.publication_verdict is not None
-        assert attempt.publication_verdict.verdict is ValidationVerdict.FAILED
+        assert attempt.latest_publication_evaluation is not None
+        assert attempt.latest_publication_evaluation.verdict is ValidationVerdict.FAILED
         assert attempt.publication_validation_passed is False
 
     def test_a_timed_out_publish_contract_records_a_timeout(
@@ -490,8 +490,8 @@ class TestFailureAndTimeoutAreDistinguishable:
         assert outcome.allowed is False
         attempt = _read(repo_root)
         assert attempt is not None
-        assert attempt.publication_verdict is not None
-        assert attempt.publication_verdict.verdict is ValidationVerdict.TIMED_OUT
+        assert attempt.latest_publication_evaluation is not None
+        assert attempt.latest_publication_evaluation.verdict is ValidationVerdict.TIMED_OUT
         assert attempt.publication_validation_passed is False
 
     def test_a_timeout_never_reads_as_a_pass_however_its_exit_code_landed(
@@ -591,9 +591,8 @@ class TestRemovingTheBindingBreaksThesePins:
 
         attempt = _read(repo_root)
         assert attempt is not None
-        assert attempt.publication_verdict is not None
-        assert attempt.publication_verdict.command == QUICK_SENTINEL
-        assert attempt.publication_verdict.suite != "publish_gate"
+        assert attempt.completed_evaluations[-1].command == QUICK_SENTINEL
+        assert attempt.completed_evaluations[-1].suite != "publish_gate"
         assert attempt.publication_validation_passed is False
 
 

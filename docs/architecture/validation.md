@@ -74,6 +74,21 @@ identify the contract that actually executed — the same three values cache
 reuse compares. `Attempt.publication_validation_passed` asks all of it at
 once.
 
+Receipts accumulate. `Attempt.completed_evaluations` is an ordered,
+append-only history — order is list position, so nothing inside the receipt
+had to change to carry it — and every gate run that reaches a verdict appends
+to it. Nothing rewrites or drops an earlier entry. Each entry names the
+contract that produced it, so a reader asks for the contract it cares about
+rather than trusting whichever entry is last:
+`Attempt.latest_publication_evaluation` walks the history newest-first for a
+receipt from the publication contract, which is why the quick gate appending
+its own evaluation cannot make a publication pass unreadable.
+
+The sidecar's `schema_version` is `2`. A `v1` sidecar's single
+`publication_verdict` slot migrates on read to a one-element history; it is
+real durable evidence about a real candidate, so refusing it would erase a
+gate result the orchestrator itself wrote.
+
 Three states stay distinguishable after cleanup, which is what issue [#85]
 existed to restore: no receipt means the gate never ran, a receipt means it
 ran and says what it decided, and a receipt that does not parse raises rather
@@ -143,7 +158,7 @@ Three properties are the whole design:
   without following a pointer. There is no pointer by design; see below.
 - **Diagnostic, never authority.** Nothing points at it from the attempt
   record, and no predicate takes its path or its existence as input.
-  `Attempt.publication_verdict` remains the only thing that decides what the
+  `Attempt.completed_evaluations` remains the only thing that decides what the
   gate decided. A losing gate run must not be able to write anything that
   admits work.
 
@@ -179,6 +194,43 @@ than at the reader:
   instead of publishing something no review could ever be launched for. This
   is only ever asked of a completion that offers its work as a change, so a
   reviewer or tech lead profile with no publish command is unaffected.
+
+### One bounded re-evaluation of an unchanged candidate
+
+A candidate can fail the publication gate for a reason that is not about the
+candidate — the observed case was a live subprocess timing out inside the
+suite. Structured evidence cannot distinguish that from a real defect: the
+receipt reads `verdict: "failed"` either way. Before [#139] the only exits
+were moving the SHA, which destroys the artifact the evidence is about, or
+editing durable state by hand, which is forbidden.
+
+`control/publication_revalidation.py` admits exactly one mechanical
+re-evaluation instead, and every part of it is a bound:
+
+- **Identity.** Its only input is a durable canonical `Attempt`. There is no
+  issue number, URL, title or reconstructed key on the surface, and a
+  candidate the store does not hold is refused before anything else happens.
+- **Admission.** The latest completed publication evaluation must be non-PASS,
+  and its suite + command + profile must still be what the contract requires —
+  compared with `ValidationGateContract.result_mismatch`, the same predicate
+  the cache and review admission use. A drifted contract is a different
+  question, not a retry of the same one.
+- **Allowance.** `Attempt.revalidation_budget_used` bounds it to one, ever, per
+  candidate, and it is durable in the attempt sidecar. It is a *start* budget:
+  it is spent before any external gate work begins, so an interruption between
+  reservation and verdict leaves the allowance spent and the prior completed
+  evaluation authoritative. There is deliberately no refund.
+- **Artifact.** The worktree is materialised at the exact recorded commit
+  through `CandidateCheckouts` (`git worktree add --detach <sha>`), never at a
+  branch — a branch is a moving name, and one that has advanced would evaluate
+  other work under this candidate's identity. The run scaffold freezes the
+  profile *name taken from the prior receipt* rather than resolving one afresh.
+
+The gate itself is untouched: the route composes `PublicationGate.check`
+whole, through the same `build_publication_gate` every other composition
+calls, and the verdict reaches the history through the gate's own receipt
+writer — appended beside the failure it re-ran. `entrypoints/
+bootstrap_revalidation.py` is the only wiring.
 
 ## Worktree readiness is a precondition of a meaningful verdict
 

@@ -16,16 +16,21 @@ lives inside the worktree and dies with it. A gate given a
 that durable destination too, at the moment it has the bytes in hand — see
 :mod:`.publish_gate_diagnostics` for why it is not copied out afterwards (#94).
 
+A gate given an attempt identity consults that candidate's durable evaluation
+history rather than a path into the run directory (#139): the receipts live in
+the primary checkout, so "this exact contract already decided about this exact
+commit" stays answerable after the worktree is reaped. A completed run appends
+its own verdict to that history; reuse appends nothing.
+
 Record storage and cache-reuse rules live in
 :mod:`.validation_record_cache`; ``ValidationRecordStore``,
 ``ValidationCache`` and ``VALIDATION_SCHEMA_VERSION`` are re-exported here so
 existing importers keep working.
 """
 
-import json
 import logging
 import time
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -48,6 +53,7 @@ from ..infra.validation_profiles import (
 from ..ports import CommandRunner, CommandResult, WorkingCopy
 from ..ports.attempt_store import AttemptStore
 from ..ports.session_output import ValidationRecord
+from .candidate_evaluations import CandidateEvaluations, PriorEvaluation
 from .isolation import build_runtime_tool_env
 from .publish_gate_diagnostics import (
     CandidateGateDiagnostics,
@@ -371,6 +377,17 @@ class ValidationGate:
         self.contract = contract
         self.attempt_store = attempt_store
         self.attempt_key = attempt_key
+        # The candidate's durable evaluation history, as *this* contract sees
+        # it (#139). Built once, here, so the gate never reaches into attempt
+        # internals: it asks one owner what was already decided and tells the
+        # same owner what it decided.
+        self.evaluations = (
+            None
+            if attempt_store is None or attempt_key is None
+            else CandidateEvaluations(
+                attempt_store, attempt_key, contract=contract, worktree=worktree
+            )
+        )
         self.store = ValidationRecordStore(worktree, contract.kind)
         self.cache = ValidationCache(self.store)
         self.runner = ValidationRunner(
@@ -444,35 +461,23 @@ class ValidationGate:
                 "attempt_key.head_sha must match the current validation HEAD"
             )
 
-    def _read_record_file(self, path: Path) -> ValidationRecord | None:
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-            if not isinstance(payload, dict):
-                logger.warning("Validation cache record must be an object: %s", path)
-                return None
-            return ValidationRecord.from_dict(payload)
-        except (json.JSONDecodeError, KeyError, TypeError, OSError) as exc:
-            logger.warning("Failed to read validation cache record at %s: %s", path, exc)
-            return None
-
-    def _resolve_attempt_validation_record_path(self, raw_path: str) -> Path:
-        path = Path(raw_path)
-        if path.is_absolute():
-            return path
-        return self.worktree / path
-
     def _record_matches_request(
         self,
         record: ValidationRecord,
         *,
         head_sha: str,
-        cache_source: str,
     ) -> bool:
+        """Whether a record found in the SHA-scoped store answers this request.
+
+        The attempt-scoped source asks the same question of a durable receipt
+        through :class:`~.candidate_evaluations.CandidateEvaluations`, and both
+        end at ``result_mismatch`` below, so the two cache sources cannot drift
+        about which contract a stored result belongs to.
+        """
         if record.schema_version != VALIDATION_SCHEMA_VERSION:
             logger.debug(
-                "%s: %s cache miss for %s: schema version mismatch (%d != %d)",
+                "%s: sha cache miss for %s: schema version mismatch (%d != %d)",
                 self.suite,
-                cache_source,
                 head_sha[:8],
                 record.schema_version,
                 VALIDATION_SCHEMA_VERSION,
@@ -480,9 +485,8 @@ class ValidationGate:
             return False
         if record.head_sha != head_sha:
             logger.debug(
-                "%s: %s cache miss for %s: record SHA mismatch (%s)",
+                "%s: sha cache miss for %s: record SHA mismatch (%s)",
                 self.suite,
-                cache_source,
                 head_sha[:8],
                 record.head_sha[:8],
             )
@@ -501,10 +505,9 @@ class ValidationGate:
         )
         if mismatch is not None:
             logger.debug(
-                "%s: %s cache miss for %s: %s mismatch "
+                "%s: sha cache miss for %s: %s mismatch "
                 "(cached suite=%s profile='%s', requested profile='%s')",
                 self.suite,
-                cache_source,
                 head_sha[:8],
                 mismatch,
                 record.suite,
@@ -513,36 +516,6 @@ class ValidationGate:
             )
             return False
         return True
-
-    def _attempt_cached_record(self, head_sha: str) -> ValidationRecord | None:
-        if self.attempt_store is None or self.attempt_key is None:
-            return None
-        attempt = self.attempt_store.for_key(self.attempt_key)
-        if attempt is None or not attempt.validation_record_path:
-            logger.debug("%s: attempt cache miss for %s", self.suite, head_sha[:8])
-            return None
-        record_path = self._resolve_attempt_validation_record_path(
-            attempt.validation_record_path
-        )
-        if not record_path.exists():
-            logger.debug(
-                "%s: attempt cache miss for %s; record missing at %s",
-                self.suite,
-                head_sha[:8],
-                record_path,
-            )
-            return None
-        record = self._read_record_file(record_path)
-        if record is None:
-            return None
-        if not self._record_matches_request(
-            record,
-            head_sha=head_sha,
-            cache_source="attempt",
-        ):
-            return None
-        logger.debug("%s: attempt cache hit for %s", self.suite, head_sha[:8])
-        return record
 
     def _materialize_cached_record(
         self,
@@ -569,20 +542,20 @@ class ValidationGate:
             return session_output_dir / VALIDATION_RECORD_NAME
         return self.store.get_record_path(record.head_sha)
 
-    def _store_attempt_validation_record(
+    def _file_evaluation(
         self,
         record: ValidationRecord,
         session_output_dir: Path | None,
+        *,
+        completed: bool,
     ) -> None:
-        if self.attempt_store is None or self.attempt_key is None:
+        """Hand this run's result to the candidate's evaluation history (#139)."""
+        if self.evaluations is None:
             return
-        record_path = self._attempt_record_path_for(record, session_output_dir)
-        self.attempt_store.update(
-            self.attempt_key,
-            lambda attempt: replace(
-                attempt,
-                validation_record_path=str(record_path.resolve()),
-            ),
+        self.evaluations.file(
+            record,
+            self._attempt_record_path_for(record, session_output_dir),
+            completed=completed,
         )
 
     def check(self, session_output_dir: Optional[Path] = None) -> PublishGateResult:
@@ -643,19 +616,26 @@ class ValidationGate:
 
         # Check cache - only trust cached passes, not failures
         # Failures might be due to flaky tests or transient issues, so always re-run
-        if self.attempt_key is not None:
-            cached = self._attempt_cached_record(head_sha)
+        if self.evaluations is not None:
+            cached = self.evaluations.prior(head_sha)
             cache_hit_prefix = "attempt_"
         else:
-            cached = self.cache.lookup(head_sha, command, self.profile)
+            record_cached = self.cache.lookup(head_sha, command, self.profile)
             # The store is already contract-scoped, so a record found here was
             # written under this contract. Re-checking is deliberate: it keeps
             # one predicate answering "may this record satisfy this request"
             # for both cache sources, rather than two rules that can drift.
-            if cached is not None and not self._record_matches_request(
-                cached, head_sha=head_sha, cache_source="sha"
+            if record_cached is not None and not self._record_matches_request(
+                record_cached, head_sha=head_sha
             ):
-                cached = None
+                record_cached = None
+            cached = (
+                None
+                if record_cached is None
+                else PriorEvaluation(
+                    passed=record_cached.passed, record=record_cached
+                )
+            )
             cache_hit_prefix = ""
         if cached is not None and cached.passed:
             cache_lookup = f"{cache_hit_prefix}hit_passed"
@@ -664,14 +644,20 @@ class ValidationGate:
             # downstream consumers (manifest, review-exchange predicate, UI)
             # see the gate's authoritative result. Without this, a stale
             # ``validation-record.json`` from an earlier inline run remains
-            # in place and silently contradicts the cache hit.
-            self._materialize_cached_record(cached, session_output_dir)
-            self._store_attempt_validation_record(cached, session_output_dir)
+            # in place and silently contradicts the cache hit. A durable
+            # verdict whose record died with its worktree has nothing to
+            # materialise, and says so by carrying no record rather than by
+            # reading as a miss (#139).
+            if cached.record is not None:
+                self._materialize_cached_record(cached.record, session_output_dir)
+                self._file_evaluation(
+                    cached.record, session_output_dir, completed=False
+                )
             return finish(
                 PublishGateResult(
                     allowed=True,
                     reason=f"Cached validation passed for {head_sha[:8]}",
-                    record=cached,
+                    record=cached.record,
                     cache_hit=True,
                 )
             )
@@ -703,8 +689,10 @@ class ValidationGate:
         )
         # ValidationRunner still populates the legacy SHA cache for callers
         # without attempt identity. When attempt_key is present, the attempt
-        # sidecar below is the authoritative cross-run cache record.
-        self._store_attempt_validation_record(record, session_output_dir)
+        # sidecar below is the authoritative cross-run cache record — and this
+        # run just reached a verdict, so it is appended to the candidate's
+        # evaluation history (#139).
+        self._file_evaluation(record, session_output_dir, completed=True)
 
         if record.passed:
             return finish(

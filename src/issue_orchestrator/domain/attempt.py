@@ -12,25 +12,48 @@ refuses to hold identities naming a different commit than the key it is filed
 under — so the exact-``A`` binding is the storage key itself, not a field that
 could disagree with it.
 
-``publication_verdict`` (#85) is the third such fact, and the one that closes a
-gap the other two left open: ``validation_record_path`` *points at* the
-validation half rather than stating it, and it points into the session
+``completed_evaluations`` (#85, #139) is the third such fact, and the one that
+closes a gap the other two left open: ``validation_record_path`` *points at*
+the validation half rather than stating it, and it points into the session
 directory inside the coder worktree — so once that worktree is reaped the
-attempt still says a gate ran, without saying what it decided. The receipt
+attempt still says a gate ran, without saying what it decided. A receipt
 states the verdict itself, and is bound to the key by the same rule the
 identities are.
+
+It is a *history* rather than a slot (#139). One slot meant every later gate
+run overwrote the earlier one, so the only exits from a candidate that failed
+for a reason unrelated to the candidate were moving the SHA — which destroys
+the evaluated artifact — or editing durable state by hand. An ordered,
+append-only history lets the same candidate be evaluated again without any
+prior evaluation being rewritten or dropped: order is list position, so no
+field inside :class:`~.validation_verdict_receipt.ValidationVerdictReceipt`
+had to change to carry it.
+
+``revalidation_budget_used`` is the durable bound on that (#139), in the shape
+``reroute_budget_used`` already had. It is a *start* budget: the revalidation
+route consumes it before any external gate work begins, so an interrupted
+revalidation fails closed rather than refunding itself on restart.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from .commit_sha import normalize_commit_sha
 from .execution_identity import CandidateExecutionIdentities
 from .issue_key import GitHubIssueKey, IssueKey, StableIssueId
 from .validation_verdict_receipt import ValidationVerdictReceipt
 
-_SCHEMA_VERSION = 1
+_SCHEMA_VERSION = 2
+_V1_SCHEMA_VERSION = 1
+
+REVALIDATION_ALLOWANCE = 1
+"""How many same-SHA revalidations one candidate may ever start (#139).
+
+Exactly one, and stated here rather than at the route that spends it: the
+counter is durable, so the ceiling it is compared against has to be a property
+of the record, not of whichever caller happens to read it.
+"""
 
 
 @dataclass(frozen=True)
@@ -86,16 +109,30 @@ class Attempt:
     review_exchange_summary_path: str | None = None
     review_exchange_job_id: str | None = None
     execution_identities: CandidateExecutionIdentities | None = None
-    # The publication gate's own verdict for this candidate (#85). One slot,
-    # holding the *publish* contract's receipt: the quick gate runs again after
-    # every completion, so a shared slot would let a later quick verdict erase
-    # the publication one. ``None`` means no publication gate has reported on
-    # this candidate — never-run, which is not a failure and not a pass.
-    publication_verdict: ValidationVerdictReceipt | None = None
+    # Every gate run that reached a verdict on this candidate, oldest first
+    # (#85, #139). Ordered by list position and never rewritten: a later
+    # evaluation is appended beside the earlier ones, so the FAIL that caused a
+    # revalidation is still readable after the PASS that followed it.
+    #
+    # Each entry names the contract it executed, so a reader asks for the
+    # contract it cares about rather than trusting whichever entry is last: the
+    # quick gate runs again after every completion, and a shared *slot* is
+    # exactly how a later quick verdict used to erase the publication one.
+    completed_evaluations: tuple[ValidationVerdictReceipt, ...] = ()
+    # How much of the one-revalidation allowance this candidate has spent
+    # (#139). Durable in the primary-checkout sidecar, so it survives restart by
+    # construction — the in-memory reroute counters cannot, which is why the
+    # policy forbids reusing them here.
+    revalidation_budget_used: int = 0
 
     def __post_init__(self) -> None:
         if self.reroute_budget_used < 0:
             raise ValueError("Attempt.reroute_budget_used must be >= 0")
+        if self.revalidation_budget_used < 0:
+            raise ValueError("Attempt.revalidation_budget_used must be >= 0")
+        object.__setattr__(
+            self, "completed_evaluations", tuple(self.completed_evaluations)
+        )
         if (
             self.execution_identities is not None
             and not self.execution_identities.covers(self.key.head_sha)
@@ -105,31 +142,84 @@ class Attempt:
                 f"commit: key={self.key.head_sha} "
                 f"identities={self.execution_identities.candidate_sha}"
             )
-        if (
-            self.publication_verdict is not None
-            and not self.publication_verdict.covers(self.key.head_sha)
-        ):
+        for receipt in self.completed_evaluations:
+            if receipt.covers(self.key.head_sha):
+                continue
             # Same rule as the identities above, for the same reason: the key
             # *is* the binding to one candidate, so a receipt naming another
             # commit is not evidence filed under the wrong name — it is
             # evidence about other work, and must not be readable here at all.
+            # Held for *every* entry, not only the newest, so appending cannot
+            # smuggle another candidate's verdict in behind one that binds.
             raise ValueError(
-                "Attempt.publication_verdict must name the attempt's own "
-                f"commit: key={self.key.head_sha} "
-                f"receipt={self.publication_verdict.head_sha}"
+                "Attempt.completed_evaluations must name the attempt's own "
+                f"commit: key={self.key.head_sha} receipt={receipt.head_sha}"
             )
+
+    @property
+    def latest_publication_evaluation(self) -> ValidationVerdictReceipt | None:
+        """The most recent evaluation produced by the *publication* contract.
+
+        Newest-first over the history rather than "the last entry": the history
+        holds whatever contract actually ran, and an ``agent_gate`` or
+        ``quick_gate`` receipt appended after a publication one says nothing
+        about publication. ``None`` means no publication gate has reported on
+        this candidate — never-run, which is not a failure and not a pass.
+        """
+        for receipt in reversed(self.completed_evaluations):
+            if receipt.from_publication_contract:
+                return receipt
+        return None
 
     @property
     def publication_validation_passed(self) -> bool:
         """Whether this candidate passed the publication contract.
 
-        The question the durable receipt exists to answer, asked of the
-        attempt's own commit so no caller has to re-supply it. ``False`` covers
-        every way the answer is not yes: no receipt (never gated), a failure, a
-        timeout, and a receipt produced by some other contract.
+        The question the durable receipts exist to answer, asked of the
+        attempt's own commit so no caller has to re-supply it, and of the
+        *latest* publication evaluation so a revalidation's result supersedes
+        the evaluation it re-ran. ``False`` covers every way the answer is not
+        yes: no receipt (never gated), a failure, a timeout, and a receipt
+        produced by some other contract.
         """
-        return self.publication_verdict is not None and (
-            self.publication_verdict.certifies_publication(self.key.head_sha)
+        latest = self.latest_publication_evaluation
+        return latest is not None and latest.certifies_publication(self.key.head_sha)
+
+    @property
+    def revalidation_allowance_available(self) -> bool:
+        """Whether a same-SHA revalidation may still be *started* (#139)."""
+        return self.revalidation_budget_used < REVALIDATION_ALLOWANCE
+
+    def with_completed_evaluation(
+        self, receipt: ValidationVerdictReceipt
+    ) -> "Attempt":
+        """This attempt with ``receipt`` appended to its evaluation history.
+
+        The only way an evaluation enters the record, so "append, never
+        overwrite" is a property of the type rather than a convention each
+        writer re-implements. The binding rule in :meth:`__post_init__` runs on
+        the result, so a receipt naming another commit is refused here exactly
+        as it is on construction.
+        """
+        return replace(
+            self,
+            completed_evaluations=(*self.completed_evaluations, receipt),
+        )
+
+    def with_revalidation_reserved(self) -> "Attempt":
+        """This attempt with one revalidation allowance durably spent (#139).
+
+        Spending is unconditional here and bounded by the caller's admission
+        check, but the ceiling is re-asserted so a second reservation cannot be
+        written even if a caller asked for one.
+        """
+        if not self.revalidation_allowance_available:
+            raise ValueError(
+                "Attempt revalidation allowance is already spent: "
+                f"{self.revalidation_budget_used}/{REVALIDATION_ALLOWANCE}"
+            )
+        return replace(
+            self, revalidation_budget_used=self.revalidation_budget_used + 1
         )
 
     def to_dict(self) -> dict[str, object]:
@@ -148,16 +238,15 @@ class Attempt:
                 if self.execution_identities is not None
                 else None
             ),
-            "publication_verdict": (
-                self.publication_verdict.to_payload()
-                if self.publication_verdict is not None
-                else None
-            ),
+            "completed_evaluations": [
+                receipt.to_payload() for receipt in self.completed_evaluations
+            ],
+            "revalidation_budget_used": self.revalidation_budget_used,
         }
 
     @classmethod
     def from_dict(cls, data: dict[str, object]) -> "Attempt":
-        _validate_schema_version(data.get("schema_version"))
+        schema_version = _validate_schema_version(data.get("schema_version"))
         issue_key_type_raw = data.get("issue_key_type")
         issue_key_raw = data.get("issue_key")
         issue_scope_raw = data.get("issue_scope")
@@ -190,8 +279,9 @@ class Attempt:
             execution_identities=_optional_execution_identities(
                 data.get("execution_identities")
             ),
-            publication_verdict=_optional_publication_verdict(
-                data.get("publication_verdict")
+            completed_evaluations=_completed_evaluations(data, schema_version),
+            revalidation_budget_used=_int_field(
+                data.get("revalidation_budget_used"), "revalidation_budget_used"
             ),
         )
 
@@ -221,9 +311,46 @@ def _issue_key_from_dict(
             raise ValueError(f"unknown Attempt issue_key_type: {other}")
 
 
-def _validate_schema_version(value: object) -> None:
-    if isinstance(value, bool) or value != _SCHEMA_VERSION:
-        raise ValueError(f"Attempt sidecar schema_version must be {_SCHEMA_VERSION}")
+def _validate_schema_version(value: object) -> int:
+    """Return the sidecar version this payload may be read as.
+
+    Two versions are readable, not one: v1 filed a single ``publication_verdict``
+    slot and v2 files the ordered history that replaced it (#139). A v1 sidecar
+    is real durable evidence about a real candidate, so refusing it would erase
+    a gate result the orchestrator itself wrote. Anything else still fails
+    closed — a version this code does not know is a record written by a schema
+    it cannot claim to understand.
+    """
+    if isinstance(value, bool) or value not in (_V1_SCHEMA_VERSION, _SCHEMA_VERSION):
+        raise ValueError(
+            "Attempt sidecar schema_version must be "
+            f"{_V1_SCHEMA_VERSION} or {_SCHEMA_VERSION}"
+        )
+    return int(value)  # type: ignore[arg-type]
+
+
+def _completed_evaluations(
+    data: dict[str, object], schema_version: int
+) -> tuple[ValidationVerdictReceipt, ...]:
+    """The evaluation history this payload states, whichever schema wrote it.
+
+    A v1 record's single verdict migrates to a one-element history: it *is* one
+    completed evaluation, and it was the only one that could be recorded. The
+    migration is a read-time projection rather than a rewrite, so a sidecar the
+    orchestrator never writes to again keeps reading correctly.
+    """
+    if schema_version == _V1_SCHEMA_VERSION:
+        migrated = _optional_publication_verdict(data.get("publication_verdict"))
+        return () if migrated is None else (migrated,)
+    raw = data.get("completed_evaluations")
+    if raw is None:
+        return ()
+    if not isinstance(raw, list):
+        raise ValueError("Attempt sidecar completed_evaluations must be a list")
+    return tuple(
+        _publication_verdict(entry, field_name="completed_evaluations entry")
+        for entry in raw
+    )
 
 
 def _optional_execution_identities(
@@ -245,7 +372,7 @@ def _optional_execution_identities(
 
 
 def _optional_publication_verdict(value: object) -> ValidationVerdictReceipt | None:
-    """Parse the publication verdict, or ``None`` when none was recorded.
+    """Parse a v1 sidecar's single publication verdict, or ``None`` if absent.
 
     A malformed receipt raises rather than reading as absent, for the reason
     :func:`_optional_execution_identities` gives: absent means "no publication
@@ -256,8 +383,14 @@ def _optional_publication_verdict(value: object) -> ValidationVerdictReceipt | N
     """
     if value is None:
         return None
+    return _publication_verdict(value, field_name="publication_verdict")
+
+
+def _publication_verdict(
+    value: object, *, field_name: str
+) -> ValidationVerdictReceipt:
     if not isinstance(value, dict):
-        raise ValueError("Attempt sidecar publication_verdict must be an object")
+        raise ValueError(f"Attempt sidecar {field_name} must be an object")
     return ValidationVerdictReceipt.from_payload(value)
 
 

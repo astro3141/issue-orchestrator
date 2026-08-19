@@ -65,7 +65,7 @@ def test_attempt_from_dict_rejects_unknown_schema_version() -> None:
     payload = Attempt(
         key=AttemptKey(GitHubIssueKey("owner/repo", "6130"), SHA)
     ).to_dict()
-    payload["schema_version"] = 2
+    payload["schema_version"] = 3
 
     with pytest.raises(ValueError, match="schema_version"):
         Attempt.from_dict(payload)
@@ -78,30 +78,145 @@ def test_attempt_to_dict_rejects_unsupported_issue_key_type() -> None:
         attempt.to_dict()
 
 
-def test_attempt_round_trips_a_publication_verdict() -> None:
-    key = AttemptKey(GitHubIssueKey("owner/repo", "85"), SHA)
-    receipt = ValidationVerdictReceipt(
-        suite="publish_gate",
+def _publish_receipt(
+    *,
+    verdict: ValidationVerdict = ValidationVerdict.PASSED,
+    suite: str = "publish_gate",
+) -> ValidationVerdictReceipt:
+    return ValidationVerdictReceipt(
+        suite=suite,
         head_sha=SHA,
-        verdict=ValidationVerdict.PASSED,
+        verdict=verdict,
         command="make validate-pr-raw",
         profile="default",
     )
 
+
+def test_attempt_round_trips_its_evaluation_history() -> None:
+    key = AttemptKey(GitHubIssueKey("owner/repo", "85"), SHA)
+    failed = _publish_receipt(verdict=ValidationVerdict.FAILED)
+    passed = _publish_receipt()
+
     restored = Attempt.from_dict(
-        Attempt(key=key, publication_verdict=receipt).to_dict()
+        Attempt(key=key)
+        .with_completed_evaluation(failed)
+        .with_completed_evaluation(passed)
+        .to_dict()
     )
 
-    assert restored.publication_verdict == receipt
+    assert restored.completed_evaluations == (failed, passed)
+    assert restored.latest_publication_evaluation == passed
     assert restored.publication_validation_passed is True
 
 
 def test_a_sidecar_written_before_verdicts_existed_still_parses() -> None:
     """Absence is "no publication gate has reported", not a parse failure."""
     payload = Attempt(key=AttemptKey(GitHubIssueKey("owner/repo", "85"), SHA)).to_dict()
-    del payload["publication_verdict"]
+    del payload["completed_evaluations"]
 
     restored = Attempt.from_dict(payload)
 
-    assert restored.publication_verdict is None
+    assert restored.completed_evaluations == ()
     assert restored.publication_validation_passed is False
+
+
+def test_a_v1_sidecars_single_verdict_migrates_to_a_one_entry_history() -> None:
+    """A v1 record is real evidence; refusing it would erase a gate result."""
+    receipt = _publish_receipt()
+    v1_payload = {
+        "schema_version": 1,
+        "issue_key_type": "github",
+        "issue_key": "85",
+        "issue_scope": "owner/repo",
+        "head_sha": SHA,
+        "reroute_budget_used": 0,
+        "validation_record_path": None,
+        "review_exchange_summary_path": None,
+        "review_exchange_job_id": None,
+        "execution_identities": None,
+        "publication_verdict": receipt.to_payload(),
+    }
+
+    restored = Attempt.from_dict(v1_payload)
+
+    assert restored.completed_evaluations == (receipt,)
+    assert restored.publication_validation_passed is True
+    assert restored.revalidation_budget_used == 0
+
+
+def test_a_v1_sidecar_with_no_verdict_migrates_to_an_empty_history() -> None:
+    v1_payload = {
+        "schema_version": 1,
+        "issue_key_type": "github",
+        "issue_key": "85",
+        "issue_scope": "owner/repo",
+        "head_sha": SHA,
+        "publication_verdict": None,
+    }
+
+    assert Attempt.from_dict(v1_payload).completed_evaluations == ()
+
+
+def test_appending_never_rewrites_or_drops_an_earlier_evaluation() -> None:
+    failed = _publish_receipt(verdict=ValidationVerdict.FAILED)
+    passed = _publish_receipt()
+
+    attempt = (
+        Attempt(key=AttemptKey(GitHubIssueKey("owner/repo", "139"), SHA))
+        .with_completed_evaluation(failed)
+        .with_completed_evaluation(passed)
+    )
+
+    assert attempt.completed_evaluations == (failed, passed)
+    assert attempt.completed_evaluations[0] is failed
+
+
+def test_an_attempt_refuses_a_history_entry_naming_another_commit() -> None:
+    other = ValidationVerdictReceipt(
+        suite="publish_gate",
+        head_sha="b" * 40,
+        verdict=ValidationVerdict.PASSED,
+        command="make validate-pr-raw",
+        profile="default",
+    )
+
+    with pytest.raises(ValueError, match="must name the attempt's own commit"):
+        Attempt(
+            key=AttemptKey(GitHubIssueKey("owner/repo", "139"), SHA),
+            completed_evaluations=(_publish_receipt(), other),
+        )
+
+
+def test_a_later_quick_evaluation_does_not_answer_the_publication_question() -> None:
+    """A shared slot is how a quick verdict used to erase the publication one."""
+    published = _publish_receipt()
+
+    attempt = (
+        Attempt(key=AttemptKey(GitHubIssueKey("owner/repo", "139"), SHA))
+        .with_completed_evaluation(published)
+        .with_completed_evaluation(_publish_receipt(suite="agent_gate"))
+    )
+
+    assert attempt.latest_publication_evaluation == published
+    assert attempt.publication_validation_passed is True
+
+
+def test_the_revalidation_allowance_is_exactly_one_and_durable() -> None:
+    attempt = Attempt(key=AttemptKey(GitHubIssueKey("owner/repo", "139"), SHA))
+    assert attempt.revalidation_allowance_available is True
+
+    reserved = attempt.with_revalidation_reserved()
+
+    assert reserved.revalidation_budget_used == 1
+    assert reserved.revalidation_allowance_available is False
+    assert Attempt.from_dict(reserved.to_dict()).revalidation_budget_used == 1
+    with pytest.raises(ValueError, match="allowance is already spent"):
+        reserved.with_revalidation_reserved()
+
+
+def test_attempt_rejects_negative_revalidation_budget() -> None:
+    with pytest.raises(ValueError, match="revalidation_budget_used"):
+        Attempt(
+            key=AttemptKey(GitHubIssueKey("owner/repo", "139"), SHA),
+            revalidation_budget_used=-1,
+        )

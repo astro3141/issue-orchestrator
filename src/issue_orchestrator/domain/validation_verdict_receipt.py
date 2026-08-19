@@ -34,11 +34,14 @@ Four meanings, none of which a reader may lose:
 * **Contract provenance.** ``command`` and ``profile`` are what identifies the
   contract that actually executed. Traced, not assumed: the one predicate in
   this codebase that decides whether a stored gate result may satisfy a
-  request — ``ValidationGate._record_matches_request`` — compares suite *and*
+  request — ``ValidationGateContract.result_mismatch`` — compares suite *and*
   command *and* profile, the last because two profiles may define the same
   command string while naming different contracts ("cache reuse cannot cross
   profiles", #7059). So ``command`` alone does not carry contract identity;
-  the receipt carries both, and nothing beyond them.
+  the receipt carries both, and nothing beyond them. It is also what makes the
+  *history* of these receipts (#139) readable: an attempt holds every completed
+  evaluation, and each reader selects the entries its own contract produced
+  rather than trusting whichever is last.
 
 Evidence only. Nothing here admits, holds, approves or publishes anything;
 #45 owns the gate that reads it.

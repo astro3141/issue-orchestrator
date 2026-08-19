@@ -28,7 +28,6 @@ evidence about it. One source, one candidate.
 from __future__ import annotations
 
 import logging
-from dataclasses import replace
 
 from ..domain.issue_key import IssueKey
 from ..domain.validation_verdict_receipt import (
@@ -77,7 +76,14 @@ class PublicationVerdictReceipts:
         issue_key: IssueKey,
         record: ValidationRecord,
     ) -> ValidationVerdictReceipt:
-        """Persist ``record``'s verdict under the candidate it validated.
+        """Append ``record``'s verdict to the candidate's evaluation history.
+
+        Appended, never assigned (#139). The previous shape assigned one slot,
+        so a second evaluation of the same candidate destroyed the first — and
+        with it the only account of a candidate that failed for a reason
+        unrelated to the candidate. Nothing here reads, rewrites or drops an
+        earlier entry; :meth:`~..domain.attempt.Attempt.with_completed_evaluation`
+        is the only way one enters the record.
 
         Both invariants are the store's and the domain's rather than this
         caller's: :meth:`~..ports.attempt_store.AttemptStore.update` hands over
@@ -91,7 +97,7 @@ class PublicationVerdictReceipts:
             head_sha=receipt.head_sha,
         )
         self._attempts.update(
-            key, lambda attempt: replace(attempt, publication_verdict=receipt)
+            key, lambda attempt: attempt.with_completed_evaluation(receipt)
         )
         logger.info(
             "[PUBLICATION_VERDICT] recorded %s suite=%s profile=%s for %s@%s",
