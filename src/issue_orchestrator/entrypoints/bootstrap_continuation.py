@@ -8,7 +8,9 @@ The continuation OWNER itself is not built here, and that is deliberate. It
 holds the lock that serialises live-truth derivation against claim creation, so
 it must live exactly as long as the engine does and be bound to the engine's
 live ``OrchestratorState`` — which is the facade's, not this container's. So the
-root supplies the durable ports, and the facade assembles the owner around them
+root supplies the durable ports, and
+:func:`~..control.continuation_scheduling.build_control_continuation` assembles
+the owner around them from the facade's state
 (:attr:`~...infra.orchestrator.Orchestrator._control_continuation`).
 """
 

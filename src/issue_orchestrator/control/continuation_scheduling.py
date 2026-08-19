@@ -24,6 +24,14 @@ the distinction the two types draw.
 
 ``QueueCache`` is untouched and still reads only the published projection. No
 raw ownership-store read reaches the scheduler, here or anywhere.
+
+:func:`build_control_continuation` assembles the owner, beside the type it
+builds and for the reason ``build_launch_provisioner`` sits beside
+``WorktreeProvisioner``: what the continuation is MADE of is one decision, and
+a facade that re-made it each time this leaf grew a collaborator would be
+choosing implementations rather than coordinating them. It is not in the
+composition root only because it needs the engine's live ``OrchestratorState``,
+which the dependency container deliberately does not hold.
 """
 
 from __future__ import annotations
@@ -35,10 +43,13 @@ from typing import TYPE_CHECKING
 from .continuation_live_truth import ContinuationReconciliation
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
+    from ..domain.models import OrchestratorState
+    from ..infra.config import Config
     from ..ports.issue import Issue
     from .continuation_live_truth import ContinuationLiveReading, ContinuationLiveTruth
     from .continuation_runner import ControlContinuationRunner
     from .control_operation_ownership import ControlOperationOwnership
+    from .orchestrator_deps import OrchestratorDeps
     from .queue_cache import QueueCache, QueueMutationOutcome
 
 logger = logging.getLogger(__name__)
@@ -135,4 +146,81 @@ class ControlContinuation:
         return reading
 
 
-__all__ = ["ControlContinuation"]
+def build_control_continuation(
+    *,
+    state: "OrchestratorState",
+    config: "Config",
+    deps: "OrchestratorDeps",
+) -> "ControlContinuation":
+    """The single continuation owner for one engine's lifetime (#149).
+
+    Called from a ``cached_property`` and never per tick, because three of the
+    things assembled here are stateful and agree about nothing when duplicated:
+
+    * ``ControlOperationOwnership`` holds the lock that serialises live-truth
+      derivation against claim creation (#146's ordering precondition, #149 §4);
+      rebuilt per call it would hold a fresh lock each time and serialise
+      nothing.
+    * ``ContinuationsInFlight`` is claimed into by the runner and read by live
+      truth — one registry, or the two disagree about what this engine is
+      executing.
+    * ``ContinuationRuns`` holds a run open across as many passes as the
+      completion pipeline needs, so a container rebuilt per call would forget
+      every open run and derive "the allowance is spent and nothing came of it"
+      while an exchange was still running.
+
+    ``WorktreeRunnability`` is built from the same ``Config`` and ports the
+    launcher's provisioner and the #139 revalidation route read the recipe from,
+    so a continuation's coder worktree is provisioned by the operator's own
+    ``setup_worktree`` and by nothing else (#153, #160). What is deliberately
+    NOT shared is :class:`~.worktree_provisioning.WorktreeProvisioner`:
+    its consecutive-failure ledger and ``needs-human`` escalation would be a
+    second bound over a run whose allowance #149 has already spent.
+    """
+    from ..ports.background_job import NullBackgroundJobRunner
+    from .continuation_finalize import ContinuationFinalizer
+    from .continuation_in_flight import ContinuationsInFlight
+    from .continuation_live_truth import ContinuationLiveTruth
+    from .continuation_runner import ControlContinuationRunner
+    from .continuation_runs import ContinuationRuns
+    from .control_operation_ownership import ControlOperationOwnership
+    from .worktree_runnability import WorktreeRunnability
+
+    in_flight = ContinuationsInFlight()
+    runs = ContinuationRuns(deps.worktree_manager)
+    return ControlContinuation(
+        ControlOperationOwnership(state, deps.continuation_ports.ownership_store),
+        ContinuationLiveTruth(
+            deps.attempt_store,
+            pr_pending_label=deps.label_manager.pr_pending,
+            in_flight=in_flight,
+            runs=runs,
+        ),
+        ControlContinuationRunner(
+            state=state,
+            revalidation_route=deps.publication_revalidation,
+            attempts=deps.attempt_store,
+            worktrees=deps.worktree_manager,
+            working_copy=deps.working_copy,
+            runnability=WorktreeRunnability(
+                config=config,
+                command_runner=deps.command_runner,
+                working_copy=deps.working_copy,
+            ),
+            session_output=deps.session_output,
+            completion_processor=deps.completion_processor,
+            review_verdicts=deps.continuation_ports.review_verdicts,
+            finalizer=ContinuationFinalizer(
+                attempts=deps.attempt_store,
+                action_applier=deps.action_applier,
+                pr_pending_label=deps.label_manager.pr_pending,
+            ),
+            in_flight=in_flight,
+            runs=runs,
+            jobs=deps.services.background_job_supervisor or NullBackgroundJobRunner(),
+            repo_root=config.repo_root,
+        ),
+    )
+
+
+__all__ = ["ControlContinuation", "build_control_continuation"]

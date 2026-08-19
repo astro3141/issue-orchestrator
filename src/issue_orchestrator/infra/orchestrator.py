@@ -27,14 +27,7 @@ from ..control.orchestrator_support import (
 )
 from ..control.github_workflow import GitHubWorkflow, launch_issue_by_number as _gw_launch_issue_by_number, get_issue_machine as _gw_get_issue_machine
 from ..control.worktree_manager import get_worktree_path, get_session_name, extract_issue_branches
-from ..control.continuation_finalize import ContinuationFinalizer
-from ..control.continuation_in_flight import ContinuationsInFlight
-from ..control.continuation_live_truth import ContinuationLiveTruth
-from ..control.continuation_runner import ControlContinuationRunner
-from ..control.continuation_runs import ContinuationRuns
-from ..control.continuation_scheduling import ControlContinuation
-from ..control.control_operation_ownership import ControlOperationOwnership
-from ..ports.background_job import NullBackgroundJobRunner
+from ..control.continuation_scheduling import ControlContinuation, build_control_continuation
 
 logger = logging.getLogger(__name__)
 
@@ -309,57 +302,18 @@ class Orchestrator:
         """The single continuation owner for this engine's lifetime.
 
         A ``cached_property`` and not a per-call construction, unlike the
-        stateless helpers around it. ``ControlOperationOwnership`` holds the
-        lock that serialises live-truth derivation against claim creation
-        (#146's ordering precondition, #149 §4); rebuilt per call it would hold
-        a fresh lock each time and serialise nothing.
+        stateless helpers around it: the owner it builds holds the lock, the
+        in-flight registry and the open runs that only mean anything while they
+        are the engine's only copy — ``build_control_continuation`` states why
+        for each.
 
-        Assembled here rather than in ``OrchestratorDeps`` for the reason the
-        in-flight ledger is: it is bound to live orchestrator state, which the
-        dependency container deliberately does not hold. The root supplies the
-        ports; the facade supplies the state.
+        What the owner is MADE of is decided beside the owner
+        (``build_control_continuation``), not here: the facade supplies the one
+        thing no builder can have — this engine's live ``OrchestratorState`` —
+        and coordinates what it gets back.
         """
-        ownership = ControlOperationOwnership(
-            self.state, self.deps.continuation_ports.ownership_store
-        )
-        # One registry, shared by the runner that claims into it and the live
-        # truth that reads it. Constructed here for the same reason the lock
-        # above is: it is what this engine is executing, so it must live exactly
-        # as long as the engine, and two instances would agree about nothing.
-        in_flight = ContinuationsInFlight()
-        # Engine-lifetime for the same reason: a run stays open across passes
-        # while the completion pipeline reports it unfinished, so a container
-        # rebuilt per call would forget every open run — deriving "the allowance
-        # is spent and nothing came of it" while an exchange was still running.
-        runs = ContinuationRuns(self.deps.worktree_manager)
-        return ControlContinuation(
-            ownership,
-            ContinuationLiveTruth(
-                self.deps.attempt_store,
-                pr_pending_label=self.deps.label_manager.pr_pending,
-                in_flight=in_flight,
-                runs=runs,
-            ),
-            ControlContinuationRunner(
-                state=self.state,
-                revalidation_route=self.deps.publication_revalidation,
-                attempts=self.deps.attempt_store,
-                worktrees=self.deps.worktree_manager,
-                working_copy=self.deps.working_copy,
-                session_output=self.deps.session_output,
-                completion_processor=self.deps.completion_processor,
-                review_verdicts=self.deps.continuation_ports.review_verdicts,
-                finalizer=ContinuationFinalizer(
-                    attempts=self.deps.attempt_store,
-                    action_applier=self.deps.action_applier,
-                    pr_pending_label=self.deps.label_manager.pr_pending,
-                ),
-                in_flight=in_flight,
-                runs=runs,
-                jobs=self.deps.services.background_job_supervisor
-                or NullBackgroundJobRunner(),
-                repo_root=self.config.repo_root,
-            ),
+        return build_control_continuation(
+            state=self.state, config=self.config, deps=self.deps
         )
 
     def _get_session_name(self, number: int, session_type: str = "issue") -> str: return get_session_name(number, session_type)

@@ -13,10 +13,12 @@ of the completion pipeline is what is under test, not the pipeline.
 
 from __future__ import annotations
 
+import inspect
 import json
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -32,6 +34,7 @@ from issue_orchestrator.control.continuation_live_truth import (
 )
 from issue_orchestrator.control.continuation_runner import ControlContinuationRunner
 from issue_orchestrator.control.publication_revalidation import RevalidationOutcome
+from issue_orchestrator.control.worktree_runnability import WorktreeRunnability
 from issue_orchestrator.domain.attempt import (
     CONTINUATION_RUN_ALLOWANCE,
     Attempt,
@@ -63,6 +66,8 @@ from issue_orchestrator.domain.validation_verdict_receipt import (
     ValidationVerdict,
     ValidationVerdictReceipt,
 )
+from issue_orchestrator.infra.config import Config
+from issue_orchestrator.ports.command_runner import CommandResult
 from issue_orchestrator.ports.worktree_manager import WorktreeInfo
 
 REPO = "owner/repo"
@@ -74,6 +79,11 @@ PROFILE = "default"
 AGENT = "agent:backend"
 PR_PENDING = "pr-pending"
 PR_URL = f"https://example.test/{REPO}/pull/7"
+#: The operator's provisioning recipe for these tests. A sentinel rather than
+#: this repository's real ``make worktree-setup``, because what is under test is
+#: that the CONFIGURED commands run: a name no production file mentions cannot
+#: pass by being hard-coded somewhere.
+SETUP_SENTINEL = "provision-the-continuation-worktree"
 
 
 # ----------------------------------------------------------------------
@@ -100,6 +110,7 @@ class FakeWorktrees:
     """A worktree manager over real temporary directories."""
 
     root: Path
+    journal: list[str] = field(default_factory=list)
     created: list[str] = field(default_factory=list)
     removed: list[Path] = field(default_factory=list)
     error: Exception | None = None
@@ -114,6 +125,7 @@ class FakeWorktrees:
         if self.error is not None:
             raise self.error
         name = str(kwargs.get("worktree_name") or f"repo-{issue_number}")
+        self.journal.append("materialize")
         self.created.append(name)
         path = self.root / name
         path.mkdir(parents=True, exist_ok=True)
@@ -125,12 +137,61 @@ class FakeWorktrees:
 
 @dataclass
 class FakeWorkingCopy:
-    """Reports whatever HEAD the test says the branch currently stands at."""
+    """Reports whatever HEAD the test says the branch currently stands at.
+
+    Also answers the candidate-integrity questions the runnability core asks
+    around the recipe. Both are read from the same fields, so a recipe that
+    moves ``HEAD`` or dirties the checkout says so here exactly as a real one
+    would in a real worktree.
+    """
 
     head: str | None = SHA_A
+    dirty: bool = False
 
     def get_head_sha(self, worktree: Path) -> str | None:
         return self.head
+
+    def has_uncommitted_changes(self, worktree: Path) -> bool:
+        return self.dirty
+
+
+@dataclass
+class SetupCommands:
+    """The operator's provisioning recipe, at the ``CommandRunner`` port.
+
+    Records what ran and where, so "the configured recipe ran in the
+    continuation's own checkout" is a claim the tests can make rather than
+    infer. ``alters`` is how a recipe misbehaves in a fake worktree the way a
+    real one misbehaves in a real one: it changes what the working copy reports
+    about the candidate while the commands are running.
+    """
+
+    journal: list[str] = field(default_factory=list)
+    commands: list[str] = field(default_factory=list)
+    cwds: list[Path | None] = field(default_factory=list)
+    failing: bool = False
+    timing_out: bool = False
+    alters: Callable[[], None] | None = None
+
+    def run(self, command: str | list[str], **kwargs: Any) -> CommandResult:
+        self.journal.append("setup")
+        self.commands.append(str(command))
+        cwd = kwargs.get("cwd")
+        self.cwds.append(Path(cwd) if cwd is not None else None)
+        if self.alters is not None:
+            self.alters()
+        if self.timing_out:
+            return CommandResult(
+                returncode=137, stdout="", stderr="killed", timed_out=True
+            )
+        if self.failing:
+            return CommandResult(
+                returncode=1,
+                stdout="",
+                stderr="pyright: not found",
+                timed_out=False,
+            )
+        return CommandResult(returncode=0, stdout="", stderr="", timed_out=False)
 
 
 @dataclass
@@ -143,6 +204,7 @@ class FakeSessionOutput:
     second allocation is a second exchange.
     """
 
+    journal: list[str] = field(default_factory=list)
     runs: list[SessionRunAssets] = field(default_factory=list)
     profiles: list[str | None] = field(default_factory=list)
 
@@ -155,6 +217,7 @@ class FakeSessionOutput:
         validation_profile: str | None = None,
         **kwargs: object,
     ) -> SessionRunAssets:
+        self.journal.append("start_run")
         run_id = f"run-{len(self.runs) + 1}"
         run_dir = worktree_path / ".issue-orchestrator" / "sessions" / run_id
         run_dir.mkdir(parents=True, exist_ok=True)
@@ -191,6 +254,7 @@ class ProcessingOutcome:
 class FakeCompletionOwner:
     """Records the completion re-entry, and what intent it was handed."""
 
+    journal: list[str] = field(default_factory=list)
     calls: list[dict[str, object]] = field(default_factory=list)
     records: list[dict[str, object]] = field(default_factory=list)
     outcome: ProcessingOutcome = field(default_factory=ProcessingOutcome)
@@ -203,6 +267,7 @@ class FakeCompletionOwner:
         issue_title: str,
         **kwargs: object,
     ) -> ProcessingOutcome:
+        self.journal.append("process")
         completion_path = str(kwargs["completion_path"])
         self.records.append(
             json.loads((worktree / completion_path).read_text(encoding="utf-8"))
@@ -367,6 +432,7 @@ class Harness:
     revalidation: FakeRevalidation
     worktrees: FakeWorktrees
     working_copy: FakeWorkingCopy
+    setup: SetupCommands
     session_output: FakeSessionOutput
     completion: FakeCompletionOwner
     verdicts: FakeVerdicts
@@ -375,16 +441,43 @@ class Harness:
     labels: FakeActionApplier
     in_flight: ContinuationsInFlight
     runs: ContinuationRuns
+    #: Every step of opening a run, in the order it happened. The ordering is
+    #: itself the contract (#160): a worktree that is not runnable must not
+    #: reach the run assets, the completion record or the exchange.
+    journal: list[str]
+
+
+def _runnability(
+    working_copy: FakeWorkingCopy,
+    setup: SetupCommands,
+    *,
+    commands: list[str] | None = None,
+) -> WorktreeRunnability:
+    """The provisioning CORE, holding the operator's recipe and nothing else.
+
+    The real one, not a double: what #160 requires is that the continuation
+    consumes this core, so a test that stubbed it out could not tell the
+    difference between consuming it and reimplementing it.
+    """
+    config = Config()
+    config.setup_worktree = [SETUP_SENTINEL] if commands is None else commands
+    return WorktreeRunnability(
+        config=config,
+        command_runner=setup,  # type: ignore[arg-type]
+        working_copy=working_copy,  # type: ignore[arg-type]
+    )
 
 
 @pytest.fixture
 def harness(tmp_path: Path) -> Harness:
     state = OrchestratorState()
     revalidation = FakeRevalidation()
-    worktrees = FakeWorktrees(root=tmp_path / "worktrees")
+    journal: list[str] = []
+    worktrees = FakeWorktrees(root=tmp_path / "worktrees", journal=journal)
     working_copy = FakeWorkingCopy()
-    session_output = FakeSessionOutput()
-    completion = FakeCompletionOwner()
+    setup = SetupCommands(journal=journal)
+    session_output = FakeSessionOutput(journal=journal)
+    completion = FakeCompletionOwner(journal=journal)
     verdicts = FakeVerdicts()
     jobs = InlineJobs()
     attempts = SidecarAttemptStore(tmp_path / "primary")
@@ -397,6 +490,7 @@ def harness(tmp_path: Path) -> Harness:
         attempts=attempts,
         worktrees=worktrees,  # type: ignore[arg-type]
         working_copy=working_copy,  # type: ignore[arg-type]
+        runnability=_runnability(working_copy, setup),
         session_output=session_output,  # type: ignore[arg-type]
         completion_processor=completion,  # type: ignore[arg-type]
         review_verdicts=verdicts,  # type: ignore[arg-type]
@@ -416,6 +510,7 @@ def harness(tmp_path: Path) -> Harness:
         revalidation=revalidation,
         worktrees=worktrees,
         working_copy=working_copy,
+        setup=setup,
         session_output=session_output,
         completion=completion,
         verdicts=verdicts,
@@ -424,6 +519,7 @@ def harness(tmp_path: Path) -> Harness:
         labels=labels,
         in_flight=in_flight,
         runs=runs,
+        journal=journal,
     )
 
 
@@ -556,6 +652,7 @@ class TestActiveSessionRefusal:
             attempts=harness.attempts,
             worktrees=harness.worktrees,  # type: ignore[arg-type]
             working_copy=harness.working_copy,  # type: ignore[arg-type]
+            runnability=_runnability(harness.working_copy, harness.setup),
             session_output=harness.session_output,  # type: ignore[arg-type]
             completion_processor=harness.completion,  # type: ignore[arg-type]
             review_verdicts=harness.verdicts,  # type: ignore[arg-type]
@@ -1256,3 +1353,299 @@ class TestTheRunAllowanceBoundsTheRetry:
         assert stored is not None
         assert stored.continuation_runs_used == 1
         assert stored.continuation_settlement is not None
+
+
+class TestTheCoderWorktreeIsMadeRunnable:
+    """#160: the continuation's checkout is an execution environment.
+
+    It is not a read-only carrier for a cached PASS. The persistent review
+    exchange opens on it as the CODER's worktree, and a ``CHANGES_REQUESTED``
+    round asks that coder to edit and validate in it — so a checkout that only
+    holds the source bytes fails on a toolchain that was never installed, and
+    the failure is recorded against the candidate (#48).
+
+    What runs is the operator's own ``setup_worktree`` recipe, through the
+    runnability core #153 extracted. Nothing here knows what that recipe is.
+    """
+
+    def _open(self, harness: Harness) -> Attempt:
+        attempt = _attempt(RequestedAction.CREATE_PR)
+        harness.attempts.update(attempt.key, lambda _current: attempt)
+        harness.completion.outcome = ProcessingOutcome(review_exchange_deferred=True)
+        harness.runner.advance(
+            _owned(_operation(attempt, ContinuationPhase.PASS_PENDING_REVIEW))
+        )
+        return attempt
+
+    def test_the_recipe_runs_before_any_run_asset_exists(
+        self, harness: Harness
+    ) -> None:
+        """The ordering IS the requirement, so it is asserted whole.
+
+        Run assets, the completion record and the exchange's ``run_id`` are what
+        the next pass resumes; a run opened around an unrunnable worktree is one
+        the pipeline would keep re-entering.
+        """
+        self._open(harness)
+
+        assert harness.journal == ["materialize", "setup", "start_run", "process"]
+
+    def test_the_recipe_is_the_operators_configured_one(
+        self, harness: Harness
+    ) -> None:
+        """No hard-coded ``make worktree-setup``, and no second recipe."""
+        self._open(harness)
+
+        assert harness.setup.commands == [SETUP_SENTINEL]
+
+    def test_the_recipe_runs_in_the_continuations_own_checkout(
+        self, harness: Harness
+    ) -> None:
+        """Exactly one worktree is provisioned: the coder's.
+
+        The sibling REVIEWER worktree keeps its own policy — deliberately
+        unprovisioned, guarded where the provider supports it — and this leaf
+        does not reach it. One recorded working directory, and it is the
+        checkout this run materialised.
+        """
+        self._open(harness)
+
+        worktree = harness.session_output.runs[0].worktree_path
+        assert harness.setup.cwds == [worktree]
+
+    def test_a_provisioned_worktree_still_standing_at_the_candidate_is_used(
+        self, harness: Harness
+    ) -> None:
+        """Direction 3: runtime state may appear; the candidate may not change.
+
+        The core takes its checkpoint around the recipe, so "the run opened"
+        already means HEAD is still ``A`` and the candidate's tracked content
+        was not left modified.
+        """
+        self._open(harness)
+
+        worktree = harness.session_output.runs[0].worktree_path
+        assert harness.completion.calls[0]["worktree"] == worktree
+        assert harness.working_copy.head == SHA_A
+        assert harness.worktrees.removed == []
+
+    def test_a_runnable_worktree_proceeds_straight_into_the_review_exchange(
+        self, harness: Harness
+    ) -> None:
+        """Direction 12: no coder work turn stands between setup and review.
+
+        What the pipeline is handed is the intent the agent already recorded,
+        replayed for this exact commit — so the run enters the reviewer-first
+        exchange rather than starting a session for the coder to work in first.
+        """
+        self._open(harness)
+
+        assert harness.journal == ["materialize", "setup", "start_run", "process"]
+        assert harness.completion.records[0]["outcome"] == "completed"
+        assert harness.completion.records[0]["requested_actions"] == ["create_pr"]
+        assert harness.state.active_sessions == []
+
+    def test_a_repository_with_no_recipe_opens_its_run_exactly_as_before(
+        self, harness: Harness, tmp_path: Path
+    ) -> None:
+        """An empty recipe is not a provisioning failure: nothing to install."""
+        runner = ControlContinuationRunner(
+            state=harness.state,
+            revalidation_route=harness.revalidation,  # type: ignore[arg-type]
+            attempts=harness.attempts,
+            worktrees=harness.worktrees,  # type: ignore[arg-type]
+            working_copy=harness.working_copy,  # type: ignore[arg-type]
+            runnability=_runnability(
+                harness.working_copy, harness.setup, commands=[]
+            ),
+            session_output=harness.session_output,  # type: ignore[arg-type]
+            completion_processor=harness.completion,  # type: ignore[arg-type]
+            review_verdicts=harness.verdicts,  # type: ignore[arg-type]
+            finalizer=ContinuationFinalizer(
+                attempts=harness.attempts,
+                action_applier=harness.labels,  # type: ignore[arg-type]
+                pr_pending_label=PR_PENDING,
+            ),
+            in_flight=harness.in_flight,
+            runs=harness.runs,
+            jobs=harness.jobs,  # type: ignore[arg-type]
+            repo_root=tmp_path / "primary",
+        )
+        attempt = _attempt(RequestedAction.CREATE_PR)
+        harness.attempts.update(attempt.key, lambda _current: attempt)
+
+        runner.advance(
+            _owned(_operation(attempt, ContinuationPhase.PASS_PENDING_REVIEW))
+        )
+
+        assert harness.setup.commands == []
+        assert len(harness.completion.calls) == 1
+
+    def test_the_runner_composes_the_core_and_no_retry_policy(self) -> None:
+        """The collaborator, named: a recipe, and no launch-shaped bound.
+
+        Asserted on the constructor rather than on behaviour because what must
+        not exist cannot be observed by running it. ``WorktreeProvisioner``
+        carries a consecutive-failure ledger and a ``needs-human`` escalation,
+        and admitting it here would be a second bound over a run whose
+        allowance #149 has already spent.
+
+        The annotation is compared as text because the runner declares it under
+        ``TYPE_CHECKING``; that it is the CORE and behaves like one is what the
+        rest of this suite exercises, with the real
+        :class:`WorktreeRunnability` wired in.
+        """
+        parameters = inspect.signature(ControlContinuationRunner.__init__).parameters
+
+        annotation = parameters["runnability"].annotation.strip("\"'")
+        assert annotation == WorktreeRunnability.__name__
+        assert "provisioner" not in parameters
+        assert "issue_number" not in parameters
+
+
+class TestAnUnrunnableWorktreeOpensNoRun:
+    """#160's failure direction: nothing downstream of the recipe happens.
+
+    Every case below asserts the same things — no run assets, no completion
+    processing, no verdict, no settlement, and a durable PASS(A) still latest —
+    because a continuation that provisioned badly and continued anyway would
+    file evidence about an environment under the candidate's name.
+    """
+
+    def _unrunnable(self, harness: Harness, attempt: Attempt | None = None) -> Attempt:
+        candidate = attempt if attempt is not None else _attempt(
+            RequestedAction.CREATE_PR
+        )
+        harness.attempts.update(candidate.key, lambda _current: candidate)
+        harness.runner.advance(
+            _owned(_operation(candidate, ContinuationPhase.PASS_PENDING_REVIEW))
+        )
+        stored = harness.attempts.for_key(candidate.key)
+        assert stored is not None
+        assert harness.session_output.runs == []
+        assert harness.completion.calls == []
+        return stored
+
+    def test_a_failing_setup_command_starts_no_run(self, harness: Harness) -> None:
+        harness.setup.failing = True
+
+        self._unrunnable(harness)
+
+        assert harness.journal == ["materialize", "setup"]
+
+    def test_a_setup_command_that_times_out_starts_no_run(
+        self, harness: Harness
+    ) -> None:
+        harness.setup.timing_out = True
+
+        self._unrunnable(harness)
+
+        assert harness.setup.commands == [SETUP_SENTINEL]
+
+    def test_setup_that_moves_head_off_the_candidate_starts_no_run(
+        self, harness: Harness
+    ) -> None:
+        """Provisioning installs tooling; it does not get to move the candidate."""
+        harness.setup.alters = lambda: setattr(
+            harness.working_copy, "head", SHA_A_PRIME
+        )
+
+        self._unrunnable(harness)
+
+    def test_setup_that_dirties_the_candidates_tracked_content_starts_no_run(
+        self, harness: Harness
+    ) -> None:
+        harness.setup.alters = lambda: setattr(harness.working_copy, "dirty", True)
+
+        self._unrunnable(harness)
+
+    def test_the_failed_checkout_is_removed(self, harness: Harness) -> None:
+        """Nothing else will: the run was never opened, so nobody holds it."""
+        harness.setup.failing = True
+
+        self._unrunnable(harness)
+
+        assert harness.worktrees.removed == [
+            harness.worktrees.root / f"continuation-{ISSUE_NUMBER}-{SHA_A[:12]}"
+        ]
+
+    def test_the_run_allowance_stays_spent(self, harness: Harness) -> None:
+        """A start budget: a broken environment must not refund its own run."""
+        harness.setup.failing = True
+
+        stored = self._unrunnable(harness)
+
+        assert stored.continuation_runs_used == 1
+
+    def test_the_durable_pass_is_left_untouched(self, harness: Harness) -> None:
+        """No publication evaluation is appended, and PASS(A) is still latest."""
+        harness.setup.failing = True
+
+        stored = self._unrunnable(harness)
+
+        assert len(stored.publication_evaluations) == 1
+        latest = stored.latest_publication_evaluation
+        assert latest is not None
+        assert latest.verdict is ValidationVerdict.PASSED
+        assert latest.head_sha == SHA_A
+
+    def test_no_verdict_or_settlement_is_fabricated(self, harness: Harness) -> None:
+        harness.setup.failing = True
+        harness.verdicts.binding = BoundReviewVerdict(
+            verdict=ReviewVerdictOutcome.APPROVED,
+            reviewed_sha=SHA_A,
+            decided_at="2026-08-19T01:00:00Z",
+            completed_rounds=1,
+        )
+
+        stored = self._unrunnable(harness)
+
+        assert stored.continuation_review_verdict is None
+        assert stored.continuation_settlement is None
+        assert harness.labels.applied == []
+
+    def test_the_recorded_intent_survives_for_a_later_pass(
+        self, harness: Harness
+    ) -> None:
+        """The candidate is not retired: it is the branch tip, and still live."""
+        harness.setup.failing = True
+
+        stored = self._unrunnable(harness)
+
+        assert stored.continuation_descriptor is not None
+
+    def test_a_repaired_environment_opens_a_run_on_a_later_pass(
+        self, harness: Harness
+    ) -> None:
+        """No new counter refuses the retry: the allowance alone bounds it."""
+        harness.setup.failing = True
+        attempt = self._unrunnable(harness)
+
+        harness.setup.failing = False
+        harness.runner.advance(
+            _owned(_operation(attempt, ContinuationPhase.PASS_PENDING_REVIEW))
+        )
+
+        assert len(harness.completion.calls) == 1
+        stored = harness.attempts.for_key(attempt.key)
+        assert stored is not None
+        assert stored.continuation_runs_used == 2
+
+    def test_the_retry_stops_when_the_existing_allowance_runs_out(
+        self, harness: Harness
+    ) -> None:
+        """Exhaustion is #149's own ``RUNS_EXHAUSTED``, not a second bound."""
+        harness.setup.failing = True
+        attempt = _attempt(RequestedAction.CREATE_PR)
+        harness.attempts.update(attempt.key, lambda _current: attempt)
+        operation = _operation(attempt, ContinuationPhase.PASS_PENDING_REVIEW)
+
+        for _ in range(CONTINUATION_RUN_ALLOWANCE + 2):
+            harness.runner.advance(_owned(operation))
+
+        assert harness.setup.commands == [SETUP_SENTINEL] * CONTINUATION_RUN_ALLOWANCE
+        assert len(harness.worktrees.created) == CONTINUATION_RUN_ALLOWANCE
+        stored = harness.attempts.for_key(attempt.key)
+        assert stored is not None
+        assert stored.continuation_runs_used == CONTINUATION_RUN_ALLOWANCE
+        assert stored.continuation_run_allowance_available is False
