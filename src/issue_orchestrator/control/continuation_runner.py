@@ -7,6 +7,7 @@ that already exist rather than reimplementing what they decide:
 ======================================  =====================================
 same-SHA admission, allowance, gate     :class:`~.publication_revalidation.PublicationRevalidation` (#139)
 exact-commit materialisation            the issue's own branch, verified
+making that checkout runnable           :class:`~.worktree_runnability.WorktreeRunnability` (#153)
 reviewer-first exchange, PR creation    :class:`~.completion_processor.CompletionProcessor`
 settlement of a discharged intent       :class:`~.continuation_finalize.ContinuationFinalizer`
 ownership and exclusion                 :class:`~.control_operation_ownership.ControlOperationOwnership` (#146)
@@ -88,6 +89,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from .continuation_live_truth import ContinuationReconciliation
     from .continuation_runs import ContinuationRuns
     from .publication_revalidation import PublicationRevalidation
+    from .worktree_runnability import WorktreeRunnability
 
 logger = logging.getLogger(__name__)
 
@@ -143,6 +145,7 @@ class ControlContinuationRunner:
         attempts: "AttemptStore",
         worktrees: "WorktreeManager",
         working_copy: "WorkingCopy",
+        runnability: "WorktreeRunnability",
         session_output: "SessionOutput",
         completion_processor: ContinuationCompletionOwner,
         review_verdicts: "ReviewVerdictBindings",
@@ -157,6 +160,11 @@ class ControlContinuationRunner:
         self._attempts = attempts
         self._worktrees = worktrees
         self._working_copy = working_copy
+        # The provisioning CORE, not the launch provisioner: the continuation's
+        # bound is #149's run allowance, already spent before the checkout
+        # existed, and the launch provisioner's consecutive-failure ledger and
+        # ``needs-human`` escalation would be a second one over the same run.
+        self._runnability = runnability
         self._session_output = session_output
         self._completion_processor = completion_processor
         self._review_verdicts = review_verdicts
@@ -344,17 +352,29 @@ class ControlContinuationRunner:
     def _open_run(
         self, operation: LiveContinuation, descriptor: "ContinuationDescriptor"
     ) -> ContinuationRun | None:
-        """Mint this operation's run: its worktree, its assets, its intent.
+        """Mint this operation's run: its worktree, its environment, its intent.
 
         Allocated once and registered with the owner immediately, so from the
         moment the checkout exists there is exactly one place that knows about
         it and exactly one place that will dispose of it.
+
+        The order is::
+
+            reserve the run allowance
+                -> materialize the checkout at exactly A
+                -> make it runnable, candidate unchanged
+                -> allocate run assets, write the intent, register the run
 
         The allowance is spent FIRST, before the checkout and long before the
         exchange, in the start-budget style #139 chose and for the reason it
         gives: a run interrupted anywhere leaves the allowance spent rather than
         refunding itself. Refunding would make the bound mean "one per crash",
         and this is the bound on the most expensive work in the system.
+
+        Provisioning follows materialisation and precedes every asset the
+        pipeline keys work to: a run whose worktree is not runnable must not
+        exist, because the run directory, the completion record and the
+        exchange's ``run_id`` are what re-enter the pipeline on the next pass.
 
         The run scaffold freezes the profile *the descriptor recorded*, for the
         reason #139's does: a candidate evaluated under one contract is
@@ -368,6 +388,8 @@ class ControlContinuationRunner:
         if materialized is None:
             return None
         worktree, agent_label = materialized
+        if not self._make_runnable(operation, worktree):
+            return None
         assets = self._session_output.start_run(
             worktree_path=worktree,
             session_name=_worktree_name(operation),
@@ -481,10 +503,72 @@ class ControlContinuationRunner:
                 operation.key,
                 (head or "unknown")[:12],
             )
-            self._worktrees.remove_checkout(info.path, force=True)
+            self._discard_checkout(info.path)
             self._retire(operation)
             return None
         return info.path, agent_lane
+
+    def _discard_checkout(self, worktree: Path) -> None:
+        """Dispose of a checkout no run owns yet.
+
+        Every pre-run refusal disposes HERE rather than through
+        :class:`~.continuation_runs.ContinuationRuns`, because the run does not
+        exist: nothing else knows this checkout is there, and the name is
+        deterministic per candidate, so one left behind would block every later
+        pass at ``git worktree add``.
+
+        After a run is opened the rule inverts — the run owner disposes, and
+        only when the completion pipeline says the work is finished — so this is
+        reachable only from the refusals above ``_open_run``'s registration.
+        """
+        self._worktrees.remove_checkout(worktree, force=True)
+
+    def _make_runnable(self, operation: LiveContinuation, worktree: Path) -> bool:
+        """Make the continuation's CODER worktree runnable, or open no run.
+
+        The checkout this run materialises is not a read-only carrier for a
+        cached verdict. It is handed to the persistent review exchange as the
+        coder's worktree, and a ``CHANGES_REQUESTED`` round asks that coder to
+        edit and validate *in it* — so it needs the same runtime environment
+        every other agent worktree gets, or the round dies on a toolchain that
+        was never installed and the failure is attributed to the candidate
+        (#48, #153).
+
+        The recipe is the operator's own (``Config.setup_worktree``, via
+        :class:`~.worktree_runnability.WorktreeRunnability`); nothing is
+        hard-coded or copied here. The same core also proves what
+        materialisation established is still true afterwards: provisioning may
+        write untracked runtime state into the worktree, and may not move
+        ``HEAD`` off ``A`` or leave the candidate's tracked content modified.
+
+        The sibling REVIEWER worktree keeps its own policy
+        (:mod:`~..execution.reviewer_worktree`): deliberately unprovisioned,
+        guarded where the provider supports it. Nothing here reaches it.
+
+        Failure opens no run at all, and the checkout is discarded through the
+        one pre-run disposal (:meth:`_discard_checkout`). The reservation stays
+        spent: it is a start budget, and refunding it would turn a repeatably
+        broken environment into an unbounded supply of continuation runs. A
+        later pass may open another run only while #149's existing allowance
+        lasts, and once it is gone the ordinary ``RUNS_EXHAUSTED`` derivation
+        hands the candidate back to rework — where the launch provisioner
+        escalates the same broken environment to ``needs-human``. There is no
+        second counter and no escalation of its own.
+
+        Returns:
+            Whether the worktree is runnable and the run may be opened.
+        """
+        unrunnable = self._runnability.make_runnable(worktree)
+        if unrunnable is None:
+            return True
+        logger.warning(
+            "[CONTINUATION] %s opens no run: its coder worktree could not be"
+            " made runnable: %s",
+            operation.key,
+            unrunnable,
+        )
+        self._discard_checkout(worktree)
+        return False
 
     def _process(self, operation: LiveContinuation, run: ContinuationRun) -> bool:
         """Re-enter the completion pipeline for ``run``, and say whether it ended.

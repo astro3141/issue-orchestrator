@@ -421,9 +421,25 @@ left the candidate alone — is `WorktreeRunnability`
 (`control/worktree_runnability.py`), and the two rules below marked
 *(enforced by `WorktreeRunnability`)* are enforced there. The provisioner is
 that core plus the launch policy around it: how often a launch may re-ask, and
-what happens when it stops being worth asking. The same-SHA revalidation route
-consumes the core directly ([#153]), because its bound is [#139]'s single start
-allowance and not a launch ledger.
+what happens when it stops being worth asking. Two callers consume the core
+directly rather than through the provisioner, because each already carries its
+own start budget and a launch ledger over it would be a second bound:
+
+- the same-SHA revalidation route ([#153]), bounded by [#139]'s single start
+  allowance;
+- the control continuation's `continuation-*` coder worktree ([#160]), bounded
+  by [#149]'s continuation-run allowance. That checkout is not a read-only
+  carrier for a cached PASS: the persistent review exchange opens on it as the
+  **coder's** worktree, and a `CHANGES_REQUESTED` round asks that coder to edit
+  and validate in it. It is provisioned after the run allowance is reserved and
+  before any run asset exists, and a checkout that cannot be made runnable
+  opens no run, records no verdict or settlement, leaves the durable PASS
+  latest, is removed, and gets no refund. A *persistently* broken environment
+  therefore spends that allowance one run at a time with only a warning per
+  pass — no escalation of its own, by design. It still reaches a human, one hop
+  later: exhaustion derives `RUNS_EXHAUSTED`, the candidate returns to ordinary
+  rework, and the launch provisioner escalates the same broken environment to
+  `needs-human` there.
 
 The provisioner is the single owner of provisioning for launches, and **every
 session launch path** goes through it: coding, validation retry, rework, review
@@ -523,7 +539,8 @@ The table is framed per session launch, but a same-SHA revalidation ([#153])
 pays the same recipe in its exact-SHA checkout, which is then force-removed
 once the gate has run. That cost is bounded the same way the revalidation
 itself is: [#139]'s single start allowance means at most one such run per
-candidate, not one per tick.
+candidate, not one per tick. A continuation coder worktree ([#160]) pays it on
+the same terms, bounded by [#149]'s continuation-run allowance.
 
 **Concurrency needs no coordination primitive here.** Two sessions provisioning
 at once have no shared environment to race over, so nothing has to be trusted
@@ -724,6 +741,12 @@ That is deliberate, and it is the only such exemption. The reviewer reads the
 candidate's code; it does not run gates, and provisioning it would pay
 `worktrees.setup` — for this repository an `npm ci` and a browser install — per
 exchange to support a command that cannot produce a verdict there anyway.
+
+"Not created by a session launch" is not itself the exemption. Its sibling —
+the `continuation-*` **coder** worktree the same exchange opens on — is not
+created by a launch either, and it *is* provisioned ([#160]), because a
+`CHANGES_REQUESTED` round runs the candidate's own edit-and-validate work
+there. What is exempt is the worktree that only reads.
 
 **A barrier, not an instruction, is what makes the exemption safe.**
 `docs/architecture/hooks.md` is explicit that policy documents and prompts are
