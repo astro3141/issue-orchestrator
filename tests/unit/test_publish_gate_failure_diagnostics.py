@@ -44,7 +44,6 @@ from issue_orchestrator.control.publication_gate import (
     RunValidationContracts,
     publish_gate_output_dir,
 )
-from issue_orchestrator.control.publication_verdict import PublicationVerdictReceipts
 from issue_orchestrator.control.publish_gate_diagnostics import (
     DIAGNOSTIC_FILE_NAME,
     PUBLISH_GATE_FAILURES_DIR,
@@ -171,9 +170,8 @@ def _gate(
         ),
         command_runner=runner,
         working_copy=StubWorkingCopy(head_sha),
-        verdicts=PublicationVerdictReceipts(
-            SidecarAttemptStore(repo_root), StubAttemptKeys()
-        ),
+        attempts=SidecarAttemptStore(repo_root),
+        attempt_keys=StubAttemptKeys(),
         diagnostics=PublishGateDiagnostics(repo_root),
     )
 

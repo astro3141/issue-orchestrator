@@ -25,7 +25,6 @@ from issue_orchestrator.control.publication_gate import (
     RunValidationContracts,
     publish_gate_output_dir,
 )
-from issue_orchestrator.control.publication_verdict import PublicationVerdictReceipts
 from issue_orchestrator.control.publish_gate_diagnostics import (
     PublishGateDiagnostics,
 )
@@ -79,20 +78,18 @@ class StubAttemptKeys:
         return AttemptKey(issue_key, head_sha)
 
 
-def verdict_receipts(worktree: Path) -> PublicationVerdictReceipts:
-    """A receipt writer over a real sidecar store, outside the worktree.
+def attempts(worktree: Path) -> SidecarAttemptStore:
+    """A real sidecar store, outside the worktree.
 
     ``.parent`` on purpose: the attempt sidecar is what has to survive the
     worktree being removed, so these tests never let it live inside one.
     """
-    return PublicationVerdictReceipts(
-        SidecarAttemptStore(worktree.parent), StubAttemptKeys()
-    )
+    return SidecarAttemptStore(worktree.parent)
 
 
 def failure_diagnostics(worktree: Path) -> PublishGateDiagnostics:
     """Durable failure diagnostics, rooted outside the worktree for the same
-    reason ``verdict_receipts`` is: what has to survive cleanup cannot live in
+    reason ``attempts`` is: what has to survive cleanup cannot live in
     the thing being cleaned up (#94)."""
     return PublishGateDiagnostics(worktree.parent)
 
@@ -149,7 +146,8 @@ class TestThePublishGateRunsThePublishContract:
             contracts=contracts,
             command_runner=runner,
             working_copy=StubWorkingCopy(),
-            verdicts=verdict_receipts(worktree),
+            attempts=attempts(worktree),
+            attempt_keys=StubAttemptKeys(),
             diagnostics=failure_diagnostics(worktree),
         )
 
@@ -222,7 +220,8 @@ class TestThePublishGateRunsThePublishContract:
             contracts=RunValidationContracts(session_output, sentinel_registry()),
             command_runner=runner,
             working_copy=StubWorkingCopy(),
-            verdicts=verdict_receipts(worktree),
+            attempts=attempts(worktree),
+            attempt_keys=StubAttemptKeys(),
             diagnostics=failure_diagnostics(worktree),
         )
 
@@ -395,7 +394,8 @@ class TestTheRunsFrozenProfileSelectsTheContract:
             contracts=RunValidationContracts(session_output, registry),
             command_runner=runner,
             working_copy=StubWorkingCopy(),
-            verdicts=verdict_receipts(worktree),
+            attempts=attempts(worktree),
+            attempt_keys=StubAttemptKeys(),
             diagnostics=failure_diagnostics(worktree),
         ).check(worktree=worktree, run_assets=run, issue_key=None)
 
@@ -415,7 +415,8 @@ class TestTheRunsFrozenProfileSelectsTheContract:
             contracts=RunValidationContracts(session_output, sentinel_registry()),
             command_runner=runner,
             working_copy=StubWorkingCopy(),
-            verdicts=verdict_receipts(worktree),
+            attempts=attempts(worktree),
+            attempt_keys=StubAttemptKeys(),
             diagnostics=failure_diagnostics(worktree),
         ).check(worktree=worktree, run_assets=run, issue_key=None)
 
@@ -441,7 +442,8 @@ class TestTheRunsFrozenProfileSelectsTheContract:
             contracts=RunValidationContracts(session_output, registry),
             command_runner=runner,
             working_copy=StubWorkingCopy(),
-            verdicts=verdict_receipts(worktree),
+            attempts=attempts(worktree),
+            attempt_keys=StubAttemptKeys(),
             diagnostics=failure_diagnostics(worktree),
         ).check(worktree=worktree, run_assets=run, issue_key=None)
 
@@ -486,7 +488,8 @@ class TestAProfileThatCouldNeverCertifyItsCandidate:
             contracts=RunValidationContracts(FileSystemSessionOutput(), registry),
             command_runner=runner,
             working_copy=StubWorkingCopy(),
-            verdicts=verdict_receipts(worktree),
+            attempts=attempts(worktree),
+            attempt_keys=StubAttemptKeys(),
             diagnostics=failure_diagnostics(worktree),
         ).check(worktree=worktree, run_assets=run, issue_key=None)
         return result, runner
@@ -516,7 +519,8 @@ class TestAProfileThatCouldNeverCertifyItsCandidate:
             ),
             command_runner=RecordingCommandRunner(),
             working_copy=StubWorkingCopy(),
-            verdicts=verdict_receipts(worktree),
+            attempts=attempts(worktree),
+            attempt_keys=StubAttemptKeys(),
             diagnostics=failure_diagnostics(worktree),
         ).check(worktree=worktree, run_assets=run, issue_key=None)
 
@@ -565,7 +569,8 @@ class TestTheGateReportsWhereItsEvidenceLives:
             ),
             command_runner=runner,
             working_copy=StubWorkingCopy(),
-            verdicts=verdict_receipts(worktree),
+            attempts=attempts(worktree),
+            attempt_keys=StubAttemptKeys(),
             diagnostics=failure_diagnostics(worktree),
         )
 

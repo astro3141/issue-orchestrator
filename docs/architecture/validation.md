@@ -6,7 +6,9 @@ Validation is a **local lifecycle gate**, not a CI system.
 
 - Run one quick local command while the coding/review loop is active
 - Run one deeper publish command before push/publish
-- Cache passing results by worktree + commit SHA + command + contract
+- Cache passing results by commit SHA + command + contract — against the
+  candidate's durable `Attempt(issue, A)` where the caller can name the
+  candidate, and against the worktree's own records where it cannot
 - Reuse passing publish records across the callers that run the publish command
 - Observe GitHub CI rather than reproducing it locally
 
@@ -121,6 +123,49 @@ number back into a key is the drift [#40] removed, and a receipt filed under a
 key nothing else uses is worse than no receipt at all. That is why resume asks
 the repository instead of reusing the display-title lookup, which answers with
 the placeholder `Issue #<n>` when nothing responds.
+
+### The receipt is also the cache
+
+The publication gate does not only *file* verdicts on `Attempt(issue, A)`; it
+**consults** the same history before executing anything. Both directions go
+through one owner, `CandidateEvaluations`, which is the only writer of
+`Attempt.completed_evaluations` and the only reader of it that a gate uses.
+
+That closes issue [#159]. Until then, the publication gate's only cache was the
+publish record store *inside the worktree it was running in*, so the reuse it
+could see died with the worktree. The observed sequence was:
+
+```text
+eval[0] FAILED   # the original gate run
+eval[1] PASSED   # #139's bounded same-SHA revalidation, in a detached checkout
+eval[2] FAILED   # a fresh continuation worktree re-ran the whole publish gate
+```
+
+The third evaluation displaced the legitimate PASS as latest authority and
+locked the candidate out of review. It should never have existed: nothing about
+the candidate had changed, and the contract had already decided about it.
+
+The bounds are the ones the history already carries, not new ones:
+
+- Only a **PASS** is reusable. A FAIL or a timeout re-runs, which is what makes
+  [#139]'s revalidation route possible at all.
+- The **latest** matching evaluation decides. An older PASS never hides a newer
+  non-PASS.
+- Reuse is matched on the exact `head_sha` and on `result_mismatch` over
+  suite + command + profile, so `A'` never inherits `A`'s receipt and a drifted
+  contract is a miss rather than a reuse.
+- Reuse **appends nothing**. A cache hit executed no contract, and an
+  append-only history that recorded lookups would claim the gate ran more times
+  than it did.
+- A caller with no canonical issue key derives no attempt identity at all: it
+  neither reads nor writes the durable history, and keeps the worktree-local
+  cache semantics it has always had.
+
+`Attempt.validation_record_path` is a single slot that every contract filing
+here writes, so the last one to run owns it. That pointer is **not** authority:
+it exists so a surviving record can be materialised into a run directory, and a
+pointer naming another contract's record — or a reaped one — reads the same
+way, as a cache hit with nothing to materialise.
 
 ### A failed verdict also has to leave its explanation
 

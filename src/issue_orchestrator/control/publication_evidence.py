@@ -103,7 +103,8 @@ class CandidatePublicationEvidence:
     to leave a long-lived reader answering from the contract it was built with.
 
     ``attempt_keys`` is the same port the *writer* derives its key from
-    (:class:`~.publication_verdict.PublicationVerdictReceipts`). Filing a
+    (:meth:`~.publication_gate.PublicationGate._attempt_key_for`, which hands
+    it to :class:`~.candidate_evaluations.CandidateEvaluations`). Filing a
     receipt and finding it again are two halves of one identity question, and
     spelling that identity out separately on each side is how the two ends of a
     record drift apart — the drift ``result_mismatch`` was extracted to prevent

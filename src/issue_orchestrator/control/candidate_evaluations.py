@@ -21,9 +21,21 @@ the contract now being asked about". That is what makes a shared history safe:
 the quick gate runs again after every completion, and its receipt sits beside
 the publication one without either being readable as the other.
 
+Since #159 this is the *only* writer of that history. The publication gate
+used to keep a second one of its own, which was harmless while it did not read
+the history and would have doubled every completed publication evaluation the
+moment it did. One owner answers both questions for every contract, so a rule
+about the history — most of all "reuse appends nothing" — cannot be enforced
+one way by the quick gate and another way by the publication gate.
+
 The record file is looked up only so a surviving one can still be materialised
 into a run directory. It is not authority and its absence is not a miss —
-:class:`PriorEvaluation` says so by carrying ``record=None``.
+:class:`PriorEvaluation` says so by carrying ``record=None``. The pointer it is
+found through, ``Attempt.validation_record_path``, is one slot shared by every
+contract that files here, so the last contract to run owns it and an earlier
+one's reuse reads as "nothing to materialise". That is a loss of convenience,
+not of authority: the receipts say what was decided, and a record describing
+another contract is refused rather than materialised.
 """
 
 from __future__ import annotations
@@ -108,7 +120,10 @@ class CandidateEvaluations:
         that did appends its receipt, so the decision survives the worktree the
         record lives in; reusing an earlier evaluation appends nothing, because
         reuse is not a second completed evaluation and an append-only history
-        that recorded it would grow one entry per lookup.
+        that recorded it would grow one entry per lookup. That is exactly the
+        rule #159 needs from the publication side: a fresh continuation
+        checkout at ``A`` reuses the durable ``PASS(A)`` and leaves the history
+        the length it was.
 
         One store write either way, so a reader can never see the pointer moved
         without the verdict it points at, or the reverse.

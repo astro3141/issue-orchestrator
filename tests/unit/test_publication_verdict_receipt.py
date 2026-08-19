@@ -32,7 +32,6 @@ from issue_orchestrator.control.publication_gate import (
     PublicationGate,
     RunValidationContracts,
 )
-from issue_orchestrator.control.publication_verdict import PublicationVerdictReceipts
 from issue_orchestrator.control.publish_gate_diagnostics import (
     PublishGateDiagnostics,
 )
@@ -145,9 +144,8 @@ def _gate(
         ),
         command_runner=runner,
         working_copy=StubWorkingCopy(head_sha),
-        verdicts=PublicationVerdictReceipts(
-            SidecarAttemptStore(repo_root), StubAttemptKeys()
-        ),
+        attempts=SidecarAttemptStore(repo_root),
+        attempt_keys=StubAttemptKeys(),
         # Durable failure output lands in the same root the receipts do (#94);
         # these proofs are about the receipt, not about that artefact.
         diagnostics=PublishGateDiagnostics(repo_root),
@@ -278,16 +276,24 @@ class TestThePublishVerdictIsRecordedDurably:
             ),
         )
 
-        _gate(repo_root=repo_root, runner=StubCommandRunner()).check(
+        outcome = _gate(repo_root=repo_root, runner=StubCommandRunner()).check(
             worktree=worktree, run_assets=_run(worktree), issue_key=ISSUE
         )
 
         attempt = _read(repo_root)
         assert attempt is not None
         assert attempt.reroute_budget_used == 2
-        assert attempt.validation_record_path == "/runs/1/validation-record.json"
         assert attempt.execution_identities == identities
         assert attempt.publication_validation_passed is True
+        # The one fact this run does replace: since #159 the gate files through
+        # the attempt-scoped evaluation owner, which moves the record pointer to
+        # the record the verdict it just appended is about. The pointer is
+        # best-effort materialisation, not authority, and a pointer left naming
+        # a previous run's file would be a claim about this verdict that is not
+        # true of it.
+        assert attempt.validation_record_path == str(
+            outcome.evidence.paths.record_path
+        )
 
 
 class TestTheVerdictOutlivesItsWorktree:
@@ -537,13 +543,15 @@ class TestReuseIsNotASecondCompletedEvaluation:
         assert len(attempt.publication_evaluations) == 1
         assert attempt.publication_validation_passed is True
 
-    def test_the_rule_matches_the_other_writer_of_the_same_history(self) -> None:
-        """Both writers of the history answer "was this reached?" explicitly.
+    def test_the_one_writer_of_the_history_must_be_told_what_was_reached(
+        self,
+    ) -> None:
+        """The rule cannot be enforced differently by path (#159).
 
-        The attempt-scoped path already refused to append on reuse. A publish
-        path that quietly appended anyway would be the same rule enforced
-        differently by path — the drift ``CandidateEvaluations.file`` documents
-        as the thing not to do.
+        There is one writer, so "reuse appends nothing" is one rule rather than
+        two that agree today. It is stated by requiring the caller to say
+        whether the verdict was *reached*: no default, keyword-only, so a
+        caller reusing an earlier evaluation cannot omit the fact.
         """
         import inspect
 
@@ -551,10 +559,35 @@ class TestReuseIsNotASecondCompletedEvaluation:
             CandidateEvaluations,
         )
 
-        for method in (PublicationVerdictReceipts.record, CandidateEvaluations.file):
-            completed = inspect.signature(method).parameters["completed"]
-            assert completed.kind is inspect.Parameter.KEYWORD_ONLY
-            assert completed.default is inspect.Parameter.empty
+        completed = inspect.signature(CandidateEvaluations.file).parameters[
+            "completed"
+        ]
+        assert completed.kind is inspect.Parameter.KEYWORD_ONLY
+        assert completed.default is inspect.Parameter.empty
+
+    def test_nothing_else_in_the_source_appends_to_the_history(self) -> None:
+        """A second writer is the defect, not a redundancy.
+
+        The publication gate kept its own writer until #159. That was harmless
+        only while it did not *read* the history: the moment it consulted the
+        same evaluations to reuse a durable PASS, its own append ran beside
+        ``CandidateEvaluations.file`` and every completed publication verdict
+        landed twice. So the append is pinned to one call site.
+        """
+        import issue_orchestrator
+
+        src = Path(issue_orchestrator.__file__).parent
+        callers = sorted(
+            path.relative_to(src).as_posix()
+            for path in src.rglob("*.py")
+            if "with_completed_evaluation(" in path.read_text(encoding="utf-8")
+        )
+
+        assert callers == [
+            # The domain method itself, and the one owner that calls it.
+            "control/candidate_evaluations.py",
+            "domain/attempt.py",
+        ]
 
 
 class TestRemovingTheBindingBreaksThesePins:
@@ -569,10 +602,14 @@ class TestRemovingTheBindingBreaksThesePins:
     def test_without_the_durable_write_no_receipt_exists(
         self, repo_root: Path, worktree: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        from issue_orchestrator.control.candidate_evaluations import (
+            CandidateEvaluations,
+        )
+
         monkeypatch.setattr(
-            PublicationGate,
-            "_record_verdict",
-            lambda self, record, issue_key, *, completed: None,
+            CandidateEvaluations,
+            "file",
+            lambda self, record, record_path, *, completed: None,
         )
 
         _gate(repo_root=repo_root, runner=StubCommandRunner()).check(

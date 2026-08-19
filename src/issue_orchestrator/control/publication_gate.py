@@ -31,10 +31,15 @@ gate's logs while carrying the publish gate's record.
 
 All of that evidence lives inside the coder worktree and dies with it. So
 every run of the publish contract also files a durable verdict receipt on
-``Attempt(issue, A)`` (#85) — see :mod:`.publication_verdict`. The gate is the
-producer seam for that fact because it is the only thing that knows the
-contract it just executed; a caller reconstructing the verdict from the
-outcome would be a second place that decides what the gate decided.
+``Attempt(issue, A)`` (#85), and since #159 it *consults* the same history
+before running anything — both through
+:class:`~.candidate_evaluations.CandidateEvaluations`, the one owner of a
+candidate's evaluations, reached the way every other attempt-scoped gate
+reaches it: by handing :class:`~.validation.ValidationGate` the candidate's
+attempt identity. The gate is the producer seam for that fact because it is
+the only thing that knows the contract it just executed; a caller
+reconstructing the verdict from the outcome would be a second place that
+decides what the gate decided.
 
 The receipt states *what* the gate decided. A run that FAILS also has to leave
 *why*, and for the same reason: its stdout and stderr are in the run directory
@@ -50,6 +55,7 @@ import logging
 from dataclasses import dataclass
 from pathlib import Path
 
+from ..domain.attempt import AttemptKey
 from ..domain.issue_key import IssueKey
 from ..domain.session_run import SessionRunAssets, ValidationArtifactPaths
 from ..domain.validation_profile import ValidationGateKind
@@ -62,7 +68,6 @@ from ..ports import CommandRunner, WorkingCopy
 from ..ports.attempt_store import AttemptStore
 from ..ports.session_output import SessionOutput, ValidationRecord
 from ..ports.validation_attempt_key_factory import ValidationAttemptKeyFactory
-from .publication_verdict import PublicationVerdictReceipts
 from .publish_gate_diagnostics import (
     CandidateGateDiagnostics,
     PublishGateDiagnostics,
@@ -174,7 +179,9 @@ def build_publication_gate(
 
     ``attempt_store`` and ``attempt_keys`` are required, not optional: a gate
     built without them would run the publish contract and leave no durable
-    trace of what it decided, which is the defect #85 exists to close.
+    trace of what it decided, which is the defect #85 exists to close — and,
+    since #159, would re-run a contract this candidate has already passed
+    because it could not see the history it should have consulted.
     ``repo_root`` is required for the same reason one step further: without it
     the gate would record *that* a candidate failed and destroy the only
     account of *why* along with the worktree, which is #94's defect.
@@ -183,7 +190,8 @@ def build_publication_gate(
         contracts=RunValidationContracts(session_output, profiles),
         command_runner=command_runner,
         working_copy=working_copy,
-        verdicts=PublicationVerdictReceipts(attempt_store, attempt_keys),
+        attempts=attempt_store,
+        attempt_keys=attempt_keys,
         diagnostics=PublishGateDiagnostics(repo_root),
     )
 
@@ -196,14 +204,27 @@ class PublicationGate:
     *run's own* frozen profile — not a command captured at composition time —
     so a rework round and the run it reworks are held to the same contract.
 
-    Caching is by HEAD SHA + command + profile within the publish record
-    store. Attempt-scoped caching is deliberately not used here: an attempt
-    carries one validation record path, and letting the publish gate read or
-    write it would put quick and publish results in one slot — the reuse this
-    issue exists to prevent. The verdict receipt this gate files on the
-    attempt (#85) is a different slot with a different meaning: it states what
-    this contract decided rather than pointing at a record, and the quick gate
-    never writes it.
+    Caching is scoped to ``Attempt(issue, A)`` whenever the caller can name the
+    candidate, and by HEAD SHA + command + profile within this worktree's
+    publish record store when it cannot (#159). The attempt scope is the only
+    one that survives the worktree: a candidate whose PASS was reached in a
+    revalidation checkout (#139) that has since been released re-enters
+    completion from a fresh checkout holding no record of anything, and a gate
+    that could only see this worktree re-ran the whole publication contract and
+    appended a third evaluation that displaced the PASS it should have reused.
+
+    The reuse the older shape guarded against — a *quick* result satisfying a
+    *publish* request — is prevented by
+    :meth:`~..infra.validation_profiles.ValidationGateContract.result_mismatch`
+    rather than by keeping the two contracts in separate stores: the shared
+    history names the contract each entry executed, so the publication gate
+    reads only publication evaluations however many quick ones sit beside them.
+    What the two contracts still share is ``Attempt.validation_record_path``,
+    which is one slot and is now written by both. That slot is not authority
+    and never was: it is a best-effort pointer used to materialise a surviving
+    record into a run directory, and a pointer naming the other contract's
+    record reads exactly as a reaped one does — a cache hit with nothing to
+    materialise.
     """
 
     def __init__(
@@ -212,13 +233,15 @@ class PublicationGate:
         contracts: RunValidationContracts,
         command_runner: CommandRunner,
         working_copy: WorkingCopy,
-        verdicts: PublicationVerdictReceipts,
+        attempts: AttemptStore,
+        attempt_keys: ValidationAttemptKeyFactory,
         diagnostics: PublishGateDiagnostics,
     ) -> None:
         self._contracts = contracts
         self._command_runner = command_runner
         self._working_copy = working_copy
-        self._verdicts = verdicts
+        self._attempts = attempts
+        self._attempt_keys = attempt_keys
         self._diagnostics = diagnostics
 
     def check(
@@ -234,18 +257,18 @@ class PublicationGate:
             worktree: The working copy the contract runs in.
             run_assets: The owned run whose frozen profile selects the contract.
             issue_key: The candidate's canonical issue identity, under which
-                this run's verdict is filed durably. Required as an explicit
-                argument — including when it is ``None`` — so a caller that has
-                no canonical identity says so rather than omitting it. The
-                manual-reprocess route is the ``None`` case: it holds only an
-                issue *number* from a URL path, and deriving a key from a
-                work-item snapshot is what #40 removed. The republish path
-                carries the key on its durable locators instead.
+                this run's evaluations are read and filed durably. Required as
+                an explicit argument — including when it is ``None`` — so a
+                caller that has no canonical identity says so rather than
+                omitting it. The manual-reprocess route is the ``None`` case:
+                it holds only an issue *number* from a URL path, and deriving a
+                key from a work-item snapshot is what #40 removed. The
+                republish path carries the key on its durable locators instead.
 
         Returns:
             The outcome, including the evidence paths this gate wrote to.
             ``allowed`` is True when the publish command passed (or was reused
-            from a passing record for this exact HEAD/command/profile), and
+            from a passing evaluation of this exact HEAD/command/profile), and
             when *no* profile in the repository configures a publish command —
             an explicit operator choice, not a silent skip. A run whose own
             profile configures none while another profile does is refused
@@ -273,6 +296,8 @@ class PublicationGate:
             command_runner=self._command_runner,
             working_copy=self._working_copy,
             contract=contract,
+            attempt_store=self._attempts,
+            attempt_key=self._attempt_key_for(contract, worktree, issue_key),
             failure_diagnostics=self._failure_diagnostics_for(contract, issue_key),
         )
         # One local for both: the directory the gate runs into is the
@@ -280,7 +305,6 @@ class PublicationGate:
         # could name a different one.
         output_dir = publish_gate_output_dir(run_assets.run_dir)
         result = gate.check(session_output_dir=output_dir)
-        self._record_verdict(result.record, issue_key, completed=not result.cache_hit)
         return PublicationGateOutcome(
             allowed=result.allowed,
             reason=result.reason,
@@ -364,7 +388,7 @@ class PublicationGate:
         keep and nothing is degraded by having no destination for it.
 
         ``None`` where there is no canonical issue identity, which is the same
-        answer :meth:`_record_verdict` gives and for the same reason: the
+        answer :meth:`_attempt_key_for` gives and for the same reason: the
         artefact is bound to ``(issue, A)``, and one filed under an identity
         nothing else uses could not be found from the receipt. Warned about
         here rather than silently, because the consequence — a failure nobody
@@ -381,55 +405,49 @@ class PublicationGate:
             return None
         return self._diagnostics.for_candidate(issue_key)
 
-    def _record_verdict(
+    def _attempt_key_for(
         self,
-        record: ValidationRecord | None,
+        contract: ValidationGateContract,
+        worktree: Path,
         issue_key: IssueKey | None,
-        *,
-        completed: bool,
-    ) -> None:
-        """File this run's verdict on the attempt, when there is one to file.
+    ) -> AttemptKey | None:
+        """This run's candidate identity, or ``None`` when it has none (#159).
 
-        ``completed`` distinguishes a verdict this run *reached* from one it
-        reused out of the publish record store (#139). Only the first is a
-        completed evaluation; the history is append-only, so recording reuse
-        would state that the publish contract executed twice on a candidate it
-        executed on once.
+        The identity is ``(issue, A)`` and both halves have to be nameable, so
+        this answers ``None`` in exactly the two shapes where one is not:
 
-        A run with no record executed no contract, and "never gated" is the
-        *absence* of a receipt, not a receipt saying nothing. Writing one here
-        would make the one state a reader most needs to distinguish
-        indistinguishable. Two causes reach this branch, and skipping the
-        receipt is right for both:
+        - no canonical issue identity. The manual-reprocess route holds an
+          issue *number*, and #40 removed deriving a key from one. The gate
+          still runs, still decides, and still caches — from this worktree's
+          own publish record store, which is the behaviour that route has
+          always had. What it cannot do is read or add to the candidate's
+          durable history, so it is said out loud rather than degraded
+          silently.
+        - no readable HEAD. :meth:`ValidationGate.check` refuses such a run
+          before executing anything, and there is no commit to key an identity
+          on in the first place.
 
-        - no profile configures a publish command, so nothing ran and nothing
-          will ever ask for a receipt (a profile that is alone in configuring
-          none is refused before this, by :meth:`_uncertifiable_candidate`);
-        - ``ValidationGate.check`` refused before running because it could not
-          determine HEAD (``control.validation``). That is a refusal rather
-          than an unconfigured gate, but it has no commit — so there is no
-          candidate ``A`` to file a verdict under in the first place.
+        An unconfigured contract executes nothing and decides nothing, so it
+        binds to no candidate: "never gated" must stay the *absence* of a
+        receipt rather than a receipt saying nothing.
 
-        Failures on both sides are recorded: a FAIL and a timeout are facts
-        about A exactly as a PASS is, and a reader that only ever saw passes
-        could not tell a refusal from a gate that never ran.
+        The HEAD read here and the gate's own are two reads of one working
+        copy, and :meth:`ValidationGate.check` refuses outright if they
+        disagree — the same guard the quick gate's caller relies on. A key
+        built from a HEAD that moved under the gate would file this run's
+        verdict against a candidate it never evaluated.
         """
-        if record is None:
-            return
-        if issue_key is None:
-            if completed:
-                # Only a verdict this run *reached* is lost by having nowhere
-                # to file it. A reused one is already on the record it was
-                # reused from, so warning about it would report a loss that
-                # did not happen.
+        if not contract.configured or issue_key is None:
+            if contract.configured:
                 logger.warning(
-                    "Publish verdict not durably recorded: no canonical issue "
-                    "identity for %s@%s; Attempt(issue, A) keeps no receipt for "
-                    "this run",
-                    record.suite,
-                    record.head_sha[:12],
+                    "Publish gate runs with no candidate identity: no canonical "
+                    "issue key for this run, so it neither reads nor adds to "
+                    "Attempt(issue, A) and caches only within this worktree"
                 )
-            return
-        self._verdicts.record(
-            issue_key=issue_key, record=record, completed=completed
+            return None
+        head_sha = self._working_copy.get_head_sha(worktree)
+        if not head_sha:
+            return None
+        return self._attempt_keys.for_validation_attempt(
+            issue_key=issue_key, head_sha=head_sha
         )

@@ -31,7 +31,6 @@ from issue_orchestrator.control.publication_revalidation import (
     PublicationRevalidation,
     RevalidationOutcome,
 )
-from issue_orchestrator.control.publication_verdict import PublicationVerdictReceipts
 from issue_orchestrator.control.publish_gate_diagnostics import PublishGateDiagnostics
 from issue_orchestrator.control.worktree_runnability import WorktreeRunnability
 from issue_orchestrator.domain.attempt import Attempt, AttemptKey
@@ -388,7 +387,8 @@ def _route(
             # The real working copy: the SHA the receipt claims is the SHA the
             # materialized checkout actually sits at, not one a stub supplied.
             working_copy=GitWorkingCopy(),
-            verdicts=PublicationVerdictReceipts(store, StubAttemptKeys()),
+            attempts=store,
+            attempt_keys=StubAttemptKeys(),
             diagnostics=PublishGateDiagnostics(repo.root),
         ),
     )
@@ -1168,8 +1168,7 @@ def _keyless_gate(repo: SimpleNamespace, runner: StubCommandRunner) -> Publicati
         contracts=RunValidationContracts(FileSystemSessionOutput(), profiles),
         command_runner=runner,
         working_copy=GitWorkingCopy(),
-        verdicts=PublicationVerdictReceipts(
-            SidecarAttemptStore(repo.root), StubAttemptKeys()
-        ),
+        attempts=SidecarAttemptStore(repo.root),
+        attempt_keys=StubAttemptKeys(),
         diagnostics=PublishGateDiagnostics(repo.root),
     )

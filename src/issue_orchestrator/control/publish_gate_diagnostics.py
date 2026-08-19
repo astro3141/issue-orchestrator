@@ -113,8 +113,8 @@ class CandidateGateDiagnostics:
     Bound to the issue at construction and to the commit by the record it is
     handed, so no caller can supply an identity that disagrees with the run:
     the ``head_sha`` is the gate's own, exactly as
-    :class:`~.publication_verdict.PublicationVerdictReceipts` takes it from the
-    record rather than from a second read of the working copy.
+    :func:`~.publication_verdict.receipt_for` takes it from the record rather
+    than from a second read of the working copy.
     """
 
     def __init__(self, *, failures_dir: Path, issue_key: IssueKey) -> None:
