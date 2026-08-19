@@ -71,9 +71,10 @@ class ControlOperationKey:
     operation be claimed twice — once per spelling.
 
     ``head_sha`` is normalised by the same rule every authority record binding
-    evidence to a candidate uses, so an abbreviated or upper-case SHA is
-    refused rather than turned into an identity that compares unequal to a real
-    HEAD later.
+    evidence to a candidate uses: case is canonicalised, and anything that does
+    not name one exact commit — an abbreviated or non-hex value — is refused
+    rather than turned into an identity that compares unequal to a real HEAD
+    later.
     """
 
     issue_key: "IssueKey"

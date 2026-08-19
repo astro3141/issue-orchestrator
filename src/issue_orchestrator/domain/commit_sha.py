@@ -26,7 +26,8 @@ _HEX_DIGITS = frozenset("0123456789abcdef")
 def normalize_commit_sha(value: object, *, field_name: str) -> str:
     """Return ``value`` as a canonical full commit SHA, or raise.
 
-    Abbreviated, uppercase, or non-hex values are rejected rather than
+    Case is canonicalised, because an upper-case SHA still names one exact
+    commit. Abbreviated or non-hex values do not, and are rejected rather than
     normalised into something that would compare unequal to a real HEAD later.
     """
     if not isinstance(value, str):

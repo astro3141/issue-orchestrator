@@ -299,6 +299,32 @@ class TestUnreadableStoreFailsClosed:
         assert not release.settled
         assert _eligibility(state) is QueueMutationStatus.REJECTED_EXCLUDED
 
+    def test_a_recovered_store_does_not_let_a_failed_claim_free_a_peer(self, tmp_path):
+        """A release that gave nothing back cannot reopen a fail-closed entry.
+
+        The claim could not be written, so the exclusion is ``UNAVAILABLE``. By
+        the time the caller unwinds the store is back — and it reports the
+        operation as another holder's. Ignorance may only be resolved by a
+        reconciliation against live truth, never by a release of ours that
+        released nothing.
+        """
+        ControlOperationOwnership(
+            OrchestratorState(), _ledger(tmp_path), holder="engine-a"
+        ).claim(_key())
+
+        loser_state = OrchestratorState()
+        ControlOperationOwnership(
+            loser_state, UnreadableOwnershipStore(), holder="engine-b"
+        ).claim(_key())
+        release = ControlOperationOwnership(
+            loser_state, _ledger(tmp_path), holder="engine-b"
+        ).release(_key())
+
+        assert release.status is ControlOperationReleaseStatus.NOT_HELD
+        assert release.holder == "engine-a"
+        assert loser_state.control_operation_exclusions.unavailable == (_key(),)
+        assert _eligibility(loser_state) is QueueMutationStatus.REJECTED_EXCLUDED
+
 
 class TestTheDurableLeaseSurface:
     """Direction 6 again, at the real store rather than at a double.
@@ -379,6 +405,34 @@ class TestNoDoubleOwnership:
         assert [row.holder for row in ledger.list_control_operation_ownership().rows] == [
             "engine-a"
         ]
+
+    def test_a_losers_release_does_not_free_the_winners_operation(self, tmp_path):
+        """The loser's own ``try/finally`` unwind must free nothing.
+
+        A ``CONTENDED`` claim publishes an exclusion because someone IS running
+        the operation. The release that follows deletes nothing — the row is
+        the winner's — so treating it as settlement would readmit ordinary work
+        on an issue whose control operation is still live under engine-a.
+        """
+        ledger = _ledger(tmp_path)
+        ControlOperationOwnership(
+            OrchestratorState(), ledger, holder="engine-a"
+        ).claim(_key())
+
+        loser_state = OrchestratorState()
+        loser = ControlOperationOwnership(
+            loser_state, _ledger(tmp_path), holder="engine-b"
+        )
+        loser.claim(_key())
+        release = loser.release(_key())
+
+        assert release.status is ControlOperationReleaseStatus.NOT_HELD
+        assert release.holder == "engine-a"
+        assert loser_state.control_operation_exclusions.contended == (_key(),)
+        assert _eligibility(loser_state) is QueueMutationStatus.REJECTED_EXCLUDED
+        assert [
+            row.holder for row in ledger.list_control_operation_ownership().rows
+        ] == ["engine-a"]
 
     def test_reconciliation_reports_contention_rather_than_stealing(self, tmp_path):
         ledger = _ledger(tmp_path)

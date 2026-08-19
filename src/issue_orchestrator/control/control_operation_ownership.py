@@ -161,7 +161,17 @@ class ControlOperationOwnership:
             return self._projection().owns(key)
 
     def release(self, key: ControlOperationKey) -> ControlOperationRelease:
-        """Hand ``key`` back because the operation settled.
+        """Hand ``key`` back because THIS engine's operation settled.
+
+        Only an exclusion this holder put there may be dropped. A release that
+        gave nothing back is not a reason to free the issue: after a
+        ``CONTENDED`` claim the ordinary ``try/finally`` unwind reaches here,
+        the store answers ``NOT_HELD`` because the row belongs to a peer, and
+        dropping the entry on that would convert "another holder is running
+        this operation" into "nothing is running it" — the one direction a
+        reader of the projection may never move. :meth:`_frees_our_exclusion`
+        is the single place that rule is decided, and the store's own
+        ``holder`` is what decides it.
 
         Typed rather than silent: the store reports an unreachable backend as
         ``UNAVAILABLE`` instead of raising, and a caller that inferred success
@@ -171,8 +181,16 @@ class ControlOperationOwnership:
         """
         with self._lock:
             release = self._store.release_control_operation(key, holder=self._holder)
-            if release.settled:
+            if self._frees_our_exclusion(release):
                 self._publish(self._without(key))
+            elif release.settled:
+                logger.warning(
+                    "[CONTROL_OP] %s is held by %s, not by %s; keeping the"
+                    " exclusion rather than freeing another holder's operation",
+                    key,
+                    release.holder or "another holder",
+                    self._holder,
+                )
             else:
                 logger.warning(
                     "[CONTROL_OP] Could not release %s (%s); keeping the"
@@ -181,6 +199,24 @@ class ControlOperationOwnership:
                     release.detail,
                 )
             return release
+
+    def _frees_our_exclusion(self, release: ControlOperationRelease) -> bool:
+        """Whether ``release`` proves this holder's exclusion may be dropped.
+
+        Three answers, and only the first two free anything:
+
+        * ``RELEASED`` — our row is gone because we deleted it;
+        * ``NOT_HELD`` with no recorded holder — no row exists for anyone, so
+          there is nothing left to exclude;
+        * ``NOT_HELD`` naming another holder, or ``UNAVAILABLE`` — someone
+          else's reservation stands, or we could not tell. Both keep the
+          exclusion; only reconciliation against live truth removes it.
+        """
+        if release.status is ControlOperationReleaseStatus.RELEASED:
+            return True
+        if release.status is ControlOperationReleaseStatus.NOT_HELD:
+            return release.holder in ("", self._holder)
+        return False
 
     # ------------------------------------------------------------------
     # Reconciliation
@@ -205,6 +241,15 @@ class ControlOperationOwnership:
 
         Returns the projection it published, so a caller can act on the typed
         result without re-reading shared state.
+
+        **Ordering precondition.** ``live_operations`` is derived outside this
+        owner's lock, while :meth:`claim` is reachable off the tick thread, so
+        the caller must derive the live set no EARLIER than the claims it is
+        meant to cover. A set derived before a claim does not name that
+        operation, and the first bullet above would then release a lease whose
+        operation is still running, leaving it unowned. Deriving the live set
+        after the claims it should cover — or serialising the two against the
+        caller's own live-operation truth — is what makes that impossible.
         """
         live = set(live_operations)
         with self._lock:
