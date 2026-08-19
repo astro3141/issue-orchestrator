@@ -34,6 +34,7 @@ if TYPE_CHECKING:
     from ..ports.label_store import LabelStore
     from ..ports.queue_cache_store import QueueCacheStore
     from ..ports.tech_lead_authority import TechLeadAuthorityStore
+    from .continuation_scheduling import ControlContinuation
     from .label_manager import LabelManager
     from .label_store_reconciler import FreshLabelSnapshot
     from .worktree_reconciliation import StartupWorktreeReconciler
@@ -101,6 +102,7 @@ class StartupManager:
         tech_lead_authority: "TechLeadAuthorityStore | None" = None,
         *,
         publication_verdict: "PublicationVerdictReader",
+        control_continuation: "ControlContinuation",
     ):
         """Initialize the startup manager.
 
@@ -129,6 +131,12 @@ class StartupManager:
                 whether the PR waiting with ``needs-code-review`` ever cleared
                 a gate. Required, with no default, for the reason the scanner's
                 is.
+            control_continuation: The owner that reconciles control-operation
+                ownership before the queue is hydrated (#149). Startup is the
+                first of #148's three measured hydration points, and the one
+                where the permissive window is widest: nothing this process
+                knows is left, so a lease written before the crash is the only
+                record that an operation is still running.
         """
         self.config = config
         self.events = events
@@ -148,6 +156,7 @@ class StartupManager:
             label_manager = LabelManager(config)
         self._lm = label_manager
         self._publication_verdict = publication_verdict
+        self._control_continuation = control_continuation
         self._label_store = label_store
         # Gated-proposal ledger (#6778); None (tests) = no op-backed exclusions.
         self._tech_lead_authority = tech_lead_authority
@@ -357,8 +366,17 @@ class StartupManager:
         if state.cached_queue_issues:
             # Warm path: filter in-progress from cache (0 GitHub calls)
             stale_in_progress = self._recover_stale_in_progress_from_label_store(state.cached_queue_issues)
-            for issue in stale_in_progress:
-                outcome = queue_cache.upsert_refreshed_issue(issue)
+            # The board reconciliation must cover is everything this engine
+            # knows about, not just the issue being upserted: reconciliation
+            # releases every lease the derived live set does not name, so a
+            # single-issue board would free every OTHER issue's running control
+            # operation on the way in (#149).
+            hydrated = self._control_continuation.hydrate_issues(
+                queue_cache,
+                stale_in_progress,
+                board=[*state.cached_queue_issues, *stale_in_progress],
+            )
+            for issue, outcome in hydrated:
                 if outcome.status != QueueMutationStatus.ACCEPTED:
                     logger.warning(
                         "[startup] Recovered locally in-progress issue is out of dashboard queue scope: issue=%d status=%s",

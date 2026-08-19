@@ -38,6 +38,7 @@ if TYPE_CHECKING:
     from ..ports.e2e_issue_tracker import E2EIssueTracker
     from ..ports.goal_pilot_store import GoalPilotStore
     from ..ports.attempt_store import AttemptStore
+    from ..ports.continuation_ports import ContinuationPorts
     from ..ports.tech_lead_authority import TechLeadAuthorityStore
     from .open_issue_corpus import OpenIssueCorpusManager
     from ..ports.fresh_issue_reader import FreshIssueReader
@@ -169,6 +170,13 @@ class OrchestratorDeps:
     # only a factory knew how to build would be unreachable from the running
     # system; a required field means neither composition root can omit it.
     publication_revalidation: "PublicationRevalidation"
+
+    # Durable leases for terminal-less control operations (#146) and the
+    # reader of a finished review-exchange run's exact-SHA verdict (#149). Held
+    # here for the reason the revalidation route is: the continuation owner
+    # that consumes them is assembled against live orchestrator state, so the
+    # composition root supplies the ports and the facade supplies the state.
+    continuation_ports: "ContinuationPorts"
 
     # Cross-cutting infrastructure services (label mgmt, persistence, etc.)
     services: "InfraServices"

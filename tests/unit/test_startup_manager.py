@@ -31,6 +31,7 @@ from issue_orchestrator.domain.models import (
 )
 from issue_orchestrator.domain.tech_lead_session import TechLeadSessionFlavor
 from tests.unit.session_run_helpers import make_session_run_assets
+from tests.unit.continuation_helpers import inert_control_continuation
 from tests.unit.publication_evidence_helpers import (
     configure_publication_contract,
     verdict_with,
@@ -182,6 +183,7 @@ def startup_manager(
         startup_worktree_reconciler=_startup_worktree_reconciler(),
         label_store=mock_label_store,
         publication_verdict=verdict_with_no_evidence(),
+        control_continuation=inert_control_continuation(),
     )
 
 
@@ -405,6 +407,7 @@ class TestStartupManagerInProgressIssues:
             queue_cache_store=queue_cache_store,
             label_store=mock_label_store,
             publication_verdict=verdict_with_no_evidence(),
+            control_continuation=inert_control_continuation(),
         )
 
         mock_state = MagicMock()
@@ -544,6 +547,7 @@ class TestStartupManagerIssueScopeBindsRecovery:
             startup_worktree_reconciler=_startup_worktree_reconciler(),
             label_store=mock_label_store,
             publication_verdict=verdict_with_no_evidence(),
+            control_continuation=inert_control_continuation(),
         )
 
     @staticmethod
@@ -990,6 +994,7 @@ class TestStartupManagerLabelStoreReconcile:
             startup_worktree_reconciler=_startup_worktree_reconciler(),
             label_store=store,
             publication_verdict=verdict_with_no_evidence(),
+            control_continuation=inert_control_continuation(),
         )
 
         # Warm cache snapshot captured before recovery: still in-progress.
@@ -1063,6 +1068,7 @@ class TestStartupManagerLabelStoreReconcile:
             queue_cache_store=queue_cache_store,
             label_store=store,
             publication_verdict=verdict_with_no_evidence(),
+            control_continuation=inert_control_continuation(),
         )
         return sm, store, mock_repository_host
 
@@ -1407,6 +1413,7 @@ class TestStartupManagerPublicationEvidenceRecovery:
             startup_worktree_reconciler=_startup_worktree_reconciler(),
             label_store=label_store,
             publication_verdict=evidence,
+            control_continuation=inert_control_continuation(),
         )
 
     def _configure(self, mock_config, mock_repository_host, *, head_sha):
@@ -2152,6 +2159,7 @@ class TestStartupManagerResumePartialWork:
             startup_worktree_reconciler=_startup_worktree_reconciler(),
             label_store=mock_label_store,
             publication_verdict=verdict_with_no_evidence(),
+            control_continuation=inert_control_continuation(),
         )
 
         await manager.run_startup(sample_state)
@@ -2213,6 +2221,7 @@ class TestStartupManagerResumePartialWork:
             startup_worktree_reconciler=_startup_worktree_reconciler(),
             label_store=mock_label_store,
             publication_verdict=verdict_with_no_evidence(),
+            control_continuation=inert_control_continuation(),
         )
 
         await manager.run_startup(sample_state)
@@ -2541,6 +2550,7 @@ class TestStartupGitHubCallBudget:
             issue_fetch_resilience=IssueFetchResilience("owner/repo"),
             startup_worktree_reconciler=_startup_worktree_reconciler(),
             publication_verdict=verdict_with_no_evidence(),
+            control_continuation=inert_control_continuation(),
         )
 
         await sm.run_startup(OrchestratorState())
@@ -2575,6 +2585,7 @@ class TestStartupGitHubCallBudget:
             issue_fetch_resilience=IssueFetchResilience("owner/repo"),
             startup_worktree_reconciler=_startup_worktree_reconciler(),
             publication_verdict=verdict_with_no_evidence(),
+            control_continuation=inert_control_continuation(),
         )
 
         await sm.run_startup(OrchestratorState())
@@ -2602,6 +2613,7 @@ class TestStartupGitHubCallBudget:
             issue_fetch_resilience=IssueFetchResilience("owner/repo"),
             startup_worktree_reconciler=_startup_worktree_reconciler(),
             publication_verdict=verdict_with_no_evidence(),
+            control_continuation=inert_control_continuation(),
         )
 
         await sm.run_startup(OrchestratorState())
@@ -2656,6 +2668,7 @@ class TestStartupGitHubCallBudget:
             startup_worktree_reconciler=_startup_worktree_reconciler(),
             queue_cache_store=mock_store,
             publication_verdict=verdict_with_no_evidence(),
+            control_continuation=inert_control_continuation(),
         )
 
         await sm.run_startup(OrchestratorState())
@@ -2695,6 +2708,7 @@ class TestStartupGitHubCallBudget:
             startup_worktree_reconciler=_startup_worktree_reconciler(),
             queue_cache_store=mock_store,
             publication_verdict=verdict_with_no_evidence(),
+            control_continuation=inert_control_continuation(),
         )
 
         state = OrchestratorState()
@@ -2728,6 +2742,7 @@ class TestStartupGitHubCallBudget:
             startup_worktree_reconciler=_startup_worktree_reconciler(),
             queue_cache_store=mock_store,
             publication_verdict=verdict_with_no_evidence(),
+            control_continuation=inert_control_continuation(),
         )
 
         state = OrchestratorState()
@@ -2767,6 +2782,7 @@ class TestStartupGitHubCallBudget:
             startup_worktree_reconciler=_startup_worktree_reconciler(),
             queue_cache_store=mock_store,
             publication_verdict=verdict_with_no_evidence(),
+            control_continuation=inert_control_continuation(),
         )
 
         caplog.clear()
@@ -2872,6 +2888,7 @@ class TestStartupSweepsThePendingWorkLedger:
             startup_worktree_reconciler=_startup_worktree_reconciler(),
             label_store=mock_label_store,
             publication_verdict=verdict_with_no_evidence(),
+            control_continuation=inert_control_continuation(),
         )
 
         await manager.run_startup(sample_state)

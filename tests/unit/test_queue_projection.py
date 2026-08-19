@@ -14,6 +14,7 @@ from issue_orchestrator.domain.models import OrchestratorState, Issue, AgentConf
 from issue_orchestrator.events import EventName
 from issue_orchestrator.infra.config import Config
 from issue_orchestrator.ports.event_sink import InMemoryEventSink
+from tests.unit.continuation_helpers import inert_control_continuation
 
 
 # =============================================================================
@@ -48,7 +49,12 @@ def mock_repository_host():
 @pytest.fixture
 def queue_projection(sample_config, mock_repository_host, sample_event_sink):
     """Create a QueueProjection instance for testing."""
-    return QueueProjection(sample_config, mock_repository_host, sample_event_sink)
+    return QueueProjection(
+        sample_config,
+        mock_repository_host,
+        sample_event_sink,
+        inert_control_continuation(),
+    )
 
 
 # =============================================================================
@@ -201,6 +207,7 @@ class TestUpdateAndEmit:
             sample_config,
             mock_repository_host,
             sample_event_sink,
+            inert_control_continuation(),
             queue_cache_store,
         )
 

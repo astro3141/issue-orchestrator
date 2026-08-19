@@ -76,6 +76,7 @@ from issue_orchestrator.ports.provider_readiness import (
 )
 from issue_orchestrator.ports.provider_resilience import ProviderErrorType
 
+from tests.unit.continuation_helpers import inert_control_continuation
 from tests.unit.publication_evidence_helpers import verdict_with_no_evidence
 from tests.unit.test_session_controller import (
     MockCompletionProcessor,
@@ -2905,6 +2906,7 @@ class _ProductionTick:
             refresh_requested=False,
             inflight_stable_ids={},
             issue_fetch_resilience=IssueFetchResilience("owner/repo"),
+            control_continuation=inert_control_continuation(),
             provider_launch_sampler=self.sampler,
         )
 

@@ -23,11 +23,13 @@ operation, not that the operation is still running. If a row could vouch for
 itself, a crash after settlement would turn a durable lease into a durable
 deadlock, and the only exit would be editing durable state by hand.
 
-This leaf deliberately does not implement the production source of
-``live_operations``. The continuation successor that owns the durable
-descriptor and the exact ``Attempt`` evaluation state will supply it, and this
-owner is built and proved against an explicit typed live-operation collection
-until then.
+The production source of ``live_operations`` is
+:class:`~.continuation_live_truth.ContinuationLiveTruth` (#149), which derives
+it from the durable descriptor and the exact ``Attempt`` evaluation state. This
+owner still consumes an explicit typed live-operation collection and knows
+nothing about how one is derived; :meth:`ControlOperationOwnership.reconcile_derived`
+is the seam where the two meet, and the lock it holds is what discharges
+:meth:`ControlOperationOwnership.reconcile`'s ordering precondition.
 
 **No authority inflation.** Claiming, reconciling and releasing change no
 label, no evaluation history, no completion intent, and neither
@@ -40,6 +42,7 @@ from __future__ import annotations
 
 import logging
 import threading
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING, Collection, Iterable
@@ -224,6 +227,18 @@ class ControlOperationOwnership:
         """The name this engine's reservations are recorded under."""
         return self._holder
 
+    @property
+    def exclusions(self) -> ControlOperationExclusions:
+        """The projection standing right now, whatever last published it.
+
+        A read, never a derivation: a caller that could not reconcile needs the
+        answer already in force rather than a fresh one it has no evidence for.
+        The value is frozen and replaced wholesale, so this hands back one
+        complete reconciliation rather than a view that can change underneath.
+        """
+        with self._lock:
+            return self._projection()
+
     # ------------------------------------------------------------------
     # Acquisition
     # ------------------------------------------------------------------
@@ -278,6 +293,35 @@ class ControlOperationOwnership:
     # ------------------------------------------------------------------
     # Reconciliation
     # ------------------------------------------------------------------
+
+    def reconcile_derived(
+        self,
+        derive: Callable[[], Collection[ControlOperationKey]],
+    ) -> ControlOperationExclusions:
+        """Derive the live set and reconcile against it, as one transaction.
+
+        The discharge of :meth:`reconcile`'s ordering precondition, offered
+        here rather than left to each caller to arrange. ``derive`` runs while
+        this owner's lock is held, and :meth:`claim` takes the same lock, so
+        the falsifying interleaving has nowhere to happen:
+
+        * a claim that lands BEFORE the lock is granted has already written the
+          durable fact ``derive`` reads, so the operation is named live and its
+          lease is kept;
+        * a claim that lands AFTER cannot begin until this reconciliation has
+          published, and :meth:`claim` adds its own entry to the projection
+          immediately rather than waiting for the next pass.
+
+        No generation counter, no snapshot version, and no new subsystem: the
+        serialisation is the lock the owner already holds, which is exactly
+        what "serialising the two against the caller's own live-operation
+        truth" means.
+
+        ``derive`` must be a pure read of durable truth. It runs under a lock
+        that completions also take, so work inside it delays them.
+        """
+        with self._lock:
+            return self.reconcile(derive())
 
     def reconcile(
         self, live_operations: Collection[ControlOperationKey]

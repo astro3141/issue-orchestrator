@@ -911,6 +911,9 @@ def build_test_orchestrator_deps(
     from issue_orchestrator.entrypoints.bootstrap_operator_commands import (
         build_operator_issue_command_factory,
     )
+    from issue_orchestrator.entrypoints.bootstrap_continuation import (
+        build_continuation_ports,
+    )
     from issue_orchestrator.entrypoints.bootstrap_revalidation import (
         build_publication_revalidation,
     )
@@ -1286,6 +1289,10 @@ def build_test_orchestrator_deps(
             command_runner=command_runner,
             working_copy=working_copy,
         ),
+        # Through the same factory both production roots call (#146, #149), so
+        # a test orchestrator reconciles against the durable store production
+        # uses rather than a stub that can neither contend nor fail to read.
+        continuation_ports=build_continuation_ports(config),
         services=infra_services,
     )
 

@@ -65,7 +65,10 @@ def test_attempt_from_dict_rejects_unknown_schema_version() -> None:
     payload = Attempt(
         key=AttemptKey(GitHubIssueKey("owner/repo", "6130"), SHA)
     ).to_dict()
-    payload["schema_version"] = 3
+    # One past the newest version this code writes: an unknown schema is a
+    # record written by rules it cannot claim to understand, and reading it
+    # anyway would let a gate act on fields it may be misreading.
+    payload["schema_version"] = 4
 
     with pytest.raises(ValueError, match="schema_version"):
         Attempt.from_dict(payload)

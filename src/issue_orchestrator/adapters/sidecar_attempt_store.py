@@ -22,16 +22,25 @@ class SidecarAttemptStore:
         path = self._path_for(key)
         if not path.exists():
             return None
+        attempt = self._read(path)
+        if not _names_same_attempt(attempt.key, key):
+            raise ValueError(f"Attempt sidecar key mismatch: {path}")
+        return attempt
+
+    def _read(self, path: Path) -> Attempt:
+        """The record one sidecar file states, or a loud failure.
+
+        Shared by both readers so an enumeration cannot parse by a laxer rule
+        than a keyed read: a payload one accepted and the other rejected would
+        make "what is recorded for this candidate" depend on how it was asked.
+        """
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
             raise ValueError(f"Attempt sidecar is unreadable: {path}") from exc
         if not isinstance(payload, dict):
             raise ValueError(f"Attempt sidecar must contain an object: {path}")
-        attempt = Attempt.from_dict(payload)
-        if not _names_same_attempt(attempt.key, key):
-            raise ValueError(f"Attempt sidecar key mismatch: {path}")
-        return attempt
+        return Attempt.from_dict(payload)
 
     def update(self, key: AttemptKey, mutate: Callable[[Attempt], Attempt]) -> Attempt:
         existing = self.for_key(key)
@@ -45,6 +54,20 @@ class SidecarAttemptStore:
             )
         atomic_write_json(self._path_for(key), updated.to_dict())
         return updated
+
+    def for_issue(self, issue_key: IssueKey) -> tuple[Attempt, ...]:
+        if not self._base_dir.exists():
+            return ()
+        issue_prefix = f"{_issue_part(issue_key)}--"
+        attempts = [
+            self._read(path)
+            for path in sorted(self._base_dir.glob(f"{issue_prefix}*.json"))
+            if path.is_file()
+        ]
+        # Sorted by the sidecar's own filename above, which is
+        # ``<issue part>--<head sha>.json`` — one spelling, so two readers of
+        # this directory agree on order without re-deriving a rule.
+        return tuple(attempts)
 
     def supersede_issue(self, issue_key: IssueKey) -> int:
         if not self._base_dir.exists():
