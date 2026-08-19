@@ -86,6 +86,13 @@ class ControlContinuation:
         there is no interval in which the work has begun and ordinary rework
         could still be found eligible.
 
+        A paused engine still runs every line of this method (#161). Pause is a
+        barrier to STARTING work, and the barrier lives in the runner, which is
+        where work starts; making this method return early instead would stop
+        reconciling ownership and publishing exclusions, which is how a paused
+        engine would hand a running control operation's issue back to ordinary
+        work.
+
         An unreadable durable record publishes NOTHING, advances nothing, and
         returns the projection already standing. That is the fail-closed
         direction: the standing projection was reconciled against a set that

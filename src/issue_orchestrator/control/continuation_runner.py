@@ -13,7 +13,7 @@ settlement of a discharged intent       :class:`~.continuation_finalize.Continua
 ownership and exclusion                 :class:`~.control_operation_ownership.ControlOperationOwnership` (#146)
 ======================================  =====================================
 
-Four rules keep it from becoming a second lifecycle.
+Six rules keep it from becoming a second lifecycle.
 
 **It never decides admission.** A ``RETRY_PENDING`` operation is handed whole
 to #139, which re-checks the contract, the allowance and the reserve-before-
@@ -32,6 +32,18 @@ queue, but an issue whose session is still running was never the continuation's
 subject — the continuation exists for a candidate whose worktree is *gone*. So
 a live session is an execution refusal, exactly as it is for the publish-retry
 route, and the operation simply stays owned until the session finishes.
+
+**It never starts new work while the engine is paused.** Pause is a new-work
+barrier (#161), and this is the one place a control operation's work begins, so
+this is where the barrier goes. It is deliberately NOT in
+:meth:`~.continuation_scheduling.ControlContinuation.reconcile`: a paused engine
+must go on reading durable truth, reconciling #146 ownership and publishing the
+exclusion projection, or a pause would free every running operation to ordinary
+work. What it must not do is submit a job, spend a #139 or #149 allowance, cut
+a checkout, open a reviewer exchange or create a pull request — all of which
+begin below :meth:`ControlContinuationRunner.advance`. Withholding is not
+cancelling: an operation stays owned, its run stays open, and the next
+reconciliation after a resume starts whatever is still live.
 
 **It never discards what its own run produced.** The
 :class:`~.completion_types.ProcessingResult` a run returns is the ONLY record
@@ -204,7 +216,7 @@ class ControlContinuationRunner:
     # ------------------------------------------------------------------
 
     def advance(self, reconciliation: "ContinuationReconciliation") -> None:
-        """Start work for every owned operation that has none in flight.
+        """Start work for every owned operation this engine may start now.
 
         Takes the reconciliation rather than re-deriving one: acting on a later
         reading than the exclusion was published from is precisely the stale
@@ -220,10 +232,34 @@ class ControlContinuationRunner:
         pull request that arrived some other way — is held by nobody and would
         otherwise survive until the engine restarted. A ``CONTENDED`` operation
         is live and keeps its run; only leaving the live set closes one.
+
+        A paused engine gets the sweep and nothing else (#161). The sweep is
+        disposal of a checkout nobody holds any more, not the start of anything,
+        and withholding it would leave a paused engine leaking the worktrees of
+        operations that left live truth while it was stopped.
         """
         self._runs.close_dropped(frozenset(reconciliation.keys))
+        if self._state.paused:
+            self._withhold(reconciliation)
+            return
         for operation in reconciliation.owned:
             self._start(operation)
+
+    def _withhold(self, reconciliation: "ContinuationReconciliation") -> None:
+        """Name what a paused engine is not starting, and leave it owned.
+
+        Every operation here keeps its lease, its recorded intent, its
+        allowances and any run already open: the barrier withholds a START, and
+        an operation that is not started has changed nothing to undo. It is
+        also not a refusal the durable record remembers — the next
+        reconciliation after a resume derives the same live set and starts it.
+        """
+        for operation in reconciliation.owned:
+            logger.info(
+                "[CONTINUATION] %s stays owned but idle: the engine is paused,"
+                " so no new execution starts until it resumes",
+                operation.key,
+            )
 
     def _start(self, operation: LiveContinuation) -> None:
         issue_number = operation.issue.number
