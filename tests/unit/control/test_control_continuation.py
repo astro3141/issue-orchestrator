@@ -30,6 +30,7 @@ from issue_orchestrator.adapters.sidecar_attempt_store import SidecarAttemptStor
 from issue_orchestrator.control.continuation_descriptor_writer import (
     ContinuationDescriptorWriter,
 )
+from issue_orchestrator.control.continuation_in_flight import ContinuationsInFlight
 from issue_orchestrator.control.continuation_live_truth import (
     CONTINUATION_KIND,
     ContinuationLiveTruth,
@@ -43,6 +44,10 @@ from issue_orchestrator.control.queue_cache import QueueCache, QueueMutationStat
 from issue_orchestrator.domain.attempt import Attempt, AttemptKey
 from issue_orchestrator.domain.continuation_descriptor import ContinuationDescriptor
 from issue_orchestrator.domain.continuation_phase import ContinuationPhase
+from issue_orchestrator.domain.continuation_settlement import (
+    ContinuationSettlement,
+    ContinuationSettlementKind,
+)
 from issue_orchestrator.domain.control_operation import ControlOperationKey
 from issue_orchestrator.domain.issue_key import GitHubIssueKey
 from issue_orchestrator.domain.models import (
@@ -244,6 +249,9 @@ class Engine:
     runner: RecordingRunner
     continuation: ControlContinuation
     config: Config
+    #: What this engine is executing, as the real runner claims into it. A
+    #: restart gets a fresh one, which is exactly what a new process gets.
+    in_flight: ContinuationsInFlight
 
     def queue_cache(self) -> QueueCache:
         return QueueCache(self.config, self.state)
@@ -262,9 +270,14 @@ def _engine(root: Path, *, attempts: object | None = None) -> Engine:
         state, SqliteControlOperationOwnershipStore(root / STORE_FILENAME)
     )
     runner = RecordingRunner()
+    in_flight = ContinuationsInFlight()
     continuation = ControlContinuation(
         ownership,
-        ContinuationLiveTruth(store, pr_pending_label=PR_PENDING),  # type: ignore[arg-type]
+        ContinuationLiveTruth(
+            store,  # type: ignore[arg-type]
+            pr_pending_label=PR_PENDING,
+            in_flight=in_flight,
+        ),
         runner,  # type: ignore[arg-type]
     )
     return Engine(
@@ -275,6 +288,7 @@ def _engine(root: Path, *, attempts: object | None = None) -> Engine:
         runner=runner,
         continuation=continuation,
         config=config,
+        in_flight=in_flight,
     )
 
 
@@ -304,6 +318,31 @@ def _passed(engine: Engine, head_sha: str = SHA_A) -> Attempt:
         lambda attempt: attempt.with_revalidation_reserved().with_completed_evaluation(
             _receipt(head_sha, verdict=ValidationVerdict.PASSED)
         ),
+    )
+
+
+def _settled(
+    engine: Engine,
+    head_sha: str = SHA_A,
+    *,
+    pr_url: str | None = "https://example.test/owner/repo/pull/7",
+) -> Attempt:
+    """The candidate after its own run recorded what it produced."""
+    settlement = (
+        ContinuationSettlement(
+            kind=ContinuationSettlementKind.PULL_REQUEST_OPENED,
+            settled_at="2026-08-19T02:00:00Z",
+            pr_url=pr_url,
+        )
+        if pr_url is not None
+        else ContinuationSettlement(
+            kind=ContinuationSettlementKind.NOTHING_FURTHER_REQUESTED,
+            settled_at="2026-08-19T02:00:00Z",
+        )
+    )
+    return engine.attempts.update(
+        _attempt_key(head_sha),
+        lambda attempt: attempt.with_continuation_settlement(settlement),
     )
 
 
@@ -582,6 +621,86 @@ class TestNoCoderWorkTurn:
         assert queue == []
 
 
+class TestTheOwedPullRequestIsOwedExactlyOnce:
+    """An intent held forever is not a held lane; it is a loop.
+
+    ``pr-pending`` is written when a Session completes with a PR, when a scan
+    finds one carrying the code-review label, or when the publish-retry route
+    finalizes itself. The continuation goes through none of those, so without a
+    settlement recorded by its own run ``APPROVED_PENDING_PR`` is re-derived
+    live on every reconciliation and a full reviewer exchange runs again.
+    """
+
+    def test_an_approved_pr_intent_is_advanced_again_until_it_settles(
+        self, engine: Engine
+    ) -> None:
+        _failed_candidate(engine, RequestedAction.CREATE_PR)
+        _passed(engine)
+        _reviewed(engine, ReviewVerdictOutcome.APPROVED)
+        issue = _issue("agent:backend")
+        cache = engine.queue_cache()
+
+        engine.continuation.hydrate_queue(cache, [issue])
+        engine.continuation.hydrate_queue(cache, [issue])
+
+        assert engine.runner.advanced == [
+            (_operation_key(), ContinuationPhase.APPROVED_PENDING_PR),
+            (_operation_key(), ContinuationPhase.APPROVED_PENDING_PR),
+        ]
+
+    def test_the_settlement_the_run_recorded_ends_the_operation(
+        self, engine: Engine
+    ) -> None:
+        _failed_candidate(engine, RequestedAction.CREATE_PR)
+        _passed(engine)
+        _reviewed(engine, ReviewVerdictOutcome.APPROVED)
+        _settled(engine)
+        issue = _issue("agent:backend")
+
+        queue = engine.continuation.hydrate_queue(engine.queue_cache(), [issue])
+
+        assert engine.runner.advanced == []
+        assert engine.ownership.exclusions.entries == ()
+        assert [i.number for i in queue] == [ISSUE_NUMBER]
+
+    def test_a_settled_operation_stays_settled_across_a_restart(
+        self, tmp_path: Path
+    ) -> None:
+        """The settlement is durable, so a restart cannot resurrect the loop."""
+        first = _engine(tmp_path)
+        _failed_candidate(first, RequestedAction.CREATE_PR)
+        _passed(first)
+        _reviewed(first, ReviewVerdictOutcome.APPROVED)
+        _settled(first)
+
+        restarted = _engine(tmp_path)
+        restarted.continuation.hydrate_queue(
+            restarted.queue_cache(), [_issue("agent:backend")]
+        )
+
+        assert restarted.runner.advanced == []
+        assert restarted.ownership.exclusions.entries == ()
+
+    def test_a_settlement_releases_a_lease_written_before_the_crash(
+        self, tmp_path: Path
+    ) -> None:
+        first = _engine(tmp_path)
+        _failed_candidate(first, RequestedAction.CREATE_PR)
+        _passed(first)
+        _reviewed(first, ReviewVerdictOutcome.APPROVED)
+        first.continuation.hydrate_queue(first.queue_cache(), [_issue("agent:backend")])
+        assert first.ownership.exclusions.owns(_operation_key())
+        _settled(first)
+
+        restarted = _engine(tmp_path)
+        queue = restarted.continuation.hydrate_queue(
+            restarted.queue_cache(), [_issue("agent:backend")]
+        )
+
+        assert restarted.ownership.exclusions.entries == ()
+        assert [i.number for i in queue] == [ISSUE_NUMBER]
+
+
 # ======================================================================
 # 6. Ordering — reconciliation precedes every eligibility evaluation
 # ======================================================================
@@ -681,7 +800,9 @@ class TestStaleSnapshot:
             # reconcile: the durable write lands, then the set is derived.
             _failed_candidate(engine, RequestedAction.CREATE_PR)
             reading = ContinuationLiveTruth(
-                engine.attempts, pr_pending_label=PR_PENDING
+                engine.attempts,
+                pr_pending_label=PR_PENDING,
+                in_flight=engine.in_flight,
             ).read(board)
             derived.append(tuple(key.head_sha for key in reading.keys))
             return reading.keys
@@ -712,7 +833,11 @@ class TestStoreOutage:
 
         blind = ControlContinuation(
             readable.ownership,
-            ContinuationLiveTruth(UnreadableAttempts(), pr_pending_label=PR_PENDING),  # type: ignore[arg-type]
+            ContinuationLiveTruth(
+                UnreadableAttempts(),  # type: ignore[arg-type]
+                pr_pending_label=PR_PENDING,
+                in_flight=ContinuationsInFlight(),
+            ),
             readable.runner,  # type: ignore[arg-type]
         )
         result = blind.reconcile(board)
@@ -728,7 +853,11 @@ class TestStoreOutage:
         runner = RecordingRunner()
         blind = ControlContinuation(
             readable.ownership,
-            ContinuationLiveTruth(UnreadableAttempts(), pr_pending_label=PR_PENDING),  # type: ignore[arg-type]
+            ContinuationLiveTruth(
+                UnreadableAttempts(),  # type: ignore[arg-type]
+                pr_pending_label=PR_PENDING,
+                in_flight=ContinuationsInFlight(),
+            ),
             runner,  # type: ignore[arg-type]
         )
 
@@ -748,7 +877,11 @@ class TestStoreOutage:
         )
         continuation = ControlContinuation(
             blind_ownership,
-            ContinuationLiveTruth(engine.attempts, pr_pending_label=PR_PENDING),
+            ContinuationLiveTruth(
+                engine.attempts,
+                pr_pending_label=PR_PENDING,
+                in_flight=engine.in_flight,
+            ),
             engine.runner,  # type: ignore[arg-type]
         )
         issue = _issue("agent:backend")
@@ -772,7 +905,11 @@ class TestStoreOutage:
 
         blind = ControlContinuation(
             readable.ownership,
-            ContinuationLiveTruth(UnreadableAttempts(), pr_pending_label=PR_PENDING),  # type: ignore[arg-type]
+            ContinuationLiveTruth(
+                UnreadableAttempts(),  # type: ignore[arg-type]
+                pr_pending_label=PR_PENDING,
+                in_flight=ContinuationsInFlight(),
+            ),
             readable.runner,  # type: ignore[arg-type]
         )
         blind.hydrate_queue(readable.queue_cache(), [issue])
@@ -908,6 +1045,83 @@ class TestNonPassCleanReturn:
         assert attempt is not None
         assert len(attempt.publication_evaluations) == 2
         assert attempt.continuation_descriptor is not None
+
+
+class TestAnInFlightRevalidationIsNotExhaustion:
+    """#139's allowance is a START budget, so the two look identical durably.
+
+    From the instant ``revalidate`` reserves the allowance until the instant the
+    gate files its verdict, the record reads ``allowance spent, latest
+    publication evaluation still the failure`` — the exact facts a revalidation
+    that ran and failed leaves behind. Deriving from them alone releases the
+    lease of a running operation and re-admits ordinary work onto the issue.
+    """
+
+    def _reserved_but_unreported(self, engine: Engine) -> None:
+        """The durable state during a gate run: spent, nothing new appended."""
+        _failed_candidate(engine, RequestedAction.CREATE_PR)
+        engine.attempts.update(
+            _attempt_key(), lambda attempt: attempt.with_revalidation_reserved()
+        )
+
+    def test_the_lane_stays_held_while_the_gate_runs(self, engine: Engine) -> None:
+        self._reserved_but_unreported(engine)
+        engine.in_flight.claim(_operation_key())
+
+        queue = engine.continuation.hydrate_queue(
+            engine.queue_cache(), [_issue("agent:backend")]
+        )
+
+        assert queue == []
+        assert engine.ownership.exclusions.owns(_operation_key())
+
+    def test_a_second_reconciliation_starts_no_second_run(
+        self, engine: Engine
+    ) -> None:
+        self._reserved_but_unreported(engine)
+        engine.in_flight.claim(_operation_key())
+        cache = engine.queue_cache()
+
+        engine.continuation.hydrate_queue(cache, [_issue("agent:backend")])
+        engine.continuation.hydrate_queue(cache, [_issue("agent:backend")])
+
+        assert engine.runner.advanced == [
+            (_operation_key(), ContinuationPhase.EXECUTING),
+            (_operation_key(), ContinuationPhase.EXECUTING),
+        ]
+
+    def test_the_same_facts_release_once_the_run_ends(self, engine: Engine) -> None:
+        """A verdict the gate never recorded must still reach a terminal answer."""
+        self._reserved_but_unreported(engine)
+        engine.in_flight.claim(_operation_key())
+        cache = engine.queue_cache()
+        engine.continuation.hydrate_queue(cache, [_issue("agent:backend")])
+
+        engine.in_flight.release(_operation_key())
+        queue = engine.continuation.hydrate_queue(cache, [_issue("agent:backend")])
+
+        assert [i.number for i in queue] == [ISSUE_NUMBER]
+        assert engine.ownership.exclusions.entries == ()
+
+    def test_a_crash_mid_run_exhausts_rather_than_pinning_the_issue(
+        self, tmp_path: Path
+    ) -> None:
+        """The claim cannot outlive its engine, so #139 stays fail-closed."""
+        first = _engine(tmp_path)
+        self._reserved_but_unreported(first)
+        first.in_flight.claim(_operation_key())
+        first.continuation.hydrate_queue(
+            first.queue_cache(), [_issue("agent:backend")]
+        )
+        assert first.ownership.exclusions.owns(_operation_key())
+
+        restarted = _engine(tmp_path)
+        queue = restarted.continuation.hydrate_queue(
+            restarted.queue_cache(), [_issue("agent:backend")]
+        )
+
+        assert [i.number for i in queue] == [ISSUE_NUMBER]
+        assert restarted.ownership.exclusions.entries == ()
 
 
 # ======================================================================

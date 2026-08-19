@@ -21,6 +21,9 @@ from pathlib import Path
 import pytest
 
 from issue_orchestrator.adapters.sidecar_attempt_store import SidecarAttemptStore
+from issue_orchestrator.control.actions import AddLabelAction
+from issue_orchestrator.control.continuation_finalize import ContinuationFinalizer
+from issue_orchestrator.control.continuation_in_flight import ContinuationsInFlight
 from issue_orchestrator.control.continuation_live_truth import (
     CONTINUATION_KIND,
     ContinuationReconciliation,
@@ -31,6 +34,9 @@ from issue_orchestrator.control.publication_revalidation import RevalidationOutc
 from issue_orchestrator.domain.attempt import Attempt, AttemptKey
 from issue_orchestrator.domain.continuation_descriptor import ContinuationDescriptor
 from issue_orchestrator.domain.continuation_phase import ContinuationPhase
+from issue_orchestrator.domain.continuation_settlement import (
+    ContinuationSettlementKind,
+)
 from issue_orchestrator.domain.control_operation import (
     ControlOperationExclusions,
     ControlOperationKey,
@@ -61,6 +67,8 @@ SHA_A_PRIME = "b" * 40
 PUBLISH_COMMAND = "make validate-pr-raw"
 PROFILE = "default"
 AGENT = "agent:backend"
+PR_PENDING = "pr-pending"
+PR_URL = f"https://example.test/{REPO}/pull/7"
 
 
 # ----------------------------------------------------------------------
@@ -154,8 +162,17 @@ class FakeSessionOutput:
 
 @dataclass
 class ProcessingOutcome:
+    """The pipeline's answer, in the shape ``ProcessingResult`` reports it."""
+
     success: bool = True
     message: str = "processed"
+    pr_url: str | None = None
+    review_exchange_deferred: bool = False
+    validation_failed_rerouted: bool = False
+
+    @property
+    def is_non_terminal(self) -> bool:
+        return self.review_exchange_deferred or self.validation_failed_rerouted
 
 
 @dataclass
@@ -164,6 +181,8 @@ class FakeCompletionOwner:
 
     calls: list[dict[str, object]] = field(default_factory=list)
     records: list[dict[str, object]] = field(default_factory=list)
+    outcome: ProcessingOutcome = field(default_factory=ProcessingOutcome)
+    during_process: Callable[[], None] | None = None
 
     def process(
         self,
@@ -184,7 +203,27 @@ class FakeCompletionOwner:
                 **kwargs,
             }
         )
-        return ProcessingOutcome()
+        if self.during_process is not None:
+            self.during_process()
+        return self.outcome
+
+
+@dataclass
+class LabelResult:
+    success: bool = True
+    error: str | None = None
+
+
+@dataclass
+class FakeActionApplier:
+    """Records the board signal the finalizer emits, and can refuse it."""
+
+    applied: list[AddLabelAction] = field(default_factory=list)
+    result: LabelResult = field(default_factory=LabelResult)
+
+    def apply(self, action: AddLabelAction) -> LabelResult:
+        self.applied.append(action)
+        return self.result
 
 
 @dataclass
@@ -316,6 +355,8 @@ class Harness:
     verdicts: FakeVerdicts
     jobs: InlineJobs
     attempts: SidecarAttemptStore
+    labels: FakeActionApplier
+    in_flight: ContinuationsInFlight
 
 
 @pytest.fixture
@@ -329,6 +370,8 @@ def harness(tmp_path: Path) -> Harness:
     verdicts = FakeVerdicts()
     jobs = InlineJobs()
     attempts = SidecarAttemptStore(tmp_path / "primary")
+    labels = FakeActionApplier()
+    in_flight = ContinuationsInFlight()
     runner = ControlContinuationRunner(
         state=state,
         revalidation_route=revalidation,  # type: ignore[arg-type]
@@ -338,6 +381,12 @@ def harness(tmp_path: Path) -> Harness:
         session_output=session_output,  # type: ignore[arg-type]
         completion_processor=completion,  # type: ignore[arg-type]
         review_verdicts=verdicts,  # type: ignore[arg-type]
+        finalizer=ContinuationFinalizer(
+            attempts=attempts,
+            action_applier=labels,  # type: ignore[arg-type]
+            pr_pending_label=PR_PENDING,
+        ),
+        in_flight=in_flight,
         jobs=jobs,  # type: ignore[arg-type]
         repo_root=tmp_path / "primary",
     )
@@ -352,6 +401,8 @@ def harness(tmp_path: Path) -> Harness:
         verdicts=verdicts,
         jobs=jobs,
         attempts=attempts,
+        labels=labels,
+        in_flight=in_flight,
     )
 
 
@@ -487,20 +538,26 @@ class TestActiveSessionRefusal:
             session_output=harness.session_output,  # type: ignore[arg-type]
             completion_processor=harness.completion,  # type: ignore[arg-type]
             review_verdicts=harness.verdicts,  # type: ignore[arg-type]
+            finalizer=ContinuationFinalizer(
+                attempts=harness.attempts,
+                action_applier=harness.labels,  # type: ignore[arg-type]
+                pr_pending_label=PR_PENDING,
+            ),
+            in_flight=harness.in_flight,
             jobs=RefusingJobs(),  # type: ignore[arg-type]
             repo_root=tmp_path / "primary",
         )
-
-        runner.advance(
-            _owned(
-                _operation(
-                    _attempt(RequestedAction.CREATE_PR),
-                    ContinuationPhase.PASS_PENDING_REVIEW,
-                )
-            )
+        operation = _operation(
+            _attempt(RequestedAction.CREATE_PR),
+            ContinuationPhase.PASS_PENDING_REVIEW,
         )
 
+        runner.advance(_owned(operation))
+
         assert harness.completion.calls == []
+        # The claim this tick took is given back, or the operation would be
+        # pinned live by a run that never started.
+        assert harness.in_flight.is_executing(operation.key) is False
 
 
 class TestExactCandidateMaterialisation:
@@ -729,3 +786,197 @@ class TestFailureLeavesTruthUnchanged:
         assert stored is not None
         assert stored.continuation_descriptor is not None
         assert harness.completion.calls == []
+
+
+class TestTheRunSettlesFromWhatItProduced:
+    """The board never learns about this PR, so the run must record it (F1)."""
+
+    def test_a_created_pull_request_is_recorded_as_the_settlement(
+        self, harness: Harness
+    ) -> None:
+        attempt = _attempt(RequestedAction.CREATE_PR)
+        harness.attempts.update(attempt.key, lambda _current: attempt)
+        harness.completion.outcome = ProcessingOutcome(pr_url=PR_URL)
+
+        harness.runner.advance(
+            _owned(_operation(attempt, ContinuationPhase.APPROVED_PENDING_PR))
+        )
+
+        stored = harness.attempts.for_key(attempt.key)
+        assert stored is not None
+        assert stored.continuation_settlement is not None
+        assert (
+            stored.continuation_settlement.kind
+            is ContinuationSettlementKind.PULL_REQUEST_OPENED
+        )
+        assert stored.continuation_settlement.pr_url == PR_URL
+
+    def test_the_board_is_told_a_pull_request_now_exists(
+        self, harness: Harness
+    ) -> None:
+        attempt = _attempt(RequestedAction.CREATE_PR)
+        harness.attempts.update(attempt.key, lambda _current: attempt)
+        harness.completion.outcome = ProcessingOutcome(pr_url=PR_URL)
+
+        harness.runner.advance(
+            _owned(_operation(attempt, ContinuationPhase.APPROVED_PENDING_PR))
+        )
+
+        assert [action.label for action in harness.labels.applied] == [PR_PENDING]
+        assert harness.labels.applied[0].issue_number == ISSUE_NUMBER
+
+    def test_a_board_signal_that_could_not_be_applied_settles_nothing(
+        self, harness: Harness
+    ) -> None:
+        """Settling on an unannounced PR would hand the lane back with it open."""
+        attempt = _attempt(RequestedAction.CREATE_PR)
+        harness.attempts.update(attempt.key, lambda _current: attempt)
+        harness.completion.outcome = ProcessingOutcome(pr_url=PR_URL)
+        harness.labels.result = LabelResult(success=False, error="label API refused")
+
+        with pytest.raises(RuntimeError, match="label API refused"):
+            harness.runner.advance(
+                _owned(_operation(attempt, ContinuationPhase.APPROVED_PENDING_PR))
+            )
+
+        stored = harness.attempts.for_key(attempt.key)
+        assert stored is not None
+        assert stored.continuation_settlement is None
+
+    def test_a_run_that_produced_no_requested_pull_request_settles_nothing(
+        self, harness: Harness
+    ) -> None:
+        """The intent is undischarged, so the next pass must try again."""
+        attempt = _attempt(RequestedAction.CREATE_PR)
+        harness.attempts.update(attempt.key, lambda _current: attempt)
+        harness.completion.outcome = ProcessingOutcome(success=False, pr_url=None)
+
+        harness.runner.advance(
+            _owned(_operation(attempt, ContinuationPhase.APPROVED_PENDING_PR))
+        )
+
+        stored = harness.attempts.for_key(attempt.key)
+        assert stored is not None
+        assert stored.continuation_settlement is None
+        assert harness.labels.applied == []
+
+    def test_an_intent_that_asked_for_no_pull_request_settles_on_a_clean_run(
+        self, harness: Harness
+    ) -> None:
+        attempt = _attempt(RequestedAction.PUSH_BRANCH)
+        harness.attempts.update(attempt.key, lambda _current: attempt)
+
+        harness.runner.advance(
+            _owned(_operation(attempt, ContinuationPhase.PASS_PENDING_REVIEW))
+        )
+
+        stored = harness.attempts.for_key(attempt.key)
+        assert stored is not None
+        assert stored.continuation_settlement is not None
+        assert (
+            stored.continuation_settlement.kind
+            is ContinuationSettlementKind.NOTHING_FURTHER_REQUESTED
+        )
+        assert harness.labels.applied == []
+
+    def test_a_deferred_review_exchange_settles_nothing(
+        self, harness: Harness
+    ) -> None:
+        """Completion has NOT finished for this record, and the pipeline says so."""
+        attempt = _attempt(RequestedAction.CREATE_PR)
+        harness.attempts.update(attempt.key, lambda _current: attempt)
+        harness.completion.outcome = ProcessingOutcome(review_exchange_deferred=True)
+
+        harness.runner.advance(
+            _owned(_operation(attempt, ContinuationPhase.PASS_PENDING_REVIEW))
+        )
+
+        stored = harness.attempts.for_key(attempt.key)
+        assert stored is not None
+        assert stored.continuation_settlement is None
+
+
+class TestTheEngineKnowsWhatItIsExecuting:
+    """The one fact no durable record can state (F2)."""
+
+    def test_the_operation_is_claimed_for_the_whole_run(
+        self, harness: Harness
+    ) -> None:
+        attempt = _attempt(RequestedAction.CREATE_PR)
+        harness.attempts.update(attempt.key, lambda _current: attempt)
+        operation = _operation(attempt, ContinuationPhase.PASS_PENDING_REVIEW)
+        seen: list[bool] = []
+        harness.completion.during_process = lambda: seen.append(
+            harness.in_flight.is_executing(operation.key)
+        )
+
+        harness.runner.advance(_owned(operation))
+
+        assert seen == [True]
+        assert harness.in_flight.is_executing(operation.key) is False
+
+    def test_a_revalidation_is_claimed_while_it_spends_the_allowance(
+        self, harness: Harness
+    ) -> None:
+        """#139 spends the allowance before the gate runs; the claim spans both."""
+        attempt = _attempt(
+            RequestedAction.CREATE_PR, verdict=ValidationVerdict.FAILED
+        )
+        operation = _operation(attempt, ContinuationPhase.RETRY_PENDING)
+        seen: list[bool] = []
+
+        def _observe(candidate: Attempt) -> RevalidationOutcome:
+            seen.append(harness.in_flight.is_executing(operation.key))
+            return RevalidationOutcome(started=True, reason="revalidation_completed")
+
+        harness.revalidation.revalidate = _observe  # type: ignore[method-assign]
+
+        harness.runner.advance(_owned(operation))
+
+        assert seen == [True]
+        assert harness.in_flight.is_executing(operation.key) is False
+
+    def test_a_run_that_raised_still_gives_the_claim_back(
+        self, harness: Harness
+    ) -> None:
+        """Ownership is durable and survives; the claim is about right now."""
+        attempt = _attempt(RequestedAction.CREATE_PR)
+        harness.attempts.update(attempt.key, lambda _current: attempt)
+        operation = _operation(attempt, ContinuationPhase.PASS_PENDING_REVIEW)
+
+        def _explode() -> None:
+            raise RuntimeError("the pipeline blew up")
+
+        harness.completion.during_process = _explode
+
+        with pytest.raises(RuntimeError, match="the pipeline blew up"):
+            harness.runner.advance(_owned(operation))
+
+        assert harness.in_flight.is_executing(operation.key) is False
+
+    def test_an_operation_already_claimed_is_not_started_again(
+        self, harness: Harness
+    ) -> None:
+        attempt = _attempt(RequestedAction.CREATE_PR)
+        harness.attempts.update(attempt.key, lambda _current: attempt)
+        operation = _operation(attempt, ContinuationPhase.PASS_PENDING_REVIEW)
+        assert harness.in_flight.claim(operation.key) is True
+
+        harness.runner.advance(_owned(operation))
+
+        assert harness.jobs.submitted == []
+        assert harness.completion.calls == []
+
+    def test_an_executing_phase_starts_nothing_and_raises_nothing(
+        self, harness: Harness
+    ) -> None:
+        """Reachable when a run ends between reconciliation and submit."""
+        attempt = _attempt(RequestedAction.CREATE_PR)
+        harness.attempts.update(attempt.key, lambda _current: attempt)
+
+        harness.runner.advance(
+            _owned(_operation(attempt, ContinuationPhase.EXECUTING))
+        )
+
+        assert harness.completion.calls == []
+        assert harness.revalidation.candidates == []

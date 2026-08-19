@@ -16,6 +16,7 @@ real reconciliation path.
 
 from __future__ import annotations
 
+from issue_orchestrator.control.continuation_in_flight import ContinuationsInFlight
 from issue_orchestrator.control.continuation_live_truth import ContinuationLiveTruth
 from issue_orchestrator.control.continuation_scheduling import ControlContinuation
 from issue_orchestrator.control.control_operation_ownership import (
@@ -132,7 +133,11 @@ def inert_control_continuation(
             state if state is not None else OrchestratorState(),
             InMemoryControlOperationOwnershipStore(),
         ),
-        ContinuationLiveTruth(NoAttempts(), pr_pending_label=PR_PENDING_LABEL),  # type: ignore[arg-type]
+        ContinuationLiveTruth(
+            NoAttempts(),  # type: ignore[arg-type]
+            pr_pending_label=PR_PENDING_LABEL,
+            in_flight=ContinuationsInFlight(),
+        ),
         NoContinuationRunner(),  # type: ignore[arg-type]
     )
 

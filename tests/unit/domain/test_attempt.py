@@ -5,6 +5,10 @@ from dataclasses import FrozenInstanceError
 import pytest
 
 from issue_orchestrator.domain.attempt import Attempt, AttemptKey
+from issue_orchestrator.domain.continuation_settlement import (
+    ContinuationSettlement,
+    ContinuationSettlementKind,
+)
 from issue_orchestrator.domain.issue_key import FakeIssueKey, GitHubIssueKey
 from issue_orchestrator.domain.validation_verdict_receipt import (
     ValidationVerdict,
@@ -223,3 +227,55 @@ def test_attempt_rejects_negative_revalidation_budget() -> None:
             key=AttemptKey(GitHubIssueKey("owner/repo", "139"), SHA),
             revalidation_budget_used=-1,
         )
+
+
+def test_the_continuation_settlement_survives_storage() -> None:
+    settlement = ContinuationSettlement(
+        kind=ContinuationSettlementKind.PULL_REQUEST_OPENED,
+        settled_at="2026-08-19T02:00:00Z",
+        pr_url="https://example.test/owner/repo/pull/7",
+    )
+
+    restored = Attempt.from_dict(
+        Attempt(key=AttemptKey(GitHubIssueKey("owner/repo", "149"), SHA))
+        .with_continuation_settlement(settlement)
+        .to_dict()
+    )
+
+    assert restored.continuation_settlement == settlement
+
+
+def test_a_sidecar_written_before_settlements_existed_reads_as_unsettled() -> None:
+    """Absence is "this continuation still owes work", which permits a run."""
+    payload = Attempt(
+        key=AttemptKey(GitHubIssueKey("owner/repo", "149"), SHA)
+    ).to_dict()
+    del payload["continuation_settlement"]
+
+    assert Attempt.from_dict(payload).continuation_settlement is None
+
+
+def test_a_damaged_settlement_refuses_rather_than_reading_as_unsettled() -> None:
+    """Reading damage as absence would put a finished run back on the runner."""
+    payload = Attempt(
+        key=AttemptKey(GitHubIssueKey("owner/repo", "149"), SHA)
+    ).to_dict()
+    payload["continuation_settlement"] = {"kind": "pull_request_opened"}
+
+    with pytest.raises(ValueError):
+        Attempt.from_dict(payload)
+
+
+def test_retiring_the_recorded_intent_keeps_the_settlement() -> None:
+    """Supersession clears intent only; what a run produced is still evidence."""
+    settlement = ContinuationSettlement(
+        kind=ContinuationSettlementKind.NOTHING_FURTHER_REQUESTED,
+        settled_at="2026-08-19T02:00:00Z",
+    )
+    attempt = Attempt(
+        key=AttemptKey(GitHubIssueKey("owner/repo", "149"), SHA)
+    ).with_continuation_settlement(settlement)
+
+    assert attempt.without_continuation_descriptor().continuation_settlement == (
+        settlement
+    )

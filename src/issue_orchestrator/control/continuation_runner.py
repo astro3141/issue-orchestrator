@@ -8,10 +8,11 @@ that already exist rather than reimplementing what they decide:
 same-SHA admission, allowance, gate     :class:`~.publication_revalidation.PublicationRevalidation` (#139)
 exact-commit materialisation            the issue's own branch, verified
 reviewer-first exchange, PR creation    :class:`~.completion_processor.CompletionProcessor`
+settlement of a discharged intent       :class:`~.continuation_finalize.ContinuationFinalizer`
 ownership and exclusion                 :class:`~.control_operation_ownership.ControlOperationOwnership` (#146)
 ======================================  =====================================
 
-Three rules keep it from becoming a second lifecycle.
+Four rules keep it from becoming a second lifecycle.
 
 **It never decides admission.** A ``RETRY_PENDING`` operation is handed whole
 to #139, which re-checks the contract, the allowance and the reserve-before-
@@ -31,6 +32,14 @@ subject — the continuation exists for a candidate whose worktree is *gone*. So
 a live session is an execution refusal, exactly as it is for the publish-retry
 route, and the operation simply stays owned until the session finishes.
 
+**It never discards what its own run produced.** The
+:class:`~.completion_types.ProcessingResult` a run returns is the ONLY record
+that this operation created the pull request its intent asked for — no session
+completes, and the PR carries no code-review label, so none of the three writers
+of ``pr-pending`` observe it. Handing that result to the finalizer is what makes
+the operation terminate; logging it and dropping it is what made
+``APPROVED_PENDING_PR`` re-run a full reviewer exchange on every reconciliation.
+
 A supersession the durable record has not yet noticed is retired rather than
 retried: if the issue's branch no longer points at the candidate, the intent
 recorded for it is cleared, which drops the operation out of live truth on the
@@ -48,7 +57,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol
 
-from ..domain.attempt import Attempt, AttemptKey
+from ..domain.attempt import Attempt
 from ..domain.continuation_phase import ContinuationPhase
 from ..domain.models import CompletionOutcome, CompletionRecord, get_completion_path
 from .continuation_live_truth import LiveContinuation
@@ -64,6 +73,8 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from ..ports.working_copy import WorkingCopy
     from ..ports.worktree_manager import WorktreeManager
     from .completion_types import ProcessingResult
+    from .continuation_finalize import ContinuationFinalizer
+    from .continuation_in_flight import ContinuationsInFlight
     from .continuation_live_truth import ContinuationReconciliation
     from .publication_revalidation import PublicationRevalidation
 
@@ -132,6 +143,8 @@ class ControlContinuationRunner:
         session_output: "SessionOutput",
         completion_processor: ContinuationCompletionOwner,
         review_verdicts: "ReviewVerdictBindings",
+        finalizer: "ContinuationFinalizer",
+        in_flight: "ContinuationsInFlight",
         jobs: ContinuationJobs,
         repo_root: Path,
     ) -> None:
@@ -143,6 +156,11 @@ class ControlContinuationRunner:
         self._session_output = session_output
         self._completion_processor = completion_processor
         self._review_verdicts = review_verdicts
+        self._finalizer = finalizer
+        # The SAME registry live truth reads. The claim taken here is what keeps
+        # a reconciliation seconds later from deriving a mid-run candidate as
+        # finished and releasing the lease under a running operation.
+        self._in_flight = in_flight
         self._jobs = jobs
         self._repo_root = repo_root
         # What each LIVE phase does, decided in one table rather than by a
@@ -156,6 +174,13 @@ class ControlContinuationRunner:
             ContinuationPhase.RETRY_PENDING: self._revalidate,
             ContinuationPhase.PASS_PENDING_REVIEW: self._continue_into_review,
             ContinuationPhase.APPROVED_PENDING_PR: self._continue_into_review,
+            # An operation this engine is already executing has nothing to
+            # start. It is a live phase and therefore reachable, so it needs a
+            # handler; the honest one does nothing. The claim below normally
+            # refuses long before the lookup, but a run that finished between
+            # the reconciliation and the submit reaches here, and a KeyError is
+            # not what "the work is already done" should look like.
+            ContinuationPhase.EXECUTING: _already_executing,
         }
 
     # ------------------------------------------------------------------
@@ -185,15 +210,28 @@ class ControlContinuationRunner:
                 operation.key,
             )
             return
+        # Claimed HERE and not inside the job, because a job runner may queue
+        # work: between "submitted" and "started" the operation would otherwise
+        # be unclaimed, and a reconciliation in that gap derives from durable
+        # facts a started run is about to change. The claim is also the primary
+        # duplicate guard — atomic, and taken before anything external happens.
+        if not self._in_flight.claim(operation.key):
+            logger.debug(
+                "[CONTINUATION] %s already executing in this engine", operation.key
+            )
+            return
         job_id = f"{CONTINUATION_JOB_PREFIX}:{':'.join(operation.key.durable_parts)}"
         # ``submit`` reports an already-running job by returning False, which is
-        # the whole duplicate guard: a job still running from a previous tick
-        # must not be started again, and the operation stays owned meanwhile.
+        # the second half of the duplicate guard: a job still running from a
+        # previous tick must not be started again, and the operation stays owned
+        # meanwhile.
         if not self._jobs.submit(job_id, lambda: self._run(operation)):
             # The runner did not start it: either this operation's job is
             # already in flight from an earlier tick, or the deployment has no
             # background runner at all. Either way the operation stays owned
-            # and the next reconciliation asks again.
+            # and the next reconciliation asks again — so the claim this tick
+            # took must be given back, or nothing would ever ask again.
+            self._in_flight.release(operation.key)
             logger.debug("[CONTINUATION] %s not started this tick", operation.key)
 
     def _has_active_session(self, issue_number: int) -> bool:
@@ -215,8 +253,18 @@ class ControlContinuationRunner:
         on error would instead free the issue while a partially-applied run's
         side effects were still landing. The job runner records what escaped,
         which is the loud report a swallow would not be.
+
+        The execution claim IS released on error, and only there is the
+        distinction: ownership is durable and says "this operation is someone's
+        to advance", while the claim is process-local and says "a run is in
+        flight right now". A run that ended — cleanly or not — is not in flight,
+        and a claim left behind by a raised handler would pin the issue until
+        the engine restarted.
         """
-        self._advance_by_phase[operation.phase](operation)
+        try:
+            self._advance_by_phase[operation.phase](operation)
+        finally:
+            self._in_flight.release(operation.key)
 
     def _revalidate(self, operation: LiveContinuation) -> None:
         """Hand the candidate to #139, whole.
@@ -355,6 +403,13 @@ class ControlContinuationRunner:
             result.message,
         )
         self._record_review_verdict(operation, assets.run_dir)
+        # The verdict first, then the settlement: both are facts this run
+        # produced, and the ordering is the crash window. Settled-without-a-
+        # verdict loses only evidence about a PR that demonstrably exists;
+        # verdict-without-settlement re-enters the pipeline, finds the open PR
+        # and reuses it. Only the first ordering can lose the review outcome
+        # for good.
+        self._finalizer.finalize(operation, result)
 
     def _record_review_verdict(
         self, operation: LiveContinuation, run_dir: Path
@@ -386,9 +441,13 @@ class ControlContinuationRunner:
                 binding.reviewed_sha[:12],
             )
             return
-        key = AttemptKey(operation.issue.key, operation.key.head_sha)
+        # The attempt's OWN key, not a third spelling rebuilt from the issue and
+        # the operation. ``LiveContinuation`` already carries the record this
+        # operation is about, and the binding between candidate and evidence
+        # should have one spelling wherever it is written.
         self._attempts.update(
-            key, lambda attempt: attempt.with_continuation_review_verdict(binding)
+            operation.attempt.key,
+            lambda attempt: attempt.with_continuation_review_verdict(binding),
         )
         logger.info(
             "[CONTINUATION] %s durable review verdict=%s",
@@ -398,8 +457,14 @@ class ControlContinuationRunner:
 
     def _retire(self, operation: LiveContinuation) -> None:
         """Clear the recorded intent for a candidate the branch has left behind."""
-        key = AttemptKey(operation.issue.key, operation.key.head_sha)
-        self._attempts.update(key, Attempt.without_continuation_descriptor)
+        self._attempts.update(
+            operation.attempt.key, Attempt.without_continuation_descriptor
+        )
+
+
+def _already_executing(operation: LiveContinuation) -> None:
+    """Start nothing: this engine already has a run in flight for ``operation``."""
+    logger.debug("[CONTINUATION] %s is already executing", operation.key)
 
 
 def _worktree_name(operation: LiveContinuation) -> str:

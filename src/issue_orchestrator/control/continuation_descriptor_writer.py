@@ -189,15 +189,33 @@ class _RecordsNoIntent(ContinuationDescriptorWriter):
     branches on whether intent is being recorded. What it does is the safe
     direction by construction: recording nothing means no continuation can ever
     run for these candidates, which is refusal, not permission.
+
+    Both overrides restate the real signatures rather than absorbing anything
+    into ``**kwargs``. A null object that accepts more than the thing it stands
+    in for is a null object that silently accepts a mis-spelled keyword, so a
+    composition without an attempt store would lose the arity check every other
+    composition gets.
     """
 
     def __init__(self) -> None:
         """Deliberately holds no store: there is nothing for it to write to."""
 
-    def record_gate_outcome(self, **kwargs: object) -> None:
+    def record_gate_outcome(
+        self,
+        *,
+        issue_key: "IssueKey | None",
+        completion: "CompletionRecord",
+        outcome: "PublicationGateOutcome",
+    ) -> None:
         return None
 
-    def record_refused_candidate(self, **kwargs: object) -> None:
+    def record_refused_candidate(
+        self,
+        *,
+        issue_key: "IssueKey",
+        completion: "CompletionRecord",
+        gate_record: "ValidationRecord",
+    ) -> None:
         return None
 
 

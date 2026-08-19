@@ -11,10 +11,18 @@ Two properties are the whole design.
 
 **No lease row is read here.** Liveness comes from the attempt sidecar (the
 recorded intent, the evaluation history, the same-SHA allowance, the exact-``A``
-review verdict) and from board labels the tick already fetched. Nothing in this
-module can see the ownership store, so a surviving row can never vouch for
-itself into the live set — which is what stops a crash after settlement from
-becoming a durable deadlock.
+review verdict, the run's recorded settlement) and from board labels the tick
+already fetched. Nothing in this module can see the ownership store, so a
+surviving row can never vouch for itself into the live set — which is what
+stops a crash after settlement from becoming a durable deadlock.
+
+The one non-durable input is :class:`~.continuation_in_flight.ContinuationsInFlight`,
+and it is the opposite of a lease row rather than a variation on one: it is
+process-local, so it cannot survive the engine that wrote it, and a crash
+therefore erases every claim it holds instead of preserving one. It answers the
+single question no durable record can — "is this engine executing the operation
+right now" — which #139's start-budget ordering makes indistinguishable from
+"the operation ran and failed" for the whole duration of a gate run.
 
 **Ignorance is not emptiness.** A live set is a set of *claims about what is
 running*, and reconciliation releases every lease outside it. So a derivation
@@ -46,6 +54,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from ..domain.issue_key import IssueKey
     from ..ports.attempt_store import AttemptStore
     from ..ports.issue import Issue
+    from .continuation_in_flight import ContinuationsInFlight
 
 logger = logging.getLogger(__name__)
 
@@ -124,9 +133,20 @@ class ContinuationReconciliation:
 class ContinuationLiveTruth:
     """Derives the live control operations for a board of already-fetched issues."""
 
-    def __init__(self, attempts: "AttemptStore", *, pr_pending_label: str) -> None:
+    def __init__(
+        self,
+        attempts: "AttemptStore",
+        *,
+        pr_pending_label: str,
+        in_flight: "ContinuationsInFlight",
+    ) -> None:
         self._attempts = attempts
         self._pr_pending_label = pr_pending_label
+        # Required rather than defaulted, and the SAME instance the runner
+        # claims into. A live truth given its own empty registry would derive
+        # correct-looking phases that release running operations, which is the
+        # bug this closes wearing the shape of a working composition.
+        self._in_flight = in_flight
 
     def read(self, board: Sequence["Issue"]) -> ContinuationLiveReading:
         """Every live continuation across ``board``, or an unreadable answer.
@@ -157,23 +177,30 @@ class ContinuationLiveTruth:
         board_shows_pr_pending = self._pr_pending_label in tuple(issue.labels)
         live: list[LiveContinuation] = []
         for attempt in self._attempts.for_issue(issue.key):
+            key = _operation_key(issue.key, attempt)
             phase = derive_continuation_phase(
-                _facts(attempt, board_shows_pr_pending=board_shows_pr_pending)
+                _facts(
+                    attempt,
+                    board_shows_pr_pending=board_shows_pr_pending,
+                    engine_is_executing=self._in_flight.is_executing(key),
+                )
             )
             if not phase.live:
                 continue
             live.append(
                 LiveContinuation(
-                    key=_operation_key(issue.key, attempt),
-                    issue=issue,
-                    attempt=attempt,
-                    phase=phase,
+                    key=key, issue=issue, attempt=attempt, phase=phase
                 )
             )
         return live
 
 
-def _facts(attempt: Attempt, *, board_shows_pr_pending: bool) -> ContinuationFacts:
+def _facts(
+    attempt: Attempt,
+    *,
+    board_shows_pr_pending: bool,
+    engine_is_executing: bool,
+) -> ContinuationFacts:
     """The durable facts one attempt states, reduced to the decision's shape."""
     latest = attempt.latest_publication_evaluation
     verdict = attempt.continuation_review_verdict
@@ -195,6 +222,8 @@ def _facts(attempt: Attempt, *, board_shows_pr_pending: bool) -> ContinuationFac
             else None
         ),
         board_shows_pr_pending=board_shows_pr_pending,
+        settlement=attempt.continuation_settlement,
+        engine_is_executing=engine_is_executing,
     )
 
 

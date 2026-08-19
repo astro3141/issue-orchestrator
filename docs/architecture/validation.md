@@ -252,6 +252,7 @@ and nothing about what to do with it, so [#149] adds the missing half:
 |------|----------------|------------|
 | Recorded intent (`requested_actions`, `implementation`, `problems`) plus the contract identity | `Attempt.continuation_descriptor` | `control/continuation_descriptor_writer.py`, at the gate's verdict, **only when the verdict refuses** |
 | The exact-`A` review outcome | `Attempt.continuation_review_verdict` | `control/continuation_runner.py`, promoted from the run's own verdict binding before its worktree is discarded |
+| What the continuation run produced — the pull request, or that none was asked for | `Attempt.continuation_settlement` | `control/continuation_finalize.py`, from the `ProcessingResult` the run's own completion pipeline returned |
 
 Every field is **copied** from an authoritative producer. Nothing is derived
 from issue text, labels, logs, diagnostics, URLs or branch names, and an
@@ -262,16 +263,34 @@ second driver to race it. One descriptor exists per issue, because filing a
 newer candidate's intent clears the older one — supersession the durable record
 states rather than one a reader has to infer.
 
-From those two facts plus the evaluation history, the allowance, and the
+From those three facts plus the evaluation history, the allowance, and the
 `pr-pending` label the tick has already fetched,
 `domain/continuation_phase.py` derives which phase a candidate is in, and
 `control/continuation_live_truth.py` turns the live ones into the
-`live_operations` set `ControlOperationOwnership.reconcile` consumes. Three
-phases hold the issue (`RETRY_PENDING`, `PASS_PENDING_REVIEW`,
+`live_operations` set `ControlOperationOwnership.reconcile` consumes. Four
+phases hold the issue (`EXECUTING`, `RETRY_PENDING`, `PASS_PENDING_REVIEW`,
 `APPROVED_PENDING_PR`); the rest settle it. No lease row is read to decide
 liveness, so a row that outlived its operation can never exclude ordinary work
 on its own authority — and a durable record that cannot be READ keeps the
 projection already standing rather than publishing "nothing is live".
+
+Two of those phases exist because a durable record alone answers the wrong
+question:
+
+- **`EXECUTING`** is derived from `control/continuation_in_flight.py`, the one
+  non-durable input. The [#139] allowance is a *start* budget spent before any
+  gate work, so for the whole duration of a revalidation the record reads
+  "allowance spent, latest evaluation still the failure" — indistinguishable
+  from a revalidation that ran and failed, and therefore `EXHAUSTED`. Without
+  this phase the lease of a *running* operation is released and ordinary rework
+  is re-admitted mid-run. The registry is process-local by design: it cannot
+  survive a crash, so a restart falls back to the durable facts and [#139]'s
+  fail-closed direction is preserved rather than replaced by a deadlock.
+- **`SETTLED_PR` via the recorded settlement** exists because the continuation
+  creates no session and its pull request carries no code-review label, so none
+  of the three writers of `pr-pending` ever observe it. Waiting on the board
+  would leave `APPROVED_PENDING_PR` live forever, re-running a full reviewer
+  exchange on every reconciliation while holding the issue's lane.
 
 `control/continuation_scheduling.py` is the one hydration path: it derives,
 reconciles, publishes, advances what this engine owns, and only then lets
@@ -280,7 +299,13 @@ own lock (`reconcile_derived`), which is what makes a stale snapshot unable to
 release a newer claim. `control/continuation_runner.py` executes: it hands a
 `RETRY_PENDING` candidate whole to [#139] — no second admission predicate and
 no second allowance — and drives a passing one through the ordinary
-`CompletionProcessor`, in a worktree verified to stand at exactly `A`.
+`CompletionProcessor`, in a worktree verified to stand at exactly `A`. It hands
+the resulting `ProcessingResult` to `control/continuation_finalize.py`, the
+continuation's analogue of `control/publish_retry_finalize.py`: the finalizer
+announces the pull request on the board and *then* records the settlement, so a
+board signal that could not be applied leaves the operation retryable rather
+than terminating it while the issue's lane reopens with an approved PR already
+open.
 
 ## Worktree readiness is a precondition of a meaningful verdict
 

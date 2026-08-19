@@ -16,6 +16,10 @@ from issue_orchestrator.domain.continuation_phase import (
     ContinuationPhase,
     derive_continuation_phase,
 )
+from issue_orchestrator.domain.continuation_settlement import (
+    ContinuationSettlement,
+    ContinuationSettlementKind,
+)
 from issue_orchestrator.domain.models import RequestedAction
 from issue_orchestrator.domain.review_verdict_binding import ReviewVerdictOutcome
 
@@ -47,6 +51,8 @@ def _facts(
     revalidation_allowance_available: bool = True,
     review_verdict: ReviewVerdictOutcome | None = None,
     board_shows_pr_pending: bool = False,
+    settlement: ContinuationSettlement | None = None,
+    engine_is_executing: bool = False,
 ) -> ContinuationFacts:
     return ContinuationFacts(
         descriptor=(
@@ -59,14 +65,25 @@ def _facts(
         revalidation_allowance_available=revalidation_allowance_available,
         review_verdict=review_verdict,
         board_shows_pr_pending=board_shows_pr_pending,
+        settlement=settlement,
+        engine_is_executing=engine_is_executing,
+    )
+
+
+def _settlement(
+    kind: ContinuationSettlementKind, pr_url: str | None = None
+) -> ContinuationSettlement:
+    return ContinuationSettlement(
+        kind=kind, settled_at="2026-08-19T02:00:00Z", pr_url=pr_url
     )
 
 
 class TestEveryPhaseDeclaresLiveness:
-    def test_the_live_phases_are_exactly_the_three_with_work_outstanding(self) -> None:
+    def test_the_live_phases_are_exactly_those_with_work_outstanding(self) -> None:
         live = {phase for phase in ContinuationPhase if phase.live}
 
         assert live == {
+            ContinuationPhase.EXECUTING,
             ContinuationPhase.RETRY_PENDING,
             ContinuationPhase.PASS_PENDING_REVIEW,
             ContinuationPhase.APPROVED_PENDING_PR,
@@ -191,3 +208,112 @@ class TestSettlementOutranksContinuation:
         )
 
         assert phase is ContinuationPhase.EXIT_TO_REWORK
+
+
+class TestTheRunsOwnSettlementTerminates:
+    """The board never learns about a continuation's PR, so the run must say so."""
+
+    def test_a_recorded_pull_request_settles_an_approval_the_board_is_silent_on(
+        self,
+    ) -> None:
+        """The F1 loop: APPROVED + CREATE_PR + no ``pr-pending`` ran forever."""
+        phase = derive_continuation_phase(
+            _facts(
+                latest_publication_passed=True,
+                review_verdict=ReviewVerdictOutcome.APPROVED,
+                board_shows_pr_pending=False,
+                settlement=_settlement(
+                    ContinuationSettlementKind.PULL_REQUEST_OPENED,
+                    pr_url="https://example.test/pr/1",
+                ),
+            )
+        )
+
+        assert phase is ContinuationPhase.SETTLED_PR
+        assert phase.live is False
+
+    def test_a_run_that_owed_no_pull_request_settles_without_one(self) -> None:
+        phase = derive_continuation_phase(
+            _facts(
+                descriptor=_descriptor(RequestedAction.PUSH_BRANCH),
+                latest_publication_passed=True,
+                settlement=_settlement(
+                    ContinuationSettlementKind.NOTHING_FURTHER_REQUESTED
+                ),
+            )
+        )
+
+        assert phase is ContinuationPhase.SETTLED_NO_PR
+        assert phase.live is False
+
+    def test_settlement_outranks_a_still_retryable_non_pass(self) -> None:
+        phase = derive_continuation_phase(
+            _facts(
+                revalidation_allowance_available=True,
+                settlement=_settlement(
+                    ContinuationSettlementKind.PULL_REQUEST_OPENED,
+                    pr_url="https://example.test/pr/1",
+                ),
+            )
+        )
+
+        assert phase is ContinuationPhase.SETTLED_PR
+
+    def test_an_unsettled_approval_that_asked_for_a_pr_is_still_live(self) -> None:
+        """Absence of settlement is what keeps a failed run retryable."""
+        phase = derive_continuation_phase(
+            _facts(
+                latest_publication_passed=True,
+                review_verdict=ReviewVerdictOutcome.APPROVED,
+                settlement=None,
+            )
+        )
+
+        assert phase is ContinuationPhase.APPROVED_PENDING_PR
+        assert phase.live is True
+
+
+class TestExecutionOutranksEveryDurableFact:
+    """#139 spends the allowance BEFORE the gate runs, so mid-run facts lie."""
+
+    def test_a_reserved_but_unreported_revalidation_is_not_exhausted(self) -> None:
+        """The F2 window: allowance spent, latest evaluation still the failure."""
+        phase = derive_continuation_phase(
+            _facts(revalidation_allowance_available=False, engine_is_executing=True)
+        )
+
+        assert phase is ContinuationPhase.EXECUTING
+        assert phase.live is True
+
+    def test_the_same_facts_without_a_run_in_flight_are_exhausted(self) -> None:
+        """A crash erases the claim, so #139's fail-closed direction survives."""
+        phase = derive_continuation_phase(
+            _facts(revalidation_allowance_available=False, engine_is_executing=False)
+        )
+
+        assert phase is ContinuationPhase.EXHAUSTED
+
+    @pytest.mark.parametrize(
+        "overrides",
+        [
+            {"descriptor": None},
+            {"board_shows_pr_pending": True},
+            {"review_verdict": ReviewVerdictOutcome.CHANGES_REQUESTED},
+            {
+                "settlement": ContinuationSettlement(
+                    kind=ContinuationSettlementKind.PULL_REQUEST_OPENED,
+                    settled_at="2026-08-19T02:00:00Z",
+                    pr_url="https://example.test/pr/1",
+                )
+            },
+        ],
+    )
+    def test_a_run_in_flight_outranks_every_terminal_fact(
+        self, overrides: dict
+    ) -> None:
+        """Terminal facts are being WRITTEN by the run; it still holds the issue."""
+        phase = derive_continuation_phase(
+            _facts(engine_is_executing=True, **overrides)
+        )
+
+        assert phase is ContinuationPhase.EXECUTING

@@ -34,7 +34,7 @@ had to change to carry it.
 route consumes it before any external gate work begins, so an interrupted
 revalidation fails closed rather than refunding itself on restart.
 
-The last two facts are the continuation half (#143, #149), and they are here
+The last three facts are the continuation half (#143, #149), and they are here
 for the same reason the receipts are: they are about one ``(issue, commit)``
 and they have to outlive the worktree that produced them.
 ``continuation_descriptor`` is the agent's recorded intent, copied at the gate
@@ -42,7 +42,10 @@ seam while the completion record still exists; ``continuation_review_verdict``
 is the orchestrator's exact-``A`` review outcome, which is otherwise written
 only into the exchange directory *inside* the run dir *inside* the worktree —
 durable enough for the session that made it, and gone by the time a
-continuation needs to know whether ``A`` was already reviewed.
+continuation needs to know whether ``A`` was already reviewed; and
+``continuation_settlement`` is the terminal fact the run itself produced,
+without which every phase meaning "still owes work" is re-derived unchanged
+after a run that already discharged it.
 """
 
 from __future__ import annotations
@@ -51,6 +54,7 @@ from dataclasses import dataclass, replace
 
 from .commit_sha import normalize_commit_sha
 from .continuation_descriptor import ContinuationDescriptor
+from .continuation_settlement import ContinuationSettlement
 from .execution_identity import CandidateExecutionIdentities
 from .issue_key import GitHubIssueKey, IssueKey, StableIssueId
 from .review_verdict_binding import BoundReviewVerdict
@@ -168,6 +172,14 @@ class Attempt:
     # a verdict rendered against ``A'`` can never be read here as a decision
     # about ``A``. ``None`` means no review has settled on this candidate.
     continuation_review_verdict: BoundReviewVerdict | None = None
+    # The terminal outcome of this candidate's continuation run (#149). Written
+    # by the run that produced it, never by a board signal: the continuation
+    # creates no session and its pull request carries no code-review label, so
+    # none of the three writers of ``pr-pending`` observe it. ``None`` means the
+    # recorded intent is still undischarged — which is what keeps a failed run
+    # retryable — so absence is permission to run again, and only an explicit
+    # settlement ends the operation.
+    continuation_settlement: ContinuationSettlement | None = None
 
     def __post_init__(self) -> None:
         if self.reroute_budget_used < 0:
@@ -333,6 +345,19 @@ class Attempt:
         """
         return replace(self, continuation_review_verdict=verdict)
 
+    def with_continuation_settlement(
+        self, settlement: ContinuationSettlement
+    ) -> "Attempt":
+        """This attempt with its continuation's terminal outcome filed (#149).
+
+        The one way an operation stops. Nothing here inspects what is already
+        recorded: the writer runs once per discharged run, and a second run of
+        the same candidate — the crash window between "PR created" and "record
+        the fact" — reaches the same settlement from the same evidence, so
+        re-filing is idempotent in content.
+        """
+        return replace(self, continuation_settlement=settlement)
+
     def to_dict(self) -> dict[str, object]:
         return {
             "schema_version": _SCHEMA_VERSION,
@@ -361,6 +386,11 @@ class Attempt:
             "continuation_review_verdict": (
                 self.continuation_review_verdict.to_payload()
                 if self.continuation_review_verdict is not None
+                else None
+            ),
+            "continuation_settlement": (
+                self.continuation_settlement.to_payload()
+                if self.continuation_settlement is not None
                 else None
             ),
         }
@@ -409,6 +439,9 @@ class Attempt:
             ),
             continuation_review_verdict=_optional_review_verdict(
                 data.get("continuation_review_verdict")
+            ),
+            continuation_settlement=_optional_settlement(
+                data.get("continuation_settlement")
             ),
         )
 
@@ -527,6 +560,21 @@ def _optional_review_verdict(value: object) -> BoundReviewVerdict | None:
             "Attempt sidecar continuation_review_verdict must be an object"
         )
     return BoundReviewVerdict.from_payload(value)
+
+
+def _optional_settlement(value: object) -> ContinuationSettlement | None:
+    """Parse the continuation's terminal outcome, or ``None`` if it has none.
+
+    Absent means the recorded intent is still undischarged, which permits the
+    operation to run. Unparseable means the record of its terminal outcome is
+    damaged, and reading the second as the first would put a finished
+    continuation — pull request and all — back on the runner.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ValueError("Attempt sidecar continuation_settlement must be an object")
+    return ContinuationSettlement.from_payload(value)
 
 
 def _optional_publication_verdict(value: object) -> ValidationVerdictReceipt | None:

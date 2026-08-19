@@ -27,6 +27,8 @@ from ..control.orchestrator_support import (
 )
 from ..control.github_workflow import GitHubWorkflow, launch_issue_by_number as _gw_launch_issue_by_number, get_issue_machine as _gw_get_issue_machine
 from ..control.worktree_manager import get_worktree_path, get_session_name, extract_issue_branches
+from ..control.continuation_finalize import ContinuationFinalizer
+from ..control.continuation_in_flight import ContinuationsInFlight
 from ..control.continuation_live_truth import ContinuationLiveTruth
 from ..control.continuation_runner import ControlContinuationRunner
 from ..control.continuation_scheduling import ControlContinuation
@@ -319,11 +321,17 @@ class Orchestrator:
         ownership = ControlOperationOwnership(
             self.state, self.deps.continuation_ports.ownership_store
         )
+        # One registry, shared by the runner that claims into it and the live
+        # truth that reads it. Constructed here for the same reason the lock
+        # above is: it is what this engine is executing, so it must live exactly
+        # as long as the engine, and two instances would agree about nothing.
+        in_flight = ContinuationsInFlight()
         return ControlContinuation(
             ownership,
             ContinuationLiveTruth(
                 self.deps.attempt_store,
                 pr_pending_label=self.deps.label_manager.pr_pending,
+                in_flight=in_flight,
             ),
             ControlContinuationRunner(
                 state=self.state,
@@ -334,6 +342,12 @@ class Orchestrator:
                 session_output=self.deps.session_output,
                 completion_processor=self.deps.completion_processor,
                 review_verdicts=self.deps.continuation_ports.review_verdicts,
+                finalizer=ContinuationFinalizer(
+                    attempts=self.deps.attempt_store,
+                    action_applier=self.deps.action_applier,
+                    pr_pending_label=self.deps.label_manager.pr_pending,
+                ),
+                in_flight=in_flight,
                 jobs=self.deps.services.background_job_supervisor
                 or NullBackgroundJobRunner(),
                 repo_root=self.config.repo_root,
