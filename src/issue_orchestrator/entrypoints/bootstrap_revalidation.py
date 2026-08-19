@@ -46,9 +46,17 @@ def build_publication_revalidation(
     Checkouts are detached worktrees of the exact recorded commit, created
     beside the primary checkout so a revalidation never touches — or is
     confused with — an issue's own worktree.
+
+    The checkout is made runnable by the same operator-pinned recipe every
+    managed worktree uses, read from the same ``Config`` the launcher's
+    provisioner reads it from (#153). What is deliberately NOT shared is the
+    launch attempt ledger and its ``needs-human`` escalation: this route's bound
+    is #139's single start allowance, already reserved before the checkout
+    existed.
     """
     from ..control.publication_gate import build_publication_gate
     from ..control.publication_revalidation import PublicationRevalidation
+    from ..control.worktree_runnability import WorktreeRunnability
     from ..execution.git_candidate_checkouts import build_candidate_checkouts
 
     repo_root = config.repo_root
@@ -60,6 +68,11 @@ def build_publication_revalidation(
         profiles=config.validation_profiles,
         checkouts=build_candidate_checkouts(
             repo_root=repo_root, command_runner=command_runner
+        ),
+        runnability=WorktreeRunnability(
+            config=config,
+            command_runner=command_runner,
+            working_copy=working_copy,
         ),
         session_output=session_output,
         publication_gate=build_publication_gate(

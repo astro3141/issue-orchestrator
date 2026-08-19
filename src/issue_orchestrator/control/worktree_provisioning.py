@@ -13,6 +13,14 @@ invoked from two of the five launch paths, so whether a worktree was runnable
 depended on which path happened to create it — a rework or review worktree
 reached the publish gate unprovisioned.
 
+What "runnable" *means* — the operator-pinned recipe and the proof that running
+it did not alter the candidate — is :class:`.worktree_runnability.
+WorktreeRunnability`, and it is deliberately not owned here: the same-SHA
+revalidation route needs a runnable checkout too (#153) and must not inherit the
+launch-shaped retry ledger below with it. What this module owns is the LAUNCH
+half — how often a launch may re-ask, and what happens when it stops being
+worth asking.
+
 Three invariants ride along with running the commands:
 
 * **Fail closed, at the point of failure.** A provisioning failure aborts the
@@ -83,10 +91,10 @@ review launch paths therefore adds no class of executed code and no authority
 that the gate in those same worktrees did not already carry — it makes the
 gate's verdict mean what the record says it means.
 
-One bound on that permission is enforced here and is checkable:
-:meth:`WorktreeProvisioner._require_pinned_recipe` refuses to provision when the
-recipe's source resolves inside the worktree being provisioned, so a candidate
-cannot choose *which* commands run on it. What bounds the permission itself —
+One bound on that permission is enforced by the runnability core and is
+checkable: it refuses to provision when the recipe's source resolves inside the
+worktree being provisioned, so a candidate cannot choose *which* commands run on
+it. What bounds the permission itself —
 under what contract repository-controlled build code may execute at orchestrator
 host authority at all — is not stated by any canonical document in this
 repository. It is recorded as a CONTRACT GAP in **#55** and is not decided here.
@@ -96,7 +104,6 @@ from __future__ import annotations
 
 import logging
 import threading
-import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from enum import Enum
@@ -111,11 +118,11 @@ from ..ports.command_runner import CommandRunner
 from ..ports.event_sink import make_trace_event
 from ..ports.working_copy import WorkingCopy
 from .actions import Action, AddCommentAction, AddLabelAction
-from .isolation import build_runtime_tool_env
 from .label_manager import LabelManager
 from .needs_human_block import NeedsHumanCause
 from .session_launch_types import LaunchResult
 from .transition_log import log_transition
+from .worktree_runnability import WorktreeProvisioningError, WorktreeRunnability
 
 logger = logging.getLogger(__name__)
 
@@ -136,14 +143,6 @@ PROVISIONING_ESCALATION_CONTEXT = "provisioning_attempts_exhausted"
 
 #: Why the label and the comment are being applied, for the mutation log.
 _ESCALATION_REASON = "worktree provisioning failed past its attempt bound"
-
-
-class WorktreeProvisioningError(RuntimeError):
-    """A worktree could not be provisioned for a session launch.
-
-    Subclasses :class:`RuntimeError` because the launch paths that already
-    treated a setup failure as a runtime error keep catching it unchanged.
-    """
 
 
 class ProvisioningAttemptsExhausted(WorktreeProvisioningError):
@@ -329,20 +328,17 @@ class ProvisioningAttemptLedger:
         )
 
 
-@dataclass(frozen=True)
-class _CandidateCheckpoint:
-    """What the candidate looked like immediately before provisioning."""
-
-    head_sha: str | None
-    dirty: bool
-
-
 class WorktreeProvisioner:
-    """Makes a worktree runnable, or explains why it is not.
+    """A launch's bounded, escalating use of :class:`WorktreeRunnability`.
 
-    Holds the ``Config`` rather than a snapshot of its commands so a runtime
-    configuration change is picked up by the next launch, exactly as reading
-    ``config.setup_worktree`` at each call site used to.
+    The recipe and the candidate-integrity proof belong to the runnability core;
+    what this adds is the LAUNCH policy around them — how many consecutive
+    failures one issue's worktree gets, and what happens when it runs out.
+
+    Takes the core's own ingredients rather than the core, because a launcher
+    asking for a provisioned worktree has no use for one without the bound: the
+    two are one collaborator from here outwards, and the seam exists for the
+    caller that needs the core *without* the bound (#153).
     """
 
     def __init__(
@@ -354,16 +350,18 @@ class WorktreeProvisioner:
         escalation: ProvisioningEscalation,
         ledger: ProvisioningAttemptLedger | None = None,
     ) -> None:
-        self._config = config
-        self._command_runner = command_runner
-        self._working_copy = working_copy
+        self._runnability = WorktreeRunnability(
+            config=config,
+            command_runner=command_runner,
+            working_copy=working_copy,
+        )
         self._escalation = escalation
         self._ledger = ledger or ProvisioningAttemptLedger()
 
     @property
     def has_commands(self) -> bool:
         """Whether this repository configures any provisioning commands."""
-        return bool(self._config.setup_worktree)
+        return self._runnability.has_commands
 
     def provision(self, worktree_path: Path, *, issue_number: int) -> None:
         """Run the configured setup commands in ``worktree_path``.
@@ -386,53 +384,16 @@ class WorktreeProvisioner:
                 worktree, a command failed or timed out, or provisioning
                 changed the candidate's committed state.
         """
-        commands = list(self._config.setup_worktree)
-        if not commands:
+        if not self._runnability.has_commands:
             return
         self._refuse_if_budget_spent(issue_number)
-        failure = self._run_recipe(commands, worktree_path)
+        failure = self._runnability.make_runnable(worktree_path)
         if failure is None:
             # Whatever was wrong with this issue's environment is not wrong now,
             # so a later unrelated fault starts from a full budget (#54).
             self._ledger.record_success(issue_number)
             return
         raise self._bounded(self._ledger.record_failure(issue_number, str(failure)), failure)
-
-    def _run_recipe(
-        self, commands: list[str], worktree_path: Path
-    ) -> WorktreeProvisioningError | None:
-        """Run the pinned recipe; return why the worktree is not runnable, or ``None``.
-
-        Refusals are RETURNED rather than raised so every reason a worktree is
-        not runnable — including an unpinned recipe, which is as persistent as
-        a missing toolchain — passes through the same attempt budget.
-        """
-        try:
-            self._require_pinned_recipe(worktree_path)
-        except WorktreeProvisioningError as unpinned:
-            return unpinned
-        checkpoint = self._checkpoint(worktree_path)
-        step_start = time.time()
-        setup_failure: WorktreeProvisioningError | None = None
-        try:
-            for cmd in commands:
-                self._run_command(cmd, worktree_path)
-        except WorktreeProvisioningError as exc:
-            setup_failure = exc
-        else:
-            logger.info("[launch] Setup completed in %.1fs", time.time() - step_start)
-        candidate_change = self._describe_candidate_change(worktree_path, checkpoint)
-        if candidate_change is not None:
-            logger.error("Provisioning altered the candidate: %s", candidate_change)
-        if setup_failure is not None and candidate_change is not None:
-            return WorktreeProvisioningError(
-                f"{setup_failure}; the candidate was also altered: {candidate_change}"
-            )
-        if setup_failure is not None:
-            return setup_failure
-        if candidate_change is not None:
-            return WorktreeProvisioningError(candidate_change)
-        return None
 
     def _refuse_if_budget_spent(self, issue_number: int) -> None:
         """Stop before the recipe runs when this issue has no attempts left.
@@ -521,73 +482,6 @@ class WorktreeProvisioner:
                 "next launch attempt retries the escalation",
                 attempt.issue_number,
             )
-
-    def _require_pinned_recipe(self, worktree_path: Path) -> None:
-        """Refuse a recipe the provisioned worktree could itself supply.
-
-        ``Config.setup_worktree`` is only as trustworthy as the file it was read
-        from. A configuration file resolved *inside* the worktree being
-        provisioned would let the worktree under test choose what runs on it, so
-        that arrangement is refused rather than executed. A ``Config`` built
-        in-process carries no file and is trivially not worktree-sourced.
-        """
-        config_path = self._config.config_path
-        if config_path is None:
-            return
-        resolved = Path(config_path).resolve()
-        worktree = Path(worktree_path).resolve()
-        if resolved.is_relative_to(worktree):
-            raise WorktreeProvisioningError(
-                "provisioning commands must come from configuration outside the "
-                f"worktree they provision: {resolved} is inside {worktree}"
-            )
-
-    def _run_command(self, cmd: str, worktree_path: Path) -> None:
-        logger.debug("Running setup command: %s", cmd)
-        logger.info("[launch] Running setup: %s", cmd)
-        result = self._command_runner.run(
-            cmd,
-            shell=True,
-            cwd=worktree_path,
-            env=build_runtime_tool_env(worktree_path),
-        )
-        if result.timed_out:
-            logger.error("[launch] Setup command timed out: %s", cmd)
-            raise WorktreeProvisioningError(f"setup command timed out: {cmd}")
-        if result.returncode != 0:
-            stderr = result.stderr.strip() or "no stderr captured"
-            logger.error("Setup command failed: %s\n%s", cmd, stderr)
-            raise WorktreeProvisioningError(
-                f"setup command failed: {cmd} (exit_code={result.returncode}): {stderr}"
-            )
-
-    def _checkpoint(self, worktree_path: Path) -> _CandidateCheckpoint:
-        return _CandidateCheckpoint(
-            head_sha=self._working_copy.get_head_sha(worktree_path),
-            dirty=self._working_copy.has_uncommitted_changes(worktree_path),
-        )
-
-    def _describe_candidate_change(
-        self, worktree_path: Path, before: _CandidateCheckpoint
-    ) -> str | None:
-        """Name what provisioning changed about the candidate, or ``None``.
-
-        Returns rather than raises so the caller can report it alongside a setup
-        command that failed after making the change.
-
-        A worktree that was already dirty stays a question this check cannot
-        answer, so only a clean-to-dirty transition is treated as provisioning's
-        doing. Moving ``HEAD`` is always provisioning's doing.
-        """
-        after = self._checkpoint(worktree_path)
-        if after.head_sha != before.head_sha:
-            return (
-                f"provisioning moved HEAD in {worktree_path}: "
-                f"{before.head_sha} -> {after.head_sha}"
-            )
-        if after.dirty and not before.dirty:
-            return f"provisioning left uncommitted changes in {worktree_path}"
-        return None
 
 
 def provision_launch_worktree(

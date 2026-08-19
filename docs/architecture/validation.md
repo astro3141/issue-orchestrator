@@ -225,6 +225,26 @@ re-evaluation instead, and every part of it is a bound:
   branch — a branch is a moving name, and one that has advanced would evaluate
   other work under this candidate's identity. The run scaffold freezes the
   profile *name taken from the prior receipt* rather than resolving one afresh.
+- **Environment.** Materialising source bytes does not make the contract
+  runnable against them: the gate's command resolves its tools out of the
+  worktree it runs in, and a detached checkout that has never been provisioned
+  answers `.venv/bin/pyright: No such file or directory` ([#153]) — an
+  environment gap wearing the same `verdict: "failed"` this route exists to
+  disambiguate. So the checkout is made runnable by the operator-pinned
+  `worktrees.setup` recipe every managed worktree already uses, through
+  `control/worktree_runnability.py`, *after* the allowance is reserved and
+  *before* the gate is asked anything. The same core proves the recipe left
+  HEAD at the recorded commit and the candidate's tracked content untouched. A
+  checkout that cannot be made runnable reaches no gate, appends no
+  evaluation, leaves the prior non-PASS authoritative, and does **not** get its
+  allowance back — a repeatably broken environment is not a supply of retries.
+
+`WorktreeRunnability` is deliberately the provisioning **core** and not
+`WorktreeProvisioner`: the launch provisioner bundles a per-issue
+consecutive-failure ledger and a `needs-human` escalation with the recipe, and
+a second retry predicate over [#139]'s single start allowance is precisely
+what the policy forbids. The recipe and the candidate-integrity proof are
+shared; the bound around them is not.
 
 The gate itself is untouched: the route composes `PublicationGate.check`
 whole, through the same `build_publication_gate` every other composition
@@ -351,9 +371,17 @@ Two collaborators decide whether a worktree can run anything:
 | Create/reuse the worktree | `WorktreeManager` (adapter) | The checkout, its branch, its hooks, and that the worktree's `.venv` is the worktree's own — never a link to another checkout's |
 | Provision the worktree | `WorktreeProvisioner` (`control/worktree_provisioning.py`) | Everything `worktrees.setup` installs — the whole runtime environment, `.venv` and `packages/vscode/node_modules` alike |
 
-The provisioner is the single owner of provisioning, and **every session launch
-path** goes through it: coding, validation retry, rework, review and
-retrospective review. It used to be invoked from the coding and validation-retry
+What "provisioned" *means* — running the operator-pinned recipe and proving it
+left the candidate alone — is `WorktreeRunnability`
+(`control/worktree_runnability.py`), and the two rules below marked as its own
+are enforced there. The provisioner is that core plus the launch policy around
+it: how often a launch may re-ask, and what happens when it stops being worth
+asking. The same-SHA revalidation route consumes the core directly ([#153]),
+because its bound is [#139]'s single start allowance and not a launch ledger.
+
+The provisioner is the single owner of provisioning for launches, and **every
+session launch path** goes through it: coding, validation retry, rework, review
+and retrospective review. It used to be invoked from the coding and validation-retry
 paths only, so whether a worktree was runnable depended on which path had
 created it: a rework or review worktree — the reused ones — reached the publish
 gate unprovisioned, and the run died on a late, unrelated gate target. That was

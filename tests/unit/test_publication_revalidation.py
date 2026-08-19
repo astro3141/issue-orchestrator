@@ -33,6 +33,7 @@ from issue_orchestrator.control.publication_revalidation import (
 )
 from issue_orchestrator.control.publication_verdict import PublicationVerdictReceipts
 from issue_orchestrator.control.publish_gate_diagnostics import PublishGateDiagnostics
+from issue_orchestrator.control.worktree_runnability import WorktreeRunnability
 from issue_orchestrator.domain.attempt import Attempt, AttemptKey
 from issue_orchestrator.domain.issue_key import GitHubIssueKey
 from issue_orchestrator.domain.validation_verdict_receipt import (
@@ -46,6 +47,7 @@ from issue_orchestrator.execution.git_candidate_checkouts import (
 )
 from issue_orchestrator.execution.git_working_copy import GitWorkingCopy
 from issue_orchestrator.execution.session_output_adapter import FileSystemSessionOutput
+from issue_orchestrator.infra.config import Config
 from issue_orchestrator.infra.config_models import (
     PublishValidationConfig,
     ValidationCommandConfig,
@@ -61,6 +63,12 @@ from issue_orchestrator.ports.candidate_checkout import (
 ISSUE = GitHubIssueKey(repo="acme/repo", external_id="139")
 PUBLISH_SENTINEL = "run-the-publish-contract"
 QUICK_SENTINEL = "run-the-quick-contract"
+SETUP_SENTINEL = "provision-this-checkout"
+#: The prerequisite the gate's command resolves out of the worktree it runs in.
+#: Named after the real one: the live #153 failure was the publication suite
+#: reporting ``.venv/bin/pyright: No such file or directory`` in a checkout that
+#: had only ever had its source bytes materialised.
+PREREQUISITE = Path(".venv/bin/pyright")
 
 
 # ---------------------------------------------------------------------------
@@ -69,18 +77,98 @@ QUICK_SENTINEL = "run-the-quick-contract"
 
 
 class StubCommandRunner:
-    """Reports a fixed outcome for the gate's command, and remembers the asks."""
+    """Reports a fixed outcome for the gate's command, and remembers the asks.
 
-    def __init__(self, returncode: int = 0, timed_out: bool = False) -> None:
+    ``failing`` and ``timing_out`` name commands that answer differently from
+    the rest, which is what lets one runner play a setup recipe that fails and
+    a publish contract that would have passed — the two must be told apart to
+    prove the gate never ran.
+    """
+
+    def __init__(
+        self,
+        returncode: int = 0,
+        timed_out: bool = False,
+        *,
+        failing: tuple[str, ...] = (),
+        timing_out: tuple[str, ...] = (),
+    ) -> None:
         self.returncode = returncode
         self.timed_out = timed_out
+        self._failing = frozenset(failing)
+        self._timing_out = frozenset(timing_out)
         self.commands: list[str] = []
 
     def run(self, command, *, cwd=None, env=None, timeout_seconds=None, shell=False):
         self.commands.append(command)
+        self.observe(command, cwd)
+        if command in self._failing:
+            return SimpleNamespace(
+                returncode=1, stdout="", stderr="no toolchain", timed_out=False
+            )
+        if command in self._timing_out:
+            return SimpleNamespace(
+                returncode=None, stdout="", stderr="", timed_out=True
+            )
         return SimpleNamespace(
             returncode=self.returncode, stdout="", stderr="", timed_out=self.timed_out
         )
+
+    def observe(self, command: str, cwd) -> None:
+        """What this command does to the checkout it runs in. Nothing, here."""
+
+
+class ProvisioningCommandRunner(StubCommandRunner):
+    """A recipe that installs a prerequisite the gate's command needs.
+
+    The setup command writes the tool into the checkout it is run in — the
+    untracked runtime state real provisioning creates — and the publish command
+    records whether it was there when it ran. That ordering is the whole subject
+    of #153: source bytes alone do not satisfy the gate's environment.
+    """
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.prerequisite_at_publish: bool | None = None
+        #: What the checkout the gate is about to run in actually holds, read
+        #: with the real working copy at the moment the gate's command runs.
+        self.head_at_publish: str | None = None
+        self.dirty_at_publish: bool | None = None
+
+    def observe(self, command: str, cwd) -> None:
+        if cwd is None:
+            return
+        if command == SETUP_SENTINEL:
+            tool = Path(cwd) / PREREQUISITE
+            tool.parent.mkdir(parents=True, exist_ok=True)
+            tool.write_text("#!/bin/sh\n")
+        if command == PUBLISH_SENTINEL:
+            working_copy = GitWorkingCopy()
+            self.prerequisite_at_publish = (Path(cwd) / PREREQUISITE).exists()
+            self.head_at_publish = working_copy.get_head_sha(Path(cwd))
+            self.dirty_at_publish = working_copy.has_uncommitted_changes(Path(cwd))
+
+
+class CandidateAlteringCommandRunner(StubCommandRunner):
+    """A recipe that really moves HEAD, or really modifies tracked content.
+
+    Not a stubbed working copy: the checkout is a real detached worktree and the
+    integrity proof reads it with the real ``GitWorkingCopy``, so what is being
+    asserted is that provisioning which changed the candidate is caught by the
+    same check the launch paths rely on.
+    """
+
+    def __init__(self, *, checkout: str | None = None, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self._checkout = checkout
+
+    def observe(self, command: str, cwd) -> None:
+        if command != SETUP_SENTINEL or cwd is None:
+            return
+        if self._checkout is not None:
+            _git(Path(cwd), "checkout", "-q", "--detach", self._checkout)
+            return
+        (Path(cwd) / "candidate.txt").write_text("provisioning rewrote the artifact\n")
 
 
 class StubAttemptKeys:
@@ -162,7 +250,13 @@ def repo(tmp_path: Path) -> SimpleNamespace:
     _git(repo_root, "config", "user.email", "t@example.com")
     _git(repo_root, "config", "user.name", "T")
     (repo_root / "candidate.txt").write_text("the evaluated artifact\n")
-    _git(repo_root, "add", "candidate.txt")
+    # What every repository this route runs against already ignores: the
+    # runtime state provisioning installs, and the run assets the gate writes.
+    # Both land inside the checkout, and neither is candidate content — the
+    # integrity proof reads `git status`, so what a repository declares
+    # ignorable is what decides whether provisioning "dirtied" it.
+    (repo_root / ".gitignore").write_text(".venv/\n.issue-orchestrator/\n")
+    _git(repo_root, "add", "candidate.txt", ".gitignore")
     _git(repo_root, "commit", "-q", "-m", "candidate")
     candidate_sha = _git(repo_root, "rev-parse", "HEAD")
 
@@ -243,6 +337,27 @@ def _checkouts(repo: SimpleNamespace) -> GitCandidateCheckouts:
     return checkouts
 
 
+def _runnability(
+    repo: SimpleNamespace,
+    runner: StubCommandRunner,
+    *,
+    setup: list[str] | None = None,
+    config_path: Path | None = None,
+) -> WorktreeRunnability:
+    """The provisioning core, holding the operator's recipe and nothing else.
+
+    ``setup`` defaults to a one-command recipe rather than to the repository's
+    real ``make worktree-setup``: what is under test is that the *configured*
+    commands run, so a sentinel no production file mentions is the honest one.
+    """
+    config = Config(repo_root=repo.root)
+    config.setup_worktree = [SETUP_SENTINEL] if setup is None else setup
+    config.config_path = config_path
+    return WorktreeRunnability(
+        config=config, command_runner=runner, working_copy=GitWorkingCopy()
+    )
+
+
 def _route(
     repo: SimpleNamespace,
     runner: StubCommandRunner,
@@ -250,6 +365,7 @@ def _route(
     registry: ValidationProfileRegistry | None = None,
     checkouts=None,
     gate=None,
+    runnability: WorktreeRunnability | None = None,
 ) -> PublicationRevalidation:
     """The route, assembled exactly as ``build_publication_revalidation`` does."""
     profiles = registry or _registry()
@@ -260,6 +376,9 @@ def _route(
         checkouts=checkouts
         if checkouts is not None
         else _checkouts(repo),
+        runnability=runnability
+        if runnability is not None
+        else _runnability(repo, runner),
         session_output=FileSystemSessionOutput(),
         publication_gate=gate
         if gate is not None
@@ -296,7 +415,7 @@ class TestOneRevalidationIsAdmitted:
 
         assert outcome.started is True
         assert outcome.reason == "revalidation_completed"
-        assert runner.commands == [PUBLISH_SENTINEL]
+        assert runner.commands == [SETUP_SENTINEL, PUBLISH_SENTINEL]
         assert outcome.evaluation is not None
         assert outcome.evaluation.verdict is ValidationVerdict.PASSED
         assert outcome.evaluation.head_sha == repo.candidate_sha
@@ -349,7 +468,9 @@ class TestOneRevalidationIsAdmitted:
     ) -> None:
         key = _file(repo, _receipt(repo.candidate_sha))
 
-        outcome = _route(repo, StubCommandRunner(returncode=1)).revalidate(Attempt(key))
+        runner = StubCommandRunner(failing=(PUBLISH_SENTINEL,))
+
+        outcome = _route(repo, runner).revalidate(Attempt(key))
 
         assert outcome.evaluation is not None
         assert outcome.evaluation.verdict is ValidationVerdict.FAILED
@@ -402,6 +523,246 @@ class TestTheCandidateIsMaterializedAtItsOwnCommit:
             _checkouts(repo).materialize(missing)
 
 
+class TestTheCheckoutIsMadeRunnableBeforeItIsGated:
+    """#153: source bytes do not satisfy the gate's environment.
+
+    The gate's command is the repository's own publication suite and it
+    resolves its tools out of the worktree it runs in. A detached checkout that
+    has only been materialised has no ``.venv``, so the suite dies on a missing
+    binary and that reads, in the record, exactly like the candidate failing —
+    the misattribution the whole route exists to undo. So the operator's own
+    worktree recipe runs first, and the same core that runs it proves the
+    checkout is still the candidate afterwards.
+    """
+
+    def test_the_gate_command_finds_what_provisioning_installed(
+        self, repo: SimpleNamespace
+    ) -> None:
+        key = _file(repo, _receipt(repo.candidate_sha))
+        runner = ProvisioningCommandRunner()
+
+        outcome = _route(repo, runner).revalidate(Attempt(key))
+
+        assert runner.commands == [SETUP_SENTINEL, PUBLISH_SENTINEL]
+        assert runner.prerequisite_at_publish is True
+        assert outcome.reason == "revalidation_completed"
+
+    def test_a_successful_provisioning_leaves_the_exact_candidate_behind(
+        self, repo: SimpleNamespace
+    ) -> None:
+        """Direction 3: runtime state may appear; the candidate may not change.
+
+        Read out of the real detached checkout, at the moment the gate's own
+        command runs in it: the tooling provisioning installed is there, HEAD
+        is still the recorded commit and not the advanced branch, and nothing
+        the candidate tracks has been touched.
+        """
+        key = _file(repo, _receipt(repo.candidate_sha))
+        runner = ProvisioningCommandRunner()
+
+        outcome = _route(repo, runner).revalidate(Attempt(key))
+
+        assert runner.prerequisite_at_publish is True
+        assert runner.head_at_publish == repo.candidate_sha
+        assert runner.head_at_publish != repo.branch_head
+        assert runner.dirty_at_publish is False
+        assert outcome.evaluation is not None
+        assert outcome.evaluation.head_sha == repo.candidate_sha
+
+    def test_a_repository_with_no_setup_recipe_is_gated_exactly_as_before(
+        self, repo: SimpleNamespace
+    ) -> None:
+        """Direction 9: an empty recipe changes nothing about the route."""
+        key = _file(repo, _receipt(repo.candidate_sha))
+        runner = StubCommandRunner()
+
+        outcome = _route(
+            repo, runner, runnability=_runnability(repo, runner, setup=[])
+        ).revalidate(Attempt(key))
+
+        assert runner.commands == [PUBLISH_SENTINEL]
+        assert outcome.reason == "revalidation_completed"
+        assert outcome.evaluation is not None
+        assert outcome.evaluation.verdict is ValidationVerdict.PASSED
+
+
+class TestAnUnprovisionableCheckoutIsNeverGated:
+    """#153, the failure direction: no gate, no receipt, no refund.
+
+    Every case below asserts the same two things — the publish command was
+    never executed, and the prior FAIL is still the candidate's only
+    publication evidence — because a provisioning failure that reached the gate
+    would file a verdict about an environment under the candidate's name, and
+    one that appended anything at all would rewrite the history this route is
+    supposed to be re-reading.
+    """
+
+    def _unprovisionable(
+        self, repo: SimpleNamespace, runner: StubCommandRunner, **kwargs
+    ) -> tuple[RevalidationOutcome, Attempt]:
+        prior = _receipt(repo.candidate_sha)
+        key = _file(repo, prior)
+        outcome = _route(
+            repo, runner, runnability=_runnability(repo, runner, **kwargs)
+        ).revalidate(Attempt(key))
+        attempt = _read(repo, key)
+        assert attempt is not None
+        assert attempt.completed_evaluations == (prior,)
+        assert attempt.latest_publication_evaluation == prior
+        assert attempt.publication_validation_passed is False
+        return outcome, attempt
+
+    def test_a_failing_setup_command_runs_no_gate(
+        self, repo: SimpleNamespace
+    ) -> None:
+        runner = StubCommandRunner(failing=(SETUP_SENTINEL,))
+
+        outcome, _ = self._unprovisionable(repo, runner)
+
+        assert runner.commands == [SETUP_SENTINEL]
+        assert outcome.started is True
+        assert outcome.reason == "revalidation_candidate_not_provisionable"
+        assert outcome.evaluation is None
+
+    def test_a_setup_command_that_times_out_runs_no_gate(
+        self, repo: SimpleNamespace
+    ) -> None:
+        runner = StubCommandRunner(timing_out=(SETUP_SENTINEL,))
+
+        outcome, _ = self._unprovisionable(repo, runner)
+
+        assert runner.commands == [SETUP_SENTINEL]
+        assert outcome.reason == "revalidation_candidate_not_provisionable"
+
+    def test_setup_that_moves_head_off_the_candidate_runs_no_gate(
+        self, repo: SimpleNamespace
+    ) -> None:
+        runner = CandidateAlteringCommandRunner(checkout=repo.branch_head)
+
+        outcome, _ = self._unprovisionable(repo, runner)
+
+        assert runner.commands == [SETUP_SENTINEL]
+        assert outcome.reason == "revalidation_candidate_not_provisionable"
+
+    def test_setup_that_modifies_the_candidates_tracked_content_runs_no_gate(
+        self, repo: SimpleNamespace
+    ) -> None:
+        runner = CandidateAlteringCommandRunner()
+
+        outcome, _ = self._unprovisionable(repo, runner)
+
+        assert runner.commands == [SETUP_SENTINEL]
+        assert outcome.reason == "revalidation_candidate_not_provisionable"
+
+    def test_a_recipe_the_candidate_could_supply_runs_no_gate(
+        self, repo: SimpleNamespace
+    ) -> None:
+        """Direction 10: the candidate does not choose what runs on it.
+
+        The configuration file is planted where the checkout is about to be
+        materialised, which is the one arrangement that would let the artifact
+        under evaluation name the commands executed at host authority.
+        """
+        runner = StubCommandRunner()
+        inside = (
+            repo.checkout_base
+            / f"revalidate-{repo.candidate_sha[:12]}"
+            / "config.yaml"
+        )
+
+        outcome, _ = self._unprovisionable(repo, runner, config_path=inside)
+
+        assert runner.commands == []
+        assert outcome.reason == "revalidation_candidate_not_provisionable"
+
+    def test_the_checkout_is_removed_after_a_provisioning_failure(
+        self, repo: SimpleNamespace
+    ) -> None:
+        """Direction 8: cleanup is the same on this exit as on every other."""
+        runner = StubCommandRunner(failing=(SETUP_SENTINEL,))
+
+        self._unprovisionable(repo, runner)
+
+        leftovers = (
+            sorted(repo.checkout_base.iterdir())
+            if repo.checkout_base.exists()
+            else []
+        )
+        assert leftovers == []
+
+    def test_the_allowance_is_still_spent_and_no_second_attempt_starts(
+        self, repo: SimpleNamespace
+    ) -> None:
+        """Direction 6: a broken environment is not an unbounded supply of runs."""
+        runner = StubCommandRunner(failing=(SETUP_SENTINEL,))
+
+        _, attempt = self._unprovisionable(repo, runner)
+        assert attempt.revalidation_budget_used == 1
+        assert attempt.revalidation_allowance_available is False
+
+        # A later tick, reading through fresh instances, with the environment
+        # now repaired: the allowance was spent on the attempt, not on a verdict.
+        retry = StubCommandRunner()
+        second = _route(repo, retry).revalidate(Attempt(attempt.key))
+
+        assert second.started is False
+        assert second.reason == "revalidation_allowance_consumed"
+        assert retry.commands == []
+
+    def test_one_candidates_provisioning_failure_bounds_no_other_candidate(
+        self, repo: SimpleNamespace
+    ) -> None:
+        """Direction 12: nothing in this seam is a second admission owner.
+
+        The launch provisioner counts consecutive failures per ISSUE and stops
+        provisioning once the count is spent. Importing that here would give
+        #139 a second retry predicate: a candidate refused for someone else's
+        failure count, before its own allowance was even read. The route's only
+        bound is the allowance, so a fresh candidate of the same issue is
+        admitted normally after a provisioning failure.
+        """
+        failing = StubCommandRunner(failing=(SETUP_SENTINEL,))
+        self._unprovisionable(repo, failing)
+
+        other = AttemptKey(ISSUE, repo.branch_head)
+        SidecarAttemptStore(repo.root).update(
+            other,
+            lambda attempt: attempt.with_completed_evaluation(
+                _receipt(repo.branch_head)
+            ),
+        )
+        runner = StubCommandRunner()
+
+        outcome = _route(repo, runner).revalidate(Attempt(other))
+
+        assert runner.commands == [SETUP_SENTINEL, PUBLISH_SENTINEL]
+        assert outcome.reason == "revalidation_completed"
+
+    def test_the_route_composes_no_escalation_or_attempt_ledger(self) -> None:
+        """The seam's collaborators, named: a recipe, and no retry policy.
+
+        Asserted on the constructor rather than on behaviour because what must
+        not exist cannot be observed by running it. ``WorktreeRunnability`` is
+        the provisioning CORE — no issue number, no consecutive-failure count,
+        no ``needs-human`` escalation — and admitting the launch provisioner
+        here instead is exactly what the policy forbids.
+        """
+        parameters = inspect.signature(
+            PublicationRevalidation.__init__, eval_str=True
+        ).parameters
+
+        assert list(parameters) == [
+            "self",
+            "attempts",
+            "profiles",
+            "checkouts",
+            "runnability",
+            "session_output",
+            "publication_gate",
+        ]
+        assert parameters["runnability"].annotation is WorktreeRunnability
+
+
 # ---------------------------------------------------------------------------
 # The seven failure directions
 # ---------------------------------------------------------------------------
@@ -415,7 +776,6 @@ class TestTheCompositionRootAssemblesTheRoute:
         from issue_orchestrator.entrypoints.bootstrap_revalidation import (
             build_publication_revalidation,
         )
-        from issue_orchestrator.infra.config import Config
 
         config = Config(repo_root=repo.root)
         config.validation.publish.cmd = PUBLISH_SENTINEL
@@ -433,6 +793,43 @@ class TestTheCompositionRootAssemblesTheRoute:
         assert isinstance(route, PublicationRevalidation)
         assert outcome.started is True
         assert outcome.evaluation is not None
+        assert outcome.evaluation.head_sha == repo.candidate_sha
+
+    def test_the_production_route_provisions_the_checkout_before_it_gates_it(
+        self, repo: SimpleNamespace
+    ) -> None:
+        """Direction 2: the recipe production runs is the operator's own.
+
+        Real commands, real shell, the real composition root. The publish
+        contract here PASSES only if the configured ``setup_worktree`` recipe
+        already ran — which is #153's live failure inverted: the gate command
+        resolving a prerequisite provisioning creates. Nothing in production is
+        allowed to know what that recipe is, so this one is invented here and
+        appears in no repository file.
+        """
+        from issue_orchestrator.entrypoints.bootstrap_revalidation import (
+            build_publication_revalidation,
+        )
+
+        prerequisite = repo.root.parent / "provisioned-by-the-operator-recipe"
+        publish_cmd = f"test -f {prerequisite}"
+        config = Config(repo_root=repo.root)
+        config.validation.publish.cmd = publish_cmd
+        config.setup_worktree = [f"touch {prerequisite}"]
+        key = _file(repo, _receipt(repo.candidate_sha, command=publish_cmd))
+
+        route = build_publication_revalidation(
+            config,
+            attempt_store=SidecarAttemptStore(repo.root),
+            session_output=FileSystemSessionOutput(),
+            command_runner=LocalCommandRunner(),
+            working_copy=GitWorkingCopy(),
+        )
+        outcome = route.revalidate(Attempt(key))
+
+        assert prerequisite.exists()
+        assert outcome.evaluation is not None
+        assert outcome.evaluation.verdict is ValidationVerdict.PASSED
         assert outcome.evaluation.head_sha == repo.candidate_sha
 
     def test_a_built_orchestrator_holds_the_route(self, tmp_path: Path) -> None:
@@ -545,9 +942,9 @@ class TestTheAllowanceIsExactlyOne:
         self, repo: SimpleNamespace
     ) -> None:
         key = _file(repo, _receipt(repo.candidate_sha))
-        first_runner = StubCommandRunner(returncode=1)
+        first_runner = StubCommandRunner(failing=(PUBLISH_SENTINEL,))
         _route(repo, first_runner).revalidate(Attempt(key))
-        assert first_runner.commands == [PUBLISH_SENTINEL]
+        assert first_runner.commands == [SETUP_SENTINEL, PUBLISH_SENTINEL]
 
         second_runner = StubCommandRunner()
         outcome = _route(repo, second_runner).revalidate(Attempt(key))
