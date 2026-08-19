@@ -4,7 +4,15 @@ from dataclasses import FrozenInstanceError
 
 import pytest
 
-from issue_orchestrator.domain.attempt import Attempt, AttemptKey
+from issue_orchestrator.domain.attempt import (
+    CONTINUATION_RUN_ALLOWANCE,
+    Attempt,
+    AttemptKey,
+)
+from issue_orchestrator.domain.continuation_settlement import (
+    ContinuationSettlement,
+    ContinuationSettlementKind,
+)
 from issue_orchestrator.domain.issue_key import FakeIssueKey, GitHubIssueKey
 from issue_orchestrator.domain.validation_verdict_receipt import (
     ValidationVerdict,
@@ -65,7 +73,10 @@ def test_attempt_from_dict_rejects_unknown_schema_version() -> None:
     payload = Attempt(
         key=AttemptKey(GitHubIssueKey("owner/repo", "6130"), SHA)
     ).to_dict()
-    payload["schema_version"] = 3
+    # One past the newest version this code writes: an unknown schema is a
+    # record written by rules it cannot claim to understand, and reading it
+    # anyway would let a gate act on fields it may be misreading.
+    payload["schema_version"] = 4
 
     with pytest.raises(ValueError, match="schema_version"):
         Attempt.from_dict(payload)
@@ -219,4 +230,91 @@ def test_attempt_rejects_negative_revalidation_budget() -> None:
         Attempt(
             key=AttemptKey(GitHubIssueKey("owner/repo", "139"), SHA),
             revalidation_budget_used=-1,
+        )
+
+
+def test_the_continuation_settlement_survives_storage() -> None:
+    settlement = ContinuationSettlement(
+        kind=ContinuationSettlementKind.PULL_REQUEST_OPENED,
+        settled_at="2026-08-19T02:00:00Z",
+        pr_url="https://example.test/owner/repo/pull/7",
+    )
+
+    restored = Attempt.from_dict(
+        Attempt(key=AttemptKey(GitHubIssueKey("owner/repo", "149"), SHA))
+        .with_continuation_settlement(settlement)
+        .to_dict()
+    )
+
+    assert restored.continuation_settlement == settlement
+
+
+def test_a_sidecar_written_before_settlements_existed_reads_as_unsettled() -> None:
+    """Absence is "this continuation still owes work", which permits a run."""
+    payload = Attempt(
+        key=AttemptKey(GitHubIssueKey("owner/repo", "149"), SHA)
+    ).to_dict()
+    del payload["continuation_settlement"]
+
+    assert Attempt.from_dict(payload).continuation_settlement is None
+
+
+def test_a_damaged_settlement_refuses_rather_than_reading_as_unsettled() -> None:
+    """Reading damage as absence would put a finished run back on the runner."""
+    payload = Attempt(
+        key=AttemptKey(GitHubIssueKey("owner/repo", "149"), SHA)
+    ).to_dict()
+    payload["continuation_settlement"] = {"kind": "pull_request_opened"}
+
+    with pytest.raises(ValueError):
+        Attempt.from_dict(payload)
+
+
+def test_retiring_the_recorded_intent_keeps_the_settlement() -> None:
+    """Supersession clears intent only; what a run produced is still evidence."""
+    settlement = ContinuationSettlement(
+        kind=ContinuationSettlementKind.NOTHING_FURTHER_REQUESTED,
+        settled_at="2026-08-19T02:00:00Z",
+    )
+    attempt = Attempt(
+        key=AttemptKey(GitHubIssueKey("owner/repo", "149"), SHA)
+    ).with_continuation_settlement(settlement)
+
+    assert attempt.without_continuation_descriptor().continuation_settlement == (
+        settlement
+    )
+
+
+def test_the_continuation_run_allowance_is_bounded_and_durable() -> None:
+    attempt = Attempt(key=AttemptKey(GitHubIssueKey("owner/repo", "149"), SHA))
+    assert attempt.continuation_run_allowance_available is True
+
+    spent = attempt
+    for _ in range(CONTINUATION_RUN_ALLOWANCE):
+        spent = spent.with_continuation_run_reserved()
+
+    assert spent.continuation_runs_used == CONTINUATION_RUN_ALLOWANCE
+    assert spent.continuation_run_allowance_available is False
+    assert (
+        Attempt.from_dict(spent.to_dict()).continuation_runs_used
+        == CONTINUATION_RUN_ALLOWANCE
+    )
+    with pytest.raises(ValueError, match="allowance is already spent"):
+        spent.with_continuation_run_reserved()
+
+
+def test_a_sidecar_written_before_the_run_allowance_existed_reads_as_unspent() -> None:
+    payload = Attempt(
+        key=AttemptKey(GitHubIssueKey("owner/repo", "149"), SHA)
+    ).to_dict()
+    del payload["continuation_runs_used"]
+
+    assert Attempt.from_dict(payload).continuation_runs_used == 0
+
+
+def test_attempt_rejects_a_negative_continuation_run_count() -> None:
+    with pytest.raises(ValueError, match="continuation_runs_used"):
+        Attempt(
+            key=AttemptKey(GitHubIssueKey("owner/repo", "149"), SHA),
+            continuation_runs_used=-1,
         )

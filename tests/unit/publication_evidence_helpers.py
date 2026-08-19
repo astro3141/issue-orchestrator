@@ -49,17 +49,26 @@ class InMemoryAttemptStore:
         self._attempts[_identity(key)] = updated
         return updated
 
+    def for_issue(self, issue_key: IssueKey) -> tuple[Attempt, ...]:
+        return tuple(
+            self._attempts[identity]
+            for identity in sorted(self._issue_identities(issue_key))
+        )
+
     def supersede_issue(self, issue_key: IssueKey) -> int:
+        doomed = self._issue_identities(issue_key)
+        for identity in doomed:
+            del self._attempts[identity]
+        return len(doomed)
+
+    def _issue_identities(self, issue_key: IssueKey) -> list[tuple[str, str, str]]:
         scope = issue_key.scope()
         stable = str(issue_key.stable_id())
-        doomed = [
+        return [
             identity
             for identity in self._attempts
             if identity[0] == scope and identity[1] == stable
         ]
-        for identity in doomed:
-            del self._attempts[identity]
-        return len(doomed)
 
 
 class UnreadableAttemptStore:
@@ -76,6 +85,9 @@ class UnreadableAttemptStore:
         self, key: AttemptKey, mutate: Callable[[Attempt], Attempt]
     ) -> Attempt:
         raise ValueError("unreadable")
+
+    def for_issue(self, issue_key: IssueKey) -> tuple[Attempt, ...]:
+        raise ValueError(f"Attempt sidecars are unreadable: {issue_key}")
 
     def supersede_issue(self, issue_key: IssueKey) -> int:
         raise ValueError("unreadable")

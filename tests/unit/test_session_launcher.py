@@ -45,6 +45,7 @@ from issue_orchestrator.control.session_launch_types import (
     LaunchDisposition,
     LaunchResult,
 )
+from tests.unit.continuation_helpers import inert_control_continuation
 from tests.callback_endpoint_helpers import ready_callback_endpoint
 from issue_orchestrator.control.session_launcher import (
     SessionLauncher,
@@ -4835,6 +4836,7 @@ class TestLaunchTechLeadIssueSessionFlavors:
             cleanup_manager=MagicMock(),
             get_review_machine=MagicMock(),
             kill_session=MagicMock(),
+            control_continuation=inert_control_continuation(),
         )
         support.apply_plan(
             Plan(actions=tuple(actions), skipped=()), MagicMock()
@@ -5763,6 +5765,7 @@ class TestTechLeadProducerToLaunchBoundary:
             cleanup_manager=MagicMock(),
             get_review_machine=MagicMock(),
             kill_session=MagicMock(),
+            control_continuation=inert_control_continuation(),
         )
         support.apply_plan(
             Plan(actions=tuple(actions), skipped=()), MagicMock()

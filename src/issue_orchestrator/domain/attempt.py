@@ -33,6 +33,19 @@ had to change to carry it.
 ``reroute_budget_used`` already had. It is a *start* budget: the revalidation
 route consumes it before any external gate work begins, so an interrupted
 revalidation fails closed rather than refunding itself on restart.
+
+The last three facts are the continuation half (#143, #149), and they are here
+for the same reason the receipts are: they are about one ``(issue, commit)``
+and they have to outlive the worktree that produced them.
+``continuation_descriptor`` is the agent's recorded intent, copied at the gate
+seam while the completion record still exists; ``continuation_review_verdict``
+is the orchestrator's exact-``A`` review outcome, which is otherwise written
+only into the exchange directory *inside* the run dir *inside* the worktree —
+durable enough for the session that made it, and gone by the time a
+continuation needs to know whether ``A`` was already reviewed; and
+``continuation_settlement`` is the terminal fact the run itself produced,
+without which every phase meaning "still owes work" is re-derived unchanged
+after a run that already discharged it.
 """
 
 from __future__ import annotations
@@ -40,12 +53,16 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 
 from .commit_sha import normalize_commit_sha
+from .continuation_descriptor import ContinuationDescriptor
+from .continuation_settlement import ContinuationSettlement
 from .execution_identity import CandidateExecutionIdentities
 from .issue_key import GitHubIssueKey, IssueKey, StableIssueId
+from .review_verdict_binding import BoundReviewVerdict
 from .validation_verdict_receipt import ValidationVerdictReceipt
 
-_SCHEMA_VERSION = 2
+_SCHEMA_VERSION = 3
 _V1_SCHEMA_VERSION = 1
+_READABLE_SCHEMA_VERSIONS = (1, 2, 3)
 
 REVALIDATION_ALLOWANCE = 1
 """How many same-SHA revalidations one candidate may ever start (#139).
@@ -62,6 +79,32 @@ rather than re-run. They stop being the same thing the moment a second
 contract becomes revalidatable, and at that point this must become a
 per-contract counter rather than one allowance both contracts draw from; see
 :attr:`Attempt.revalidation_budget_used`.
+"""
+
+
+CONTINUATION_RUN_ALLOWANCE = 2
+"""How many runs one candidate's continuation may ever OPEN (#149).
+
+A bound in the shape :data:`REVALIDATION_ALLOWANCE` has, and for the reason
+#139 gives: the continuation's re-entry re-runs the most expensive thing in the
+system — a reviewer/coder exchange — and a terminal run that discharged nothing
+leaves every durable fact exactly as it found them. Without a bound the next
+reconciliation derives the same phase and opens another run, forever, holding
+the issue out of ordinary rework the whole time.
+
+The exchange has a no-progress budget of its own, and it cannot help here: it
+is read from the cache under ``<worktree>/.issue-orchestrator/sessions``, which
+goes with the checkout each closed run removes. Every retry therefore starts
+that budget afresh, which is precisely why the bound has to be durable and live
+beside the candidate rather than inside the run.
+
+Two, and the second is not slack. One run drives the exchange and creates the
+pull request. The second exists for the crash window the continuation is built
+around: a run that recorded ``APPROVED(A)`` and died before the pull request
+existed re-enters as ``APPROVED_PENDING_PR`` and must be able to finish what it
+started. A third would be a second attempt at work that has already failed
+twice with nothing to show, and ordinary rework is the better answer to that
+than a third agent pair.
 """
 
 
@@ -145,12 +188,40 @@ class Attempt:
     # per contract: see REVALIDATION_ALLOWANCE for why those coincide today and
     # what has to change when they stop.
     revalidation_budget_used: int = 0
+    # The agent's recorded completion intent for this exact candidate (#143,
+    # #149), copied from the completion record at the publication-gate verdict
+    # seam. ``None`` means NO RECORDED INTENT — never empty intent — and the
+    # continuation refuses on it rather than proceeding with defaults.
+    continuation_descriptor: ContinuationDescriptor | None = None
+    # The orchestrator's exact-``A`` review outcome (#149). Bound to this
+    # attempt's own commit by the same rule the receipts and identities are, so
+    # a verdict rendered against ``A'`` can never be read here as a decision
+    # about ``A``. ``None`` means no review has settled on this candidate.
+    continuation_review_verdict: BoundReviewVerdict | None = None
+    # The terminal outcome of this candidate's continuation run (#149). Written
+    # by the run that produced it, never by a board signal: the continuation
+    # creates no session and its pull request carries no code-review label, so
+    # none of the three writers of ``pr-pending`` observe it. ``None`` means the
+    # recorded intent is still undischarged — which is what keeps a failed run
+    # retryable — so absence is permission to run again, and only an explicit
+    # settlement ends the operation.
+    continuation_settlement: ContinuationSettlement | None = None
+    # How many runs this candidate's continuation has OPENED (#149). A start
+    # budget, like the revalidation allowance above and for the same reason: it
+    # is spent before the run does anything external, so a run interrupted
+    # anywhere leaves the allowance spent rather than refunding itself. Counted
+    # per RUN and not per pass — a deferred review exchange re-enters the
+    # pipeline on every reconciliation until it concludes, and those are one
+    # attempt at the work, not a dozen.
+    continuation_runs_used: int = 0
 
     def __post_init__(self) -> None:
         if self.reroute_budget_used < 0:
             raise ValueError("Attempt.reroute_budget_used must be >= 0")
         if self.revalidation_budget_used < 0:
             raise ValueError("Attempt.revalidation_budget_used must be >= 0")
+        if self.continuation_runs_used < 0:
+            raise ValueError("Attempt.continuation_runs_used must be >= 0")
         object.__setattr__(
             self, "completed_evaluations", tuple(self.completed_evaluations)
         )
@@ -175,6 +246,19 @@ class Attempt:
             raise ValueError(
                 "Attempt.completed_evaluations must name the attempt's own "
                 f"commit: key={self.key.head_sha} receipt={receipt.head_sha}"
+            )
+        if (
+            self.continuation_review_verdict is not None
+            and not self.continuation_review_verdict.covers(self.key.head_sha)
+        ):
+            # The same rule again, and the failure direction it closes is the
+            # one #149 names explicitly: ``A'`` must never inherit ``A``'s
+            # review. A verdict that does not cover this key is evidence about
+            # other work and must not be readable here at all.
+            raise ValueError(
+                "Attempt.continuation_review_verdict must name the attempt's "
+                f"own commit: key={self.key.head_sha} "
+                f"reviewed={self.continuation_review_verdict.reviewed_sha}"
             )
 
     @property
@@ -228,6 +312,11 @@ class Attempt:
         """Whether a same-SHA revalidation may still be *started* (#139)."""
         return self.revalidation_budget_used < REVALIDATION_ALLOWANCE
 
+    @property
+    def continuation_run_allowance_available(self) -> bool:
+        """Whether this candidate's continuation may still OPEN a run (#149)."""
+        return self.continuation_runs_used < CONTINUATION_RUN_ALLOWANCE
+
     def with_completed_evaluation(
         self, receipt: ValidationVerdictReceipt
     ) -> "Attempt":
@@ -260,6 +349,72 @@ class Attempt:
             self, revalidation_budget_used=self.revalidation_budget_used + 1
         )
 
+    def with_continuation_run_reserved(self) -> "Attempt":
+        """This attempt with one continuation-run allowance durably spent (#149).
+
+        The ceiling is re-asserted here rather than trusted from the caller, as
+        :meth:`with_revalidation_reserved` does: the counter is durable, so the
+        bound it is compared against has to be a property of the record.
+        """
+        if not self.continuation_run_allowance_available:
+            raise ValueError(
+                "Attempt continuation run allowance is already spent: "
+                f"{self.continuation_runs_used}/{CONTINUATION_RUN_ALLOWANCE}"
+            )
+        return replace(
+            self, continuation_runs_used=self.continuation_runs_used + 1
+        )
+
+    def with_continuation_descriptor(
+        self, descriptor: ContinuationDescriptor
+    ) -> "Attempt":
+        """This attempt with the agent's recorded intent filed against it (#149).
+
+        Write-once in effect rather than by enforcement: the seam that writes it
+        runs when the publication gate reaches a verdict on this candidate, and
+        the intent it copies comes from the one completion record that produced
+        the candidate. A later gate run on the same commit copies the same
+        record, so re-filing is idempotent in content. Nothing here derives,
+        merges or defaults a field — an absent record produces no call at all.
+        """
+        return replace(self, continuation_descriptor=descriptor)
+
+    def without_continuation_descriptor(self) -> "Attempt":
+        """This attempt with its recorded intent cleared, and nothing else (#149).
+
+        Used when a NEWER candidate of the same issue records its intent: an
+        issue offers one candidate at a time, and two attempts both claiming to
+        be it would make "which continuation is this issue's" a question the
+        durable record cannot answer. Only the intent goes — the evaluation
+        history #139 exists to preserve, the allowance, and any review verdict
+        already bound to this commit all stay exactly as they are.
+        """
+        return replace(self, continuation_descriptor=None)
+
+    def with_continuation_review_verdict(
+        self, verdict: BoundReviewVerdict
+    ) -> "Attempt":
+        """This attempt with the orchestrator's exact-``A`` review outcome (#149).
+
+        The binding rule in :meth:`__post_init__` runs on the result, so a
+        verdict rendered against another commit is refused here exactly as it is
+        on construction.
+        """
+        return replace(self, continuation_review_verdict=verdict)
+
+    def with_continuation_settlement(
+        self, settlement: ContinuationSettlement
+    ) -> "Attempt":
+        """This attempt with its continuation's terminal outcome filed (#149).
+
+        The one way an operation stops. Nothing here inspects what is already
+        recorded: the writer runs once per discharged run, and a second run of
+        the same candidate — the crash window between "PR created" and "record
+        the fact" — reaches the same settlement from the same evidence, so
+        re-filing is idempotent in content.
+        """
+        return replace(self, continuation_settlement=settlement)
+
     def to_dict(self) -> dict[str, object]:
         return {
             "schema_version": _SCHEMA_VERSION,
@@ -280,6 +435,22 @@ class Attempt:
                 receipt.to_payload() for receipt in self.completed_evaluations
             ],
             "revalidation_budget_used": self.revalidation_budget_used,
+            "continuation_descriptor": (
+                self.continuation_descriptor.to_payload()
+                if self.continuation_descriptor is not None
+                else None
+            ),
+            "continuation_review_verdict": (
+                self.continuation_review_verdict.to_payload()
+                if self.continuation_review_verdict is not None
+                else None
+            ),
+            "continuation_settlement": (
+                self.continuation_settlement.to_payload()
+                if self.continuation_settlement is not None
+                else None
+            ),
+            "continuation_runs_used": self.continuation_runs_used,
         }
 
     @classmethod
@@ -321,6 +492,18 @@ class Attempt:
             revalidation_budget_used=_int_field(
                 data.get("revalidation_budget_used"), "revalidation_budget_used"
             ),
+            continuation_descriptor=_optional_continuation_descriptor(
+                data.get("continuation_descriptor")
+            ),
+            continuation_review_verdict=_optional_review_verdict(
+                data.get("continuation_review_verdict")
+            ),
+            continuation_settlement=_optional_settlement(
+                data.get("continuation_settlement")
+            ),
+            continuation_runs_used=_int_field(
+                data.get("continuation_runs_used"), "continuation_runs_used"
+            ),
         )
 
 
@@ -352,17 +535,20 @@ def _issue_key_from_dict(
 def _validate_schema_version(value: object) -> int:
     """Return the sidecar version this payload may be read as.
 
-    Two versions are readable, not one: v1 filed a single ``publication_verdict``
-    slot and v2 files the ordered history that replaced it (#139). A v1 sidecar
-    is real durable evidence about a real candidate, so refusing it would erase
-    a gate result the orchestrator itself wrote. Anything else still fails
-    closed — a version this code does not know is a record written by a schema
-    it cannot claim to understand.
+    Every version this code has ever written is readable, not just the newest:
+    v1 filed a single ``publication_verdict`` slot, v2 filed the ordered history
+    that replaced it (#139), and v3 adds the continuation half (#143, #149). An
+    older sidecar is real durable evidence about a real candidate, so refusing
+    it would erase a gate result the orchestrator itself wrote — and the older
+    versions differ from v3 only by *absent* fields, which read as "not
+    recorded", exactly what they were. Anything else still fails closed: a
+    version this code does not know is a record written by a schema it cannot
+    claim to understand.
     """
-    if isinstance(value, bool) or value not in (_V1_SCHEMA_VERSION, _SCHEMA_VERSION):
+    if isinstance(value, bool) or value not in _READABLE_SCHEMA_VERSIONS:
+        readable = ", ".join(str(version) for version in _READABLE_SCHEMA_VERSIONS)
         raise ValueError(
-            "Attempt sidecar schema_version must be "
-            f"{_V1_SCHEMA_VERSION} or {_SCHEMA_VERSION}"
+            f"Attempt sidecar schema_version must be one of {readable}"
         )
     return int(value)  # type: ignore[arg-type]
 
@@ -407,6 +593,49 @@ def _optional_execution_identities(
     if not isinstance(value, dict):
         raise ValueError("Attempt sidecar execution_identities must be an object")
     return CandidateExecutionIdentities.from_payload(value)
+
+
+def _optional_continuation_descriptor(
+    value: object,
+) -> ContinuationDescriptor | None:
+    """Parse the recorded continuation intent, or ``None`` when none was filed.
+
+    Absent means the agent's intent was never recorded for this candidate, which
+    forbids continuation. Unparseable means the record of that intent is
+    damaged, and reading the second as the first would turn a broken instrument
+    into a clean "no PR was ever asked for".
+    """
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ValueError("Attempt sidecar continuation_descriptor must be an object")
+    return ContinuationDescriptor.from_payload(value)
+
+
+def _optional_review_verdict(value: object) -> BoundReviewVerdict | None:
+    """Parse the exact-``A`` review outcome, or ``None`` when none has settled."""
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ValueError(
+            "Attempt sidecar continuation_review_verdict must be an object"
+        )
+    return BoundReviewVerdict.from_payload(value)
+
+
+def _optional_settlement(value: object) -> ContinuationSettlement | None:
+    """Parse the continuation's terminal outcome, or ``None`` if it has none.
+
+    Absent means the recorded intent is still undischarged, which permits the
+    operation to run. Unparseable means the record of its terminal outcome is
+    damaged, and reading the second as the first would put a finished
+    continuation — pull request and all — back on the runner.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ValueError("Attempt sidecar continuation_settlement must be an object")
+    return ContinuationSettlement.from_payload(value)
 
 
 def _optional_publication_verdict(value: object) -> ValidationVerdictReceipt | None:

@@ -45,6 +45,24 @@ class AttemptStore(Protocol):
         """
         ...
 
+    def for_issue(self, issue_key: IssueKey) -> tuple[Attempt, ...]:
+        """Every durable attempt recorded for ``issue_key``, in key order.
+
+        Read-only, and the one way a caller that holds an *issue* can find the
+        *candidates* recorded under it. Continuation needs exactly that (#149):
+        the candidate whose publication failed is named by a commit nothing on
+        the board still points at, so there is no issue-shaped route to it —
+        the durable record is the only index.
+
+        Ordered deterministically by the attempt key so two readers of the same
+        directory derive the same live set. Damage raises rather than being
+        skipped, for the reason :meth:`for_key` does: a caller deciding what is
+        live from a partial read would silently conclude that an operation
+        stopped, and releasing a lease on that is the one direction a scheduler
+        reader may never be moved.
+        """
+        ...
+
     def supersede_issue(self, issue_key: IssueKey) -> int:
         """Drop all cached attempts for an issue.
 

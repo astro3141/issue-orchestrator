@@ -82,6 +82,7 @@ from tests.unit.session_run_helpers import make_session_run_assets
 from issue_orchestrator.events import EventName
 from issue_orchestrator.ports import TraceEvent
 from issue_orchestrator.infra.config import Config
+from tests.unit.continuation_helpers import inert_control_continuation
 
 
 # =============================================================================
@@ -241,6 +242,7 @@ class TestQueueFetchPlanner:
             refresh_requested=True,
             inflight_stable_ids={},
             issue_fetch_resilience=IssueFetchResilience("owner/repo"),
+            control_continuation=inert_control_continuation(),
         )
 
         github_workflow.fetch_all_issues.assert_called_once()
@@ -275,6 +277,7 @@ class TestQueueFetchPlanner:
             refresh_requested=True,
             inflight_stable_ids={},
             issue_fetch_resilience=IssueFetchResilience("owner/repo"),
+            control_continuation=inert_control_continuation(),
             open_issue_corpus=corpus_sync,
         )
 
@@ -304,6 +307,7 @@ class TestQueueFetchPlanner:
             refresh_requested=False,
             inflight_stable_ids={},
             issue_fetch_resilience=IssueFetchResilience("owner/repo"),
+            control_continuation=inert_control_continuation(),
         )
 
         github_workflow.fetch_all_issues.assert_not_called()
@@ -339,6 +343,7 @@ class TestQueueFetchPlanner:
             refresh_requested=False,
             inflight_stable_ids={},
             issue_fetch_resilience=IssueFetchResilience("owner/repo"),
+            control_continuation=inert_control_continuation(),
         )
 
         github_workflow.scan_needs_code_review_prs.assert_not_called()
@@ -373,6 +378,7 @@ class TestQueueFetchPlanner:
             refresh_requested=False,
             inflight_stable_ids={},
             issue_fetch_resilience=IssueFetchResilience("owner/repo"),
+            control_continuation=inert_control_continuation(),
         )
 
         github_workflow.scan_pending_pr_work.assert_called_once_with(
@@ -408,6 +414,7 @@ class TestQueueFetchPlanner:
             refresh_requested=False,
             inflight_stable_ids={},
             issue_fetch_resilience=IssueFetchResilience("owner/repo"),
+            control_continuation=inert_control_continuation(),
         )
 
         github_workflow.refresh_issues.assert_called_once_with([99, 1])
@@ -438,6 +445,7 @@ class TestQueueFetchPlanner:
             refresh_requested=False,
             inflight_stable_ids={},
             issue_fetch_resilience=IssueFetchResilience("owner/repo"),
+            control_continuation=inert_control_continuation(),
         )
 
         github_workflow.scan_needs_code_review_prs.assert_not_called()
@@ -473,6 +481,7 @@ class TestQueueFetchPlanner:
             refresh_requested=False,
             inflight_stable_ids={},
             issue_fetch_resilience=IssueFetchResilience("owner/repo"),
+            control_continuation=inert_control_continuation(),
         )
 
         assert 1 in state.issue_refresh_timestamps
@@ -507,6 +516,7 @@ class TestQueueFetchPlanner:
             refresh_requested=False,
             inflight_stable_ids={},
             issue_fetch_resilience=IssueFetchResilience("owner/repo"),
+            control_continuation=inert_control_continuation(),
         )
 
         github_workflow.fetch_delta_issues.assert_called_once_with(
@@ -547,6 +557,7 @@ class TestQueueFetchPlanner:
                 refresh_requested=False,
                 inflight_stable_ids={},
                 issue_fetch_resilience=IssueFetchResilience("owner/repo"),
+                control_continuation=inert_control_continuation(),
             )
 
         assert isinstance(exc_info.value.__cause__, GitHubHttpError)
@@ -597,6 +608,7 @@ class TestQueueFetchPlanner:
                 refresh_requested=True,  # manual → full scan → PR scan runs
                 inflight_stable_ids={},
                 issue_fetch_resilience=resilience,
+                control_continuation=inert_control_continuation(),
             )
 
         # Raw repository error surfaces, NOT a resilience classification.
@@ -644,6 +656,7 @@ class TestQueueFetchPlanner:
             refresh_requested=False,
             inflight_stable_ids={},
             issue_fetch_resilience=IssueFetchResilience("owner/repo"),
+            control_continuation=inert_control_continuation(),
         )
 
         assert all(issue.number != 7 for issue in state.cached_queue_issues)
@@ -678,6 +691,7 @@ class TestQueueFetchPlanner:
             refresh_requested=False,
             inflight_stable_ids={},
             issue_fetch_resilience=IssueFetchResilience("owner/repo"),
+            control_continuation=inert_control_continuation(),
         )
 
         assert next_sync == last_sync
@@ -727,6 +741,7 @@ class TestQueueFetchPlanner:
             refresh_requested=False,
             inflight_stable_ids={},
             issue_fetch_resilience=IssueFetchResilience("owner/repo"),
+            control_continuation=inert_control_continuation(),
         )
 
         assert next_sync >= last_sync
@@ -775,6 +790,7 @@ class TestQueueFetchPlanner:
             refresh_requested=True,
             inflight_stable_ids={},
             issue_fetch_resilience=IssueFetchResilience("owner/repo"),
+            control_continuation=inert_control_continuation(),
         )
 
         github_workflow.fetch_all_issues.assert_called_once()
@@ -819,6 +835,7 @@ class TestQueueFetchPlanner:
                 issue_fetch_resilience=IssueFetchResilience(
                     "owner/repo", repo_not_found_tolerance=1
                 ),
+                control_continuation=inert_control_continuation(),
             )
 
         assert "owner/repo" in str(exc_info.value)
@@ -858,6 +875,7 @@ class TestQueueFetchPlanner:
             inflight_stable_ids={},
             queue_cache_store=queue_cache_store,
             issue_fetch_resilience=IssueFetchResilience("owner/repo"),
+            control_continuation=inert_control_continuation(),
         )
 
         assert [issue.number for issue in state.cached_queue_issues] == list(range(1, 21))
@@ -895,6 +913,7 @@ class TestQueueFetchPlanner:
             refresh_requested=False,
             inflight_stable_ids={},
             issue_fetch_resilience=IssueFetchResilience("owner/repo"),
+            control_continuation=inert_control_continuation(),
         )
 
         assert "[FETCH-COST]" in caplog.text
@@ -929,6 +948,7 @@ class TestQueueFetchPlanner:
             refresh_requested=True,
             inflight_stable_ids={},
             issue_fetch_resilience=IssueFetchResilience("owner/repo"),
+            control_continuation=inert_control_continuation(),
         )
 
         scheduler.evaluate_issues.assert_called_once()
@@ -1376,6 +1396,7 @@ class TestOrchestratorSupportApplyPlan:
             cleanup_manager=mock_cleanup_manager,
             get_review_machine=Mock(),
             kill_session=Mock(),
+            control_continuation=inert_control_continuation(),
         )
 
     def test_apply_plan_launch_releases_blocked_front_by_issue_identity(self, support):
@@ -1635,6 +1656,7 @@ class TestOrchestratorSupportClearDiscoveredFacts:
             cleanup_manager=MagicMock(),
             get_review_machine=Mock(),
             kill_session=Mock(),
+            control_continuation=inert_control_continuation(),
         )
 
     def test_clears_immediate_cleanups_via_method(self, support, sample_orchestrator_state):
@@ -1776,6 +1798,7 @@ class TestUpdateStateAfterAction:
             cleanup_manager=MagicMock(),
             get_review_machine=Mock(),
             kill_session=Mock(),
+            control_continuation=inert_control_continuation(),
             tech_lead_authority=InMemoryTechLeadAuthorityStore(),
         )
 
@@ -2824,6 +2847,7 @@ class TestRequestRefresh:
             cleanup_manager=MagicMock(),
             get_review_machine=Mock(),
             kill_session=Mock(),
+            control_continuation=inert_control_continuation(),
         )
 
     def test_adds_inflight_ids_with_expiry(self, support):

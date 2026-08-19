@@ -51,6 +51,7 @@ from issue_orchestrator.events import EventName
 from issue_orchestrator.infra.config import Config
 from issue_orchestrator.ports import InMemoryProviderCircuitStore
 from tests.conftest import MockGitHubAdapter
+from tests.unit.continuation_helpers import inert_control_continuation
 
 PROVIDER = "claude-code"
 AGENT = "agent:backend"
@@ -452,6 +453,7 @@ class _RecoveryTick:
             refresh_requested=False,
             inflight_stable_ids={},
             issue_fetch_resilience=IssueFetchResilience("owner/repo"),
+            control_continuation=inert_control_continuation(),
         )
 
     def _apply(self, plan) -> None:

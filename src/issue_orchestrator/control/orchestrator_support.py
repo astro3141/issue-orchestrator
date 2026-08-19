@@ -21,6 +21,7 @@ if TYPE_CHECKING:
     from .action_applier import ActionApplier, ActionResult
     from .actions import Action
     from .cleanup_manager import CleanupManager
+    from .continuation_scheduling import ControlContinuation
     from .session_manager import SessionManager
     from .fact_gatherer import FactGatherer
     from .state_machine_manager import StateMachineManager
@@ -138,6 +139,11 @@ class OrchestratorSupport:
     cleanup_manager: "CleanupManager"
     get_review_machine: Callable[[int, int], object]
     kill_session: Callable[[str], None]
+    # The one owner of "reconcile control-operation ownership, then hydrate"
+    # (#149). Required, not optional: an omitted one would silently restore the
+    # permissive window #148 measured, and a permissive window that only some
+    # compositions have is worse than none.
+    control_continuation: "ControlContinuation"
     queue_cache_store: "QueueCacheStore | None" = None
     # Durable tech_lead ledgers (#6780). Anchor intake records a storm cohort
     # here, and the end-of-tick fact clear reads it to hold the cohort's run
@@ -470,6 +476,7 @@ class OrchestratorSupport:
             self.config,
             self.repository_host,
             self.events,
+            self.control_continuation,
             self.queue_cache_store,
         )
         projection.update_and_emit(self.state)
@@ -583,6 +590,7 @@ def run_planning_cycle(
     refresh_requested: bool,
     inflight_stable_ids: dict[str, float],
     issue_fetch_resilience: IssueFetchResilience,
+    control_continuation: "ControlContinuation",
     observer: object | None = None,
     claim_manager: object | None = None,
     queue_cache_store: "QueueCacheStore | None" = None,
@@ -602,6 +610,7 @@ def run_planning_cycle(
                 config, events, state, repository_host, scheduler, github_workflow,
                 refresh_requested, inflight_stable_ids,
                 issue_fetch_resilience=issue_fetch_resilience,
+                control_continuation=control_continuation,
                 queue_cache_store=queue_cache_store,
                 open_issue_corpus=open_issue_corpus,
             )
@@ -697,6 +706,7 @@ def _fetch_and_update_queue(
     inflight_stable_ids: dict[str, float],
     *,
     issue_fetch_resilience: IssueFetchResilience,
+    control_continuation: "ControlContinuation",
     queue_cache_store: "QueueCacheStore | None" = None,
     open_issue_corpus: "OpenIssueCorpusManager | None" = None,
 ) -> tuple[float, bool]:
@@ -768,7 +778,10 @@ def _fetch_and_update_queue(
         old_key_by_number = {i.number: i.key.stable_id() for i in state.cached_queue_issues}
 
         queue_cache = QueueCache(config, state, queue_cache_store)
-        new_queue = queue_cache.replace_from_refresh(all_issues)
+        # Reconcile-then-hydrate, in that order and through the one owner of
+        # it: eligibility must never be evaluated for an issue whose live
+        # control operation has not yet published its exclusion (#149).
+        new_queue = control_continuation.hydrate_queue(queue_cache, all_issues)
         shrink_confirmation_pending = queue_shrink_confirmation_pending(state)
 
         new_numbers = {i.number for i in new_queue}

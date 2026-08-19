@@ -240,6 +240,102 @@ holds it on `OrchestratorDeps.publication_revalidation`, where a consumer
 reaches it as it reaches the other owners there. The field is required, so
 neither composition root can build an orchestrator without one.
 
+### What happens to a candidate after it is re-evaluated
+
+Re-evaluation is not continuation. A candidate whose publication failed has
+usually lost its worktree to cleanup, and with it the **completion record** —
+the only place the agent said whether it wanted a pull request and what it
+claimed to have built. A later PASS then proves something about the artifact
+and nothing about what to do with it, so [#149] adds the missing half:
+
+| Fact | Where it lives | Written by |
+|------|----------------|------------|
+| Recorded intent (`requested_actions`, `implementation`, `problems`) plus the contract identity | `Attempt.continuation_descriptor` | `control/continuation_descriptor_writer.py`, at the gate's verdict, **only when the verdict refuses** |
+| The exact-`A` review outcome | `Attempt.continuation_review_verdict` | `control/continuation_runner.py`, promoted from the run's own verdict binding before its worktree is discarded |
+| What the continuation run produced — the pull request, or that none was asked for | `Attempt.continuation_settlement` | `control/continuation_finalize.py`, from the `ProcessingResult` the run's own completion pipeline returned |
+| How many runs the continuation has opened for this candidate | `Attempt.continuation_runs_used` | `control/continuation_runner.py`, spent before a run is opened |
+
+Every field is **copied** from an authoritative producer. Nothing is derived
+from issue text, labels, logs, diagnostics, URLs or branch names, and an
+absent descriptor means *no recorded intent* — never empty intent, and never a
+continuation. Only a refused verdict records one: a candidate that PASSED is
+still being driven by its live session, and a descriptor there would invite a
+second driver to race it. One descriptor exists per issue, because filing a
+newer candidate's intent clears the older one — supersession the durable record
+states rather than one a reader has to infer.
+
+From those three facts plus the evaluation history, the allowance, and the
+`pr-pending` label the tick has already fetched,
+`domain/continuation_phase.py` derives which phase a candidate is in, and
+`control/continuation_live_truth.py` turns the live ones into the
+`live_operations` set `ControlOperationOwnership.reconcile` consumes. Four
+phases hold the issue (`EXECUTING`, `RETRY_PENDING`, `PASS_PENDING_REVIEW`,
+`APPROVED_PENDING_PR`); the rest release it. No lease row is read to decide
+liveness, so a row that outlived its operation can never exclude ordinary work
+on its own authority — and a durable record that cannot be READ keeps the
+projection already standing rather than publishing "nothing is live".
+
+Two of those phases exist because a durable record alone answers the wrong
+question:
+
+- **`EXECUTING`** is derived from `control/continuation_in_flight.py`, the one
+  non-durable input. The [#139] allowance is a *start* budget spent before any
+  gate work, so for the whole duration of a revalidation the record reads
+  "allowance spent, latest evaluation still the failure" — indistinguishable
+  from a revalidation that ran and failed, and therefore `EXHAUSTED`. Without
+  this phase the lease of a *running* operation is released and ordinary rework
+  is re-admitted mid-run. The registry is process-local by design: it cannot
+  survive a crash, so a restart falls back to the durable facts and [#139]'s
+  fail-closed direction is preserved rather than replaced by a deadlock.
+- **`SETTLED_PR` via the recorded settlement** exists because the continuation
+  creates no session and its pull request carries no code-review label, so none
+  of the three writers of `pr-pending` ever observe it. Waiting on the board
+  would leave `APPROVED_PENDING_PR` live forever, re-running a full reviewer
+  exchange on every reconciliation while holding the issue's lane.
+
+A settlement is not the only way the two run-opening phases end. A run that
+reaches a terminal result *without* discharging the intent — a halted exchange,
+an exhausted no-progress budget, a PR that could not be created — changes no
+durable fact, so the same phase is derived again and another run opens. That
+retry is right for a transient failure and unbounded for a permanent one, and
+the exchange's own no-progress budget cannot bound it: that budget is read from
+the cache under `<worktree>/.issue-orchestrator/sessions`, which goes with the
+checkout each closed run removes, so every retry starts it afresh.
+`Attempt.continuation_runs_used` is therefore the continuation's own allowance,
+in the shape [#139]'s is — durable, beside the candidate, and spent *before* a
+run opens so an interrupted one cannot refund itself. When it is gone the phase
+is `RUNS_EXHAUSTED`, which returns the candidate to ordinary rework with its
+descriptor, its evaluations and any review verdict intact.
+
+`control/continuation_scheduling.py` is the one hydration path: it derives,
+reconciles, publishes, advances what this engine owns, and only then lets
+`QueueCache` evaluate eligibility. Derivation runs inside the ownership owner's
+own lock (`reconcile_derived`), which is what makes a stale snapshot unable to
+release a newer claim. `control/continuation_runner.py` executes: it hands a
+`RETRY_PENDING` candidate whole to [#139] — no second admission predicate and
+no second allowance — and drives a passing one through the ordinary
+`CompletionProcessor`, in a worktree verified to stand at exactly `A`.
+
+That worktree belongs to a **run**, not to a pass, and
+`control/continuation_runs.py` owns it. `CompletionProcessor.process` does not
+necessarily finish when it returns: with a background job supervisor wired —
+the only configuration in which the continuation executes at all, since its own
+job goes through the same supervisor — the review exchange becomes its own job
+and the result reports `review_exchange_deferred`. A pass that disposed of its
+checkout on the way out would delete the working directory of the exchange still
+running in it, along with the `summary.json` the resume path reads; and because
+`run_id` is part of the exchange's job identity, the next pass would mint an
+identity no dedupe could recognise and start another exchange. So the run stays
+open across passes while the pipeline reports it unfinished, and is disposed of
+exactly once — when the pipeline reaches a terminal result, when the candidate is
+retired, or when the operation leaves the live set entirely. It hands
+the resulting `ProcessingResult` to `control/continuation_finalize.py`, the
+continuation's analogue of `control/publish_retry_finalize.py`: the finalizer
+announces the pull request on the board and *then* records the settlement, so a
+board signal that could not be applied leaves the operation retryable rather
+than terminating it while the issue's lane reopens with an approved PR already
+open.
+
 ## Worktree readiness is a precondition of a meaningful verdict
 
 Every gate above runs *inside a worktree*. A worktree that lacks the

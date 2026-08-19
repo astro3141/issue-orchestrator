@@ -48,6 +48,7 @@ from .bootstrap_completion import (
     create_completion_components,
 )
 from .bootstrap_revalidation import build_publication_revalidation
+from .bootstrap_continuation import build_continuation_ports
 from ..infra.config import Config
 from ..infra.env import ENV_PREFIX
 from ..adapters.github.repo import get_repo_from_git, GitRepoError
@@ -878,6 +879,7 @@ def build_orchestrator(
         # Assembled at the root (#139 §6): a factory the root never calls is
         # unreachable production code, however carefully it is assembled.
         publication_revalidation=build_publication_revalidation(config, attempt_store=attempt_store, session_output=session_output, command_runner=command_runner, working_copy=working_copy),
+        continuation_ports=build_continuation_ports(config),
         services=infra_services,
     )
 
@@ -1303,6 +1305,7 @@ def build_orchestrator_for_testing(
         # The same factory the production root calls: a testing root assembling
         # its own could build a differently-shaped route (#25, one layer up).
         publication_revalidation=build_publication_revalidation(config, attempt_store=attempt_store, session_output=session_output, command_runner=command_runner, working_copy=working_copy),
+        continuation_ports=build_continuation_ports(config),
         services=infra_services,
     )
 

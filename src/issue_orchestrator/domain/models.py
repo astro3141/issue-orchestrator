@@ -457,6 +457,25 @@ class CompletionRecord:
     follow_up_issues: Optional[list["ProposedFollowUpIssue"]] = None
 
     @property
+    def reaches_the_remote(self) -> bool:
+        """Whether this completion reaches the remote at all.
+
+        Named for what it asks, not for what it used to gate: the publish
+        contract is no longer one of its consumers. It gates the cheap
+        pre-publish guards (banned test skips, committed runtime artifacts):
+        anything that pushes must pass them, including a blocked agent
+        preserving work in progress. What the *publish contract* applies to is
+        the narrower :attr:`offers_a_change_for_review` (#25).
+
+        Beside its sibling predicate rather than on a processor, so both
+        questions about what a record ASKS FOR are answered by the record.
+        """
+        return bool(
+            {RequestedAction.PUSH_BRANCH, RequestedAction.CREATE_PR}
+            & set(self.requested_actions)
+        )
+
+    @property
     def offers_a_change_for_review(self) -> bool:
         """Whether this completion offers its work as a change to review.
 

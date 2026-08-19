@@ -73,6 +73,10 @@ from ..ports.review_exchange_runner import (
 )
 from ..ports.session_output import SessionOutput, ValidationRecord
 from .publication_authority import PublicationAuthority, UnrecordedRefusals
+from .continuation_descriptor_writer import (
+    NO_CONTINUATION_DESCRIPTORS,
+    ContinuationDescriptorWriter,
+)
 from .publication_gate import PublicationGate, PublicationGateOutcome
 from .validation import GateEvidence
 from .validation_record_cache import contract_record_path
@@ -224,6 +228,13 @@ class CompletionProcessor:
         needs_human_block: "SharedNeedsHumanBlock" = NO_OTHER_NEEDS_HUMAN_CAUSES,
         # Refusals whose label write did not commit, shared with the readers (#45).
         unrecorded_refusals: UnrecordedRefusals | None = None,
+        # Copies the agent's recorded intent at the gate seam (#143, #149).
+        # A null object rather than an optional: recording nothing makes
+        # continuation impossible rather than permissive, which is the
+        # direction an absent collaborator must fail in.
+        continuation_descriptors: "ContinuationDescriptorWriter" = (
+            NO_CONTINUATION_DESCRIPTORS
+        ),
     ):
         """Initialize the processor with required adapters.
 
@@ -274,6 +285,7 @@ class CompletionProcessor:
             unrecorded_refusals or UnrecordedRefusals.process_local(),
         )
         self.publication_gate = publication_gate
+        self._continuation_descriptors = continuation_descriptors
         self.pre_publish_gate = pre_publish_gate
         self._config = config
         self._pr_collision_strategy = (
@@ -626,26 +638,6 @@ class CompletionProcessor:
                 self._event_context.enrich(payload),
             )
         )
-
-    def _reaches_the_remote(self, record: CompletionRecord) -> bool:
-        """Whether this completion reaches the remote at all.
-
-        Named for what it asks, not for what it used to gate: the publish
-        contract is no longer one of its consumers. It gates the cheap
-        pre-publish guards (banned test skips, committed runtime
-        artifacts): anything that pushes must pass them, including a
-        blocked agent preserving work in progress. What the *publish
-        contract* applies to is the narrower
-        ``record.offers_a_change_for_review`` (#25).
-
-        Returns:
-            True if any requested action reaches the remote.
-        """
-        remote_reaching_actions = {
-            RequestedAction.PUSH_BRANCH,
-            RequestedAction.CREATE_PR,
-        }
-        return bool(set(record.requested_actions) & remote_reaching_actions)
 
     def _check_publish_gate(
         self,
@@ -1117,7 +1109,7 @@ class CompletionProcessor:
         run_assets: SessionRunAssets,
     ) -> ProcessingResult | None:
         """Reject newly added test-skip constructs before review/publish."""
-        if not self._reaches_the_remote(record):
+        if not record.reaches_the_remote:
             return None
 
         base_ref = f"origin/{self._base_branch()}"
@@ -1209,7 +1201,7 @@ class CompletionProcessor:
         Fail early here with an actionable message instead of letting the
         brittle reviewer-worktree checkout surface it opaquely mid-exchange.
         """
-        if not self._reaches_the_remote(record):
+        if not record.reaches_the_remote:
             return None
 
         base_ref = f"origin/{self._base_branch()}"
@@ -1264,6 +1256,12 @@ class CompletionProcessor:
         outcome = self._check_publish_gate(worktree, run_assets, issue_key)
         if outcome is None:
             return None
+        # The gate's verdict is the last moment the agent's completion record
+        # is both authoritative and still on disk: seconds later the worktree,
+        # and the only copy of it, is reaped (#143, #149).
+        self._continuation_descriptors.record_gate_outcome(
+            issue_key=issue_key, completion=record, outcome=outcome
+        )
         if not outcome.allowed:
             return self._handle_gate_failure(
                 worktree,

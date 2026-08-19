@@ -131,6 +131,7 @@ def create_completion_components(
     receive them assembled rather than assemble them itself (#6999 A4).
     """
     from ..control.completion_processor import CompletionProcessor
+    from ..control.continuation_descriptor_writer import ContinuationDescriptorWriter
     from ..control.pre_publish_gate import PrePublishGate
     from ..control.publication_gate import build_publication_gate
     from ..control.session_controller import SessionController
@@ -235,6 +236,11 @@ def create_completion_components(
         tech_lead_authority=tech_lead_authority,
         needs_human_block=needs_human_block,
         unrecorded_refusals=unrecorded_refusals,
+        # The gate's verdict is the last moment the agent's completion record
+        # is both authoritative and still on disk (#143). Same store and same
+        # key derivation as the verdict receipt above, so a candidate's
+        # evidence and its recorded intent land under one identity (#149).
+        continuation_descriptors=ContinuationDescriptorWriter(attempt_store),
     )
 
     session_controller_instance = SessionController(

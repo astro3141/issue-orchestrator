@@ -20,6 +20,7 @@ if TYPE_CHECKING:
     from ..infra.config import Config
     from ..ports.queue_cache_store import QueueCacheStore
     from ..ports.repository_host import RepositoryHost
+    from .continuation_scheduling import ControlContinuation
 
 logger = logging.getLogger(__name__)
 
@@ -45,11 +46,16 @@ class QueueProjection:
         config: "Config",
         repository_host: "RepositoryHost",
         events: EventSink,
+        control_continuation: "ControlContinuation",
         queue_cache_store: "QueueCacheStore | None" = None,
     ):
         self._config = config
         self._repository_host = repository_host
         self._events = events
+        # Hydration goes through the continuation owner, never straight to the
+        # cache: this projection is a queue *hydration* point, and #148
+        # measured it as one of the three that reconciled nothing first (#149).
+        self._control_continuation = control_continuation
         self._queue_cache_store = queue_cache_store
 
     def compute_queue(self, state: OrchestratorState) -> list[Issue]:
@@ -87,9 +93,10 @@ class QueueProjection:
             # removal events — the Issue objects won't be available afterwards).
             old_key_by_number = {i.number: i.key.stable_id() for i in prior_issues}
 
-            # Update state through queue cache abstraction.
+            # Update state through queue cache abstraction, behind the owner
+            # that reconciles control-operation ownership first.
             queue_cache = QueueCache(self._config, state, self._queue_cache_store)
-            queue_cache.replace_from_refresh(scope_issues)
+            self._control_continuation.hydrate_queue(queue_cache, scope_issues)
             if self._queue_cache_store is not None:
                 queue_cache.save_snapshot()
 
