@@ -152,13 +152,31 @@ class QueueCache:
         self.save_snapshot()
 
     def evaluate_issue(self, issue: "Issue") -> QueueMutationStatus:
-        """Evaluate whether issue can be in queue cache."""
+        """Evaluate whether issue can be in queue cache.
+
+        The duplicate-launch guard has two halves, and they answer the same
+        question about different kinds of work. The session-derived half —
+        ``session_history`` ∪ ``active_sessions`` — covers work a terminal is
+        doing. The control-operation half covers work the ORCHESTRATOR is doing
+        about one exact candidate with no terminal at all (#146), which is
+        invisible to every session-derived signal by construction.
+
+        The second half reads the RECONCILED projection
+        (``ControlOperationOwnership.reconcile``), never a durable lease row: a
+        row that outlived the operation it named would otherwise exclude this
+        issue for good. Both halves report ``REJECTED_EXCLUDED``, which keeps
+        the issue visible to :meth:`reconciliation_only_issues` — an issue held
+        by a live control operation still needs its other state reconciled.
+        """
         if not _matches_scope(self._config, issue):
             return QueueMutationStatus.REJECTED_OUT_OF_SCOPE
 
         excluded_numbers = {entry.issue_number for entry in self._state.session_history}
         excluded_numbers.update(session.issue.number for session in self._state.active_sessions)
         if issue.number in excluded_numbers:
+            return QueueMutationStatus.REJECTED_EXCLUDED
+
+        if self._state.control_operation_exclusions.excludes_issue(issue.key):
             return QueueMutationStatus.REJECTED_EXCLUDED
 
         if self._config.filtering.issue and issue.number != self._config.filtering.issue:
@@ -210,7 +228,8 @@ class QueueCache:
         questions asked of the same cache. :meth:`evaluate_issue` answers the
         first, and ``REJECTED_EXCLUDED`` is the ONE branch that means "in scope,
         but not launchable again this run" — a completed session, a running one,
-        or the awaiting-merge presentation record startup rehydrates into
+        a reconciled live control operation (#146), or the awaiting-merge
+        presentation record startup rehydrates into
         ``session_history``. Reconciliation must still see those issues, or state
         recorded against them (a provider block, say) can never be retired by its
         owner once the queue drops them.
