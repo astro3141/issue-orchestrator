@@ -40,6 +40,8 @@ from __future__ import annotations
 
 import logging
 import threading
+from dataclasses import dataclass
+from enum import Enum
 from typing import TYPE_CHECKING, Collection, Iterable
 
 from ..domain.control_operation import (
@@ -78,23 +80,111 @@ its own holder and gets typed contention between them.
 """
 
 
-# Every store verdict maps to exactly one projection status, declared once
-# rather than re-derived by a branch chain per call site. A new store verdict
-# fails loudly at the lookup instead of falling into whichever branch was last.
-_RESERVATION_STATUS: dict[
-    ControlOperationReservationStatus, ControlOperationOwnershipStatus
+@dataclass(frozen=True, slots=True)
+class _ReservationOutcome:
+    """What one store reservation verdict projects, and how loudly it reports.
+
+    Both answers sit on the same row so that adding a store verdict cannot give
+    it a projection without also declaring its visibility, and so neither answer
+    is re-derived by a branch at a call site.
+    """
+
+    projected: ControlOperationOwnershipStatus
+    log_level: int
+
+
+# Every store verdict maps to exactly one outcome, declared once rather than
+# re-derived by a branch chain per call site. A new store verdict fails loudly
+# at the lookup instead of falling into whichever branch was last.
+_RESERVATION_OUTCOMES: dict[
+    ControlOperationReservationStatus, _ReservationOutcome
 ] = {
-    ControlOperationReservationStatus.GRANTED: ControlOperationOwnershipStatus.OWNED,
-    ControlOperationReservationStatus.ADOPTED: ControlOperationOwnershipStatus.OWNED,
+    ControlOperationReservationStatus.GRANTED: _ReservationOutcome(
+        ControlOperationOwnershipStatus.OWNED, logging.DEBUG
+    ),
+    ControlOperationReservationStatus.ADOPTED: _ReservationOutcome(
+        ControlOperationOwnershipStatus.OWNED, logging.DEBUG
+    ),
     # Never OWNED and never dropped: another holder is running this operation,
     # so ordinary work on the issue stays excluded even though we may not act.
-    ControlOperationReservationStatus.HELD_BY_PEER: (
-        ControlOperationOwnershipStatus.CONTENDED
+    ControlOperationReservationStatus.HELD_BY_PEER: _ReservationOutcome(
+        ControlOperationOwnershipStatus.CONTENDED, logging.WARNING
     ),
-    ControlOperationReservationStatus.UNAVAILABLE: (
-        ControlOperationOwnershipStatus.UNAVAILABLE
+    ControlOperationReservationStatus.UNAVAILABLE: _ReservationOutcome(
+        ControlOperationOwnershipStatus.UNAVAILABLE, logging.WARNING
     ),
 }
+
+
+class _ReleaseVerdict(Enum):
+    """What a store release proved about THIS holder's exclusion.
+
+    The store answers a narrower question than the owner asks. It reports what
+    happened to a row; the owner needs to know whether the exclusion that row
+    backed is now ours to drop, and those are not the same question whenever a
+    peer's reservation is what the store found.
+    """
+
+    #: Nothing of this holder's is left in the store, so the exclusion goes.
+    FREED = "freed"
+    #: Someone else's reservation stands. Dropping the exclusion here would
+    #: turn "another holder is running this operation" into "nothing is", the
+    #: one direction a reader of the projection may never be moved.
+    HELD_ELSEWHERE = "held elsewhere"
+    #: The store could not say. Ignorance keeps the exclusion; only a
+    #: reconciliation against live truth may remove it.
+    UNKNOWN = "unknown"
+
+
+# What each store release verdict proves, BEFORE the recorded holder is
+# consulted. ``NOT_HELD`` is the load-bearing row: it is a settled answer, and
+# reading settlement as "freed" without asking whose row the store found is
+# exactly how a loser's ordinary unwind deletes the winner's exclusion.
+_RELEASE_VERDICTS: dict[ControlOperationReleaseStatus, _ReleaseVerdict] = {
+    ControlOperationReleaseStatus.RELEASED: _ReleaseVerdict.FREED,
+    ControlOperationReleaseStatus.NOT_HELD: _ReleaseVerdict.FREED,
+    ControlOperationReleaseStatus.UNAVAILABLE: _ReleaseVerdict.UNKNOWN,
+}
+
+
+@dataclass(frozen=True, slots=True)
+class _ReleaseReport:
+    """How one release verdict is reported to an operator."""
+
+    log_level: int
+    explanation: str
+
+
+# What each release verdict means for the holder that asked, declared once.
+# Only FREED frees anything; the other two keep the exclusion for different
+# reasons, and an operator needs to be able to tell those reasons apart.
+_RELEASE_REPORTS: dict[_ReleaseVerdict, _ReleaseReport] = {
+    _ReleaseVerdict.FREED: _ReleaseReport(
+        logging.INFO, "nothing of this holder's is left in the store"
+    ),
+    _ReleaseVerdict.HELD_ELSEWHERE: _ReleaseReport(
+        logging.WARNING,
+        "the reservation belongs to another holder; keeping the exclusion"
+        " rather than freeing their operation",
+    ),
+    _ReleaseVerdict.UNKNOWN: _ReleaseReport(
+        logging.WARNING,
+        "the store could not be reached; keeping the exclusion so a later"
+        " reconciliation asks again",
+    ),
+}
+
+
+@dataclass(frozen=True, slots=True)
+class _HandBack:
+    """One store release, and what it proved about this holder's exclusion."""
+
+    release: ControlOperationRelease
+    verdict: _ReleaseVerdict
+
+    @property
+    def freed(self) -> bool:
+        return self.verdict is _ReleaseVerdict.FREED
 
 
 def _ordered(keys: Iterable[ControlOperationKey]) -> list[ControlOperationKey]:
@@ -169,9 +259,9 @@ class ControlOperationOwnership:
         the store answers ``NOT_HELD`` because the row belongs to a peer, and
         dropping the entry on that would convert "another holder is running
         this operation" into "nothing is running it" — the one direction a
-        reader of the projection may never move. :meth:`_frees_our_exclusion`
-        is the single place that rule is decided, and the store's own
-        ``holder`` is what decides it.
+        reader of the projection may never move. :meth:`_hand_back` is the
+        single place that rule is decided, and the store's own ``holder`` is
+        what decides it.
 
         Typed rather than silent: the store reports an unreachable backend as
         ``UNAVAILABLE`` instead of raising, and a caller that inferred success
@@ -180,43 +270,10 @@ class ControlOperationOwnership:
         exclusion survives until a reconciliation can retry the release.
         """
         with self._lock:
-            release = self._store.release_control_operation(key, holder=self._holder)
-            if self._frees_our_exclusion(release):
+            hand_back = self._hand_back(key, because="this holder's operation settled")
+            if hand_back.freed:
                 self._publish(self._without(key))
-            elif release.settled:
-                logger.warning(
-                    "[CONTROL_OP] %s is held by %s, not by %s; keeping the"
-                    " exclusion rather than freeing another holder's operation",
-                    key,
-                    release.holder or "another holder",
-                    self._holder,
-                )
-            else:
-                logger.warning(
-                    "[CONTROL_OP] Could not release %s (%s); keeping the"
-                    " exclusion so the next reconciliation retries it",
-                    key,
-                    release.detail,
-                )
-            return release
-
-    def _frees_our_exclusion(self, release: ControlOperationRelease) -> bool:
-        """Whether ``release`` proves this holder's exclusion may be dropped.
-
-        Three answers, and only the first two free anything:
-
-        * ``RELEASED`` — our row is gone because we deleted it;
-        * ``NOT_HELD`` with no recorded holder — no row exists for anyone, so
-          there is nothing left to exclude;
-        * ``NOT_HELD`` naming another holder, or ``UNAVAILABLE`` — someone
-          else's reservation stands, or we could not tell. Both keep the
-          exclusion; only reconciliation against live truth removes it.
-        """
-        if release.status is ControlOperationReleaseStatus.RELEASED:
-            return True
-        if release.status is ControlOperationReleaseStatus.NOT_HELD:
-            return release.holder in ("", self._holder)
-        return False
+            return hand_back.release
 
     # ------------------------------------------------------------------
     # Reconciliation
@@ -296,38 +353,58 @@ class ControlOperationOwnership:
         return self._reserve(key)
 
     def _release_stale(self, key: ControlOperationKey) -> None:
-        """Give back a lease whose operation nothing declares live any more."""
-        release = self._store.release_control_operation(key, holder=self._holder)
-        if release.status is ControlOperationReleaseStatus.UNAVAILABLE:
-            logger.warning(
-                "[CONTROL_OP] Could not release settled operation %s (%s);"
-                " the next reconciliation retries it",
-                key,
-                release.detail,
-            )
-            return
-        logger.info(
-            "[CONTROL_OP] Released %s: no live operation claims it", key
-        )
+        """Give back a lease whose operation nothing declares live any more.
+
+        The projection this reconciliation publishes is built from ``live``
+        alone, so a lease the store could not drop stops excluding the issue
+        either way; the row is retried on the next pass rather than stranded.
+        """
+        self._hand_back(key, because="no live operation claims it")
 
     # ------------------------------------------------------------------
     # Internals
     # ------------------------------------------------------------------
 
+    def _hand_back(self, key: ControlOperationKey, *, because: str) -> _HandBack:
+        """Ask the store to drop this holder's row, and say what that proved.
+
+        The one place a store release is turned into an answer about THIS
+        holder's exclusion, so both callers get the same rule: a settled
+        verdict frees nothing unless the row the store found was ours to give
+        up. The store's own recorded ``holder`` decides that — not the
+        projection's, which is exactly what a fail-closed entry does not know.
+        """
+        release = self._store.release_control_operation(key, holder=self._holder)
+        ours = release.holder in ("", self._holder)
+        verdict = (
+            _RELEASE_VERDICTS[release.status] if ours else _ReleaseVerdict.HELD_ELSEWHERE
+        )
+        report = _RELEASE_REPORTS[verdict]
+        logger.log(
+            report.log_level,
+            "[CONTROL_OP] Release of %s (%s): %s (holder=%s) %s",
+            key,
+            because,
+            report.explanation,
+            release.holder or "unrecorded",
+            release.detail,
+        )
+        return _HandBack(release, verdict)
+
     def _reserve(self, key: ControlOperationKey) -> ControlOperationOwnershipEntry:
         reservation = self._store.reserve_control_operation(key, holder=self._holder)
-        status = _RESERVATION_STATUS[reservation.status]
-        if status is not ControlOperationOwnershipStatus.OWNED:
-            logger.warning(
-                "[CONTROL_OP] %s is %s (holder=%s): %s",
-                key,
-                status.value,
-                reservation.holder or "unknown",
-                reservation.detail,
-            )
+        outcome = _RESERVATION_OUTCOMES[reservation.status]
+        logger.log(
+            outcome.log_level,
+            "[CONTROL_OP] %s is %s (holder=%s): %s",
+            key,
+            outcome.projected.value,
+            reservation.holder or "unknown",
+            reservation.detail,
+        )
         return ControlOperationOwnershipEntry(
             key,
-            status,
+            outcome.projected,
             holder=reservation.holder or (self._holder if reservation.reserved else ""),
             detail=reservation.detail,
         )
