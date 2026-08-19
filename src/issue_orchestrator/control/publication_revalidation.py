@@ -31,10 +31,28 @@ become a way around the gate rather than a way back to it:
   :class:`~..ports.candidate_checkout.CandidateCheckouts`, never at a branch,
   and the run scaffold freezes the profile *name taken from the prior receipt*
   rather than resolving one afresh.
+* **Environment.** Materialising the source bytes is not enough to run the
+  contract against them. The gate's command is the repository's own publication
+  suite, and it resolves tools out of the worktree it runs in — a detached
+  checkout that has never been provisioned answers ``.venv/bin/pyright: No such
+  file or directory`` (#153), which is an environment gap wearing the same
+  ``verdict: "failed"`` the route exists to disambiguate. So the checkout is
+  made runnable by the operator-pinned recipe every managed worktree already
+  uses (:class:`~.worktree_runnability.WorktreeRunnability`) before the gate is
+  asked anything, and the same core proves the recipe left the candidate at
+  exactly its own commit and tracked content.
 
 The gate itself is untouched: this composes ``PublicationGate.check`` whole and
 files nothing of its own. The verdict reaches the history through the gate's
 existing receipt writer, appended beside the failure it re-ran.
+
+Provisioning happens AFTER the allowance is reserved and it is not refunded if
+it fails. The order is the point: reserving first is what makes "exactly one"
+survive a crash, and a provisioning failure that gave the allowance back would
+turn a repeatably broken environment into an unbounded supply of gate runs. A
+candidate whose checkout cannot be made runnable therefore reaches no gate,
+appends no evaluation, leaves the prior non-PASS authoritative, and returns the
+continuation to the ordinary exhausted/non-PASS rework direction.
 """
 
 from __future__ import annotations
@@ -63,6 +81,7 @@ from ..ports.candidate_checkout import (
 )
 from ..ports.session_output import SessionOutput
 from .publication_gate import PublicationGate
+from .worktree_runnability import WorktreeRunnability
 
 logger = logging.getLogger(__name__)
 
@@ -96,6 +115,7 @@ class PublicationRevalidation:
         attempts: AttemptStore,
         profiles: Callable[[], ValidationProfileRegistry],
         checkouts: CandidateCheckouts,
+        runnability: WorktreeRunnability,
         session_output: SessionOutput,
         publication_gate: PublicationGate,
     ) -> None:
@@ -107,10 +127,18 @@ class PublicationRevalidation:
         was constructed with. The same reason
         :class:`~.publication_evidence.CandidatePublicationEvidence` takes one
         per call.
+
+        ``runnability`` is the provisioning CORE and not the launch
+        provisioner: the launch provisioner bundles a consecutive-failure
+        ledger and a ``needs-human`` escalation with the recipe, and a second
+        retry predicate over this route's one start allowance is exactly what
+        #139 does not admit. The recipe and the candidate-integrity proof are
+        shared; the bound is not.
         """
         self._attempts = attempts
         self._profiles = profiles
         self._checkouts = checkouts
+        self._runnability = runnability
         self._session_output = session_output
         self._publication_gate = publication_gate
 
@@ -228,6 +256,24 @@ class PublicationRevalidation:
                 started=True, reason="revalidation_candidate_unmaterializable"
             )
         try:
+            unrunnable = self._runnability.make_runnable(materialized.path)
+            if unrunnable is not None:
+                # No gate, and therefore no evaluation: an unprovisioned
+                # checkout would fail the publish command on its missing tools
+                # and file that as a verdict about the candidate — the very
+                # misattribution this route exists to undo. The allowance stays
+                # spent, so the continuation reads this candidate as exhausted
+                # and non-PASS and takes the ordinary rework direction.
+                logger.warning(
+                    "[REVALIDATION] %s@%s could not be made runnable, so no gate "
+                    "was run: %s",
+                    key.issue_key,
+                    key.head_sha[:12],
+                    unrunnable,
+                )
+                return RevalidationOutcome(
+                    started=True, reason="revalidation_candidate_not_provisionable"
+                )
             return self._gate_materialized(durable, prior, materialized)
         finally:
             self._checkouts.release(materialized)
