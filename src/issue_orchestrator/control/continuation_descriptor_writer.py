@@ -70,7 +70,7 @@ class ContinuationDescriptorWriter:
         * a caller with no canonical issue identity cannot bind the intent to
           ``(issue, A)``, and a descriptor nothing could find again is worse
           than none. This is the answer
-          :meth:`~.publication_gate.PublicationGate._record_verdict` gives to
+          :meth:`~.publication_gate.PublicationGate._attempt_key_for` gives to
           the same question, for the same reason.
         """
         gate_record = outcome.record

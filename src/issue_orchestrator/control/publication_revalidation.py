@@ -44,7 +44,11 @@ become a way around the gate rather than a way back to it:
 
 The gate itself is untouched: this composes ``PublicationGate.check`` whole and
 files nothing of its own. The verdict reaches the history through the gate's
-existing receipt writer, appended beside the failure it re-ran.
+attempt-scoped evaluation owner, appended beside the failure it re-ran. That
+owner is also what the gate consults first, so a candidate whose latest
+publication evaluation is the non-PASS this route admitted is re-run rather
+than reused (#159) — reuse and revalidation read the same history and cannot
+disagree about which entry is latest.
 
 Provisioning happens AFTER the allowance is reserved and it is not refunded if
 it fails. The order is the point: reserving first is what makes "exactly one"
@@ -303,7 +307,7 @@ class PublicationRevalidation:
             run_assets=run_assets,
             issue_key=key.issue_key,
         )
-        # The gate files its own verdict through its existing receipt writer,
+        # The gate files its own verdict through its evaluation owner,
         # so what this reads back is whether one was actually appended. A run
         # that reached no verdict — an unconfigured contract, a HEAD the gate
         # could not determine, an evaluation it reused rather than executed —
