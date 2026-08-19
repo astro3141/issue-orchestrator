@@ -373,11 +373,12 @@ Two collaborators decide whether a worktree can run anything:
 
 What "provisioned" *means* — running the operator-pinned recipe and proving it
 left the candidate alone — is `WorktreeRunnability`
-(`control/worktree_runnability.py`), and the two rules below marked as its own
-are enforced there. The provisioner is that core plus the launch policy around
-it: how often a launch may re-ask, and what happens when it stops being worth
-asking. The same-SHA revalidation route consumes the core directly ([#153]),
-because its bound is [#139]'s single start allowance and not a launch ledger.
+(`control/worktree_runnability.py`), and the two rules below marked
+*(enforced by `WorktreeRunnability`)* are enforced there. The provisioner is
+that core plus the launch policy around it: how often a launch may re-ask, and
+what happens when it stops being worth asking. The same-SHA revalidation route
+consumes the core directly ([#153]), because its bound is [#139]'s single start
+allowance and not a launch ledger.
 
 The provisioner is the single owner of provisioning for launches, and **every
 session launch path** goes through it: coding, validation retry, rework, review
@@ -411,16 +412,18 @@ Provisioning holds four rules:
   later launch refuses **before running the recipe**. The count is
   process-local; the escalation is not, and the label is what ends the refusal
   — a human clearing it is read as the retry request and restores the budget.
-- **Do not touch the candidate.** Setup commands install tooling. The
-  provisioner checkpoints `HEAD` and the worktree's dirty state before running
-  them and re-reads both afterwards — **whether or not the commands succeeded**,
-  because a failing command and an altered candidate are separate facts and a
-  command that edits the candidate and then dies must not go unreported. A
+- **Do not touch the candidate** *(enforced by `WorktreeRunnability`)*. Setup
+  commands install tooling. The core checkpoints `HEAD` and the worktree's
+  dirty state before running them and re-reads both afterwards — **whether or
+  not the commands succeeded**, because a failing command and an altered
+  candidate are separate facts and a command that edits the candidate and then
+  dies must not go unreported. A
   moved `HEAD` or a clean-to-dirty transition is a loud failure rather than a
   silent edit to the change under test. The prerequisites themselves are build
   output and are git-ignored, so an honest setup run leaves a clean worktree
   clean.
-- **The recipe is pinned to operator configuration.** Which commands run comes
+- **The recipe is pinned to operator configuration**
+  *(enforced by `WorktreeRunnability`)*. Which commands run comes
   from `worktrees.setup` in the configuration file the orchestrator was started
   with. That file must resolve outside the worktree being provisioned;
   otherwise provisioning refuses, so the worktree under test never supplies the
@@ -470,6 +473,12 @@ shared `uv` cache, which is where the disk actually goes. So no per-session full
 install is being paid: what a session pays is a sync against a cache it shares
 with every other checkout, and `npm ci` — which the previous arrangement paid
 too, and which dominates.
+
+The table is framed per session launch, but a same-SHA revalidation ([#153])
+pays the same recipe in its exact-SHA checkout, which is then force-removed
+once the gate has run. That cost is bounded the same way the revalidation
+itself is: [#139]'s single start allowance means at most one such run per
+candidate, not one per tick.
 
 **Concurrency needs no coordination primitive here.** Two sessions provisioning
 at once have no shared environment to race over, so nothing has to be trusted
@@ -609,7 +618,9 @@ gate in those same worktrees did not already carry; it makes that gate's
 verdict mean what the record says it means. The two bounds above — a recipe
 pinned outside the worktree, and a candidate the run may not alter — are the
 bounds that are actually enforced, and both are checkable in
-`control/worktree_provisioning.py`.
+`control/worktree_runnability.py`, which is where every caller gets them from:
+a session launch through `WorktreeProvisioner`, a same-SHA revalidation
+directly.
 
 #### Operator-authorized host execution — the contract (decided in #55)
 
@@ -622,8 +633,8 @@ configuration the operator started the orchestrator with, and the repository and
 command selectors that configuration resolves to. It does **not** come from the
 repository's contents, and it does **not** come from who wrote them. A candidate
 cannot grant itself this permission by containing anything, which is what
-`_require_pinned_recipe` enforces mechanically: a recipe sourced from inside the
-worktree being provisioned is refused.
+`WorktreeRunnability._require_pinned_recipe` enforces mechanically: a recipe
+sourced from inside the worktree being provisioned is refused.
 
 **Call it operator-authorized host execution.** Do not call it a "trusted
 repository". That phrasing locates the authority in the repository, which is
