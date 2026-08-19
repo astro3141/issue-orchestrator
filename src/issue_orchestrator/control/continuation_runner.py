@@ -40,6 +40,16 @@ of ``pr-pending`` observe it. Handing that result to the finalizer is what makes
 the operation terminate; logging it and dropping it is what made
 ``APPROVED_PENDING_PR`` re-run a full reviewer exchange on every reconciliation.
 
+**It never outlives its own run.** ``process`` is not necessarily finished when
+it returns: with a background supervisor wired — the only configuration in which
+this runner executes at all — the review exchange becomes its own job and the
+result says ``review_exchange_deferred``. So the pass is not the unit of
+ownership; the run is, and :mod:`.continuation_runs` holds it across as many
+passes as the pipeline needs. A pass that disposed of its worktree on the way
+out would delete the working directory of the exchange still running in it, and
+the next pass would mint a fresh ``run_id`` that no dedupe keyed on the old one
+could recognise — one more exchange per reconciliation, forever.
+
 A supersession the durable record has not yet noticed is retired rather than
 retried: if the issue's branch no longer points at the candidate, the intent
 recorded for it is cleared, which drops the operation out of live truth on the
@@ -52,7 +62,6 @@ from __future__ import annotations
 import json
 import logging
 from collections.abc import Callable
-from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol
@@ -61,6 +70,7 @@ from ..domain.attempt import Attempt
 from ..domain.continuation_phase import ContinuationPhase
 from ..domain.models import CompletionOutcome, CompletionRecord, get_completion_path
 from .continuation_live_truth import LiveContinuation
+from .continuation_runs import ContinuationRun
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from ..domain.continuation_descriptor import ContinuationDescriptor
@@ -76,6 +86,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from .continuation_finalize import ContinuationFinalizer
     from .continuation_in_flight import ContinuationsInFlight
     from .continuation_live_truth import ContinuationReconciliation
+    from .continuation_runs import ContinuationRuns
     from .publication_revalidation import PublicationRevalidation
 
 logger = logging.getLogger(__name__)
@@ -121,14 +132,6 @@ CONTINUATION_JOB_PREFIX = "control-continuation"
 """Job-id namespace, so a continuation can never collide with a republish."""
 
 
-@dataclass(frozen=True, slots=True)
-class _ContinuationRun:
-    """One disposable worktree, verified to stand at the candidate's commit."""
-
-    worktree: Path
-    agent_label: str
-
-
 class ControlContinuationRunner:
     """Advances the control operations a reconciliation says this engine owns."""
 
@@ -145,6 +148,7 @@ class ControlContinuationRunner:
         review_verdicts: "ReviewVerdictBindings",
         finalizer: "ContinuationFinalizer",
         in_flight: "ContinuationsInFlight",
+        runs: "ContinuationRuns",
         jobs: ContinuationJobs,
         repo_root: Path,
     ) -> None:
@@ -161,6 +165,10 @@ class ControlContinuationRunner:
         # a reconciliation seconds later from deriving a mid-run candidate as
         # finished and releasing the lease under a running operation.
         self._in_flight = in_flight
+        # Separate from the claim above and deliberately so: the claim spans one
+        # job submission, while a run spans as many passes as the completion
+        # pipeline needs to finish. See :mod:`.continuation_runs`.
+        self._runs = runs
         self._jobs = jobs
         self._repo_root = repo_root
         # What each LIVE phase does, decided in one table rather than by a
@@ -196,8 +204,16 @@ class ControlContinuationRunner:
 
         ``owned`` and not ``operations``: a ``CONTENDED`` operation is another
         holder's to advance, and an ``UNAVAILABLE`` one is nobody's until the
-        store answers again. Both still exclude ordinary work.
+        store advances again. Both still exclude ordinary work.
+
+        The sweep comes first and is over ``operations``, not ``owned``: a run
+        held open across passes belongs to an operation that is still live, and
+        one whose operation has dropped out of live truth — superseded intent, a
+        pull request that arrived some other way — is held by nobody and would
+        otherwise survive until the engine restarted. A ``CONTENDED`` operation
+        is live and keeps its run; only leaving the live set closes one.
         """
+        self._runs.close_dropped(frozenset(reconciliation.keys))
         for operation in reconciliation.owned:
             self._start(operation)
 
@@ -231,6 +247,14 @@ class ControlContinuationRunner:
             # background runner at all. Either way the operation stays owned
             # and the next reconciliation asks again — so the claim this tick
             # took must be given back, or nothing would ever ask again.
+            #
+            # One narrower window stays open by construction: a runner that
+            # ACCEPTS the job and then never dispatches it (a supervisor
+            # shutting down between the two) leaves a claim no ``finally`` will
+            # release, and the lane stays held. It is not distinguishable from a
+            # job that is about to start — the distinction is the whole point of
+            # the claim — so there is nothing to detect. It is bounded the same
+            # way every claim is: process-local, so a restart clears it.
             self._in_flight.release(operation.key)
             logger.debug("[CONTINUATION] %s not started this tick", operation.key)
 
@@ -283,7 +307,22 @@ class ControlContinuationRunner:
         )
 
     def _continue_into_review(self, operation: LiveContinuation) -> None:
-        """Drive the exact candidate through the ordinary completion owner."""
+        """Drive the exact candidate through the ordinary completion owner.
+
+        Re-entrant across passes, because ``process`` is. When a background job
+        supervisor is wired — which is exactly when this runner executes at all,
+        since its own job goes through the same supervisor — the review exchange
+        is submitted as its own job and ``process`` returns
+        ``review_exchange_deferred``. The pipeline states what that obliges of a
+        caller: the work is NOT terminated, and the completion record is left on
+        disk so the next observation re-enters. So the run stays open, the next
+        pass resumes it with the same worktree and the same ``run_id``, and only
+        a terminal result closes it.
+
+        A raised pipeline also leaves the run open. Deleting a worktree an
+        exchange may still be using is the failure this ordering exists to stop,
+        and it is not made safer by having arrived via an exception.
+        """
         descriptor = operation.attempt.continuation_descriptor
         if descriptor is None:
             # Unreachable through live truth, which refuses a descriptor-less
@@ -294,15 +333,61 @@ class ControlContinuationRunner:
                 "[CONTINUATION] refusing %s: no recorded intent", operation.key
             )
             return
-        run = self._materialize(operation)
+        run = self._runs.resume(operation.key)
         if run is None:
-            return
-        try:
-            self._process(operation, run, descriptor)
-        finally:
-            self._worktrees.remove_checkout(run.worktree, force=True)
+            run = self._open_run(operation, descriptor)
+            if run is None:
+                return
+        if self._process(operation, run):
+            self._runs.close(operation.key)
 
-    def _materialize(self, operation: LiveContinuation) -> _ContinuationRun | None:
+    def _open_run(
+        self, operation: LiveContinuation, descriptor: "ContinuationDescriptor"
+    ) -> ContinuationRun | None:
+        """Mint this operation's run: its worktree, its assets, its intent.
+
+        Allocated once and registered with the owner immediately, so from the
+        moment the checkout exists there is exactly one place that knows about
+        it and exactly one place that will dispose of it.
+
+        The run scaffold freezes the profile *the descriptor recorded*, for the
+        reason #139's does: a candidate evaluated under one contract is
+        continued under that contract, whatever the current default is bound to
+        today. The publication gate therefore reuses the passing record for this
+        exact HEAD/command/profile instead of re-running it.
+        """
+        materialized = self._materialize(operation)
+        if materialized is None:
+            return None
+        worktree, agent_label = materialized
+        assets = self._session_output.start_run(
+            worktree_path=worktree,
+            session_name=_worktree_name(operation),
+            issue_number=operation.issue.number,
+            agent_label=agent_label,
+            validation_profile=descriptor.profile,
+        )
+        completion_path = get_completion_path(
+            agent_label, run_dir=assets.run_dir.name
+        )
+        # Written once, with the run. A resumed pass leaves the record exactly
+        # as the pipeline left it: it is deliberately still on disk, and the
+        # exchange running against it was started from that identity.
+        _write_completion_record(
+            worktree / completion_path,
+            descriptor,
+            session_name=assets.identity.session_name,
+        )
+        run = ContinuationRun(
+            worktree=worktree,
+            agent_label=agent_label,
+            assets=assets,
+            completion_path=completion_path,
+        )
+        self._runs.opened(operation.key, run)
+        return run
+
+    def _materialize(self, operation: LiveContinuation) -> tuple[Path, str] | None:
         """A disposable worktree standing at exactly this candidate's commit.
 
         On the issue's own branch rather than a detached checkout, because the
@@ -356,43 +441,24 @@ class ControlContinuationRunner:
             self._worktrees.remove_checkout(info.path, force=True)
             self._retire(operation)
             return None
-        return _ContinuationRun(worktree=info.path, agent_label=agent_lane)
+        return info.path, agent_lane
 
-    def _process(
-        self,
-        operation: LiveContinuation,
-        run: _ContinuationRun,
-        descriptor: "ContinuationDescriptor",
-    ) -> None:
-        """Replay the recorded intent through the completion owner.
+    def _process(self, operation: LiveContinuation, run: ContinuationRun) -> bool:
+        """Re-enter the completion pipeline for ``run``, and say whether it ended.
 
-        The run scaffold freezes the profile *the descriptor recorded*, for the
-        reason #139's does: a candidate evaluated under one contract is
-        continued under that contract, whatever the current default is bound to
-        today. The publication gate therefore reuses the passing record for
-        this exact HEAD/command/profile instead of re-running it.
+        Returns:
+            Whether the pipeline reached a TERMINAL result. ``False`` means the
+            review exchange is running in the background, or a post-review
+            failure was rerouted into rework: the work continues, so the run
+            must stay open and neither a verdict nor a settlement has been
+            produced to record.
         """
-        assets = self._session_output.start_run(
-            worktree_path=run.worktree,
-            session_name=_worktree_name(operation),
-            issue_number=operation.issue.number,
-            agent_label=run.agent_label,
-            validation_profile=descriptor.profile,
-        )
-        completion_path = get_completion_path(
-            run.agent_label, run_dir=assets.run_dir.name
-        )
-        _write_completion_record(
-            run.worktree / completion_path,
-            descriptor,
-            session_name=assets.identity.session_name,
-        )
         result = self._completion_processor.process(
             run.worktree,
             operation.issue.number,
             operation.issue.title,
-            run_assets=assets,
-            completion_path=completion_path,
+            run_assets=run.assets,
+            completion_path=run.completion_path,
             agent_label=run.agent_label,
             issue_key=operation.issue.key,
         )
@@ -402,7 +468,15 @@ class ControlContinuationRunner:
             result.success,
             result.message,
         )
-        self._record_review_verdict(operation, assets.run_dir)
+        if result.is_non_terminal:
+            logger.info(
+                "[CONTINUATION] %s keeps run %s open: completion has not"
+                " finished for this record",
+                operation.key,
+                run.assets.run_id,
+            )
+            return False
+        self._record_review_verdict(operation, run.assets.run_dir)
         # The verdict first, then the settlement: both are facts this run
         # produced, and the ordering is the crash window. Settled-without-a-
         # verdict loses only evidence about a PR that demonstrably exists;
@@ -410,6 +484,7 @@ class ControlContinuationRunner:
         # and reuses it. Only the first ordering can lose the review outcome
         # for good.
         self._finalizer.finalize(operation, result)
+        return True
 
     def _record_review_verdict(
         self, operation: LiveContinuation, run_dir: Path
@@ -456,7 +531,16 @@ class ControlContinuationRunner:
         )
 
     def _retire(self, operation: LiveContinuation) -> None:
-        """Clear the recorded intent for a candidate the branch has left behind."""
+        """Clear the recorded intent for a candidate the branch has left behind.
+
+        Any run the operation held goes with it. Retirement is reached while
+        OPENING a run, so today there is never one to close — but retiring drops
+        the operation out of live truth, and an operation nothing will advance
+        again is one nothing else would close a run for. The disposal belongs
+        with the decision that stranded it rather than with the caller that
+        happens to make it today.
+        """
+        self._runs.close(operation.key)
         self._attempts.update(
             operation.attempt.key, Attempt.without_continuation_descriptor
         )

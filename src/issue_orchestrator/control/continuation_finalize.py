@@ -130,6 +130,17 @@ class ContinuationFinalizer:
         Raises whatever the applier reports. The settlement write below is
         deliberately downstream of it: an unannounced pull request must leave
         the operation retryable rather than terminate it silently.
+
+        Called from the continuation's own job thread, which is deliberate and
+        is the only cross-thread use of ``ActionApplier`` in the codebase. A
+        single ``apply`` is safe there: the per-tick label-mutation counters are
+        guarded on their accumulator being absent, and the claim verification a
+        label write does is keyed on a session lease, which a sessionless
+        control operation never has. What the timing CAN affect is telemetry —
+        a call that lands inside a tick's ``apply_all`` is counted into that
+        tick's mutation stats. That is an accounting artefact of a label the
+        continuation genuinely applied, not a claim about a session, so it is
+        accepted rather than serialised behind the tick.
         """
         result = self._action_applier.apply(
             AddLabelAction(

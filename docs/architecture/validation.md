@@ -299,7 +299,21 @@ own lock (`reconcile_derived`), which is what makes a stale snapshot unable to
 release a newer claim. `control/continuation_runner.py` executes: it hands a
 `RETRY_PENDING` candidate whole to [#139] — no second admission predicate and
 no second allowance — and drives a passing one through the ordinary
-`CompletionProcessor`, in a worktree verified to stand at exactly `A`. It hands
+`CompletionProcessor`, in a worktree verified to stand at exactly `A`.
+
+That worktree belongs to a **run**, not to a pass, and
+`control/continuation_runs.py` owns it. `CompletionProcessor.process` does not
+necessarily finish when it returns: with a background job supervisor wired —
+the only configuration in which the continuation executes at all, since its own
+job goes through the same supervisor — the review exchange becomes its own job
+and the result reports `review_exchange_deferred`. A pass that disposed of its
+checkout on the way out would delete the working directory of the exchange still
+running in it, along with the `summary.json` the resume path reads; and because
+`run_id` is part of the exchange's job identity, the next pass would mint an
+identity no dedupe could recognise and start another exchange. So the run stays
+open across passes while the pipeline reports it unfinished, and is disposed of
+exactly once — when the pipeline reaches a terminal result, when the candidate is
+retired, or when the operation leaves the live set entirely. It hands
 the resulting `ProcessingResult` to `control/continuation_finalize.py`, the
 continuation's analogue of `control/publish_retry_finalize.py`: the finalizer
 announces the pull request on the board and *then* records the settlement, so a

@@ -31,6 +31,7 @@ from ..control.continuation_finalize import ContinuationFinalizer
 from ..control.continuation_in_flight import ContinuationsInFlight
 from ..control.continuation_live_truth import ContinuationLiveTruth
 from ..control.continuation_runner import ControlContinuationRunner
+from ..control.continuation_runs import ContinuationRuns
 from ..control.continuation_scheduling import ControlContinuation
 from ..control.control_operation_ownership import ControlOperationOwnership
 from ..ports.background_job import NullBackgroundJobRunner
@@ -348,6 +349,11 @@ class Orchestrator:
                     pr_pending_label=self.deps.label_manager.pr_pending,
                 ),
                 in_flight=in_flight,
+                # Also engine-lifetime: a run stays open across passes while
+                # the completion pipeline reports it unfinished, so a container
+                # rebuilt per call would forget every open run and mint a
+                # second one for work already in flight.
+                runs=ContinuationRuns(self.deps.worktree_manager),
                 jobs=self.deps.services.background_job_supervisor
                 or NullBackgroundJobRunner(),
                 repo_root=self.config.repo_root,

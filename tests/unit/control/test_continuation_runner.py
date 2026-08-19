@@ -24,6 +24,7 @@ from issue_orchestrator.adapters.sidecar_attempt_store import SidecarAttemptStor
 from issue_orchestrator.control.actions import AddLabelAction
 from issue_orchestrator.control.continuation_finalize import ContinuationFinalizer
 from issue_orchestrator.control.continuation_in_flight import ContinuationsInFlight
+from issue_orchestrator.control.continuation_runs import ContinuationRuns
 from issue_orchestrator.control.continuation_live_truth import (
     CONTINUATION_KIND,
     ContinuationReconciliation,
@@ -130,7 +131,13 @@ class FakeWorkingCopy:
 
 @dataclass
 class FakeSessionOutput:
-    """Allocates a real run directory under the worktree, as the real one does."""
+    """Allocates a real run directory under the worktree, as the real one does.
+
+    Each call mints a DISTINCT ``run_id``, as the real one does. That is what
+    makes "the same run was resumed" a testable claim rather than an accident
+    of the double: the exchange's job identity is built from ``run_id``, so a
+    second allocation is a second exchange.
+    """
 
     runs: list[SessionRunAssets] = field(default_factory=list)
     profiles: list[str | None] = field(default_factory=list)
@@ -144,11 +151,12 @@ class FakeSessionOutput:
         validation_profile: str | None = None,
         **kwargs: object,
     ) -> SessionRunAssets:
-        run_dir = worktree_path / ".issue-orchestrator" / "sessions" / "run-1"
+        run_id = f"run-{len(self.runs) + 1}"
+        run_dir = worktree_path / ".issue-orchestrator" / "sessions" / run_id
         run_dir.mkdir(parents=True, exist_ok=True)
         assets = SessionRunAssets.from_paths(
             session_name=session_name,
-            run_id="run-1",
+            run_id=run_id,
             worktree_path=worktree_path,
             run_dir=run_dir,
             terminal_recording_path=run_dir / "terminal.cast",
@@ -329,6 +337,11 @@ def _operation(
     )
 
 
+def _worktree_name_for(attempt: Attempt) -> str:
+    """The deterministic per-candidate checkout name the runner asks for."""
+    return f"continuation-{ISSUE_NUMBER}-{attempt.key.head_sha[:12]}"
+
+
 def _owned(*operations: LiveContinuation) -> ContinuationReconciliation:
     return ContinuationReconciliation(
         exclusions=ControlOperationExclusions(
@@ -357,6 +370,7 @@ class Harness:
     attempts: SidecarAttemptStore
     labels: FakeActionApplier
     in_flight: ContinuationsInFlight
+    runs: ContinuationRuns
 
 
 @pytest.fixture
@@ -372,6 +386,7 @@ def harness(tmp_path: Path) -> Harness:
     attempts = SidecarAttemptStore(tmp_path / "primary")
     labels = FakeActionApplier()
     in_flight = ContinuationsInFlight()
+    runs = ContinuationRuns(worktrees)  # type: ignore[arg-type]
     runner = ControlContinuationRunner(
         state=state,
         revalidation_route=revalidation,  # type: ignore[arg-type]
@@ -387,6 +402,7 @@ def harness(tmp_path: Path) -> Harness:
             pr_pending_label=PR_PENDING,
         ),
         in_flight=in_flight,
+        runs=runs,
         jobs=jobs,  # type: ignore[arg-type]
         repo_root=tmp_path / "primary",
     )
@@ -403,6 +419,7 @@ def harness(tmp_path: Path) -> Harness:
         attempts=attempts,
         labels=labels,
         in_flight=in_flight,
+        runs=runs,
     )
 
 
@@ -544,6 +561,7 @@ class TestActiveSessionRefusal:
                 pr_pending_label=PR_PENDING,
             ),
             in_flight=harness.in_flight,
+            runs=harness.runs,
             jobs=RefusingJobs(),  # type: ignore[arg-type]
             repo_root=tmp_path / "primary",
         )
@@ -980,3 +998,161 @@ class TestTheEngineKnowsWhatItIsExecuting:
 
         assert harness.completion.calls == []
         assert harness.revalidation.candidates == []
+
+
+class TestTheRunOutlivesThePass:
+    """``process`` is not necessarily finished when it returns (F3).
+
+    With a background supervisor wired — the only configuration in which this
+    runner executes at all, since its own job goes through the same supervisor —
+    the review exchange becomes its own job and the result says
+    ``review_exchange_deferred``. Deleting the worktree then deletes the working
+    directory of the exchange still running in it.
+    """
+
+    def _deferred(self, harness: Harness) -> Attempt:
+        attempt = _attempt(RequestedAction.CREATE_PR)
+        harness.attempts.update(attempt.key, lambda _current: attempt)
+        harness.completion.outcome = ProcessingOutcome(review_exchange_deferred=True)
+        return attempt
+
+    def test_a_deferred_exchange_keeps_its_worktree(self, harness: Harness) -> None:
+        attempt = self._deferred(harness)
+
+        harness.runner.advance(
+            _owned(_operation(attempt, ContinuationPhase.PASS_PENDING_REVIEW))
+        )
+
+        assert harness.worktrees.removed == []
+
+    def test_the_next_pass_resumes_the_same_run(self, harness: Harness) -> None:
+        """A fresh ``run_id`` is a second exchange: nothing dedupes on the old one."""
+        attempt = self._deferred(harness)
+        operation = _operation(attempt, ContinuationPhase.PASS_PENDING_REVIEW)
+
+        harness.runner.advance(_owned(operation))
+        harness.runner.advance(_owned(operation))
+
+        assert len(harness.completion.calls) == 2
+        assert len(harness.session_output.runs) == 1
+        assert harness.worktrees.created == [_worktree_name_for(attempt)]
+        run_ids = [call["run_assets"].run_id for call in harness.completion.calls]
+        assert run_ids == ["run-1", "run-1"]
+
+    def test_the_recorded_intent_is_written_once_for_the_run(
+        self, harness: Harness
+    ) -> None:
+        """A resumed pass leaves the record exactly as the pipeline left it."""
+        attempt = self._deferred(harness)
+        operation = _operation(attempt, ContinuationPhase.PASS_PENDING_REVIEW)
+
+        harness.runner.advance(_owned(operation))
+        first = harness.completion.records[0]
+        harness.runner.advance(_owned(operation))
+
+        assert harness.completion.records == [first, first]
+
+    def test_a_terminal_result_closes_the_run(self, harness: Harness) -> None:
+        attempt = _attempt(RequestedAction.CREATE_PR)
+        harness.attempts.update(attempt.key, lambda _current: attempt)
+        harness.completion.outcome = ProcessingOutcome(pr_url=PR_URL)
+        operation = _operation(attempt, ContinuationPhase.PASS_PENDING_REVIEW)
+
+        harness.runner.advance(_owned(operation))
+
+        assert harness.worktrees.removed == [
+            harness.session_output.runs[0].worktree_path
+        ]
+
+    def test_a_pass_after_the_run_closed_mints_a_new_one(
+        self, harness: Harness
+    ) -> None:
+        """Closing forgets the run; nothing rediscovers a disposed checkout."""
+        attempt = _attempt(RequestedAction.CREATE_PR)
+        harness.attempts.update(attempt.key, lambda _current: attempt)
+        harness.completion.outcome = ProcessingOutcome(pr_url=PR_URL)
+        operation = _operation(attempt, ContinuationPhase.PASS_PENDING_REVIEW)
+
+        harness.runner.advance(_owned(operation))
+        harness.runner.advance(_owned(operation))
+
+        assert len(harness.session_output.runs) == 2
+
+    def test_a_raised_pipeline_keeps_the_run_open(self, harness: Harness) -> None:
+        """An exception is not evidence the exchange stopped using the worktree."""
+        attempt = self._deferred(harness)
+
+        def _explode() -> None:
+            raise RuntimeError("the pipeline blew up")
+
+        harness.completion.during_process = _explode
+
+        with pytest.raises(RuntimeError, match="the pipeline blew up"):
+            harness.runner.advance(
+                _owned(_operation(attempt, ContinuationPhase.PASS_PENDING_REVIEW))
+            )
+
+        assert harness.worktrees.removed == []
+
+    def test_a_resumed_pass_does_not_re_verify_the_candidate_commit(
+        self, harness: Harness
+    ) -> None:
+        """The HEAD check belongs to opening a run, not to re-entering one.
+
+        An open run's worktree is where the exchange works, and a rework round
+        inside it commits — moving that HEAD past ``A`` is the exchange doing
+        its job, not the supersession the check exists to catch.
+        """
+        attempt = self._deferred(harness)
+        operation = _operation(attempt, ContinuationPhase.PASS_PENDING_REVIEW)
+        harness.runner.advance(_owned(operation))
+
+        harness.working_copy.head = SHA_A_PRIME
+        harness.runner.advance(_owned(operation))
+
+        assert len(harness.completion.calls) == 2
+        assert harness.worktrees.removed == []
+        stored = harness.attempts.for_key(attempt.key)
+        assert stored is not None
+        assert stored.continuation_descriptor is not None
+
+    def test_an_operation_that_leaves_live_truth_has_its_run_closed(
+        self, harness: Harness
+    ) -> None:
+        """A newer candidate supersedes the intent; nobody holds this run now."""
+        attempt = self._deferred(harness)
+        operation = _operation(attempt, ContinuationPhase.PASS_PENDING_REVIEW)
+        harness.runner.advance(_owned(operation))
+        assert harness.worktrees.removed == []
+
+        harness.runner.advance(
+            ContinuationReconciliation(
+                exclusions=ControlOperationExclusions(()), operations=()
+            )
+        )
+
+        assert harness.worktrees.removed == [
+            harness.session_output.runs[0].worktree_path
+        ]
+
+    def test_a_contended_operation_keeps_its_run(self, harness: Harness) -> None:
+        """Contended is live: another holder is running it, not nobody."""
+        attempt = self._deferred(harness)
+        operation = _operation(attempt, ContinuationPhase.PASS_PENDING_REVIEW)
+        harness.runner.advance(_owned(operation))
+
+        harness.runner.advance(
+            ContinuationReconciliation(
+                exclusions=ControlOperationExclusions(
+                    (
+                        ControlOperationOwnershipEntry(
+                            operation.key,
+                            ControlOperationOwnershipStatus.CONTENDED,
+                        ),
+                    )
+                ),
+                operations=(operation,),
+            )
+        )
+
+        assert harness.worktrees.removed == []

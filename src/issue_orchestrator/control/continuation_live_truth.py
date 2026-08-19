@@ -116,6 +116,16 @@ class ContinuationReconciliation:
     readable: bool = True
 
     @property
+    def keys(self) -> tuple[ControlOperationKey, ...]:
+        """Every operation this pass declared live, owned by us or not.
+
+        The set a holder of open run assets must compare against: a
+        ``CONTENDED`` operation is running somewhere and its run is not
+        abandoned, so "live" and not "ours" is the right question to ask.
+        """
+        return tuple(operation.key for operation in self.operations)
+
+    @property
     def owned(self) -> tuple[LiveContinuation, ...]:
         """The live operations THIS engine holds and may therefore act on.
 
