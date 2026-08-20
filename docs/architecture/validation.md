@@ -1083,6 +1083,19 @@ Target repositories can add repo-local runtime artifacts in
 [`docs/user/configuration.md`](../user/configuration.md#ignore-repo-local-runtime-artifacts)
 for the supported format and operator guidance.
 
+**These ignores classify by path, and one guard therefore does not use them.**
+`CandidateIntegrity` (`control/candidate_integrity.py`), the postflight that
+proves provisioning and continuation quick validation left the candidate alone,
+asks `WorkingCopy.list_dirty_files(..., "tracked")` and judges every path it
+gets back. Untracked runtime output — a suite's JUnit XML, a coverage database,
+a setup step's `.venv` — never reaches it, which is the concession
+[#153]'s exact-candidate contract makes. A *tracked* modification is the thing
+that contract forbids, so it stays visible there even when its path matches a
+built-in prefix or an operator pattern: dropping it by path would admit a
+preparation that mutated the candidate. `runtime-ignore` is unchanged
+everywhere it is consulted — the completion dirty guard, the pre-push check and
+agent `git status` — and this postflight simply asks a narrower question.
+
 ## Record Format
 
 Location: `.issue-orchestrator/validation/<kind>/<HEAD_SHA>.json`, where

@@ -1,7 +1,8 @@
 """Proving one operation left a candidate's commit and tracked content alone.
 
-Two reads of the same working copy — the commit ``HEAD`` stands at, and the
-dirt a guard would block on — taken before an operation and again afterwards.
+Two reads of the same working copy — the commit ``HEAD`` stands at, and which
+of the candidate's own tracked files are dirty — taken before an operation and
+again afterwards.
 The rule they enforce is one sentence: an operation the orchestrator runs
 *inside* a candidate's checkout may write untracked runtime state, and may not
 move ``HEAD`` or leave the candidate's tracked content modified.
@@ -16,17 +17,32 @@ two reads and the comparison have one owner, and each caller supplies only the
 name of the operation whose doing a change would be.
 
 **What counts as dirt is not decided here.** That question already has an owner
-— ``list_dirty_files(..., "tracked")`` for which dirt is the candidate's own
-content, and :func:`~..infra.runtime_artifacts.filter_runtime_managed_dirty_paths`
-for which of those paths are runtime metadata every dirty surface ignores — and
-this postflight asks it rather than answering it again. Reading raw
-``git status --porcelain`` here instead would have been a second, stricter rule
-under the same words: the operations run in these checkouts *emit files*
-(a suite's JUnit XML, a coverage database, a setup step's caches), so an
-untracked report a passing suite wrote would read as the candidate being
-altered, and an operator who declared that report in ``runtime-ignore``
-— documented as the way to stop repo-local runtime files blocking guards —
-would be refused here anyway.
+— :meth:`~..ports.working_copy.WorkingCopy.list_dirty_files` and its ``mode``
+vocabulary — and this postflight asks it for ``"tracked"`` rather than
+answering it again. Reading raw ``git status --porcelain`` here instead would
+have been a second, stricter rule under the same words: the operations run in
+these checkouts *emit files* (a suite's JUnit XML, a coverage database, a setup
+step's caches), so an untracked report a passing suite wrote would read as the
+candidate being altered, refusing every such run and blaming the candidate for
+a suite that passed.
+
+**Untracked-ness is the whole of that concession, and nothing narrows the
+answer further.** The dirty guards an agent meets — the completion check, the
+pre-push check — additionally drop runtime metadata through
+:func:`~..infra.runtime_artifacts.filter_runtime_managed_dirty_paths`, which
+matches by path alone and is documented as applying "regardless of
+tracked/untracked status": the built-in ``.issue-orchestrator/`` and
+``.claude/`` prefixes plus the operator's ``runtime-ignore`` patterns. Passing
+a tracked-only list through that filter would discard precisely what this
+postflight exists to catch — a *tracked* candidate file whose path happens to
+match one of those patterns, modified by the operation, would leave this
+reporting no change, and the preparation would be admitted and the reviewer
+handed evidence produced by a run that mutated the candidate. ``runtime-ignore``
+keeps its meaning exactly where it was given one, over untracked runtime state
+at the guards that ask about untracked state. The candidate's tracked content
+is a different question, and #153's exact-candidate contract answers it the
+same way for every path: provisioning may create untracked runtime state, and
+may not leave tracked candidate modifications.
 
 The check is asymmetric on purpose. Moving ``HEAD`` is always the operation's
 doing. A path that was ALREADY dirty stays a question this cannot answer, so
@@ -41,7 +57,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
-from ..infra.runtime_artifacts import filter_runtime_managed_dirty_paths
 from ..ports.working_copy import WorkingCopy
 
 CANDIDATE_DIRT_MODE = "tracked"
@@ -49,7 +64,10 @@ CANDIDATE_DIRT_MODE = "tracked"
 
 Tracked content, staged or not. Untracked files are excluded at the source
 rather than filtered afterwards, because "may write untracked runtime state" is
-the rule itself and not a concession to a list of known filenames.
+the rule itself and not a concession to a list of known filenames — and because
+a filter applied afterwards would judge by path and so would drop tracked
+modifications too (see the module docstring). What this mode returns is what
+this postflight judges, in full.
 """
 
 _DIRT_PREVIEW = 5
@@ -86,7 +104,7 @@ class CandidateIntegrity:
         self._operation = operation
 
     def checkpoint(self, worktree_path: Path) -> CandidateCheckpoint:
-        """Read the candidate's commit and blocking dirt right now."""
+        """Read the candidate's commit and its dirty tracked content right now."""
         return CandidateCheckpoint(
             head_sha=self._working_copy.get_head_sha(worktree_path),
             dirty_paths=self._candidate_dirt(worktree_path),
@@ -133,11 +151,17 @@ class CandidateIntegrity:
         return None
 
     def _candidate_dirt(self, worktree_path: Path) -> tuple[str, ...] | None:
-        """Ask the existing owners which paths a guard would block on."""
+        """Ask the existing owner which of the candidate's own content is dirty.
+
+        Sorted so the two reads are comparable and a returned message names
+        paths in a stable order; otherwise unmodified. Every path the mode
+        reports is judged — see the module docstring for why no runtime-path
+        classification is applied on top of it.
+        """
         dirty = self._working_copy.list_dirty_files(worktree_path, CANDIDATE_DIRT_MODE)
         if dirty is None:
             return None
-        return tuple(sorted(filter_runtime_managed_dirty_paths(dirty, worktree_path)))
+        return tuple(sorted(dirty))
 
 
 def _summarise(paths: tuple[str, ...]) -> str:

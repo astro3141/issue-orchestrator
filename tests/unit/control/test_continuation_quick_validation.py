@@ -479,14 +479,19 @@ class TestThePreparationMustNotAlterTheCandidate:
         assert isinstance(prepared, PreparedQuickValidation)
         assert prepared.record_path is not None
 
-    def test_a_gate_that_touches_an_operator_declared_runtime_path_is_not_refused(
+    def test_a_tracked_edit_to_an_operator_declared_runtime_path_is_refused(
         self, harness: Harness
     ) -> None:
-        """``runtime-ignore`` means the same thing here as at every other guard.
+        """``runtime-ignore`` classifies untracked state, and classifies by path.
 
-        The operator's declaration is what stops repo-local runtime files
-        blocking the completion guard and the pre-push check; a postflight with
-        its own private answer would refuse the run anyway.
+        The completion guard and the pre-push check drop a runtime-ignored path
+        on the strength of the path alone. Applying that classification to the
+        candidate's *tracked* content would let a gate edit a tracked file whose
+        path happens to match an operator pattern and leave this postflight
+        reporting no change — preparation admitted, and a reviewer handed
+        evidence produced by a run that mutated the candidate. The operator's
+        declaration keeps its meaning over untracked runtime state; it is not a
+        way to make tracked candidate content invisible here.
         """
         runtime_ignore = harness.worktree / ".issue-orchestrator" / "runtime-ignore"
         runtime_ignore.parent.mkdir(parents=True, exist_ok=True)
@@ -499,7 +504,55 @@ class TestThePreparationMustNotAlterTheCandidate:
 
         prepared = _prepare(harness)
 
+        assert isinstance(prepared, RefusedQuickValidation)
+        assert "modified tracked content" in prepared.reason
+        assert "build/test-results/report.xml" in prepared.reason
+
+    def test_the_same_runtime_path_left_untracked_still_produces_evidence(
+        self, harness: Harness
+    ) -> None:
+        """The other half of the pair above: tracked-ness is what decides.
+
+        Same path, same ``runtime-ignore`` declaration, written by the gate as
+        new untracked output rather than as an edit to the candidate's tracked
+        content — and this is ordinary suite output, so the run proceeds. The
+        refusal above is not a narrowing of what a suite may emit.
+        """
+        runtime_ignore = harness.worktree / ".issue-orchestrator" / "runtime-ignore"
+        runtime_ignore.parent.mkdir(parents=True, exist_ok=True)
+        runtime_ignore.write_text("build/test-results/\n", encoding="utf-8")
+        harness.commands.while_running = lambda: setattr(
+            harness.working_copy,
+            "untracked_dirt",
+            ("build/test-results/report.xml",),
+        )
+
+        prepared = _prepare(harness)
+
         assert isinstance(prepared, PreparedQuickValidation)
+
+    def test_a_tracked_edit_under_a_built_in_runtime_prefix_is_refused(
+        self, harness: Harness
+    ) -> None:
+        """The built-in half of the same classification is declined too.
+
+        ``.issue-orchestrator/`` is a runtime-metadata prefix every dirty guard
+        hides — and the orchestrator's own repository tracks files beneath it
+        (``.issue-orchestrator/config/``). No ``runtime-ignore`` file has to
+        exist for that to matter, so this half of the filter is pinned
+        separately from the operator-declared one.
+        """
+        harness.commands.while_running = lambda: setattr(
+            harness.working_copy,
+            "tracked_dirt",
+            (".issue-orchestrator/config/modes/default/main.yaml",),
+        )
+
+        prepared = _prepare(harness)
+
+        assert isinstance(prepared, RefusedQuickValidation)
+        assert "modified tracked content" in prepared.reason
+        assert ".issue-orchestrator/config/modes/default/main.yaml" in prepared.reason
 
     def test_a_checkout_whose_dirt_cannot_be_read_is_refused(
         self, harness: Harness
