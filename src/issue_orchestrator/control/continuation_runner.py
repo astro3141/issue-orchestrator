@@ -501,7 +501,7 @@ class ControlContinuationRunner:
                 operation.key,
             )
             return True
-        binding = self._review_verdicts.for_run(completed.run_assets.run_dir)
+        binding = self._review_verdicts.for_exchange(completed.run_assets)
         if binding is None:
             logger.warning(
                 "[CONTINUATION] %s settles nothing: its review exchange"

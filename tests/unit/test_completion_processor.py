@@ -5331,7 +5331,10 @@ class TestCompletionProcessorPublishGate:
                 ),
                 None,
                 None,
-                False,
+                # ``completed_exchange``: no exchange concluded, which is
+                # ``None`` and never ``False`` — the builder reads this slot to
+                # decide whether a review exchange completed at all.
+                None,
                 False,
                 False,
             ),
@@ -5451,7 +5454,10 @@ class TestCompletionProcessorPublishGate:
                 ),
                 None,
                 None,
-                False,
+                # ``completed_exchange``: no exchange concluded, which is
+                # ``None`` and never ``False`` — the builder reads this slot to
+                # decide whether a review exchange completed at all.
+                None,
                 False,
                 False,
             ),

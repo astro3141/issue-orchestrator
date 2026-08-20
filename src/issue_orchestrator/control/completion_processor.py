@@ -117,6 +117,7 @@ from .completion_types import (
 )
 from .pre_publish_gate import PrePublishGate, PrePublishGateResult
 from .review_exchange_contracts import ReviewExchangeCanceller
+from .review_exchange_modes import is_final_review_exchange_mode
 from .review_cache_boundary import review_cache_boundary_started_at
 from .review_exchange_pr_comment import (
     GITHUB_COMMENT_BODY_LIMIT,
@@ -1482,7 +1483,9 @@ class CompletionProcessor:
                 review_exchange_halted=True,
             )
 
-        if deferred or (exchange_mode in {"via-mcp", "via-local-loop"} and exchange_result):
+        if deferred or (
+            is_final_review_exchange_mode(exchange_mode) and exchange_result
+        ):
             resumed_actions = [
                 "Validation failed; returned to coder rework via review exchange",
                 *reroute_actions,
@@ -2349,7 +2352,7 @@ class CompletionProcessor:
 
         # Create the PR
         logger.info("Creating PR for #%d: branch=%s", issue_number, branch)
-        draft_pr = exchange_mode not in {"via-mcp", "via-local-loop"}
+        draft_pr = not is_final_review_exchange_mode(exchange_mode)
         pr = create_pr_with_collision_handling(
             pr_adapter=self.pr_adapter,
             git_adapter=self.git_adapter,

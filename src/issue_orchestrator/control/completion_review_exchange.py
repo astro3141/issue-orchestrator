@@ -28,6 +28,7 @@ from .review_exchange_cache_resolution import (
     ReviewExchangeCacheResolver,
 )
 from .review_exchange_contracts import ReviewExchangeCanceller
+from .review_exchange_modes import is_final_review_exchange_mode
 from .review_publish_pipeline import resolve_review_publish_pipeline
 
 
@@ -334,9 +335,7 @@ class CompletionReviewExchange:
         exchange_mode: str | None,
         exchange_result: ReviewExchangeOutcome | None,
     ) -> bool:
-        return (
-            exchange_mode in {"via-mcp", "via-local-loop"} and exchange_result is None
-        )
+        return is_final_review_exchange_mode(exchange_mode) and exchange_result is None
 
     def completed_review_exchange(
         self,
@@ -363,7 +362,7 @@ class CompletionReviewExchange:
         an exchange with an owner whose binding is missing, and only the owner
         can be asked about it.
         """
-        if exchange_mode not in {"via-mcp", "via-local-loop"} or exchange_result is None:
+        if not is_final_review_exchange_mode(exchange_mode) or exchange_result is None:
             return None
         return CompletedReviewExchange(
             mode=exchange_mode,
@@ -470,7 +469,7 @@ class CompletionReviewExchange:
         except ValueError as exc:
             errors.append(f"{REVIEW_EXCHANGE_ERROR_PREFIX} {exc}")
             return None, None, True, False
-        if exchange_mode not in {"via-mcp", "via-local-loop"}:
+        if not is_final_review_exchange_mode(exchange_mode):
             return exchange_mode, None, False, False
         if not session_name:
             errors.append(
@@ -1254,7 +1253,7 @@ class CompletionReviewExchange:
                     agent_label,
                 )
                 return None
-        if mode in {"via-mcp", "via-local-loop"}:
+        if is_final_review_exchange_mode(mode):
             agent_label = self.require_review_exchange_agent_label(agent_label, mode)
             if mode == "via-mcp":
                 from ..infra.review_exchange_registry import supports_mcp_pair

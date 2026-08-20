@@ -427,27 +427,32 @@ class FakeActionApplier:
         return self.result
 
 
-@dataclass
+@dataclass(slots=True)
 class FakeVerdicts:
     """Bindings, filed under the run directory that actually owns each one.
 
     Keyed rather than constant on purpose: a fake that answered the same
-    binding for every directory could not tell a reader asking the OWNING
+    binding for every exchange could not tell a reader asking the OWNING
     exchange run from one asking the continuation's own run, which is the whole
     of #178. ``raises`` stands in for a corrupt artifact, which the real port
     raises on rather than reading as absent.
+
+    ``slots=True`` so an arrangement that stocks a field this fake does not
+    have fails where it is written, instead of silently arranging nothing.
     """
 
     by_run_dir: dict[Path, BoundReviewVerdict] = field(default_factory=dict)
     raises: dict[Path, Exception] = field(default_factory=dict)
     asked: list[Path] = field(default_factory=list)
 
-    def for_run(self, run_dir: Path) -> BoundReviewVerdict | None:
-        self.asked.append(run_dir)
-        error = self.raises.get(run_dir)
+    def for_exchange(
+        self, assets: ReviewExchangeRunAssets
+    ) -> BoundReviewVerdict | None:
+        self.asked.append(assets.run_dir)
+        error = self.raises.get(assets.run_dir)
         if error is not None:
             raise error
-        return self.by_run_dir.get(run_dir)
+        return self.by_run_dir.get(assets.run_dir)
 
 
 @dataclass
@@ -1255,7 +1260,7 @@ class TestDurableReviewVerdict:
             encoding="utf-8",
         )
 
-        assert RunReviewVerdictBindings().for_run(owner.run_dir) is None
+        assert RunReviewVerdictBindings().for_exchange(owner) is None
 
     def test_re_entry_after_promotion_and_before_settlement_is_idempotent(
         self, harness: Harness
@@ -2037,16 +2042,18 @@ class TestAnUnrunnableWorktreeOpensNoRun:
         assert latest.head_sha == SHA_A
 
     def test_no_verdict_or_settlement_is_fabricated(self, harness: Harness) -> None:
+        """An available approval is not enough: nothing asked, nothing recorded.
+
+        The binding is stocked under the run that would own it, so the refusal
+        below is about the run never opening — not about there being no verdict
+        anywhere to find.
+        """
         harness.commands.failing = True
-        harness.verdicts.binding = BoundReviewVerdict(
-            verdict=ReviewVerdictOutcome.APPROVED,
-            reviewed_sha=SHA_A,
-            decided_at="2026-08-19T01:00:00Z",
-            completed_rounds=1,
-        )
+        harness.verdicts.by_run_dir[_review_run(harness).run_dir] = _approval(SHA_A)
 
         stored = self._unrunnable(harness)
 
+        assert harness.verdicts.asked == []
         assert stored.continuation_review_verdict is None
         assert stored.continuation_settlement is None
         assert harness.labels.applied == []

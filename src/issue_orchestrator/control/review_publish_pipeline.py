@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from typing import Protocol, Sequence
 
 from ..domain.models import RequestedAction
+from .review_exchange_modes import is_final_review_exchange_mode
 
 
 @dataclass(frozen=True)
@@ -52,6 +53,6 @@ class LocalLoopPublishPipeline:
 
 def resolve_review_publish_pipeline(exchange_mode: str | None) -> ReviewPublishPipeline:
     """Resolve strategy by configured review exchange mode."""
-    if exchange_mode in {"via-local-loop", "via-mcp"}:
+    if is_final_review_exchange_mode(exchange_mode):
         return LocalLoopPublishPipeline()
     return DraftPrPublishPipeline()
