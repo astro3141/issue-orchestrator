@@ -226,7 +226,7 @@ def _check_validation_record_path(value: Any) -> str | None:
     """Static validation for ``validation_record_path``.
 
     The value is produced by agent-side validation machinery (see
-    ``AgentGate.run`` in ``control/validation.py``, which currently
+    ``AgentGate.run`` in ``control/agent_gate.py``, which currently
     records ``str(self.store.get_record_path(head_sha))`` — an
     absolute path rooted at the worktree). We can't meaningfully
     enforce relative-only here without breaking the orchestrator's

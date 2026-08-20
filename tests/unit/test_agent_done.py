@@ -40,7 +40,7 @@ from issue_orchestrator.entrypoints.cli_tools.agent_done import (
     record_validation_artifacts,
     QuickValidationSelection,
 )
-from issue_orchestrator.control.validation import AgentGateResult
+from issue_orchestrator.control.agent_gate import AgentGateResult
 from issue_orchestrator.infra.validation_profiles import DEFAULT_VALIDATION_PROFILE
 from issue_orchestrator.entrypoints.cli_tools.coding_done import (
     main as coding_done_main,

@@ -6,14 +6,15 @@ that already exist rather than reimplementing what they decide:
 
 ======================================  =====================================
 same-SHA admission, allowance, gate     :class:`~.publication_revalidation.PublicationRevalidation` (#139)
-exact-commit materialisation            the issue's own branch, verified
-making that checkout runnable           :class:`~.worktree_runnability.WorktreeRunnability` (#153)
+opening a run at exactly A              :class:`~.continuation_run_open.ContinuationRunOpener` (#149, #153, #173)
 reviewer-first exchange, PR creation    :class:`~.completion_processor.CompletionProcessor`
 settlement of a discharged intent       :class:`~.continuation_finalize.ContinuationFinalizer`
 ownership and exclusion                 :class:`~.control_operation_ownership.ControlOperationOwnership` (#146)
 ======================================  =====================================
 
-Six rules keep it from becoming a second lifecycle.
+What is left here is the decision of *which* owned operation to advance now,
+and the re-entry of a run that already exists into the completion pipeline.
+Six rules keep that from becoming a second lifecycle.
 
 **It never decides admission.** A ``RETRY_PENDING`` operation is handed whole
 to #139, which re-checks the contract, the allowance and the reserve-before-
@@ -23,9 +24,13 @@ predicate only says a retry is *pending*, and #139 alone says whether one may
 start. There is no second admission predicate and no second allowance.
 
 **It never fabricates intent.** The completion record it hands the completion
-owner is written from the descriptor, field for field. A candidate with no
-descriptor never reaches here: it is not live, so it is never owned, so it is
-never advanced.
+owner is written from the descriptor, field for field — by the opener, which
+is where every field of it comes from. A candidate with no descriptor never
+reaches here: it is not live, so it is never owned, so it is never advanced.
+The one field the descriptor cannot supply — ``validation_record_path``, which
+the ordinary path's coder turn fills in — is not invented either: it names a
+record the configured quick gate has just written into this run's own
+directory, and a run whose gate produced no such record never opens (#173).
 
 **It never races ordinary work.** Ownership already excludes the issue from the
 queue, but an issue whose session is still running was never the continuation's
@@ -67,26 +72,23 @@ A supersession the durable record has not yet noticed is retired rather than
 retried: if the issue's branch no longer points at the candidate, the intent
 recorded for it is cleared, which drops the operation out of live truth on the
 next pass and releases the lease. That is the same supersession rule the
-descriptor writer applies, reached from the other side.
+descriptor writer applies, reached from the other side — and it is decided
+where the branch is read, in the opener, not here.
 """
 
 from __future__ import annotations
 
-import json
 import logging
 from collections.abc import Callable
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol
 
-from ..domain.attempt import Attempt
 from ..domain.continuation_phase import ContinuationPhase
-from ..domain.models import CompletionOutcome, CompletionRecord, get_completion_path
 from .continuation_live_truth import LiveContinuation
+from .continuation_run_open import ContinuationRunOpener
 from .continuation_runs import ContinuationRun
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
-    from ..domain.continuation_descriptor import ContinuationDescriptor
     from ..domain.issue_key import IssueKey
     from ..domain.models import OrchestratorState
     from ..domain.session_run import SessionRunAssets
@@ -99,6 +101,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from .continuation_finalize import ContinuationFinalizer
     from .continuation_in_flight import ContinuationsInFlight
     from .continuation_live_truth import ContinuationReconciliation
+    from .continuation_quick_validation import ContinuationQuickValidation
     from .continuation_runs import ContinuationRuns
     from .publication_revalidation import PublicationRevalidation
     from .worktree_runnability import WorktreeRunnability
@@ -158,6 +161,7 @@ class ControlContinuationRunner:
         worktrees: "WorktreeManager",
         working_copy: "WorkingCopy",
         runnability: "WorktreeRunnability",
+        quick_validation: "ContinuationQuickValidation",
         session_output: "SessionOutput",
         completion_processor: ContinuationCompletionOwner,
         review_verdicts: "ReviewVerdictBindings",
@@ -170,14 +174,21 @@ class ControlContinuationRunner:
         self._state = state
         self._revalidation = revalidation_route
         self._attempts = attempts
-        self._worktrees = worktrees
-        self._working_copy = working_copy
-        # The provisioning CORE, not the launch provisioner: the continuation's
-        # bound is #149's run allowance, already spent before the checkout
-        # existed, and the launch provisioner's consecutive-failure ledger and
-        # ``needs-human`` escalation would be a second one over the same run.
-        self._runnability = runnability
-        self._session_output = session_output
+        # Opening a run is its own subject: an ordered sequence of owners in
+        # which every refusal costs the same thing. Composed here from the
+        # collaborators this runner is already given, rather than wired
+        # separately, because the two are one deployment decision — a runner
+        # that could not open a run would have nothing to advance.
+        self._opener = ContinuationRunOpener(
+            attempts=attempts,
+            worktrees=worktrees,
+            working_copy=working_copy,
+            runnability=runnability,
+            quick_validation=quick_validation,
+            session_output=session_output,
+            runs=runs,
+            repo_root=repo_root,
+        )
         self._completion_processor = completion_processor
         self._review_verdicts = review_verdicts
         self._finalizer = finalizer
@@ -190,7 +201,6 @@ class ControlContinuationRunner:
         # pipeline needs to finish. See :mod:`.continuation_runs`.
         self._runs = runs
         self._jobs = jobs
-        self._repo_root = repo_root
         # What each LIVE phase does, decided in one table rather than by a
         # branch chain at the call site. Only live phases appear: a settled or
         # exhausted operation is never owned, so it never reaches here. A new
@@ -379,232 +389,11 @@ class ControlContinuationRunner:
             return
         run = self._runs.resume(operation.key)
         if run is None:
-            run = self._open_run(operation, descriptor)
+            run = self._opener.open(operation, descriptor)
             if run is None:
                 return
         if self._process(operation, run):
             self._runs.close(operation.key)
-
-    def _open_run(
-        self, operation: LiveContinuation, descriptor: "ContinuationDescriptor"
-    ) -> ContinuationRun | None:
-        """Mint this operation's run: its worktree, its environment, its intent.
-
-        Allocated once and registered with the owner immediately, so from the
-        moment the checkout exists there is exactly one place that knows about
-        it and exactly one place that will dispose of it.
-
-        The order is::
-
-            reserve the run allowance
-                -> materialize the checkout at exactly A
-                -> make it runnable, candidate unchanged
-                -> allocate run assets, write the intent, register the run
-
-        The allowance is spent FIRST, before the checkout and long before the
-        exchange, in the start-budget style #139 chose and for the reason it
-        gives: a run interrupted anywhere leaves the allowance spent rather than
-        refunding itself. Refunding would make the bound mean "one per crash",
-        and this is the bound on the most expensive work in the system.
-
-        Provisioning follows materialisation and precedes every asset the
-        pipeline keys work to: a run whose worktree is not runnable must not
-        exist, because the run directory, the completion record and the
-        exchange's ``run_id`` are what re-enter the pipeline on the next pass.
-
-        The run scaffold freezes the profile *the descriptor recorded*, for the
-        reason #139's does: a candidate evaluated under one contract is
-        continued under that contract, whatever the current default is bound to
-        today. The publication gate therefore reuses the passing record for this
-        exact HEAD/command/profile instead of re-running it.
-        """
-        if not self._reserve_run(operation):
-            return None
-        materialized = self._materialize(operation)
-        if materialized is None:
-            return None
-        worktree, agent_label = materialized
-        if not self._make_runnable(operation, worktree):
-            return None
-        assets = self._session_output.start_run(
-            worktree_path=worktree,
-            session_name=_worktree_name(operation),
-            issue_number=operation.issue.number,
-            agent_label=agent_label,
-            validation_profile=descriptor.profile,
-        )
-        completion_path = get_completion_path(
-            agent_label, run_dir=assets.run_dir.name
-        )
-        # Written once, with the run. A resumed pass leaves the record exactly
-        # as the pipeline left it: it is deliberately still on disk, and the
-        # exchange running against it was started from that identity.
-        _write_completion_record(
-            worktree / completion_path,
-            descriptor,
-            session_name=assets.identity.session_name,
-        )
-        run = ContinuationRun(
-            worktree=worktree,
-            agent_label=agent_label,
-            assets=assets,
-            completion_path=completion_path,
-        )
-        self._runs.opened(operation.key, run)
-        return run
-
-    def _reserve_run(self, operation: LiveContinuation) -> bool:
-        """Spend one of this candidate's continuation-run allowances.
-
-        The ceiling itself belongs to :class:`~..domain.attempt.Attempt`, which
-        re-asserts it on the write — so this neither reads the counter nor
-        compares it, exactly as the retry path leaves admission to #139. A
-        refusal here means the phase predicate and the durable record disagreed
-        about the allowance, which is the interleaving the store settles.
-
-        Returns:
-            Whether a run may now be opened. ``False`` is a refusal to start,
-            never a degraded start: the next reconciliation derives
-            ``RUNS_EXHAUSTED`` from the same counter and hands the candidate
-            back to ordinary rework.
-        """
-        try:
-            reserved = self._attempts.update(
-                operation.attempt.key,
-                lambda attempt: attempt.with_continuation_run_reserved(),
-            )
-        except (OSError, ValueError) as exc:
-            logger.warning(
-                "[CONTINUATION] %s opens no run: allowance could not be"
-                " reserved: %s",
-                operation.key,
-                exc,
-            )
-            return False
-        logger.info(
-            "[CONTINUATION] %s reserved continuation run %d",
-            operation.key,
-            reserved.continuation_runs_used,
-        )
-        return True
-
-    def _materialize(self, operation: LiveContinuation) -> tuple[Path, str] | None:
-        """A disposable worktree standing at exactly this candidate's commit.
-
-        On the issue's own branch rather than a detached checkout, because the
-        pull request the continuation may create names a branch as its head and
-        must name one whose tip *is* ``A``. The HEAD is verified after checkout
-        rather than assumed: "the branch is probably still there" is exactly
-        the assumption that would open a PR against other work.
-
-        A branch that has moved past the candidate is supersession. The
-        recorded intent is retired, which drops the operation from live truth
-        on the next pass and releases the lease — the same rule the descriptor
-        writer applies when a newer candidate files its own intent.
-        """
-        # The board's own accessor, not a second scan of its labels: which
-        # lane an issue is in is the board's fact and has one reader.
-        agent_lane = operation.issue.agent_type
-        if agent_lane is None:
-            logger.warning(
-                "[CONTINUATION] refusing %s: the issue names no agent lane, so"
-                " no reviewer pairing can be resolved",
-                operation.key,
-            )
-            return None
-        try:
-            info = self._worktrees.create(
-                self._repo_root,
-                operation.issue.number,
-                operation.issue.title,
-                worktree_name=_worktree_name(operation),
-            )
-        except (OSError, RuntimeError, ValueError) as exc:
-            # Narrow on purpose. These are the failures a checkout can have;
-            # anything else is a defect, and swallowing it here would turn a
-            # broken continuation into a silently idle one that still holds the
-            # issue. An escaped error is recorded by the job runner instead,
-            # and the durable facts it did not change derive the same phase
-            # next tick.
-            logger.warning(
-                "[CONTINUATION] %s could not be materialized: %s",
-                operation.key,
-                exc,
-            )
-            return None
-        head = self._working_copy.get_head_sha(info.path)
-        if head is None or head.strip().lower() != operation.key.head_sha:
-            logger.info(
-                "[CONTINUATION] retiring %s: the branch now stands at %s",
-                operation.key,
-                (head or "unknown")[:12],
-            )
-            self._discard_checkout(info.path)
-            self._retire(operation)
-            return None
-        return info.path, agent_lane
-
-    def _discard_checkout(self, worktree: Path) -> None:
-        """Dispose of a checkout no run owns yet.
-
-        Every pre-run refusal disposes HERE rather than through
-        :class:`~.continuation_runs.ContinuationRuns`, because the run does not
-        exist: nothing else knows this checkout is there, and the name is
-        deterministic per candidate, so one left behind would block every later
-        pass at ``git worktree add``.
-
-        After a run is opened the rule inverts — the run owner disposes, and
-        only when the completion pipeline says the work is finished — so this is
-        reachable only from the refusals above ``_open_run``'s registration.
-        """
-        self._worktrees.remove_checkout(worktree, force=True)
-
-    def _make_runnable(self, operation: LiveContinuation, worktree: Path) -> bool:
-        """Make the continuation's CODER worktree runnable, or open no run.
-
-        The checkout this run materialises is not a read-only carrier for a
-        cached verdict. It is handed to the persistent review exchange as the
-        coder's worktree, and a ``CHANGES_REQUESTED`` round asks that coder to
-        edit and validate *in it* — so it needs the same runtime environment
-        every other agent worktree gets, or the round dies on a toolchain that
-        was never installed and the failure is attributed to the candidate
-        (#48, #153).
-
-        The recipe is the operator's own (``Config.setup_worktree``, via
-        :class:`~.worktree_runnability.WorktreeRunnability`); nothing is
-        hard-coded or copied here. The same core also proves what
-        materialisation established is still true afterwards: provisioning may
-        write untracked runtime state into the worktree, and may not move
-        ``HEAD`` off ``A`` or leave the candidate's tracked content modified.
-
-        The sibling REVIEWER worktree keeps its own policy
-        (:mod:`~..execution.reviewer_worktree`): deliberately unprovisioned,
-        guarded where the provider supports it. Nothing here reaches it.
-
-        Failure opens no run at all, and the checkout is discarded through the
-        one pre-run disposal (:meth:`_discard_checkout`). The reservation stays
-        spent: it is a start budget, and refunding it would turn a repeatably
-        broken environment into an unbounded supply of continuation runs. A
-        later pass may open another run only while #149's existing allowance
-        lasts, and once it is gone the ordinary ``RUNS_EXHAUSTED`` derivation
-        hands the candidate back to rework — where the launch provisioner
-        escalates the same broken environment to ``needs-human``. There is no
-        second counter and no escalation of its own.
-
-        Returns:
-            Whether the worktree is runnable and the run may be opened.
-        """
-        unrunnable = self._runnability.make_runnable(worktree)
-        if unrunnable is None:
-            return True
-        logger.warning(
-            "[CONTINUATION] %s opens no run: its coder worktree could not be"
-            " made runnable: %s",
-            operation.key,
-            unrunnable,
-        )
-        self._discard_checkout(worktree)
-        return False
 
     def _process(self, operation: LiveContinuation, run: ContinuationRun) -> bool:
         """Re-enter the completion pipeline for ``run``, and say whether it ended.
@@ -693,56 +482,10 @@ class ControlContinuationRunner:
             binding.verdict.value,
         )
 
-    def _retire(self, operation: LiveContinuation) -> None:
-        """Clear the recorded intent for a candidate the branch has left behind.
-
-        Any run the operation held goes with it. Retirement is reached while
-        OPENING a run, so today there is never one to close — but retiring drops
-        the operation out of live truth, and an operation nothing will advance
-        again is one nothing else would close a run for. The disposal belongs
-        with the decision that stranded it rather than with the caller that
-        happens to make it today.
-        """
-        self._runs.close(operation.key)
-        self._attempts.update(
-            operation.attempt.key, Attempt.without_continuation_descriptor
-        )
-
 
 def _already_executing(operation: LiveContinuation) -> None:
     """Start nothing: this engine already has a run in flight for ``operation``."""
     logger.debug("[CONTINUATION] %s is already executing", operation.key)
-
-
-def _worktree_name(operation: LiveContinuation) -> str:
-    """A run-scoped name that cannot collide with the issue's own worktree."""
-    return f"continuation-{operation.issue.number}-{operation.key.head_sha[:12]}"
-
-
-def _write_completion_record(
-    path: Path,
-    descriptor: "ContinuationDescriptor",
-    *,
-    session_name: str,
-) -> None:
-    """Put the recorded intent where the completion owner reads intent.
-
-    Every field the agent owned is copied from the descriptor; every field the
-    ORCHESTRATOR owns (the session identity, the timestamp) is supplied by the
-    orchestrator. Nothing is invented in between: ``summary`` names this
-    replay for a human reading the record, and carries no claim about the work.
-    """
-    record = CompletionRecord(
-        session_id=session_name,
-        timestamp=datetime.now(timezone.utc).isoformat(),
-        outcome=CompletionOutcome.COMPLETED,
-        summary="Recorded continuation intent replayed by the orchestrator",
-        requested_actions=list(descriptor.requested_actions),
-        implementation=descriptor.implementation or None,
-        problems=descriptor.problems or None,
-    )
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(record.to_dict(), indent=2), encoding="utf-8")
 
 
 __all__ = ["CONTINUATION_JOB_PREFIX", "ControlContinuationRunner"]

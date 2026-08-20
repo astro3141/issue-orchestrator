@@ -44,7 +44,7 @@ decides what the gate decided.
 The receipt states *what* the gate decided. A run that FAILS also has to leave
 *why*, and for the same reason: its stdout and stderr are in the run directory
 that cleanup reaps. So a failing run's output is written to a durable
-destination as well (#94) — see :mod:`.publish_gate_diagnostics`. The two are
+destination as well (#94) — see :mod:`.gate_failure_diagnostics`. The two are
 deliberately asymmetric in what they authorize: the receipt is read by
 admission, the diagnostic is read by people.
 """
@@ -68,9 +68,9 @@ from ..ports import CommandRunner, WorkingCopy
 from ..ports.attempt_store import AttemptStore
 from ..ports.session_output import SessionOutput, ValidationRecord
 from ..ports.validation_attempt_key_factory import ValidationAttemptKeyFactory
-from .publish_gate_diagnostics import (
+from .gate_failure_diagnostics import (
     CandidateGateDiagnostics,
-    PublishGateDiagnostics,
+    GateFailureDiagnostics,
 )
 from .validation import GateEvidence, ValidationGate
 
@@ -192,7 +192,7 @@ def build_publication_gate(
         working_copy=working_copy,
         attempts=attempt_store,
         attempt_keys=attempt_keys,
-        diagnostics=PublishGateDiagnostics(repo_root),
+        diagnostics=GateFailureDiagnostics(repo_root),
     )
 
 
@@ -235,7 +235,7 @@ class PublicationGate:
         working_copy: WorkingCopy,
         attempts: AttemptStore,
         attempt_keys: ValidationAttemptKeyFactory,
-        diagnostics: PublishGateDiagnostics,
+        diagnostics: GateFailureDiagnostics,
     ) -> None:
         self._contracts = contracts
         self._command_runner = command_runner

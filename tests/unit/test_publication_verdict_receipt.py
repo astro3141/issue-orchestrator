@@ -32,8 +32,8 @@ from issue_orchestrator.control.publication_gate import (
     PublicationGate,
     RunValidationContracts,
 )
-from issue_orchestrator.control.publish_gate_diagnostics import (
-    PublishGateDiagnostics,
+from issue_orchestrator.control.gate_failure_diagnostics import (
+    GateFailureDiagnostics,
 )
 from issue_orchestrator.domain.attempt import Attempt, AttemptKey
 from issue_orchestrator.domain.execution_identity import (
@@ -148,7 +148,7 @@ def _gate(
         attempt_keys=StubAttemptKeys(),
         # Durable failure output lands in the same root the receipts do (#94);
         # these proofs are about the receipt, not about that artefact.
-        diagnostics=PublishGateDiagnostics(repo_root),
+        diagnostics=GateFailureDiagnostics(repo_root),
     )
 
 

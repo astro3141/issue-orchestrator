@@ -178,16 +178,30 @@ is that loss, observed twice on one issue — once 14 s after the verdict, once
 environment, so the deleted output was the only thing that could ever have
 explained it.
 
-So a publish run that does **not** pass also writes its output to a durable
+So a gate run that does **not** pass also writes its output to a durable
 destination in the primary checkout:
 
 ```
-.issue-orchestrator/diagnostics/publish-gate-failures/
-    <issue-scope>--<issue-id>--<HEAD_SHA>--<timestamp>/
+.issue-orchestrator/diagnostics/gate-failures/
+    <issue-scope>--<issue-id>--<HEAD_SHA>--<suite>--<timestamp>/
         failure.json     # issue key, verdict receipt fields, exit code, timings
         stdout.log       # the run's stdout, verbatim
         stderr.log       # the run's stderr, verbatim
 ```
+
+One store for every gate, not one per contract: the question a reader arrives
+with is "why did *this candidate* fail", and the suite in the name is what
+keeps two contracts' explanations for one candidate from erasing each other.
+`failure.json`'s `type` is taken from the record's own suite
+(`publish_gate_failure`, `agent_gate_failure`), so a diagnostic cannot name a
+contract other than the one that ran.
+
+The directory was `diagnostics/publish-gate-failures/` while the publish gate
+was the only writer (#173 de-scoped it). Nothing migrates: the store is
+diagnostic-only and nothing reads it programmatically, so an install that
+predates the rename keeps its older publish-gate explanations under the old
+name and writes new ones under this one. Look in both if you are chasing a
+failure from that era.
 
 Three properties are the whole design:
 
@@ -213,6 +227,14 @@ code alone, so a timeout is covered by the same seam with no timeout-specific
 rule. A candidate with no canonical issue key (the manual-reprocess route)
 files no diagnostic, for the same reason it files no receipt, and says so in the
 log rather than skipping silently.
+
+Whether a gate files here is a property of its **caller**, not of the contract:
+a caller that holds the candidate's canonical issue key supplies the
+destination, and one that does not cannot. So an agent's own `coding-done`
+files nothing (it knows only its worktree, and its run directory outlives the
+gate anyway), while the continuation's quick gate — orchestrator-side, holding
+`(issue, A)` — files here. That one needs it most: it deletes its checkout the
+moment the gate refuses, so it is not racing cleanup but running ahead of it.
 
 ### What the receipt authorizes
 
@@ -318,7 +340,7 @@ and nothing about what to do with it, so [#149] adds the missing half:
 | Recorded intent (`requested_actions`, `implementation`, `problems`) plus the contract identity | `Attempt.continuation_descriptor` | `control/continuation_descriptor_writer.py`, at the gate's verdict, **only when the verdict refuses** |
 | The exact-`A` review outcome | `Attempt.continuation_review_verdict` | `control/continuation_runner.py`, promoted from the run's own verdict binding before its worktree is discarded |
 | What the continuation run produced — the pull request, or that none was asked for | `Attempt.continuation_settlement` | `control/continuation_finalize.py`, from the `ProcessingResult` the run's own completion pipeline returned |
-| How many runs the continuation has opened for this candidate | `Attempt.continuation_runs_used` | `control/continuation_runner.py`, spent before a run is opened |
+| How many runs the continuation has opened for this candidate | `Attempt.continuation_runs_used` | `control/continuation_run_open.py`, spent before a run is opened |
 
 Every field is **copied** from an authoritative producer. Nothing is derived
 from issue text, labels, logs, diagnostics, URLs or branch names, and an
@@ -379,7 +401,90 @@ own lock (`reconcile_derived`), which is what makes a stale snapshot unable to
 release a newer claim. `control/continuation_runner.py` executes: it hands a
 `RETRY_PENDING` candidate whole to [#139] — no second admission predicate and
 no second allowance — and drives a passing one through the ordinary
-`CompletionProcessor`, in a worktree verified to stand at exactly `A`.
+`CompletionProcessor`, in a worktree verified to stand at exactly `A`. Opening
+that run is its own owner, `control/continuation_run_open.py`: allowance,
+checkout, provisioning, run assets, quick-validation evidence and the intent
+that names it, in that fixed order, with one disposal rule for every refusal.
+
+### The continuation's first reviewer needs evidence a coder turn never wrote
+
+On the ordinary path the first reviewer is handed validation evidence its
+**coder turn** produced: `coding-done` runs the profile's quick contract
+through `AgentGate`, writes the record into the run directory, and names it on
+the completion record. Everything downstream is a data dependency on that one
+file — the completion record starts the review exchange, the pair mirror copies
+the named record into pair and run scope, and a round cannot advance while
+`review.exchange.loop.require_validation` is on and the mirrored record is
+missing, stale or failing.
+
+A continuation has no coder turn. Its completion record is synthesised from the
+durable descriptor, whose fields are the agent's recorded intent and nothing
+else — so before [#173] the exchange reached the reviewer pointing at a file
+nothing had written, and the reviewer, told to trust that file, answered
+`changes_requested` about the missing file rather than about the code.
+
+`control/continuation_quick_validation.py` produces it instead, as **system
+preparation with no model turn**, between the run assets and the intent that
+names it:
+
+- **The owner is the existing one.** It composes `AgentGate` over the contract
+  `RunValidationContracts` resolves from the profile frozen onto this run's
+  manifest — the same resolver the publication gate uses. Nothing there runs a
+  command of its own and nothing writes a record.
+- **Nothing is reused and nothing is synthesised.** `AgentGate` consults no
+  cache and no durable evaluation history, so a candidate whose past quick
+  verdict survives while its record died with the worktree gets a fresh run
+  rather than a record invented from a receipt. The preparation executes or it
+  refuses.
+- **Nothing is retyped.** The gate carries no attempt identity, so it files no
+  durable evaluation: the candidate's publication history is exactly what it
+  was, and a `publish_gate` receipt still cannot satisfy a quick requirement.
+- **The candidate is left as it was found.** The same
+  `CandidateIntegrity` (`control/candidate_integrity.py`) checkpoint
+  `WorktreeRunnability` takes around the operator's recipe is taken around the
+  gate, so a preparation that moves `HEAD` or dirties tracked content is
+  refused — as is one whose tracked dirt could not be *enumerated*, on either
+  side of the gate: an unreadable read leaves the candidate unprovable, and an
+  unprovable candidate opens no run. Independently of that, the record names
+  the commit the gate *read*,
+  which is the binding the exchange's pair mirror re-checks against the coder
+  worktree's current `HEAD` before every round — evidence that does not name
+  the candidate reads as stale there and refuses the round rather than passing
+  silently.
+- **The run is told what its gate found.** Producing evidence and recording
+  that it exists are two steps, and the second goes through the same
+  `ValidationEvidenceRecorder` an agent's `coding-done` records its own gate
+  through: the typed outcome, the record path, the two logs and any JUnit
+  reports, onto this run's manifest. A run whose outcome is unrecorded is not a
+  run with less detail — `load_validation_failure_summary` reads the outcome
+  first and returns nothing without it, so the session-diagnostics dialog, the
+  run audit and the artifact list would all show a continuation run as one that
+  never validated anything.
+
+A refusal costs the whole run: no exchange starts, no pull request is created,
+the checkout is removed, the durable publication history is untouched and the
+[#149] run allowance stays spent — a start budget, for the reason provisioning
+failures do not refund one either. Once the allowance is gone the ordinary
+`RUNS_EXHAUSTED` derivation returns the candidate to rework.
+
+What a coder finds waiting there is the durable gate-failure artefact described
+above, filed under this candidate's `(issue, HEAD_SHA)` in the primary checkout
+— **not** the run directory, and not a log line. Every path the gate wrote is
+inside the checkout the refusal deletes, immediately and unconditionally, so
+without that artefact a candidate that exhausted its allowance on a failing
+suite would return to rework with an exit code and nothing else. The refusal
+reason names the command that ran and the store the output went to; the output
+itself is in `stdout.log` and `stderr.log` there.
+
+A repository whose run profile configures **no** quick contract has nothing to
+produce, so the record names no evidence — exactly what an ordinary coder turn
+writes there. Whether a review may proceed without it stays
+`require_validation`'s question, unchanged; config validation already refuses
+`require_validation` with no `validation.quick.cmd`.
+
+The step is assembled by `entrypoints/bootstrap_continuation.py` and reaches
+the runner on `OrchestratorDeps`, as [#139]'s revalidation route does, so both
+composition roots build the same one.
 
 That worktree belongs to a **run**, not to a pass, and
 `control/continuation_runs.py` owns it. `CompletionProcessor.process` does not
@@ -528,7 +633,10 @@ Provisioning holds four rules:
   candidate are separate facts and a command that edits the candidate and then
   dies must not go unreported. A
   moved `HEAD` or a clean-to-dirty transition is a loud failure rather than a
-  silent edit to the change under test. The prerequisites themselves are build
+  silent edit to the change under test, and so is a read that *failed* on
+  either side of the recipe: an enumeration that could not be performed leaves
+  the candidate unprovable, which is refused rather than read as "nothing
+  changed". The prerequisites themselves are build
   output and are git-ignored, so an honest setup run leaves a clean worktree
   clean.
 - **The recipe is pinned to operator configuration**
@@ -980,6 +1088,19 @@ Target repositories can add repo-local runtime artifacts in
 `.issue-orchestrator/runtime-ignore`. See
 [`docs/user/configuration.md`](../user/configuration.md#ignore-repo-local-runtime-artifacts)
 for the supported format and operator guidance.
+
+**These ignores classify by path, and one guard therefore does not use them.**
+`CandidateIntegrity` (`control/candidate_integrity.py`), the postflight that
+proves provisioning and continuation quick validation left the candidate alone,
+asks `WorkingCopy.list_dirty_files(..., "tracked")` and judges every path it
+gets back. Untracked runtime output — a suite's JUnit XML, a coverage database,
+a setup step's `.venv` — never reaches it, which is the concession
+[#153]'s exact-candidate contract makes. A *tracked* modification is the thing
+that contract forbids, so it stays visible there even when its path matches a
+built-in prefix or an operator pattern: dropping it by path would admit a
+preparation that mutated the candidate. `runtime-ignore` is unchanged
+everywhere it is consulted — the completion dirty guard, the pre-push check and
+agent `git status` — and this postflight simply asks a narrower question.
 
 ## Record Format
 

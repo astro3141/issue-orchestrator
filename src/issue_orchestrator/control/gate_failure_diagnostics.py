@@ -1,4 +1,4 @@
-"""Keeping a failed publish gate's own explanation alive (#94).
+"""Keeping a failed gate's own explanation alive (#94).
 
 #85 made the publish gate's *verdict* outlive the worktree. This is the other
 half of the same loss: the verdict says A failed, and the only thing that said
@@ -7,6 +7,14 @@ worktree, deleted by ordinary cleanup seconds after the verdict was reached.
 Twice on #93 that happened, and the second failure does not reproduce in a
 clean detached environment, so the deleted output was the only artefact that
 could ever have explained it.
+
+The publish gate was the first caller and is no longer the only one. Any gate
+run whose output would otherwise die with the checkout that produced it files
+here, under the suite it actually stamped — the continuation's quick-validation
+preparation is the second (#173), and it destroys its checkout *immediately* on
+a refusal rather than losing a race with cleanup. So nothing here is scoped to
+one contract: the suite comes from the gate's own record, which is the only
+place that knows what ran.
 
 Two properties are the whole design, and both are reactions to how the evidence
 was actually lost:
@@ -21,15 +29,19 @@ was actually lost:
   :func:`~..domain.issue_key_codec.issue_key_path_part` plus the gate's own
   ``head_sha`` — the same identity ``Attempt(issue, A)`` is keyed by, in the
   same spelling — so a reader holding the verdict receipt can find the
-  explanation, and an explanation can never be read as being about A′.
+  explanation, and an explanation can never be read as being about A′. The
+  suite the gate stamped completes the name, because two contracts may both
+  fail for one candidate and neither explanation may erase the other.
 
 Diagnostic only, deliberately. Nothing here is readable by admission: the
 artefact lives outside the attempt record, nothing points at it from the
 attempt, and no predicate in this codebase takes its path or its existence as
-input. ``Attempt.completed_evaluations`` remains the sole authority on what the
+input. ``Attempt.completed_evaluations`` remains the sole authority on what a
 gate decided (:mod:`.publication_evidence` is what reads it). An artefact that
 could admit work would be a second authority, and a second authority written by
-the losing side of a gate is the worst possible one.
+the losing side of a gate is the worst possible one. That holds a fortiori for a
+gate that files no receipt at all, such as the continuation's: its failure is
+explained here and admits nothing anywhere.
 
 The verdict fields it carries are not restated here either: they come from
 :func:`~.publication_verdict.receipt_for`, the same projection that produces the
@@ -54,27 +66,30 @@ from .publication_verdict import receipt_for
 
 logger = logging.getLogger(__name__)
 
-PUBLISH_GATE_FAILURES_DIR = (
-    Path(".issue-orchestrator") / "diagnostics" / "publish-gate-failures"
+GATE_FAILURES_DIR = (
+    Path(".issue-orchestrator") / "diagnostics" / "gate-failures"
 )
-"""Where failed publish-gate output is kept, relative to the primary checkout.
+"""Where failed gate output is kept, relative to the primary checkout.
 
 Under the diagnostics directory that already exists in that root, beside the
 ``attempts/`` sidecars this artefact is named after. Not a new store: the same
-owner, one drawer along.
+owner, one drawer along. One drawer for every suite rather than one per gate,
+because the question a reader arrives with is "why did *this candidate* fail",
+and an answer split across a directory per contract is one a reader has to know
+the contract to find.
 """
 
 DIAGNOSTIC_FILE_NAME = "failure.json"
 STDOUT_FILE_NAME = "stdout.log"
 STDERR_FILE_NAME = "stderr.log"
 
-PUBLISH_GATE_FAILURE_SCHEMA_VERSION = 1
+GATE_FAILURE_SCHEMA_VERSION = 1
 
 _NON_AUTHORITATIVE_NOTE = (
-    "Diagnostic evidence only. It explains a publish-gate failure and "
-    "authorizes nothing; the authority on what the gate decided is the "
-    "publication verdict receipt on the attempt record for this same "
-    "(issue, head_sha)."
+    "Diagnostic evidence only. It explains a gate failure and authorizes "
+    "nothing; the authority on what a gate decided is the validation verdict "
+    "receipt on the attempt record for this same (issue, head_sha), and a "
+    "gate that files no receipt has decided nothing durable at all."
 )
 
 
@@ -108,7 +123,7 @@ class GateFailureOutput:
 
 
 class CandidateGateDiagnostics:
-    """Files failed publish-gate output for one candidate's issue identity.
+    """Files failed gate output for one candidate's issue identity.
 
     Bound to the issue at construction and to the commit by the record it is
     handed, so no caller can supply an identity that disagrees with the run:
@@ -140,13 +155,17 @@ class CandidateGateDiagnostics:
         receipt = receipt_for(output.record)
         if receipt.verdict is ValidationVerdict.PASSED:
             raise ValueError(
-                "publish-gate failure diagnostics describe a failed run; "
+                "gate failure diagnostics describe a failed run; "
                 f"{receipt.suite} passed for {receipt.head_sha[:12]}"
             )
-        destination = self._destination_for(receipt.head_sha)
+        destination = self._destination_for(receipt.head_sha, receipt.suite)
         payload = {
-            "schema_version": PUBLISH_GATE_FAILURE_SCHEMA_VERSION,
-            "type": "publish_gate_failure",
+            "schema_version": GATE_FAILURE_SCHEMA_VERSION,
+            # The suite the gate stamped, not a constant chosen by whoever
+            # wired the destination: a diagnostic that named a contract other
+            # than the one that ran would be the mislabelling #25 removed from
+            # the records themselves.
+            "type": f"{receipt.suite}_failure",
             "authority": "diagnostic_only",
             "note": _NON_AUTHORITATIVE_NOTE,
             "issue_key": encode_issue_key(self._issue_key),
@@ -176,7 +195,7 @@ class CandidateGateDiagnostics:
             atomic_write_json(destination / DIAGNOSTIC_FILE_NAME, payload)
         except OSError as exc:
             logger.error(
-                "[PUBLISH_GATE_DIAGNOSTIC] could not write %s failure output "
+                "[GATE_DIAGNOSTIC] could not write %s failure output "
                 "for %s@%s to %s: %s — this failure will not be explainable "
                 "after cleanup",
                 receipt.suite,
@@ -187,7 +206,7 @@ class CandidateGateDiagnostics:
             )
             return None
         logger.info(
-            "[PUBLISH_GATE_DIAGNOSTIC] kept %s %s output for %s@%s at %s",
+            "[GATE_DIAGNOSTIC] kept %s %s output for %s@%s at %s",
             receipt.suite,
             receipt.verdict.value,
             self._issue_key,
@@ -196,25 +215,30 @@ class CandidateGateDiagnostics:
         )
         return destination
 
-    def _destination_for(self, head_sha: str) -> Path:
+    def _destination_for(self, head_sha: str, suite: str) -> Path:
         """One directory per gate run, named for the candidate it ran against.
 
         The candidate part is what makes the artefact findable from the
-        receipt; the timestamp is what stops a re-run's explanation from
-        erasing the previous one. A publish gate that failed twice on one
+        receipt; the suite says which contract this explanation is about, so a
+        candidate whose quick contract and publish contract both failed keeps
+        both accounts; and the timestamp is what stops a re-run's explanation
+        from erasing the previous one. A gate that failed twice on one
         candidate failed for two reasons worth keeping — and a cached failure
         is deliberately re-run rather than trusted, so two failures on one
         candidate is the ordinary shape of a retried publish. Sub-second
         precision because "the previous one is still there" must not depend on
         how long a gate happened to take.
+
+        The candidate parts stay leftmost so one prefix match still finds
+        everything filed for ``(issue, A)``, whatever ran.
         """
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
         candidate = f"{issue_key_path_part(self._issue_key)}--{head_sha}"
-        return self._failures_dir / f"{candidate}--{stamp}"
+        return self._failures_dir / f"{candidate}--{suite}--{stamp}"
 
 
-class PublishGateDiagnostics:
-    """The durable destination for failed publish-gate output.
+class GateFailureDiagnostics:
+    """The durable destination for failed gate output.
 
     Rooted in the primary checkout — the same root that holds the attempt
     sidecars — because that is what a coder worktree's removal does not touch.
@@ -223,7 +247,7 @@ class PublishGateDiagnostics:
     """
 
     def __init__(self, repo_root: Path) -> None:
-        self._failures_dir = repo_root / PUBLISH_GATE_FAILURES_DIR
+        self._failures_dir = repo_root / GATE_FAILURES_DIR
 
     @property
     def failures_dir(self) -> Path:
@@ -239,12 +263,12 @@ class PublishGateDiagnostics:
 
 __all__ = [
     "DIAGNOSTIC_FILE_NAME",
-    "PUBLISH_GATE_FAILURES_DIR",
-    "PUBLISH_GATE_FAILURE_SCHEMA_VERSION",
+    "GATE_FAILURES_DIR",
+    "GATE_FAILURE_SCHEMA_VERSION",
     "STDERR_FILE_NAME",
     "STDOUT_FILE_NAME",
     "CandidateGateDiagnostics",
+    "GateFailureDiagnostics",
     "GateFailureOutput",
-    "PublishGateDiagnostics",
     "needs_durable_diagnostic",
 ]

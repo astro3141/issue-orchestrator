@@ -52,10 +52,9 @@ RUNTIME_COMPLETION_RECORD: Any = RuntimeCompletionRecord
 RUNTIME_COMPLETION_OUTCOME: Any = RuntimeCompletionOutcome
 RUNTIME_PROPOSED_FOLLOW_UP_ISSUE: Any = RuntimeProposedFollowUpIssue
 RUNTIME_REQUESTED_ACTION: Any = RuntimeRequestedAction
-from ...control.validation import AgentGate, AgentGateResult
+from ...control.agent_gate import AgentGate, AgentGateResult
 from ...domain.validation_profile import ValidationGateKind
 from ...infra.validation_profiles import ValidationGateContract
-from ...domain.artifact_contracts import ValidationFailed, ValidationPassed
 from ...domain.session_run import ValidationArtifactPaths
 from ...execution.run_evidence import RunEvidenceRecorder
 from ...execution.session_output_adapter import FileSystemSessionOutput
@@ -168,95 +167,33 @@ def extract_pr_verification_status(pr_body: str) -> tuple[bool, str | None]:
     return (False, None)
 
 
-def _copy_validation_log(
-    *,
-    worktree_root: Path,
-    run_dir: Path,
-    source_path: str | None,
-    destination_name: str,
-    manifest_key: str,
-    session_output: FileSystemSessionOutput,
-) -> None:
-    """Copy one validation log artifact into the session run directory."""
-    if not source_path:
-        return
-    src = worktree_root / source_path
-    if not src.exists():
-        return
-    dest = run_dir / destination_name
-    try:
-        dest.write_text(src.read_text(errors="ignore"))
-        session_output.update_manifest(run_dir, {manifest_key: str(dest)})
-    except OSError:
-        logger.debug("Failed to write validation log %s for %s", destination_name, run_dir)
-
-
 def record_validation_artifacts(
     worktree_root: Path,
     validation_artifacts: ValidationArtifactPaths,
     validation_result: AgentGateResult,
 ) -> Path | None:
-    """Attach validation artifacts to the session output for diagnostics."""
+    """Attach this gate run's evidence to the run it validated.
+
+    Delegated whole to the run-evidence owner (#173). What a gate run leaves on
+    a manifest is one step, and it used to be spelled out here — the outcome,
+    the record pointer, the two logs — which made this entry point the only
+    place that knew all of it. The continuation's preparation runs the same
+    gate against a run of its own and could reach none of it, so a continuation
+    run recorded no validation outcome and every validation surface in the
+    product read it as a run that never validated anything.
+    """
     run_dir = validation_artifacts.run_dir
     if not run_dir.is_dir():
         raise ValueError(f"validation run directory does not exist: {run_dir}")
-    record = validation_result.record
     record_path = validation_result.record_path
-    if not record_path and not record:
-        return None
-
-    session_output = FileSystemSessionOutput()
-    run_record_path = validation_artifacts.record_path
-    resolved_record_path = (
-        run_record_path
-        if run_record_path.exists()
-        else Path(record_path) if record_path else None
-    )
-    # Outcome (status + reason) is written via the typed API so the
-    # three legacy fields stay consistent. The record path is a
-    # separate concern and goes through the unchecked merge.
-    if validation_result.passed:
-        outcome = ValidationPassed()
-    else:
-        outcome = ValidationFailed(
-            reason=validation_result.reason or "validation failed"
-        )
-    session_output.update_validation_outcome(run_dir, outcome)
-    if resolved_record_path is not None:
-        # Path-pointer field is independent of the validation outcome
-        # itself; it goes through the unchecked merge.
-        session_output.update_manifest(
-            run_dir,
-            {"validation_record_path": str(resolved_record_path)},
-        )
-
-    if not record:
-        return resolved_record_path
-
-    _copy_validation_log(
-        worktree_root=worktree_root,
-        run_dir=run_dir,
-        source_path=record.stdout_path,
-        destination_name="validation-stdout.log",
-        manifest_key="validation_stdout",
-        session_output=session_output,
-    )
-    _copy_validation_log(
-        worktree_root=worktree_root,
-        run_dir=run_dir,
-        source_path=record.stderr_path,
-        destination_name="validation-stderr.log",
-        manifest_key="validation_stderr",
-        session_output=session_output,
-    )
-    RunEvidenceRecorder(session_output).record_validation_evidence(
-        run_dir=run_dir,
+    return RunEvidenceRecorder(FileSystemSessionOutput()).record_gate_result(
+        artifacts=validation_artifacts,
         worktree=worktree_root,
-        record=record,
-        record_path=resolved_record_path,
+        outcome=validation_result.outcome,
+        record=validation_result.record,
+        store_record_path=Path(record_path) if record_path else None,
         junit_xml_paths=_runtime_validation_junit_xml_paths(worktree_root),
     )
-    return resolved_record_path
 
 
 def _runtime_validation_junit_xml_paths(worktree: Path) -> tuple[str, ...]:
