@@ -183,6 +183,12 @@ def build_control_continuation(
     NOT shared is :class:`~.worktree_provisioning.WorktreeProvisioner`:
     its consecutive-failure ledger and ``needs-human`` escalation would be a
     second bound over a run whose allowance #149 has already spent.
+
+    The quick-validation preparation is taken off ``deps`` rather than built
+    here, because unlike the runnability core it is not assembled from
+    ``Config`` alone: ``entrypoints.bootstrap_continuation`` builds it beside
+    the continuation's other durable wiring, and both composition roots call
+    that one factory (#173).
     """
     from ..ports.background_job import NullBackgroundJobRunner
     from .continuation_finalize import ContinuationFinalizer
@@ -214,6 +220,7 @@ def build_control_continuation(
                 command_runner=deps.command_runner,
                 working_copy=deps.working_copy,
             ),
+            quick_validation=deps.continuation_quick_validation,
             session_output=deps.session_output,
             completion_processor=deps.completion_processor,
             review_verdicts=deps.continuation_ports.review_verdicts,

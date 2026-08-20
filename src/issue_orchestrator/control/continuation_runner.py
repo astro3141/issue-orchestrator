@@ -8,6 +8,7 @@ that already exist rather than reimplementing what they decide:
 same-SHA admission, allowance, gate     :class:`~.publication_revalidation.PublicationRevalidation` (#139)
 exact-commit materialisation            the issue's own branch, verified
 making that checkout runnable           :class:`~.worktree_runnability.WorktreeRunnability` (#153)
+the first reviewer's quick evidence     :class:`~.continuation_quick_validation.ContinuationQuickValidation` (#173)
 reviewer-first exchange, PR creation    :class:`~.completion_processor.CompletionProcessor`
 settlement of a discharged intent       :class:`~.continuation_finalize.ContinuationFinalizer`
 ownership and exclusion                 :class:`~.control_operation_ownership.ControlOperationOwnership` (#146)
@@ -25,7 +26,11 @@ start. There is no second admission predicate and no second allowance.
 **It never fabricates intent.** The completion record it hands the completion
 owner is written from the descriptor, field for field. A candidate with no
 descriptor never reaches here: it is not live, so it is never owned, so it is
-never advanced.
+never advanced. The one field the descriptor cannot supply —
+``validation_record_path``, which the ordinary path's coder turn fills in — is
+not invented either: it names a record the configured quick gate has just
+written into this run's own directory, and a run whose gate produced no such
+record never opens (#173).
 
 **It never races ordinary work.** Ownership already excludes the issue from the
 queue, but an issue whose session is still running was never the continuation's
@@ -72,17 +77,17 @@ descriptor writer applies, reached from the other side.
 
 from __future__ import annotations
 
-import json
 import logging
 from collections.abc import Callable
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol
 
 from ..domain.attempt import Attempt
 from ..domain.continuation_phase import ContinuationPhase
-from ..domain.models import CompletionOutcome, CompletionRecord, get_completion_path
+from ..domain.models import get_completion_path
+from .continuation_intent_record import write_continuation_completion_record
 from .continuation_live_truth import LiveContinuation
+from .continuation_quick_validation import PreparedQuickValidation
 from .continuation_runs import ContinuationRun
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -99,6 +104,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from .continuation_finalize import ContinuationFinalizer
     from .continuation_in_flight import ContinuationsInFlight
     from .continuation_live_truth import ContinuationReconciliation
+    from .continuation_quick_validation import ContinuationQuickValidation
     from .continuation_runs import ContinuationRuns
     from .publication_revalidation import PublicationRevalidation
     from .worktree_runnability import WorktreeRunnability
@@ -158,6 +164,7 @@ class ControlContinuationRunner:
         worktrees: "WorktreeManager",
         working_copy: "WorkingCopy",
         runnability: "WorktreeRunnability",
+        quick_validation: "ContinuationQuickValidation",
         session_output: "SessionOutput",
         completion_processor: ContinuationCompletionOwner,
         review_verdicts: "ReviewVerdictBindings",
@@ -177,6 +184,10 @@ class ControlContinuationRunner:
         # existed, and the launch provisioner's consecutive-failure ledger and
         # ``needs-human`` escalation would be a second one over the same run.
         self._runnability = runnability
+        # The evidence a coder turn would have produced, produced by the
+        # system instead (#173). Composed, never reimplemented: it runs the
+        # configured quick contract through the existing agent-side gate.
+        self._quick_validation = quick_validation
         self._session_output = session_output
         self._completion_processor = completion_processor
         self._review_verdicts = review_verdicts
@@ -399,7 +410,9 @@ class ControlContinuationRunner:
             reserve the run allowance
                 -> materialize the checkout at exactly A
                 -> make it runnable, candidate unchanged
-                -> allocate run assets, write the intent, register the run
+                -> allocate run assets
+                -> produce this run's quick-validation evidence
+                -> write the intent naming it, register the run
 
         The allowance is spent FIRST, before the checkout and long before the
         exchange, in the start-budget style #139 chose and for the reason it
@@ -417,6 +430,15 @@ class ControlContinuationRunner:
         continued under that contract, whatever the current default is bound to
         today. The publication gate therefore reuses the passing record for this
         exact HEAD/command/profile instead of re-running it.
+
+        Quick-validation preparation sits between the run assets and the intent
+        because it needs the first and is named by the second (#173): the run
+        directory is where the evidence is written, and the completion record
+        is what points the review exchange at it. A continuation has no coder
+        turn to produce that evidence, and a reviewer told to trust a file
+        nothing wrote answers about the missing file rather than about the
+        code. A refusal here opens no run at all — see :meth:`_prepare_evidence`
+        for what that costs and why it is not refunded.
         """
         if not self._reserve_run(operation):
             return None
@@ -433,16 +455,20 @@ class ControlContinuationRunner:
             agent_label=agent_label,
             validation_profile=descriptor.profile,
         )
+        evidence = self._prepare_evidence(operation, worktree, assets)
+        if evidence is None:
+            return None
         completion_path = get_completion_path(
             agent_label, run_dir=assets.run_dir.name
         )
         # Written once, with the run. A resumed pass leaves the record exactly
         # as the pipeline left it: it is deliberately still on disk, and the
         # exchange running against it was started from that identity.
-        _write_completion_record(
+        write_continuation_completion_record(
             worktree / completion_path,
             descriptor,
             session_name=assets.identity.session_name,
+            validation_record_path=evidence.record_path,
         )
         run = ContinuationRun(
             worktree=worktree,
@@ -606,6 +632,51 @@ class ControlContinuationRunner:
         self._discard_checkout(worktree)
         return False
 
+    def _prepare_evidence(
+        self,
+        operation: LiveContinuation,
+        worktree: Path,
+        assets: "SessionRunAssets",
+    ) -> PreparedQuickValidation | None:
+        """Produce this run's quick-validation evidence, or open no run.
+
+        The ordinary path's first reviewer reads a record the CODER TURN
+        produced and named on its completion record. A continuation replays a
+        recorded intent and has no coder turn, so the same record is produced
+        here — by the same configured quick gate, into this run's own
+        directory, before the intent that names it is written. Nothing is
+        reused from a durable verdict and nothing is synthesised: the gate runs
+        or the run does not open.
+
+        A refusal costs the whole run and the reservation stays spent, for the
+        reason :meth:`_make_runnable`'s does — it is a start budget, and
+        refunding it would turn a repeatably failing suite into an unbounded
+        supply of continuation runs. Once #149's allowance is gone the ordinary
+        ``RUNS_EXHAUSTED`` derivation hands the candidate back to rework, where
+        a coder can see and fix what the quick contract rejected.
+
+        Returns:
+            What the preparation produced, or ``None`` when no run may open.
+        """
+        prepared = self._quick_validation.prepare(
+            worktree=worktree, run_assets=assets
+        )
+        if isinstance(prepared, PreparedQuickValidation):
+            logger.info(
+                "[CONTINUATION] %s prepared quick validation: record=%s",
+                operation.key,
+                prepared.record_path or "none (no quick contract configured)",
+            )
+            return prepared
+        logger.warning(
+            "[CONTINUATION] %s opens no run: its reviewer's quick-validation"
+            " evidence could not be produced: %s",
+            operation.key,
+            prepared.reason,
+        )
+        self._discard_checkout(worktree)
+        return None
+
     def _process(self, operation: LiveContinuation, run: ContinuationRun) -> bool:
         """Re-enter the completion pipeline for ``run``, and say whether it ended.
 
@@ -717,32 +788,6 @@ def _already_executing(operation: LiveContinuation) -> None:
 def _worktree_name(operation: LiveContinuation) -> str:
     """A run-scoped name that cannot collide with the issue's own worktree."""
     return f"continuation-{operation.issue.number}-{operation.key.head_sha[:12]}"
-
-
-def _write_completion_record(
-    path: Path,
-    descriptor: "ContinuationDescriptor",
-    *,
-    session_name: str,
-) -> None:
-    """Put the recorded intent where the completion owner reads intent.
-
-    Every field the agent owned is copied from the descriptor; every field the
-    ORCHESTRATOR owns (the session identity, the timestamp) is supplied by the
-    orchestrator. Nothing is invented in between: ``summary`` names this
-    replay for a human reading the record, and carries no claim about the work.
-    """
-    record = CompletionRecord(
-        session_id=session_name,
-        timestamp=datetime.now(timezone.utc).isoformat(),
-        outcome=CompletionOutcome.COMPLETED,
-        summary="Recorded continuation intent replayed by the orchestrator",
-        requested_actions=list(descriptor.requested_actions),
-        implementation=descriptor.implementation or None,
-        problems=descriptor.problems or None,
-    )
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(record.to_dict(), indent=2), encoding="utf-8")
 
 
 __all__ = ["CONTINUATION_JOB_PREFIX", "ControlContinuationRunner"]

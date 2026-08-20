@@ -381,6 +381,66 @@ release a newer claim. `control/continuation_runner.py` executes: it hands a
 no second allowance — and drives a passing one through the ordinary
 `CompletionProcessor`, in a worktree verified to stand at exactly `A`.
 
+### The continuation's first reviewer needs evidence a coder turn never wrote
+
+On the ordinary path the first reviewer is handed validation evidence its
+**coder turn** produced: `coding-done` runs the profile's quick contract
+through `AgentGate`, writes the record into the run directory, and names it on
+the completion record. Everything downstream is a data dependency on that one
+file — the completion record starts the review exchange, the pair mirror copies
+the named record into pair and run scope, and a round cannot advance while
+`review.exchange.loop.require_validation` is on and the mirrored record is
+missing, stale or failing.
+
+A continuation has no coder turn. Its completion record is synthesised from the
+durable descriptor, whose fields are the agent's recorded intent and nothing
+else — so before [#173] the exchange reached the reviewer pointing at a file
+nothing had written, and the reviewer, told to trust that file, answered
+`changes_requested` about the missing file rather than about the code.
+
+`control/continuation_quick_validation.py` produces it instead, as **system
+preparation with no model turn**, between the run assets and the intent that
+names it:
+
+- **The owner is the existing one.** It composes `AgentGate` over the contract
+  `RunValidationContracts` resolves from the profile frozen onto this run's
+  manifest — the same resolver the publication gate uses. Nothing there runs a
+  command of its own and nothing writes a record.
+- **Nothing is reused and nothing is synthesised.** `AgentGate` consults no
+  cache and no durable evaluation history, so a candidate whose past quick
+  verdict survives while its record died with the worktree gets a fresh run
+  rather than a record invented from a receipt. The preparation executes or it
+  refuses.
+- **Nothing is retyped.** The gate carries no attempt identity, so it files no
+  durable evaluation: the candidate's publication history is exactly what it
+  was, and a `publish_gate` receipt still cannot satisfy a quick requirement.
+- **The candidate is left as it was found.** The same
+  `CandidateIntegrity` (`control/candidate_integrity.py`) checkpoint
+  `WorktreeRunnability` takes around the operator's recipe is taken around the
+  gate, so a preparation that moves `HEAD` or dirties tracked content is
+  refused. Independently of that, the record names the commit the gate *read*,
+  which is the binding the exchange's pair mirror re-checks against the coder
+  worktree's current `HEAD` before every round — evidence that does not name
+  the candidate reads as stale there and refuses the round rather than passing
+  silently.
+
+A refusal costs the whole run: no exchange starts, no pull request is created,
+the checkout is removed, the durable publication history is untouched and the
+[#149] run allowance stays spent — a start budget, for the reason provisioning
+failures do not refund one either. Once the allowance is gone the ordinary
+`RUNS_EXHAUSTED` derivation returns the candidate to rework, where a coder can
+see and fix whatever the quick contract rejected.
+
+A repository whose run profile configures **no** quick contract has nothing to
+produce, so the record names no evidence — exactly what an ordinary coder turn
+writes there. Whether a review may proceed without it stays
+`require_validation`'s question, unchanged; config validation already refuses
+`require_validation` with no `validation.quick.cmd`.
+
+The step is assembled by `entrypoints/bootstrap_continuation.py` and reaches
+the runner on `OrchestratorDeps`, as [#139]'s revalidation route does, so both
+composition roots build the same one.
+
 That worktree belongs to a **run**, not to a pass, and
 `control/continuation_runs.py` owns it. `CompletionProcessor.process` does not
 necessarily finish when it returns: with a background job supervisor wired —

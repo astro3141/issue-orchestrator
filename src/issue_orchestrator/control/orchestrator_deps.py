@@ -59,6 +59,7 @@ if TYPE_CHECKING:
     from .state_machine_manager import StateMachineManager
     from .completion_processor import CompletionProcessor
     from .completion_dispatcher import CompletionDispatcher
+    from .continuation_quick_validation import ContinuationQuickValidation
     from .publication_revalidation import PublicationRevalidation
     from .publish_recovery import PublishRecoveryService
     from .session_controller import SessionController
@@ -177,6 +178,15 @@ class OrchestratorDeps:
     # that consumes them is assembled against live orchestrator state, so the
     # composition root supplies the ports and the facade supplies the state.
     continuation_ports: "ContinuationPorts"
+
+    # The continuation's own quick-validation preparation (#173). Held beside
+    # the ports for the same reason the revalidation route is held beside them:
+    # a continuation has no coder turn, so the evidence its first reviewer is
+    # told to trust has to be produced by the system, and a step only a factory
+    # knew how to build would never run. Required, not optional — a
+    # continuation that could silently skip it is the missing-file review this
+    # leaf exists to remove.
+    continuation_quick_validation: "ContinuationQuickValidation"
 
     # Cross-cutting infrastructure services (label mgmt, persistence, etc.)
     services: "InfraServices"

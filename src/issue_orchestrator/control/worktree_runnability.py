@@ -29,6 +29,9 @@ a revalidation twice. So what both share lives here and is only two facts:
   checkpoint taken before the commands is re-read afterwards, and it is read
   whether or not the commands succeeded — a failing command and an altered
   candidate are two separate facts, and the first must not suppress the second.
+  The two reads and the comparison belong to
+  :class:`~.candidate_integrity.CandidateIntegrity`, so an operation that is
+  not provisioning can be held to the same rule without a second copy of it.
 
 Failure is RETURNED rather than raised, because the two callers turn it into
 different things: a launch failure that spends an attempt, and a revalidation
@@ -39,15 +42,18 @@ from __future__ import annotations
 
 import logging
 import time
-from dataclasses import dataclass
 from pathlib import Path
 
 from ..infra.config import Config
 from ..ports.command_runner import CommandRunner
 from ..ports.working_copy import WorkingCopy
+from .candidate_integrity import CandidateCheckpoint, CandidateIntegrity
 from .isolation import build_runtime_tool_env
 
 logger = logging.getLogger(__name__)
+
+PROVISIONING_OPERATION = "provisioning"
+"""How an altered candidate is attributed when the recipe is what ran."""
 
 
 class WorktreeProvisioningError(RuntimeError):
@@ -56,14 +62,6 @@ class WorktreeProvisioningError(RuntimeError):
     Subclasses :class:`RuntimeError` because the launch paths that already
     treated a setup failure as a runtime error keep catching it unchanged.
     """
-
-
-@dataclass(frozen=True)
-class _CandidateCheckpoint:
-    """What the candidate looked like immediately before provisioning."""
-
-    head_sha: str | None
-    dirty: bool
 
 
 class WorktreeRunnability:
@@ -87,7 +85,13 @@ class WorktreeRunnability:
     ) -> None:
         self._config = config
         self._command_runner = command_runner
-        self._working_copy = working_copy
+        # The shared owner of "did this operation alter the candidate", bound
+        # to the name provisioning's changes are attributed under. The
+        # continuation's quick-validation preparation binds the same owner to
+        # its own name (#173), so the two cannot drift about the rule.
+        self._integrity = CandidateIntegrity(
+            working_copy, operation=PROVISIONING_OPERATION
+        )
 
     @property
     def has_commands(self) -> bool:
@@ -178,33 +182,24 @@ class WorktreeRunnability:
                 f"setup command failed: {cmd} (exit_code={result.returncode}): {stderr}"
             )
 
-    def _checkpoint(self, worktree_path: Path) -> _CandidateCheckpoint:
-        return _CandidateCheckpoint(
-            head_sha=self._working_copy.get_head_sha(worktree_path),
-            dirty=self._working_copy.has_uncommitted_changes(worktree_path),
-        )
+    def _checkpoint(self, worktree_path: Path) -> CandidateCheckpoint:
+        return self._integrity.checkpoint(worktree_path)
 
     def _describe_candidate_change(
-        self, worktree_path: Path, before: _CandidateCheckpoint
+        self, worktree_path: Path, before: CandidateCheckpoint
     ) -> str | None:
         """Name what provisioning changed about the candidate, or ``None``.
 
-        Returns rather than raises so the caller can report it alongside a setup
-        command that failed after making the change.
-
-        A worktree that was already dirty stays a question this check cannot
-        answer, so only a clean-to-dirty transition is treated as provisioning's
-        doing. Moving ``HEAD`` is always provisioning's doing.
+        Delegated whole to :class:`~.candidate_integrity.CandidateIntegrity`,
+        which owns both reads, the asymmetry between them and the wording — see
+        that module for why an already-dirty worktree is a question this cannot
+        answer.
         """
-        after = self._checkpoint(worktree_path)
-        if after.head_sha != before.head_sha:
-            return (
-                f"provisioning moved HEAD in {worktree_path}: "
-                f"{before.head_sha} -> {after.head_sha}"
-            )
-        if after.dirty and not before.dirty:
-            return f"provisioning left uncommitted changes in {worktree_path}"
-        return None
+        return self._integrity.describe_change(worktree_path, before)
 
 
-__all__ = ["WorktreeProvisioningError", "WorktreeRunnability"]
+__all__ = [
+    "PROVISIONING_OPERATION",
+    "WorktreeProvisioningError",
+    "WorktreeRunnability",
+]

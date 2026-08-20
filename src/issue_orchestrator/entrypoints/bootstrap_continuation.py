@@ -16,8 +16,16 @@ the owner around them from the facade's state
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 from ..infra.config import Config
 from ..ports.continuation_ports import ContinuationPorts
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from ..control.continuation_quick_validation import ContinuationQuickValidation
+    from ..ports.command_runner import CommandRunner
+    from ..ports.session_output import SessionOutput
+    from ..ports.working_copy import WorkingCopy
 
 
 def build_continuation_ports(config: Config) -> ContinuationPorts:
@@ -46,4 +54,39 @@ def build_continuation_ports(config: Config) -> ContinuationPorts:
     )
 
 
-__all__ = ["build_continuation_ports"]
+def build_continuation_quick_validation(
+    config: Config,
+    *,
+    session_output: "SessionOutput",
+    command_runner: "CommandRunner",
+    working_copy: "WorkingCopy",
+) -> "ContinuationQuickValidation":
+    """The one way to assemble the continuation's quick-validation preparation.
+
+    Assembled here for the reason ``build_publication_revalidation`` is: the
+    step runs for a candidate whose own session — and the coder turn that would
+    otherwise have produced this evidence — is gone, so it belongs to the
+    continuation's composition rather than to the completion pipeline's.
+
+    The contract resolver is the same
+    :class:`~..control.publication_gate.RunValidationContracts` the publication
+    gate is built with, over the registry rebuilt from the current config, so
+    "which contract does this run execute" has one answer however it is asked.
+    What is deliberately NOT supplied is an attempt store: the gate this
+    composes is the agent-side one, and a gate given a candidate identity would
+    file a durable evaluation for a run that exists to hand one reviewer a
+    file (#173).
+    """
+    from ..control.continuation_quick_validation import ContinuationQuickValidation
+    from ..control.publication_gate import RunValidationContracts
+
+    return ContinuationQuickValidation(
+        contracts=RunValidationContracts(
+            session_output, config.validation_profiles()
+        ),
+        command_runner=command_runner,
+        working_copy=working_copy,
+    )
+
+
+__all__ = ["build_continuation_ports", "build_continuation_quick_validation"]

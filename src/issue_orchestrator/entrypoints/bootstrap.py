@@ -48,7 +48,10 @@ from .bootstrap_completion import (
     create_completion_components,
 )
 from .bootstrap_revalidation import build_publication_revalidation
-from .bootstrap_continuation import build_continuation_ports
+from .bootstrap_continuation import (
+    build_continuation_ports,
+    build_continuation_quick_validation,
+)
 from ..infra.config import Config
 from ..infra.env import ENV_PREFIX
 from ..adapters.github.repo import get_repo_from_git, GitRepoError
@@ -880,6 +883,8 @@ def build_orchestrator(
         # unreachable production code, however carefully it is assembled.
         publication_revalidation=build_publication_revalidation(config, attempt_store=attempt_store, session_output=session_output, command_runner=command_runner, working_copy=working_copy),
         continuation_ports=build_continuation_ports(config),
+        # Same factory both roots call (#173): a continuation's first reviewer reads evidence this step produced, or no run opens.
+        continuation_quick_validation=build_continuation_quick_validation(config, session_output=session_output, command_runner=command_runner, working_copy=working_copy),
         services=infra_services,
     )
 
@@ -1306,6 +1311,8 @@ def build_orchestrator_for_testing(
         # its own could build a differently-shaped route (#25, one layer up).
         publication_revalidation=build_publication_revalidation(config, attempt_store=attempt_store, session_output=session_output, command_runner=command_runner, working_copy=working_copy),
         continuation_ports=build_continuation_ports(config),
+        # Same factory both roots call (#173): a continuation's first reviewer reads evidence this step produced, or no run opens.
+        continuation_quick_validation=build_continuation_quick_validation(config, session_output=session_output, command_runner=command_runner, working_copy=working_copy),
         services=infra_services,
     )
 

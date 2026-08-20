@@ -913,6 +913,7 @@ def build_test_orchestrator_deps(
     )
     from issue_orchestrator.entrypoints.bootstrap_continuation import (
         build_continuation_ports,
+        build_continuation_quick_validation,
     )
     from issue_orchestrator.entrypoints.bootstrap_revalidation import (
         build_publication_revalidation,
@@ -1293,6 +1294,15 @@ def build_test_orchestrator_deps(
         # a test orchestrator reconciles against the durable store production
         # uses rather than a stub that can neither contend nor fail to read.
         continuation_ports=build_continuation_ports(config),
+        # ...and through the same factory the production roots call, so a
+        # test continuation produces its reviewer's evidence the one way
+        # production produces it (#173).
+        continuation_quick_validation=build_continuation_quick_validation(
+            config,
+            session_output=session_output,
+            command_runner=command_runner,
+            working_copy=working_copy,
+        ),
         services=infra_services,
     )
 
