@@ -12,7 +12,8 @@ from pathlib import Path
 import pytest
 import yaml
 
-from issue_orchestrator.control.validation import AgentGate, ValidationGate
+from issue_orchestrator.control.agent_gate import AgentGate
+from issue_orchestrator.control.validation import ValidationGate
 from issue_orchestrator.domain.validation_profile import ValidationGateKind
 from tests.validation_contract_helpers import publish_contract, quick_contract
 from issue_orchestrator.infra.config import Config

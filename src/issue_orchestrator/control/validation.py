@@ -2,7 +2,12 @@
 
 - ``ValidationRunner`` executes a validation command and produces a record
 - ``ValidationGate`` runs one contract of a profile, cache-aware
-- ``AgentGate`` runs the quick contract at agent completion
+
+The agent-side gate is its own owner in :mod:`.agent_gate`: it runs
+unconditionally, holds no cache and no attempt identity, and is run by the
+completion command and by the continuation rather than by the orchestrator's
+own pipeline. What both gates share is here — the runner above,
+:func:`read_gate_head_sha` and :func:`gate_failure_reason`.
 
 Every gate is constructed from a :class:`ValidationGateContract`, never from a
 free-form command plus a separately chosen suite label. That pairing is what
@@ -35,11 +40,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from ..domain.artifact_contracts import (
-    ValidationFailed,
-    ValidationOutcome,
-    ValidationPassed,
-)
 from ..domain.attempt import AttemptKey
 from ..domain.session_run import (
     VALIDATION_RECORD_NAME,
@@ -47,7 +47,6 @@ from ..domain.session_run import (
     VALIDATION_STDOUT_NAME,
     ValidationArtifactPaths,
 )
-from ..domain.validation_profile import AGENT_GATE_SUITE
 from ..infra import validation_timings as timings
 from ..infra.atomic_json import atomic_write_json
 from ..infra.emit import emit_event
@@ -81,7 +80,24 @@ def _normalize_head_sha(head_sha: str | None) -> str | None:
     return normalized or None
 
 
-def _failure_reason(record: ValidationRecord) -> str:
+def read_gate_head_sha(working_copy: WorkingCopy, worktree: Path) -> str | None:
+    """The commit a gate is about to judge, normalized.
+
+    Shared by both gates rather than reimplemented per gate: what "the commit
+    this record names" means must not depend on which gate wrote the record,
+    since a downstream reader compares the two spellings against each other.
+
+    Returns:
+        The normalized SHA, or ``None`` when HEAD cannot be read — which every
+        caller treats as a refusal, never as a run at an unknown commit.
+    """
+    head_sha = _normalize_head_sha(working_copy.get_head_sha(worktree))
+    if not head_sha:
+        logger.warning("Failed to get HEAD SHA in %s", worktree)
+    return head_sha
+
+
+def gate_failure_reason(record: ValidationRecord) -> str:
     """Human-facing reason for a failed gate run.
 
     Names the validation profile whenever it is not the default one, so a
@@ -422,13 +438,6 @@ class ValidationGate:
     def profile(self) -> str:
         return self.contract.profile
 
-    def _get_head_sha(self) -> Optional[str]:
-        """Get the current HEAD SHA."""
-        head_sha = _normalize_head_sha(self.working_copy.get_head_sha(self.worktree))
-        if not head_sha:
-            logger.warning("Failed to get HEAD SHA in %s", self.worktree)
-        return head_sha
-
     def _record_summary(
         self,
         *,
@@ -613,7 +622,7 @@ class ValidationGate:
             )
 
         # Get HEAD SHA
-        head_sha = self._get_head_sha()
+        head_sha = read_gate_head_sha(self.working_copy, self.worktree)
         if not head_sha:
             cache_lookup = "head_sha_missing"
             return finish(
@@ -717,159 +726,9 @@ class ValidationGate:
             return finish(
                 PublishGateResult(
                     allowed=False,
-                    reason=_failure_reason(record),
+                    reason=gate_failure_reason(record),
                     record=record,
                     cache_hit=False,
                 )
             )
 
-
-@dataclass
-class AgentGateResult:
-    """Result of an agent gate check."""
-
-    passed: bool
-    reason: str
-    record: Optional[ValidationRecord] = None
-    record_path: Optional[str] = None  # Path where validation record was written
-
-    @property
-    def outcome(self) -> ValidationOutcome:
-        """What this run says the manifest's validation outcome now is.
-
-        Here rather than at each recording site: both callers of this gate
-        attach the result to a run, and two private conversions of "passed plus
-        reason" into a typed outcome are how one of them starts recording a
-        pass with the previous failure's reason still on it — the defect
-        ``update_validation_outcome`` exists to make impossible one layer down.
-        """
-        if self.passed:
-            return ValidationPassed()
-        return ValidationFailed(reason=self.reason or "validation failed")
-
-
-class AgentGate:
-    """Validation gate for agent completion.
-
-    Unlike :class:`ValidationGate` this runs unconditionally (no cache) and
-    records the result for informational purposes.
-
-    It runs the profile's *quick* contract and records its own suite label, so
-    a reader can tell an agent-side run from the orchestrator's own quick gate
-    while both remain honestly labelled as the quick contract. Handing it a
-    publish contract is rejected rather than mislabelled (#25).
-    """
-
-    SUITE_NAME = AGENT_GATE_SUITE
-
-    def __init__(
-        self,
-        worktree: Path,
-        command_runner: CommandRunner,
-        working_copy: WorkingCopy,
-        contract: ValidationGateContract,
-        failure_diagnostics: CandidateGateDiagnostics | None = None,
-    ):
-        """Initialize agent gate for a worktree.
-
-        Args:
-            worktree: Path to the git worktree
-            contract: The profile's quick contract. An unconfigured contract
-                (no ``cmd``) means the gate is disabled.
-            failure_diagnostics: Durable destination for a failed run's output
-                (#94), passed straight through to the runner that produces it,
-                exactly as :class:`ValidationGate` passes its own. ``None``
-                where the caller holds no candidate identity — which is every
-                agent-side caller, and was every caller of this gate until the
-                continuation (#173). The gate does not consult it: an artefact
-                this gate wrote is evidence for a human, never an input to a
-                later decision.
-
-        Raises:
-            ValueError: when handed a contract other than the quick one.
-        """
-        if not contract.is_quick:
-            raise ValueError(
-                "AgentGate runs the quick contract; "
-                f"got {contract.kind.value!r}"
-            )
-        self.worktree = worktree
-        self.command_runner = command_runner
-        self.working_copy = working_copy
-        self.contract = contract
-        self.command = contract.cmd
-        self.timeout_seconds = contract.timeout_seconds
-        self.profile = contract.profile
-        self.store = ValidationRecordStore(worktree, contract.kind)
-        self.runner = ValidationRunner(
-            self.store, command_runner, failure_diagnostics=failure_diagnostics
-        )
-
-    def _get_head_sha(self) -> Optional[str]:
-        """Get the current HEAD SHA."""
-        head_sha = _normalize_head_sha(self.working_copy.get_head_sha(self.worktree))
-        if not head_sha:
-            logger.warning("Failed to get HEAD SHA in %s", self.worktree)
-        return head_sha
-
-    def run(self, session_output_dir: Path) -> AgentGateResult:
-        """Run the agent gate validation.
-
-        Unlike ValidationGate.check(), this always runs the validation
-        (no cache lookup) because we want to capture the result at
-        the specific point in time when the completion command is called.
-
-        Args:
-            session_output_dir: Directory to write validation output
-
-        Returns:
-            AgentGateResult with validation status
-        """
-        # Gate disabled if no command
-        if not self.command:
-            logger.debug("Agent gate disabled (no command configured)")
-            return AgentGateResult(
-                passed=True,
-                reason="Agent gate disabled (no command configured)",
-            )
-
-        # Get HEAD SHA
-        head_sha = self._get_head_sha()
-        if not head_sha:
-            return AgentGateResult(
-                passed=False,
-                reason="Cannot determine HEAD SHA",
-            )
-
-        # Run validation
-        logger.info(
-            "Agent gate: running validation for %s [profile=%s]",
-            head_sha[:8],
-            self.profile,
-        )
-        record = self.runner.run(
-            suite=self.SUITE_NAME,
-            head_sha=head_sha,
-            command=self.command,
-            timeout_seconds=self.timeout_seconds,
-            session_output_dir=session_output_dir,
-            profile=self.profile,
-        )
-
-        # Get the path where the record was written
-        record_path = str(self.store.get_record_path(head_sha))
-
-        if record.passed:
-            return AgentGateResult(
-                passed=True,
-                reason=f"Validation passed for {head_sha[:8]}",
-                record=record,
-                record_path=record_path,
-            )
-        else:
-            return AgentGateResult(
-                passed=False,
-                reason=_failure_reason(record),
-                record=record,
-                record_path=record_path,
-            )

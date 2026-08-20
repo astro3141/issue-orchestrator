@@ -52,7 +52,7 @@ RUNTIME_COMPLETION_RECORD: Any = RuntimeCompletionRecord
 RUNTIME_COMPLETION_OUTCOME: Any = RuntimeCompletionOutcome
 RUNTIME_PROPOSED_FOLLOW_UP_ISSUE: Any = RuntimeProposedFollowUpIssue
 RUNTIME_REQUESTED_ACTION: Any = RuntimeRequestedAction
-from ...control.validation import AgentGate, AgentGateResult
+from ...control.agent_gate import AgentGate, AgentGateResult
 from ...domain.validation_profile import ValidationGateKind
 from ...infra.validation_profiles import ValidationGateContract
 from ...domain.session_run import ValidationArtifactPaths

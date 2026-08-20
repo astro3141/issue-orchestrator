@@ -56,7 +56,7 @@ class TestValidationRecordPath:
     def test_accepts_absolute_path_from_agent_gate(self):
         """Regression for review comment P1 on #6008.
 
-        AgentGate writes an absolute path at ``validation.py:582``;
+        ``AgentGate.run`` writes an absolute path (``control/agent_gate.py``);
         rejecting absolute paths here broke every validated
         completion with agent_gate enabled.
         """

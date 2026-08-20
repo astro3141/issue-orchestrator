@@ -66,9 +66,11 @@ from .validation import (
     ValidationCache,
     ValidationGate,
     PublishGateResult,
+    VALIDATION_SCHEMA_VERSION,
+)
+from .agent_gate import (
     AgentGate,
     AgentGateResult,
-    VALIDATION_SCHEMA_VERSION,
 )
 from .isolation import (
     FORBIDDEN_ENV_VARS,

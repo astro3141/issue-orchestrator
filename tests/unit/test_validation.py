@@ -12,6 +12,10 @@ import subprocess
 from issue_orchestrator.execution import GitWorkingCopy, LocalCommandRunner
 from issue_orchestrator.ports.command_runner import CommandResult
 
+from issue_orchestrator.control.agent_gate import (
+    AgentGate,
+    AgentGateResult,
+)
 from issue_orchestrator.control.validation import (
     ValidationRecord,
     ValidationRecordStore,
@@ -19,8 +23,6 @@ from issue_orchestrator.control.validation import (
     ValidationCache,
     ValidationGate,
     PublishGateResult,
-    AgentGate,
-    AgentGateResult,
     VALIDATION_SCHEMA_VERSION,
 )
 from issue_orchestrator.control.validation_record_cache import contract_record_path

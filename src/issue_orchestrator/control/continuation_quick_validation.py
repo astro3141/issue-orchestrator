@@ -2,7 +2,7 @@
 
 The ordinary path's first Reviewer is handed validation evidence its **coder
 turn** produced: ``coding-done`` runs the profile's quick contract through
-:class:`~.validation.AgentGate`, writes the record into the run directory, and
+:class:`~.agent_gate.AgentGate`, writes the record into the run directory, and
 names it on the completion record. Everything downstream is a data dependency
 on that one file — the completion record starts the review exchange, the pair
 mirror copies the named record into pair and run scope, and a round cannot
@@ -18,7 +18,7 @@ answers ``changes_requested`` about a missing file rather than about the code.
 So the evidence is *genuinely produced*, by system preparation, with no model
 or coder turn:
 
-* **The owner is the existing one.** :class:`~.validation.AgentGate` runs the
+* **The owner is the existing one.** :class:`~.agent_gate.AgentGate` runs the
   profile's quick contract, under the suite label an agent-side run carries,
   into the run directory the mirror already reads. Nothing here runs a command
   of its own, and nothing here writes a record.
@@ -78,7 +78,7 @@ from ..ports.working_copy import WorkingCopy
 from .candidate_integrity import CandidateIntegrity
 from .gate_failure_diagnostics import GateFailureDiagnostics
 from .publication_gate import RunValidationContracts
-from .validation import AgentGate, AgentGateResult
+from .agent_gate import AgentGate, AgentGateResult
 
 logger = logging.getLogger(__name__)
 
