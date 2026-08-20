@@ -39,7 +39,7 @@ from issue_orchestrator.control.publication_gate import (
     PublicationGateOutcome,
     RunValidationContracts,
 )
-from issue_orchestrator.control.publish_gate_diagnostics import PublishGateDiagnostics
+from issue_orchestrator.control.gate_failure_diagnostics import GateFailureDiagnostics
 from issue_orchestrator.domain.attempt import Attempt, AttemptKey
 from issue_orchestrator.domain.issue_key import GitHubIssueKey
 from issue_orchestrator.domain.validation_verdict_receipt import (
@@ -143,7 +143,7 @@ def _gate(
         working_copy=StubWorkingCopy(head_sha),
         attempts=SidecarAttemptStore(repo_root),
         attempt_keys=attempt_keys or RecordingAttemptKeys(),
-        diagnostics=PublishGateDiagnostics(repo_root),
+        diagnostics=GateFailureDiagnostics(repo_root),
     )
 
 

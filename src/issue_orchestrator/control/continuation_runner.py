@@ -652,14 +652,22 @@ class ControlContinuationRunner:
         reason :meth:`_make_runnable`'s does — it is a start budget, and
         refunding it would turn a repeatably failing suite into an unbounded
         supply of continuation runs. Once #149's allowance is gone the ordinary
-        ``RUNS_EXHAUSTED`` derivation hands the candidate back to rework, where
-        a coder can see and fix what the quick contract rejected.
+        ``RUNS_EXHAUSTED`` derivation hands the candidate back to rework.
+
+        What a coder finds waiting there is a durable artefact, not this log
+        line and not the run directory: the discard below deletes every path
+        the gate wrote inside the checkout, so the gate files a failing run's
+        output into the primary checkout as it produces it (#94). It is filed
+        under this candidate's ``(issue, head_sha)``, which is why the
+        preparation is handed the issue key rather than deriving one.
 
         Returns:
             What the preparation produced, or ``None`` when no run may open.
         """
         prepared = self._quick_validation.prepare(
-            worktree=worktree, run_assets=assets
+            worktree=worktree,
+            run_assets=assets,
+            issue_key=operation.issue.key,
         )
         if isinstance(prepared, PreparedQuickValidation):
             logger.info(

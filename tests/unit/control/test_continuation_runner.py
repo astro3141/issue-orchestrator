@@ -37,6 +37,7 @@ from issue_orchestrator.control.continuation_quick_validation import (
     ContinuationQuickValidation,
 )
 from issue_orchestrator.control.continuation_runner import ControlContinuationRunner
+from issue_orchestrator.control.gate_failure_diagnostics import GATE_FAILURES_DIR
 from issue_orchestrator.control.continuation_scheduling import (
     ControlContinuation,
     build_control_continuation,
@@ -58,6 +59,10 @@ from issue_orchestrator.domain.continuation_phase import ContinuationPhase
 from issue_orchestrator.domain.continuation_settlement import (
     ContinuationSettlementKind,
 )
+from issue_orchestrator.domain.artifact_contracts import (
+    validation_outcome_to_manifest_fields,
+)
+from issue_orchestrator.domain.issue_key_codec import issue_key_path_part
 from issue_orchestrator.domain.control_operation import (
     ControlOperationExclusions,
     ControlOperationKey,
@@ -300,6 +305,30 @@ class FakeSessionOutput:
         """
         return self.manifests.get(run_dir)
 
+    def update_manifest(self, run_dir: Path, updates: dict[str, object]) -> None:
+        self.manifests.setdefault(run_dir, {}).update(updates)
+
+    def update_validation_outcome(
+        self, run_dir: Path, outcome: object, **kwargs: object
+    ) -> None:
+        """Project the typed outcome exactly as the real adapter does.
+
+        Through the same projection rather than a second reading of it, so a
+        run this double says validated is one the real manifest would agree
+        about — the point of the record being on the manifest at all.
+
+        Deliberately absent from the journal, as the manifest writes above are:
+        the journal is the order the run's PROGRAMS ran in, and what one of
+        them recorded afterwards is a consequence of that order rather than a
+        step in it. What the manifest ends up saying is read back from
+        ``manifests``; the ordering claim it belongs to — recorded before any
+        refusal discards the checkout — is proved where the preparation itself
+        is, in ``test_continuation_quick_validation``.
+        """
+        self.manifests.setdefault(run_dir, {}).update(
+            validation_outcome_to_manifest_fields(outcome)  # type: ignore[arg-type]
+        )
+
 
 @dataclass
 class ProcessingOutcome:
@@ -507,6 +536,10 @@ class Harness:
     labels: FakeActionApplier
     in_flight: ContinuationsInFlight
     runs: ContinuationRuns
+    #: The primary checkout: what the runner is rooted at, and what a failing
+    #: gate's durable output is filed into (#94) — never the run's own
+    #: checkout, which every refusal deletes.
+    repo_root: Path
     #: Every step of opening a run, in the order it happened. The ordering is
     #: itself the contract (#160): a worktree that is not runnable must not
     #: reach the run assets, the completion record or the exchange.
@@ -538,6 +571,7 @@ def _quick_validation(
     working_copy: FakeWorkingCopy,
     command_runner: WorktreeCommands,
     session_output: FakeSessionOutput,
+    repo_root: Path,
     *,
     quick_cmd: str | None = QUICK_SENTINEL,
 ) -> ContinuationQuickValidation:
@@ -547,8 +581,14 @@ def _quick_validation(
     what #173 requires is that the continuation DELEGATES to the configured
     quick-validation owner, and a double could not tell delegation apart from
     a reimplementation.
+
+    ``repo_root`` is the same primary checkout the runner is given, because
+    that is where a failing gate's output is filed (#94) — the run's own
+    checkout is deleted on refusal. Passed rather than defaulted: ``Config``
+    resolves it to the current directory, which for a test is this repository.
     """
     config = Config()
+    config.repo_root = repo_root
     config.validation.quick.cmd = quick_cmd
     return build_continuation_quick_validation(
         config,
@@ -582,7 +622,7 @@ def harness(tmp_path: Path) -> Harness:
         working_copy=working_copy,  # type: ignore[arg-type]
         runnability=_runnability(working_copy, commands),
         quick_validation=_quick_validation(
-            working_copy, commands, session_output
+            working_copy, commands, session_output, tmp_path / "primary"
         ),
         session_output=session_output,  # type: ignore[arg-type]
         completion_processor=completion,  # type: ignore[arg-type]
@@ -612,6 +652,7 @@ def harness(tmp_path: Path) -> Harness:
         labels=labels,
         in_flight=in_flight,
         runs=runs,
+        repo_root=tmp_path / "primary",
         journal=journal,
     )
 
@@ -747,7 +788,10 @@ class TestActiveSessionRefusal:
             working_copy=harness.working_copy,  # type: ignore[arg-type]
             runnability=_runnability(harness.working_copy, harness.commands),
             quick_validation=_quick_validation(
-                harness.working_copy, harness.commands, harness.session_output
+                harness.working_copy,
+                harness.commands,
+                harness.session_output,
+                harness.repo_root,
             ),
             session_output=harness.session_output,  # type: ignore[arg-type]
             completion_processor=harness.completion,  # type: ignore[arg-type]
@@ -1567,7 +1611,10 @@ class TestTheCoderWorktreeIsMadeRunnable:
                 harness.working_copy, harness.commands, commands=[]
             ),
             quick_validation=_quick_validation(
-                harness.working_copy, harness.commands, harness.session_output
+                harness.working_copy,
+                harness.commands,
+                harness.session_output,
+                harness.repo_root,
             ),
             session_output=harness.session_output,  # type: ignore[arg-type]
             completion_processor=harness.completion,  # type: ignore[arg-type]
@@ -1941,6 +1988,7 @@ class TestTheFirstReviewersEvidenceIsGenuinelyProduced:
                 harness.working_copy,
                 harness.commands,
                 harness.session_output,
+                harness.repo_root,
                 quick_cmd=None,
             ),
             session_output=harness.session_output,  # type: ignore[arg-type]
@@ -2151,6 +2199,45 @@ class TestEvidenceThatCannotBeProducedOpensNoRun:
         assert stored is not None
         assert stored.continuation_runs_used == CONTINUATION_RUN_ALLOWANCE
         assert stored.continuation_run_allowance_available is False
+
+    def test_what_rejected_the_candidate_outlives_every_refused_run(
+        self, harness: Harness
+    ) -> None:
+        """The end state a coder is handed back into, and what explains it.
+
+        This is the whole point of filing the gate's output outside the
+        checkout (#94). Every run above deletes the directory its record,
+        stdout and stderr were written into, and does it immediately rather
+        than losing a race — so once ``RUNS_EXHAUSTED`` returns the candidate
+        to rework, the primary checkout is the only place an account of what
+        rejected it can still be.
+        """
+        harness.commands.quick_failing = True
+        attempt = _twice_evaluated(RequestedAction.CREATE_PR)
+        harness.attempts.update(attempt.key, lambda _current: attempt)
+        operation = _operation(attempt, ContinuationPhase.PASS_PENDING_REVIEW)
+
+        for _ in range(CONTINUATION_RUN_ALLOWANCE):
+            harness.runner.advance(_owned(operation))
+
+        # Every checkout the runs stood in is gone.
+        assert len(harness.worktrees.removed) == CONTINUATION_RUN_ALLOWANCE
+        # One surviving explanation per refused run, each naming this
+        # candidate and the contract that rejected it.
+        failures = sorted(
+            (harness.repo_root / GATE_FAILURES_DIR).iterdir()
+        )
+        assert len(failures) == CONTINUATION_RUN_ALLOWANCE
+        for directory in failures:
+            assert directory.name.startswith(
+                f"{issue_key_path_part(_issue().key)}--{SHA_A}--"
+            )
+            payload = json.loads(
+                (directory / "failure.json").read_text(encoding="utf-8")
+            )
+            assert payload["verdict"]["command"] == QUICK_SENTINEL
+            assert payload["verdict"]["verdict"] == ValidationVerdict.FAILED.value
+            assert (directory / "stderr.log").read_text() == "1 failed, 0 passed"
 
 
 # ======================================================================
@@ -2593,7 +2680,7 @@ def _built(tmp_path: Path) -> BuiltEngine:
         # the ports on ``deps`` alone would leave it running the real gate
         # against a directory that is not a git checkout.
         continuation_quick_validation=_quick_validation(
-            working_copy, commands, session_output
+            working_copy, commands, session_output, config.repo_root
         ),
         completion_processor=completion,  # type: ignore[arg-type]
         action_applier=FakeActionApplier(),  # type: ignore[arg-type]

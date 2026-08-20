@@ -38,11 +38,25 @@ or coder turn:
   against the coder worktree's current HEAD before every round — evidence that
   does not name the candidate reads as stale there and refuses the round rather
   than passing silently.
+* **What the gate found is recorded where the run's readers look.** The run
+  itself is told the outcome, the record and the logs, through the same
+  :class:`~..ports.run_evidence.ValidationEvidenceRecorder` an agent's
+  ``coding-done`` records its gate through. A run that produced evidence and
+  told its own manifest nothing about it is dark to the session-diagnostics
+  dialog, the run audit and the artifact list alike, because all three start
+  from the manifest's validation outcome.
 
 A refusal is returned, not raised: the caller decides what it costs, and for
 the continuation it costs the whole run — no run is opened, no exchange starts,
 no pull request is created, and the durable record the pass did not change
 derives the same phase next tick until the existing run allowance is gone.
+
+That is also why the failing gate's own output is filed *outside* the checkout
+(#94, via :mod:`.gate_failure_diagnostics`). Every path the run wrote is inside
+a worktree the caller deletes immediately on a refusal — not racing cleanup,
+ahead of it — so a candidate that reaches ``RUNS_EXHAUSTED`` on repeated
+validation failures would otherwise return to rework with nothing but an exit
+code to explain what rejected it.
 """
 
 from __future__ import annotations
@@ -51,14 +65,20 @@ import logging
 from dataclasses import dataclass
 from pathlib import Path
 
+from ..domain.issue_key import IssueKey
 from ..domain.session_run import SessionRunAssets
 from ..domain.validation_profile import ValidationGateKind
-from ..infra.validation_profiles import UnknownValidationProfileError
+from ..infra.validation_profiles import (
+    UnknownValidationProfileError,
+    ValidationGateContract,
+)
 from ..ports.command_runner import CommandRunner
+from ..ports.run_evidence import ValidationEvidenceRecorder
 from ..ports.working_copy import WorkingCopy
 from .candidate_integrity import CandidateIntegrity
+from .gate_failure_diagnostics import GateFailureDiagnostics
 from .publication_gate import RunValidationContracts
-from .validation import AgentGate
+from .validation import AgentGate, AgentGateResult
 
 logger = logging.getLogger(__name__)
 
@@ -97,6 +117,9 @@ class ContinuationQuickValidation:
         contracts: RunValidationContracts,
         command_runner: CommandRunner,
         working_copy: WorkingCopy,
+        evidence: ValidationEvidenceRecorder,
+        diagnostics: GateFailureDiagnostics,
+        junit_xml_paths: tuple[str, ...] = (),
     ) -> None:
         """Compose the gate's collaborators; decide nothing about them.
 
@@ -105,16 +128,30 @@ class ContinuationQuickValidation:
         onto the run's manifest when the run was created, so the continuation
         validates under the contract its descriptor recorded rather than
         whatever the current default is bound to today.
+
+        ``evidence`` and ``diagnostics`` are the two destinations a gate run
+        owes something to, and they are required rather than optional because
+        the thing each prevents is silence: a run that recorded no outcome, and
+        a failure with no surviving account. Both are the existing owners —
+        the recorder ``coding-done`` records its own gate through, and the
+        durable gate-failure store the publication gate files into (#94).
         """
         self._contracts = contracts
         self._command_runner = command_runner
         self._working_copy = working_copy
+        self._evidence = evidence
+        self._diagnostics = diagnostics
+        self._junit_xml_paths = junit_xml_paths
         self._integrity = CandidateIntegrity(
             working_copy, operation=QUICK_VALIDATION_OPERATION
         )
 
     def prepare(
-        self, *, worktree: Path, run_assets: SessionRunAssets
+        self,
+        *,
+        worktree: Path,
+        run_assets: SessionRunAssets,
+        issue_key: IssueKey,
     ) -> PreparedQuickValidation | RefusedQuickValidation:
         """Produce this run's quick-validation record, or say why it could not.
 
@@ -123,6 +160,11 @@ class ContinuationQuickValidation:
                 exact candidate commit.
             run_assets: The run whose frozen profile selects the contract and
                 whose directory receives the evidence.
+            issue_key: The candidate's canonical issue identity, which a failed
+                run's durable output is filed under. Required, not derived: it
+                is the same ``(issue, head_sha)`` spelling the attempt sidecar
+                uses, and an explanation filed under anything else could not be
+                found from the receipt that says a failure happened.
 
         Returns:
             The produced record's path, or a refusal. A refusal is never a
@@ -157,16 +199,38 @@ class ContinuationQuickValidation:
             command_runner=self._command_runner,
             working_copy=self._working_copy,
             contract=contract,
+            # Written by the gate itself, at execution time, into the primary
+            # checkout. Not copied out afterwards: the caller deletes this
+            # worktree on any refusal below, so a copy taken after the fact
+            # would be reading a directory that is already gone (#94).
+            failure_diagnostics=self._diagnostics.for_candidate(issue_key),
         ).run(session_output_dir=run_assets.run_dir)
-        # Read whether or not the gate passed, and reported first: a failing
-        # command and an altered candidate are two separate facts, and a
-        # candidate this preparation moved or dirtied is the more serious one.
+        # Read whether or not the gate passed, and read FIRST — before this
+        # step writes anything of its own into the checkout, so nothing the
+        # recording below leaves in the run directory can be attributed to the
+        # command that ran. A failing command and an altered candidate are two
+        # separate facts, and a candidate this preparation moved or dirtied is
+        # the more serious one.
         altered = self._integrity.describe_change(worktree, before)
+        # What the gate found, told to the run that produced it, before any
+        # refusal is decided: the manifest is what every reader of this run
+        # starts from, and a run that recorded nothing reads as one that
+        # validated nothing rather than as one that failed.
+        self._evidence.record_gate_result(
+            artifacts=run_assets.validation_artifacts,
+            worktree=worktree,
+            outcome=result.outcome,
+            record=result.record,
+            store_record_path=(
+                Path(result.record_path) if result.record_path else None
+            ),
+            junit_xml_paths=self._junit_xml_paths,
+        )
         if altered is not None:
             logger.error("[CONTINUATION] quick validation altered the candidate: %s", altered)
             return RefusedQuickValidation(altered)
         if not result.passed:
-            return RefusedQuickValidation(result.reason)
+            return RefusedQuickValidation(self._failure_reason(result, contract))
         record_path = run_assets.validation_artifacts.record_path
         if not record_path.exists():
             # A pass the gate reported but left no record for. Nothing here
@@ -177,6 +241,30 @@ class ContinuationQuickValidation:
                 f"the quick gate reported a pass but wrote no record at {record_path}"
             )
         return PreparedQuickValidation(record_path=record_path)
+
+    def _failure_reason(
+        self, result: AgentGateResult, contract: ValidationGateContract
+    ) -> str:
+        """Say what rejected the candidate, and where the account of it lives.
+
+        The gate's own reason is an exit code and a commit, which is all a
+        reader needs while the run directory still exists. This caller's
+        refusal outlives that directory by design — the checkout is discarded
+        the moment this returns — so the reason names the command that ran and
+        the store the output was written to, and a reader who wants the output
+        itself finds it filed under this candidate there.
+
+        A run that produced no record executed no command (a HEAD that could
+        not be read), so it filed no diagnostic and there is nothing to point
+        at.
+        """
+        if result.record is None:
+            return result.reason
+        return (
+            f"{result.reason}: {contract.cmd}"
+            f" — the gate's own output is kept under {self._diagnostics.failures_dir}"
+            " for this candidate"
+        )
 
 
 __all__ = [

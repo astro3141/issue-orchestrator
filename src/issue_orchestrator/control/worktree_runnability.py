@@ -47,7 +47,7 @@ from pathlib import Path
 from ..infra.config import Config
 from ..ports.command_runner import CommandRunner
 from ..ports.working_copy import WorkingCopy
-from .candidate_integrity import CandidateCheckpoint, CandidateIntegrity
+from .candidate_integrity import CandidateIntegrity
 from .isolation import build_runtime_tool_env
 
 logger = logging.getLogger(__name__)
@@ -118,7 +118,7 @@ class WorktreeRunnability:
             self._require_pinned_recipe(worktree_path)
         except WorktreeProvisioningError as unpinned:
             return unpinned
-        checkpoint = self._checkpoint(worktree_path)
+        checkpoint = self._integrity.checkpoint(worktree_path)
         step_start = time.time()
         setup_failure: WorktreeProvisioningError | None = None
         try:
@@ -130,7 +130,9 @@ class WorktreeRunnability:
             logger.info(
                 "[provisioning] Setup completed in %.1fs", time.time() - step_start
             )
-        candidate_change = self._describe_candidate_change(worktree_path, checkpoint)
+        candidate_change = self._integrity.describe_change(
+            worktree_path, checkpoint
+        )
         if candidate_change is not None:
             logger.error("Provisioning altered the candidate: %s", candidate_change)
         if setup_failure is not None and candidate_change is not None:
@@ -181,21 +183,6 @@ class WorktreeRunnability:
             raise WorktreeProvisioningError(
                 f"setup command failed: {cmd} (exit_code={result.returncode}): {stderr}"
             )
-
-    def _checkpoint(self, worktree_path: Path) -> CandidateCheckpoint:
-        return self._integrity.checkpoint(worktree_path)
-
-    def _describe_candidate_change(
-        self, worktree_path: Path, before: CandidateCheckpoint
-    ) -> str | None:
-        """Name what provisioning changed about the candidate, or ``None``.
-
-        Delegated whole to :class:`~.candidate_integrity.CandidateIntegrity`,
-        which owns both reads, the asymmetry between them and the wording — see
-        that module for why an already-dirty worktree is a question this cannot
-        answer.
-        """
-        return self._integrity.describe_change(worktree_path, before)
 
 
 __all__ = [

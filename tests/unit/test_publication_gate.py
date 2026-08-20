@@ -25,8 +25,8 @@ from issue_orchestrator.control.publication_gate import (
     RunValidationContracts,
     publish_gate_output_dir,
 )
-from issue_orchestrator.control.publish_gate_diagnostics import (
-    PublishGateDiagnostics,
+from issue_orchestrator.control.gate_failure_diagnostics import (
+    GateFailureDiagnostics,
 )
 from issue_orchestrator.domain.attempt import AttemptKey
 from issue_orchestrator.control.validation import ValidationGate
@@ -87,11 +87,11 @@ def attempts(worktree: Path) -> SidecarAttemptStore:
     return SidecarAttemptStore(worktree.parent)
 
 
-def failure_diagnostics(worktree: Path) -> PublishGateDiagnostics:
+def failure_diagnostics(worktree: Path) -> GateFailureDiagnostics:
     """Durable failure diagnostics, rooted outside the worktree for the same
     reason ``attempts`` is: what has to survive cleanup cannot live in
     the thing being cleaned up (#94)."""
-    return PublishGateDiagnostics(worktree.parent)
+    return GateFailureDiagnostics(worktree.parent)
 
 
 def sentinel_registry(profile_name: str = "default") -> ValidationProfileRegistry:

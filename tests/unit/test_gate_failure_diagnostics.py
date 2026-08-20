@@ -1,4 +1,4 @@
-"""A failed publish gate leaves its own explanation behind (#94).
+"""A failed gate leaves its own explanation behind (#94).
 
 The defect these pin: the publication gate's stdout and stderr are written into
 the session run directory, which lives inside the coder worktree. Twice on #93 a
@@ -16,6 +16,12 @@ Durability is proved by destroying things: ``git worktree remove``, then a
 reader handed nothing but the primary checkout. ``TestRemovingTheDurableWrite
 BreaksThesePins`` performs the failure-direction mutation the issue requires —
 a test that survives its own mutation has pinned nothing.
+
+The publication gate is the caller under test here because it was the first
+one. It is no longer the only one: the store is now shared by every gate whose
+output would otherwise die with its checkout, and what the continuation's quick
+gate files into it is proved in ``control/test_continuation_quick_validation``
+(#173).
 
 No GitHub adapter, no network and no repository host is constructed anywhere in
 this module.
@@ -44,14 +50,14 @@ from issue_orchestrator.control.publication_gate import (
     RunValidationContracts,
     publish_gate_output_dir,
 )
-from issue_orchestrator.control.publish_gate_diagnostics import (
+from issue_orchestrator.control.gate_failure_diagnostics import (
     DIAGNOSTIC_FILE_NAME,
-    PUBLISH_GATE_FAILURES_DIR,
+    GATE_FAILURES_DIR,
     STDERR_FILE_NAME,
     STDOUT_FILE_NAME,
     CandidateGateDiagnostics,
+    GateFailureDiagnostics,
     GateFailureOutput,
-    PublishGateDiagnostics,
     needs_durable_diagnostic,
 )
 from issue_orchestrator.domain.attempt import AttemptKey
@@ -172,7 +178,7 @@ def _gate(
         working_copy=StubWorkingCopy(head_sha),
         attempts=SidecarAttemptStore(repo_root),
         attempt_keys=StubAttemptKeys(),
-        diagnostics=PublishGateDiagnostics(repo_root),
+        diagnostics=GateFailureDiagnostics(repo_root),
     )
 
 
@@ -223,7 +229,7 @@ class DurableDiagnostics:
     """
 
     def __init__(self, repo_root: Path) -> None:
-        self._failures_dir = repo_root / PUBLISH_GATE_FAILURES_DIR
+        self._failures_dir = repo_root / GATE_FAILURES_DIR
 
     def for_candidate(self, issue_key, head_sha: str) -> list[Path]:
         prefix = f"{issue_key_path_part(issue_key)}--{head_sha}--"
@@ -304,6 +310,10 @@ class TestTheDiagnosticIsBoundToTheExactCandidate:
         assert isinstance(verdict, dict)
         assert verdict["head_sha"] == SHA_A
         # The contract half: what ran, under which profile, and what it decided.
+        # The artefact's own type names it too, and is taken from the record
+        # rather than from whoever wired the destination — the store now holds
+        # more than one gate's failures (#173).
+        assert payload["type"] == "publish_gate_failure"
         assert verdict["suite"] == "publish_gate"
         assert verdict["command"] == PUBLISH_SENTINEL
         assert verdict["profile"] == "default"
@@ -550,7 +560,7 @@ class TestTheDiagnosticIsNotAnAuthority:
         self, repo_root: Path, durable: DurableDiagnostics
     ) -> None:
         """Even hand-planted, the artefact cannot make a candidate reviewable."""
-        PublishGateDiagnostics(repo_root).for_candidate(ISSUE).record_failure(
+        GateFailureDiagnostics(repo_root).for_candidate(ISSUE).record_failure(
             GateFailureOutput(
                 record=_record(passed=False), stdout="anything", stderr="at all"
             )
@@ -674,7 +684,7 @@ class TestTheWriterOnlyDescribesFailures:
     def test_a_passing_run_handed_to_the_writer_is_refused(
         self, repo_root: Path
     ) -> None:
-        writer = PublishGateDiagnostics(repo_root).for_candidate(ISSUE)
+        writer = GateFailureDiagnostics(repo_root).for_candidate(ISSUE)
 
         with pytest.raises(ValueError, match="failed run"):
             writer.record_failure(
@@ -746,8 +756,8 @@ class TestRemovingTheDurableWriteBreaksThesePins:
         monkeypatch.setattr(
             CandidateGateDiagnostics,
             "_destination_for",
-            lambda self, head_sha: (
-                repo_root / PUBLISH_GATE_FAILURES_DIR / "the-only-failure"
+            lambda self, head_sha, suite: (
+                repo_root / GATE_FAILURES_DIR / "the-only-failure"
             ),
         )
 

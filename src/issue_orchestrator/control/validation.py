@@ -14,7 +14,7 @@ A run's stdout and stderr are written into the session run directory, which
 lives inside the worktree and dies with it. A gate given a
 ``failure_diagnostics`` destination therefore writes a *failed* run's output to
 that durable destination too, at the moment it has the bytes in hand — see
-:mod:`.publish_gate_diagnostics` for why it is not copied out afterwards (#94).
+:mod:`.gate_failure_diagnostics` for why it is not copied out afterwards (#94).
 
 A gate given an attempt identity consults that candidate's durable evaluation
 history rather than a path into the run directory (#139): the receipts live in
@@ -35,6 +35,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
+from ..domain.artifact_contracts import (
+    ValidationFailed,
+    ValidationOutcome,
+    ValidationPassed,
+)
 from ..domain.attempt import AttemptKey
 from ..domain.session_run import (
     VALIDATION_RECORD_NAME,
@@ -55,7 +60,7 @@ from ..ports.attempt_store import AttemptStore
 from ..ports.session_output import ValidationRecord
 from .candidate_evaluations import CandidateEvaluations, PriorEvaluation
 from .isolation import build_runtime_tool_env
-from .publish_gate_diagnostics import (
+from .gate_failure_diagnostics import (
     CandidateGateDiagnostics,
     GateFailureOutput,
     needs_durable_diagnostic,
@@ -132,10 +137,15 @@ class ValidationRunner:
             store: Store for writing validation records
             command_runner: Adapter for running commands
             failure_diagnostics: Where a failed run's output is kept so it
-                outlives the worktree (#94). ``None`` for gates whose evidence
-                is not candidate-bound — the agent gate has no canonical issue
-                identity to file under, and prepush runs outside a managed
-                candidate entirely. The publication gate always supplies one.
+                outlives the worktree (#94). ``None`` for a run whose CALLER
+                holds no canonical issue identity to file under — an agent-side
+                ``coding-done`` knows only its worktree, and prepush runs
+                outside a managed candidate entirely. It is not a property of
+                the gate KIND: the publication gate always supplies one, and so
+                does any orchestrator-side caller holding the candidate, which
+                since #173 includes an agent gate the continuation runs. That
+                one needs it most — it destroys the checkout the moment its
+                gate refuses, so a destination inside it would keep nothing.
         """
         self.store = store
         self.command_runner = command_runner
@@ -723,6 +733,20 @@ class AgentGateResult:
     record: Optional[ValidationRecord] = None
     record_path: Optional[str] = None  # Path where validation record was written
 
+    @property
+    def outcome(self) -> ValidationOutcome:
+        """What this run says the manifest's validation outcome now is.
+
+        Here rather than at each recording site: both callers of this gate
+        attach the result to a run, and two private conversions of "passed plus
+        reason" into a typed outcome are how one of them starts recording a
+        pass with the previous failure's reason still on it — the defect
+        ``update_validation_outcome`` exists to make impossible one layer down.
+        """
+        if self.passed:
+            return ValidationPassed()
+        return ValidationFailed(reason=self.reason or "validation failed")
+
 
 class AgentGate:
     """Validation gate for agent completion.
@@ -744,6 +768,7 @@ class AgentGate:
         command_runner: CommandRunner,
         working_copy: WorkingCopy,
         contract: ValidationGateContract,
+        failure_diagnostics: CandidateGateDiagnostics | None = None,
     ):
         """Initialize agent gate for a worktree.
 
@@ -751,6 +776,14 @@ class AgentGate:
             worktree: Path to the git worktree
             contract: The profile's quick contract. An unconfigured contract
                 (no ``cmd``) means the gate is disabled.
+            failure_diagnostics: Durable destination for a failed run's output
+                (#94), passed straight through to the runner that produces it,
+                exactly as :class:`ValidationGate` passes its own. ``None``
+                where the caller holds no candidate identity — which is every
+                agent-side caller, and was every caller of this gate until the
+                continuation (#173). The gate does not consult it: an artefact
+                this gate wrote is evidence for a human, never an input to a
+                later decision.
 
         Raises:
             ValueError: when handed a contract other than the quick one.
@@ -768,7 +801,9 @@ class AgentGate:
         self.timeout_seconds = contract.timeout_seconds
         self.profile = contract.profile
         self.store = ValidationRecordStore(worktree, contract.kind)
-        self.runner = ValidationRunner(self.store, command_runner)
+        self.runner = ValidationRunner(
+            self.store, command_runner, failure_diagnostics=failure_diagnostics
+        )
 
     def _get_head_sha(self) -> Optional[str]:
         """Get the current HEAD SHA."""

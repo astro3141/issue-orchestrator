@@ -178,16 +178,23 @@ is that loss, observed twice on one issue — once 14 s after the verdict, once
 environment, so the deleted output was the only thing that could ever have
 explained it.
 
-So a publish run that does **not** pass also writes its output to a durable
+So a gate run that does **not** pass also writes its output to a durable
 destination in the primary checkout:
 
 ```
-.issue-orchestrator/diagnostics/publish-gate-failures/
-    <issue-scope>--<issue-id>--<HEAD_SHA>--<timestamp>/
+.issue-orchestrator/diagnostics/gate-failures/
+    <issue-scope>--<issue-id>--<HEAD_SHA>--<suite>--<timestamp>/
         failure.json     # issue key, verdict receipt fields, exit code, timings
         stdout.log       # the run's stdout, verbatim
         stderr.log       # the run's stderr, verbatim
 ```
+
+One store for every gate, not one per contract: the question a reader arrives
+with is "why did *this candidate* fail", and the suite in the name is what
+keeps two contracts' explanations for one candidate from erasing each other.
+`failure.json`'s `type` is taken from the record's own suite
+(`publish_gate_failure`, `agent_gate_failure`), so a diagnostic cannot name a
+contract other than the one that ran.
 
 Three properties are the whole design:
 
@@ -213,6 +220,14 @@ code alone, so a timeout is covered by the same seam with no timeout-specific
 rule. A candidate with no canonical issue key (the manual-reprocess route)
 files no diagnostic, for the same reason it files no receipt, and says so in the
 log rather than skipping silently.
+
+Whether a gate files here is a property of its **caller**, not of the contract:
+a caller that holds the candidate's canonical issue key supplies the
+destination, and one that does not cannot. So an agent's own `coding-done`
+files nothing (it knows only its worktree, and its run directory outlives the
+gate anyway), while the continuation's quick gate — orchestrator-side, holding
+`(issue, A)` — files here. That one needs it most: it deletes its checkout the
+moment the gate refuses, so it is not racing cleanup but running ahead of it.
 
 ### What the receipt authorizes
 
@@ -423,13 +438,30 @@ names it:
   worktree's current `HEAD` before every round — evidence that does not name
   the candidate reads as stale there and refuses the round rather than passing
   silently.
+- **The run is told what its gate found.** Producing evidence and recording
+  that it exists are two steps, and the second goes through the same
+  `ValidationEvidenceRecorder` an agent's `coding-done` records its own gate
+  through: the typed outcome, the record path, the two logs and any JUnit
+  reports, onto this run's manifest. A run whose outcome is unrecorded is not a
+  run with less detail — `load_validation_failure_summary` reads the outcome
+  first and returns nothing without it, so the session-diagnostics dialog, the
+  run audit and the artifact list would all show a continuation run as one that
+  never validated anything.
 
 A refusal costs the whole run: no exchange starts, no pull request is created,
 the checkout is removed, the durable publication history is untouched and the
 [#149] run allowance stays spent — a start budget, for the reason provisioning
 failures do not refund one either. Once the allowance is gone the ordinary
-`RUNS_EXHAUSTED` derivation returns the candidate to rework, where a coder can
-see and fix whatever the quick contract rejected.
+`RUNS_EXHAUSTED` derivation returns the candidate to rework.
+
+What a coder finds waiting there is the durable gate-failure artefact described
+above, filed under this candidate's `(issue, HEAD_SHA)` in the primary checkout
+— **not** the run directory, and not a log line. Every path the gate wrote is
+inside the checkout the refusal deletes, immediately and unconditionally, so
+without that artefact a candidate that exhausted its allowance on a failing
+suite would return to rework with an exit code and nothing else. The refusal
+reason names the command that ran and the store the output went to; the output
+itself is in `stdout.log` and `stderr.log` there.
 
 A repository whose run profile configures **no** quick contract has nothing to
 produce, so the record names no evidence — exactly what an ordinary coder turn

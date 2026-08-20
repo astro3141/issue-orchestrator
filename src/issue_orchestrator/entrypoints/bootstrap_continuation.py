@@ -76,9 +76,21 @@ def build_continuation_quick_validation(
     composes is the agent-side one, and a gate given a candidate identity would
     file a durable evaluation for a run that exists to hand one reviewer a
     file (#173).
+
+    The two destinations for what the gate produces are the existing owners,
+    for the same reason the gate is: ``RunEvidenceRecorder`` is what an agent's
+    own ``coding-done`` records its gate result through, and
+    :class:`~..control.gate_failure_diagnostics.GateFailureDiagnostics` is
+    where the publication gate files a failing run's output so it outlives the
+    worktree (#94). The failures directory is rooted in ``config.repo_root``
+    and not in the run's checkout, which is the whole point: this caller
+    deletes that checkout the moment its gate refuses.
     """
     from ..control.continuation_quick_validation import ContinuationQuickValidation
+    from ..control.gate_failure_diagnostics import GateFailureDiagnostics
     from ..control.publication_gate import RunValidationContracts
+    from ..execution.run_evidence import RunEvidenceRecorder
+    from ..infra.validation_junit_paths import configured_validation_junit_xml_paths
 
     return ContinuationQuickValidation(
         contracts=RunValidationContracts(
@@ -86,6 +98,13 @@ def build_continuation_quick_validation(
         ),
         command_runner=command_runner,
         working_copy=working_copy,
+        evidence=RunEvidenceRecorder(session_output),
+        diagnostics=GateFailureDiagnostics(config.repo_root),
+        # The operator's configured report paths, as ``SessionController``
+        # resolves them for the ordinary path's gate — read from the Config the
+        # engine was launched with, never from the continuation checkout's
+        # environment, which belongs to no session.
+        junit_xml_paths=configured_validation_junit_xml_paths(config),
     )
 
 

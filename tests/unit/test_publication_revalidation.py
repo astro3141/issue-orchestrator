@@ -31,7 +31,7 @@ from issue_orchestrator.control.publication_revalidation import (
     PublicationRevalidation,
     RevalidationOutcome,
 )
-from issue_orchestrator.control.publish_gate_diagnostics import PublishGateDiagnostics
+from issue_orchestrator.control.gate_failure_diagnostics import GateFailureDiagnostics
 from issue_orchestrator.control.worktree_runnability import WorktreeRunnability
 from issue_orchestrator.domain.attempt import Attempt, AttemptKey
 from issue_orchestrator.domain.issue_key import GitHubIssueKey
@@ -389,7 +389,7 @@ def _route(
             working_copy=GitWorkingCopy(),
             attempts=store,
             attempt_keys=StubAttemptKeys(),
-            diagnostics=PublishGateDiagnostics(repo.root),
+            diagnostics=GateFailureDiagnostics(repo.root),
         ),
     )
 
@@ -1170,5 +1170,5 @@ def _keyless_gate(repo: SimpleNamespace, runner: StubCommandRunner) -> Publicati
         working_copy=GitWorkingCopy(),
         attempts=SidecarAttemptStore(repo.root),
         attempt_keys=StubAttemptKeys(),
-        diagnostics=PublishGateDiagnostics(repo.root),
+        diagnostics=GateFailureDiagnostics(repo.root),
     )

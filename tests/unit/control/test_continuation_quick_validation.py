@@ -8,8 +8,16 @@ configured quick-validation owner, it is never reused from a durable verdict or
 synthesised from a receipt, it is never the publish contract's, and an
 operation that alters the candidate is refused rather than filed.
 
-The gate is the real one. A double could not tell "delegates to the configured
-quick owner" apart from "reimplements it", which is the whole claim.
+Producing the evidence is only half of it, and the other half is what the two
+final classes pin: the run is told what its gate found, in the manifest every
+validation surface reads first, and a *failing* run's own output is written
+outside the checkout its caller is about to delete.
+
+The gate is the real one, and so are the session-output adapter and the
+diagnostics store it records through. A double could not tell "delegates to the
+configured quick owner" apart from "reimplements it", which is the whole claim,
+and a double for the recorder would prove the calls were made rather than that
+a reader can see the result.
 """
 
 from __future__ import annotations
@@ -27,7 +35,15 @@ from issue_orchestrator.control.continuation_quick_validation import (
     PreparedQuickValidation,
     RefusedQuickValidation,
 )
+from issue_orchestrator.control.gate_failure_diagnostics import (
+    DIAGNOSTIC_FILE_NAME,
+    GATE_FAILURES_DIR,
+    STDERR_FILE_NAME,
+    STDOUT_FILE_NAME,
+)
 from issue_orchestrator.domain.attempt import Attempt, AttemptKey, StoredIssueKey
+from issue_orchestrator.domain.issue_key import GitHubIssueKey
+from issue_orchestrator.domain.issue_key_codec import issue_key_path_part
 from issue_orchestrator.domain.session_run import SessionRunAssets
 from issue_orchestrator.domain.validation_profile import (
     AGENT_GATE_SUITE,
@@ -39,6 +55,12 @@ from issue_orchestrator.domain.validation_verdict_receipt import (
 )
 from issue_orchestrator.entrypoints.bootstrap_continuation import (
     build_continuation_quick_validation,
+)
+from issue_orchestrator.execution.session_output_adapter import (
+    FileSystemSessionOutput,
+)
+from issue_orchestrator.execution.validation_failure_summary import (
+    load_validation_failure_summary,
 )
 from issue_orchestrator.infra.config import Config
 from issue_orchestrator.ports.command_runner import CommandResult
@@ -52,6 +74,9 @@ QUICK_SENTINEL = "run-the-configured-quick-contract"
 PUBLISH_SENTINEL = "run-the-configured-publish-contract"
 PROFILE = "default"
 NAMED_PROFILE = "strict"
+#: The candidate a failed run's durable output is filed under — the same
+#: identity, in the same spelling, that its attempt sidecar is keyed by.
+ISSUE = GitHubIssueKey(repo="acme/repo", external_id="149")
 
 
 @dataclass
@@ -91,51 +116,43 @@ class FakeCommands:
 
 
 @dataclass
-class FakeSessionOutput:
-    """Allocates a real run directory and remembers the profile frozen onto it.
-
-    The profile round-trips through the manifest exactly as the real adapter
-    makes it: written at ``start_run``, read back by the contract resolver.
-    A run whose manifest is never written must therefore read back as absent
-    rather than as the default, which is what makes "the run's OWN contract"
-    a testable claim.
-    """
-
-    manifests: dict[Path, dict[str, object]] = field(default_factory=dict)
-
-    def start_run(
-        self, worktree_path: Path, *, profile: str | None = PROFILE
-    ) -> SessionRunAssets:
-        run_dir = worktree_path / ".issue-orchestrator" / "sessions" / "run-1"
-        run_dir.mkdir(parents=True, exist_ok=True)
-        self.manifests[run_dir] = {"validation_profile": profile}
-        return SessionRunAssets.from_paths(
-            session_name="continuation-1",
-            run_id="run-1",
-            worktree_path=worktree_path,
-            run_dir=run_dir,
-            terminal_recording_path=run_dir / "terminal.cast",
-            manifest_path=run_dir / "manifest.json",
-            started_at="2026-08-20T00:00:00Z",
-        )
-
-    def read_manifest(self, run_dir: Path) -> dict[str, object] | None:
-        return self.manifests.get(run_dir)
-
-
-@dataclass
 class Harness:
     preparation: ContinuationQuickValidation
     worktree: Path
+    repo_root: Path
     assets: SessionRunAssets
+    session_output: FileSystemSessionOutput
     commands: FakeCommands
     working_copy: FakeWorkingCopy
 
+    @property
+    def manifest(self) -> dict[str, Any]:
+        """What this run now says about itself, read back off disk."""
+        recorded = self.session_output.read_manifest(self.assets.run_dir)
+        assert recorded is not None
+        return recorded
+
+    def durable_failures(self, head_sha: str = SHA_A) -> list[Path]:
+        """What a reader holding only the primary checkout can still find."""
+        failures_dir = self.repo_root / GATE_FAILURES_DIR
+        if not failures_dir.exists():
+            return []
+        prefix = f"{issue_key_path_part(ISSUE)}--{head_sha}--"
+        return sorted(
+            path
+            for path in failures_dir.iterdir()
+            if path.is_dir() and path.name.startswith(prefix)
+        )
+
 
 def _config(
-    *, quick: str | None = QUICK_SENTINEL, publish: str | None = PUBLISH_SENTINEL
+    tmp_path: Path,
+    *,
+    quick: str | None = QUICK_SENTINEL,
+    publish: str | None = PUBLISH_SENTINEL,
 ) -> Config:
     config = Config()
+    config.repo_root = tmp_path / "primary"
     config.validation.quick.cmd = quick
     config.validation.publish.cmd = publish
     return config
@@ -145,22 +162,31 @@ def _harness(
     tmp_path: Path,
     *,
     config: Config | None = None,
-    profile: str | None = PROFILE,
+    profile: str = PROFILE,
 ) -> Harness:
     worktree = tmp_path / "continuation-149-aaaaaaaaaaaa"
     worktree.mkdir(parents=True, exist_ok=True)
     commands = FakeCommands()
     working_copy = FakeWorkingCopy()
-    session_output = FakeSessionOutput()
+    # The real adapter, not a double: the profile has to round-trip through a
+    # manifest for "the run's OWN contract" to be a claim about anything, and
+    # what this preparation records onto that manifest is half of what #173
+    # owes the run — a fake would prove only that the calls were made.
+    session_output = FileSystemSessionOutput()
+    resolved = config if config is not None else _config(tmp_path)
     return Harness(
         preparation=build_continuation_quick_validation(
-            config if config is not None else _config(),
-            session_output=session_output,  # type: ignore[arg-type]
+            resolved,
+            session_output=session_output,
             command_runner=commands,  # type: ignore[arg-type]
             working_copy=working_copy,  # type: ignore[arg-type]
         ),
         worktree=worktree,
-        assets=session_output.start_run(worktree, profile=profile),
+        repo_root=resolved.repo_root,
+        assets=session_output.start_run(
+            worktree, "continuation-1", validation_profile=profile
+        ),
+        session_output=session_output,
         commands=commands,
         working_copy=working_copy,
     )
@@ -175,7 +201,9 @@ def _prepare(
     harness: Harness,
 ) -> PreparedQuickValidation | RefusedQuickValidation:
     return harness.preparation.prepare(
-        worktree=harness.worktree, run_assets=harness.assets
+        worktree=harness.worktree,
+        run_assets=harness.assets,
+        issue_key=ISSUE,
     )
 
 
@@ -324,7 +352,7 @@ class TestTheRunsOwnContractIsTheOneThatRuns:
         )
 
         strict_quick = "run-the-strict-quick-contract"
-        config = _config()
+        config = _config(tmp_path)
         config.validation.profiles = {
             NAMED_PROFILE: ValidationProfileConfig(
                 quick=ValidationCommandConfig(cmd=strict_quick)
@@ -352,7 +380,7 @@ class TestTheRunsOwnContractIsTheOneThatRuns:
         self, tmp_path: Path
     ) -> None:
         """Nothing to run, so nothing to claim — and nothing invented."""
-        harness = _harness(tmp_path, config=_config(quick=None))
+        harness = _harness(tmp_path, config=_config(tmp_path, quick=None))
 
         prepared = _prepare(harness)
 
@@ -455,3 +483,164 @@ class TestAFailedOrUnprovableGateIsRefused:
 
         assert isinstance(prepared, RefusedQuickValidation)
         assert harness.commands.commands == []
+
+
+class TestTheRunIsToldWhatItsGateFound:
+    """The other half of producing evidence: recording that it exists.
+
+    A continuation run that validated and told its own manifest nothing is not
+    a run with less detail — every validation surface in the product reads the
+    manifest's outcome first and shows nothing at all without it. So the claims
+    here are made on both sides of that boundary: the gate result reaches the
+    manifest, and the manifest reaches the consumer that renders it.
+    """
+
+    def test_a_passing_run_records_the_outcome_its_gate_reached(
+        self, harness: Harness
+    ) -> None:
+        _prepare(harness)
+
+        assert harness.manifest["validation_status"] == "passed"
+        assert harness.manifest["validation_passed"] is True
+        assert harness.manifest.get("validation_reason") is None
+
+    def test_the_run_names_the_record_and_the_logs_the_gate_wrote(
+        self, harness: Harness
+    ) -> None:
+        artifacts = harness.assets.validation_artifacts
+
+        _prepare(harness)
+
+        assert harness.manifest["validation_record_path"] == str(
+            artifacts.record_path
+        )
+        assert harness.manifest["validation_stdout"] == str(artifacts.stdout_path)
+        assert harness.manifest["validation_stderr"] == str(artifacts.stderr_path)
+
+    def test_the_run_appears_in_the_validation_summary_the_dialog_renders(
+        self, harness: Harness
+    ) -> None:
+        """The consumer side: what an operator opening this run actually sees.
+
+        ``load_validation_failure_summary`` reads the typed outcome first and
+        returns ``None`` before it looks for any file, so this is the assertion
+        that fails when a producer records evidence without recording that it
+        validated.
+        """
+        _prepare(harness)
+
+        summary = load_validation_failure_summary(
+            harness.assets.run_dir, include_passed=True
+        )
+
+        assert summary is not None
+        assert summary.status == "passed"
+        assert summary.command == QUICK_SENTINEL
+        assert summary.suite == AGENT_GATE_SUITE
+        assert summary.exit_code == 0
+
+    def test_a_failing_run_records_the_failure_rather_than_silence(
+        self, harness: Harness
+    ) -> None:
+        """A refused preparation still leaves the run saying what happened.
+
+        The runner discards this checkout, so the manifest goes with it — but
+        it must be truthful for as long as it exists, and a *pass* recorded
+        here would be the one shape that could outlive the refusal wrongly.
+        """
+        harness.commands.failing = True
+
+        _prepare(harness)
+
+        summary = load_validation_failure_summary(harness.assets.run_dir)
+        assert summary is not None
+        assert summary.status == "failed"
+        assert harness.manifest["validation_passed"] is False
+
+    def test_a_gate_that_ran_no_command_claims_no_validation(
+        self, tmp_path: Path
+    ) -> None:
+        """No contract, no record — and no manifest saying the run passed."""
+        harness = _harness(tmp_path, config=_config(tmp_path, quick=None))
+
+        _prepare(harness)
+
+        assert "validation_status" not in harness.manifest
+        assert load_validation_failure_summary(
+            harness.assets.run_dir, include_passed=True
+        ) is None
+
+
+class TestAFailedGateLeavesAnExplanationOutsideTheCheckout:
+    """#94's loss, on the path that does not even have to lose a race.
+
+    Everything a failing run writes — the record, the two logs — is inside the
+    continuation's checkout, and its caller deletes that checkout the moment
+    this preparation refuses. So a candidate that exhausts its run allowance on
+    a failing suite would return to rework with an exit code and nothing else,
+    unless the gate wrote its output somewhere the discard cannot reach.
+    """
+
+    def test_the_failing_runs_output_is_kept_in_the_primary_checkout(
+        self, harness: Harness
+    ) -> None:
+        harness.commands.failing = True
+
+        _prepare(harness)
+
+        directories = harness.durable_failures()
+        assert len(directories) == 1
+        payload = json.loads(
+            (directories[0] / DIAGNOSTIC_FILE_NAME).read_text(encoding="utf-8")
+        )
+        assert payload["type"] == f"{AGENT_GATE_SUITE}_failure"
+        assert payload["verdict"]["head_sha"] == SHA_A
+        assert payload["verdict"]["command"] == QUICK_SENTINEL
+        assert payload["verdict"]["verdict"] == ValidationVerdict.FAILED.value
+        assert (directories[0] / STDERR_FILE_NAME).read_text() == "1 failed"
+        assert (directories[0] / STDOUT_FILE_NAME).exists()
+
+    def test_the_explanation_survives_the_checkout_it_was_produced_in(
+        self, harness: Harness
+    ) -> None:
+        """Durability proved the only way it can be: by destroying the rest."""
+        import shutil
+
+        harness.commands.failing = True
+
+        _prepare(harness)
+        shutil.rmtree(harness.worktree)
+
+        assert not harness.assets.validation_artifacts.stderr_path.exists()
+        assert len(harness.durable_failures()) == 1
+
+    def test_the_refusal_names_the_command_and_where_its_output_went(
+        self, harness: Harness
+    ) -> None:
+        """What the runner logs has to outlive the directory it refers to."""
+        harness.commands.failing = True
+
+        prepared = _prepare(harness)
+
+        assert isinstance(prepared, RefusedQuickValidation)
+        assert QUICK_SENTINEL in prepared.reason
+        assert str(harness.repo_root / GATE_FAILURES_DIR) in prepared.reason
+
+    def test_a_passing_run_files_no_failure_explanation(
+        self, harness: Harness
+    ) -> None:
+        _prepare(harness)
+
+        assert harness.durable_failures() == []
+
+    def test_a_run_that_executed_nothing_files_no_explanation(
+        self, harness: Harness
+    ) -> None:
+        """An unreadable HEAD ran no command, so it produced no account."""
+        harness.working_copy.head = None
+
+        prepared = _prepare(harness)
+
+        assert isinstance(prepared, RefusedQuickValidation)
+        assert harness.durable_failures() == []
+        assert str(GATE_FAILURES_DIR) not in prepared.reason
