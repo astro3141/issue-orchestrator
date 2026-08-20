@@ -567,6 +567,29 @@ class TestThePreparationMustNotAlterTheCandidate:
         assert isinstance(prepared, RefusedQuickValidation)
         assert "could not be enumerated" in prepared.reason
 
+    def test_a_checkout_unprovable_before_the_gate_is_refused(
+        self, harness: Harness
+    ) -> None:
+        """The read the comparison STARTS from fails closed as well.
+
+        The enumeration fails only at the first read and succeeds afterwards,
+        so the postflight has a clean aftermath and no baseline to compare it
+        against. Nothing the suite left behind can be attributed to it — and
+        declining to attribute is not the same answer as "the candidate was not
+        touched". Admitting it would hand the reviewer evidence produced in a
+        checkout whose integrity was never knowable at any point.
+        """
+        harness.working_copy.enumeration_fails = True
+        harness.commands.while_running = lambda: setattr(
+            harness.working_copy, "enumeration_fails", False
+        )
+
+        prepared = _prepare(harness)
+
+        assert isinstance(prepared, RefusedQuickValidation)
+        assert "could not be enumerated" in prepared.reason
+        assert "beforehand" in prepared.reason
+
     def test_a_checkout_that_was_already_dirty_is_not_blamed_on_the_gate(
         self, tmp_path: Path
     ) -> None:

@@ -190,6 +190,25 @@ class TestRefusalsAreReturned:
         assert isinstance(failure, WorktreeProvisioningError)
         assert "could not be enumerated" in str(failure)
 
+    def test_a_candidate_unprovable_before_the_recipe_is_refused(self, tmp_path):
+        """The read the comparison STARTS from fails closed too.
+
+        The later read succeeding is what makes this the interesting direction:
+        the postflight has an answer for the aftermath and no baseline to
+        compare it against. Nothing found afterwards can be attributed to the
+        recipe, and that is exactly not the same as finding the candidate
+        unchanged — a checkout whose dirt was never knowable is not runnable.
+        """
+        core, _ = _runnability(
+            commands=[SETUP], working_copy=StubWorkingCopy(dirty_paths=[None, []])
+        )
+
+        failure = core.make_runnable(tmp_path)
+
+        assert isinstance(failure, WorktreeProvisioningError)
+        assert "could not be enumerated" in str(failure)
+        assert "beforehand" in str(failure)
+
 
 class TestFailureAndAlterationCompose:
     """A failing command must not suppress the candidate it damaged on the way.

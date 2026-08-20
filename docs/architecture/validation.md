@@ -443,7 +443,10 @@ names it:
   `CandidateIntegrity` (`control/candidate_integrity.py`) checkpoint
   `WorktreeRunnability` takes around the operator's recipe is taken around the
   gate, so a preparation that moves `HEAD` or dirties tracked content is
-  refused. Independently of that, the record names the commit the gate *read*,
+  refused — as is one whose tracked dirt could not be *enumerated*, on either
+  side of the gate: an unreadable read leaves the candidate unprovable, and an
+  unprovable candidate opens no run. Independently of that, the record names
+  the commit the gate *read*,
   which is the binding the exchange's pair mirror re-checks against the coder
   worktree's current `HEAD` before every round — evidence that does not name
   the candidate reads as stale there and refuses the round rather than passing
@@ -630,7 +633,10 @@ Provisioning holds four rules:
   candidate are separate facts and a command that edits the candidate and then
   dies must not go unreported. A
   moved `HEAD` or a clean-to-dirty transition is a loud failure rather than a
-  silent edit to the change under test. The prerequisites themselves are build
+  silent edit to the change under test, and so is a read that *failed* on
+  either side of the recipe: an enumeration that could not be performed leaves
+  the candidate unprovable, which is refused rather than read as "nothing
+  changed". The prerequisites themselves are build
   output and are git-ignored, so an honest setup run leaves a clean worktree
   clean.
 - **The recipe is pinned to operator configuration**

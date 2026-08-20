@@ -46,10 +46,19 @@ may not leave tracked candidate modifications.
 
 The check is asymmetric on purpose. Moving ``HEAD`` is always the operation's
 doing. A path that was ALREADY dirty stays a question this cannot answer, so
-only dirt that appeared between the two reads is attributed. Changes are
-RETURNED rather than raised, because callers turn them into different things —
-a worktree that is not runnable, a preparation that produced no usable
-evidence — and this owner must not decide which.
+only dirt that appeared between the two reads is attributed.
+
+**That asymmetry is about attribution, and never about admission.** Declining
+to blame this operation for dirt it may not have caused is not the same act as
+declaring the candidate unchanged, and the difference shows up when a read
+*fails*: an enumeration that returned nothing knowable — on either side of the
+operation — leaves the candidate unprovable, and an unprovable candidate is
+refused rather than admitted. Reading a failed read as "nothing changed" is the
+one collapse both owners of this rule already forbid.
+
+Changes are RETURNED rather than raised, because callers turn them into
+different things — a worktree that is not runnable, a preparation that produced
+no usable evidence — and this owner must not decide which.
 """
 
 from __future__ import annotations
@@ -81,7 +90,10 @@ class CandidateCheckpoint:
     ``dirty_paths`` is ``None`` when the enumeration itself failed, which is
     not the same fact as "nothing was dirty" (``()``) and must not collapse
     into it: a checkout whose dirt could not be read is one whose integrity
-    cannot be proved either way.
+    cannot be proved either way. That holds for this checkpoint wherever it
+    sits — the comparison an unreadable read starts from is as unprovable as
+    the one it ends at, and :meth:`CandidateIntegrity.describe_change` refuses
+    both.
     """
 
     head_sha: str | None
@@ -135,10 +147,18 @@ class CandidateIntegrity:
                 "changes could not be enumerated afterwards"
             )
         if before.dirty_paths is None:
-            # The pre-state could not be read, so nothing found afterwards can
-            # be attributed to this operation — the same "was it already like
-            # this?" question the asymmetry above declines to answer.
-            return None
+            # And fail closed on the read the comparison starts from, for the
+            # same reason. What an unreadable pre-state costs is ATTRIBUTION:
+            # nothing found afterwards can be shown to be this operation's
+            # doing. It does not buy the candidate an alibi — unattributable
+            # is not "unchanged", and admitting it here would let an operation
+            # run, and its evidence be used, over a checkout whose integrity
+            # was never knowable at any point.
+            return (
+                f"{self._operation} ran in {worktree_path} without a provable "
+                "candidate: its tracked changes could not be enumerated "
+                "beforehand"
+            )
         already_dirty = set(before.dirty_paths)
         appeared = tuple(
             path for path in after.dirty_paths if path not in already_dirty
