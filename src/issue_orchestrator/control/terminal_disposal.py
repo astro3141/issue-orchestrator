@@ -7,9 +7,10 @@ all three parts of it —
 - :func:`immediate_disposal_actions`, which turns the immediate cleanup facts a
   completion handoff filed into :class:`~.actions.CleanupSessionAction`. The
   :class:`~.planner.Planner` calls it on an ordinary planning tick;
-- :class:`SessionDisposal`, which carries one of those actions out against the
-  runtime owners it touches. The :class:`~.action_applier.ActionApplier` holds
-  it and applies the planned action through it;
+- :class:`TerminalTeardown`, the disposal itself — close the tab, remove the
+  checkout, announce it — wrapped by :class:`SessionDisposal` for an ordinary
+  tick and by :class:`PausedSessionDisposal` for a paused one. The
+  :class:`~.action_applier.ActionApplier` holds both and applies through them;
 - :class:`PausedTerminalDisposal`, which runs the same two steps on a **paused**
   tick, where planning does not run at all (#167).
 
@@ -23,7 +24,7 @@ execution — or performs state surgery.
 Three properties keep the paused pass from becoming a way to run planning.
 
 **It disposes, and does nothing else.** It can only ever hand a
-:class:`~.actions.CleanupSessionAction` to :class:`SessionDisposal`. It admits
+:class:`~.actions.CleanupSessionAction` to :class:`PausedSessionDisposal`. It admits
 no #139 revalidation, reserves no #149 continuation run, cuts no checkout, opens
 no reviewer exchange and creates no pull request, and no queued Actor, rework,
 review, label or tech-lead action becomes reachable through it.
@@ -36,11 +37,32 @@ stays behind the pause gate. Every existing guard on that fact still applies:
 tech-lead artifact holds still withhold disposal, and a normal coding worktree
 is still removed non-forced so uncommitted work is never silently discarded.
 
-**It never cancels.** Disposal tears the issue's review exchange down on its way
-past, and a pause must not become a teardown, so
-:meth:`SessionDisposal.while_paused` refuses an issue whose exchange is still
-live. Withholding leaves the fact in place: the disposal happens once that work
-reaches terminal, or once the engine resumes and ordinary planning takes it.
+**It cannot cancel.** Ordinary disposal tears the issue's review exchange down on
+its way past, and a pause must not become a teardown. This is not enforced by
+the paused path being careful — a liveness check followed by a cancellation is
+a check-then-act race, and in-flight work admitted before the pause (#161) can
+become live inside that window and be killed by a probe that saw nothing.
+
+It is enforced by capability instead. Cancellation lives in
+:func:`~.review_exchange_lifecycle.cancel_issue_review_exchange`, which takes the
+pair registry and the job supervisor as arguments. :class:`TerminalTeardown`
+holds neither, and :class:`PausedSessionDisposal` holds only a
+:class:`TerminalTeardown` and a closed-over read-only liveness predicate
+(:func:`~.review_exchange_lifecycle.live_review_exchange_probe`). No reference
+reachable from the paused path can release a pair or cancel a job, so no
+interleaving produces a cancellation — there is no call to be raced into.
+
+The liveness predicate remains, purely as a fail-safe withholding guard in front
+of the non-cancelling teardown: an issue whose exchange still looks live keeps
+its tab and its checkout too, because a disposal is part of that issue's
+lifecycle and should not run underneath work that is still using it. Withholding
+leaves the fact in place: the disposal happens once that work reaches terminal,
+or once the engine resumes and ordinary planning takes it.
+
+Nothing is lost by not cancelling while paused. ``has_active_pair`` reports true
+for exactly the membership ``release`` pops, and ``has_matching`` for exactly the
+jobs ``cancel_matching`` cancels, so on the only branch the paused path ever
+reaches the cancellation it does not perform would have been a no-op.
 """
 
 from __future__ import annotations
@@ -57,10 +79,7 @@ from ..ports import EventSink, make_trace_event
 from .action_results import ActionResult
 from .actions import CleanupSessionAction
 from .completion_cleanup_state import CompletionCleanupStateOwner
-from .review_exchange_lifecycle import (
-    cancel_issue_review_exchange,
-    has_live_issue_review_exchange,
-)
+from .review_exchange_lifecycle import cancel_issue_review_exchange
 from .session_manager import SessionManager, SessionRef, SessionType
 
 if TYPE_CHECKING:
@@ -82,8 +101,8 @@ def immediate_disposal_actions(facts: "CleanupFacts") -> list[CleanupSessionActi
     review workflow first. They are ready EXCEPT for run assets that pending or
     active tech_lead work still references (#6771, #6780): disposing those
     before the investigation or health review launches deletes the artifact
-    hints it was queued to read. The hold set comes from the
-    tech-lead-problem-artifact owner in the fact gatherer, which is also what
+    hints it was queued to read. The hold set is read by the cleanup-fact
+    gatherer from the tech-lead-problem-artifact owner, which is also what
     retains these entries across the end-of-tick fact clear; they are re-planned
     once the hold releases.
     """
@@ -114,106 +133,59 @@ def immediate_disposal_actions(facts: "CleanupFacts") -> list[CleanupSessionActi
 
 
 @dataclass(frozen=True)
-class SessionDisposal:
-    """Carry out one session's disposal against the runtime owners it touches.
+class TerminalTeardown:
+    """The disposal itself: close the tab, remove the checkout, announce it.
 
     The execution half of this module, held by the applier rather than spread
     through it: closing a terminal tab and removing a checkout is one operation
-    on one finished session, and the rules about WHICH removal (forced only for
-    a disposable scratch checkout) and WHICH lifecycle teardown belong with it.
+    on one finished session, and the rule about WHICH removal (forced only for
+    a disposable scratch checkout) belongs with it.
 
-    Ordinary disposal is unconditional — the plan that produced the cleanup
-    owns everything else happening to that issue, so the issue's review
-    exchange is torn down on the way past. :meth:`while_paused` is the same
-    disposal for an engine that owns nothing else this tick, and it refuses
-    rather than tearing anything live down.
+    It holds no review-exchange owner. The pair registry and the background job
+    supervisor are not fields here, and nothing that IS a field exposes them, so
+    no call reachable through this object can release a pair or cancel a job.
+    That is what lets :class:`PausedSessionDisposal` — which holds this and a
+    read-only predicate and nothing else — be structurally incapable of
+    cancellation rather than merely careful about it (#167).
     """
 
     sessions: SessionManager
     events: EventSink
     worktree_manager: Optional["WorktreeManager"] = None
-    pair_registry: Optional["PersistentExchangePairRegistry"] = None
-    job_supervisor: Optional["BackgroundJobSupervisor"] = None
     on_worktree_removed: Optional[Callable[[str], int]] = None
 
-    def apply(self, action: CleanupSessionAction) -> ActionResult:
-        """Dispose of the session: lifecycle teardown, tab, checkout."""
+    def tear_down(self, action: CleanupSessionAction) -> "TeardownOutcome":
+        """Close the tab, remove the checkout, announce the cleanup."""
         errors: list[str] = []
-        cancellation = self._cancel_review_exchange(action)
         self._close_terminal(action, errors)
         self._remove_worktree(action, errors)
+        self._announce(action)
+        return TeardownOutcome(tuple(errors))
 
-        self.events.publish(make_trace_event(
-            EventName.CLEANUP_COMPLETED,
-            {"issue_number": action.issue_number, "pr_number": action.pr_number},
-        ))
+    def _announce(self, action: CleanupSessionAction) -> None:
+        """Publish the cleanup event; a failed announcement is not a failed
+        disposal.
 
-        details = {
-            "issue_number": action.issue_number,
-            "pr_number": action.pr_number,
-            "review_exchange_lifecycle_checked": cancellation is not None,
-            "cancelled_review_exchange_jobs": list(cancellation.cancelled_job_ids)
-            if cancellation is not None
-            else [],
-        }
-        if errors:
-            return ActionResult.fail(action, "; ".join(errors), **details)
-        return ActionResult.ok(action, **details)
-
-    def while_paused(self, action: CleanupSessionAction) -> ActionResult:
-        """The same disposal, minus the one thing a pause may not become (#167).
-
-        A pause is a barrier to starting work, never a cancellation (#161).
-        Nothing new may start while it stands, so review-exchange work still
-        live for this issue predates the pause and is finishing on its own
-        terms. Withholding defers the disposal rather than failing it: the
-        caller keeps the fact and retries once that work reaches terminal, or
-        leaves it for ordinary planning after a resume.
+        Same reasoning as the worktree-removed callback below: the tab and the
+        checkout are already gone by this point, so re-failing the action would
+        retain the cleanup fact and retry a disposal that has nothing left to
+        do. Guarding here also means no unguarded call remains on the paused
+        path, which runs outside ``ActionApplier.apply``'s catch-all and would
+        otherwise skip the tick heartbeat on a raise (#6824 R3, #167 N1).
         """
-        if has_live_issue_review_exchange(
-            issue_number=action.issue_number,
-            pair_registry=self.pair_registry,
-            job_supervisor=self.job_supervisor,
-        ):
-            logger.info(issue_log(
-                action.issue_number,
-                "Withholding paused terminal disposal: review-exchange work "
-                "predating the pause is still live",
+        try:
+            self.events.publish(make_trace_event(
+                EventName.CLEANUP_COMPLETED,
+                {"issue_number": action.issue_number, "pr_number": action.pr_number},
             ))
-            return ActionResult.skip(
-                action, "review exchange still live; pause is not cancellation"
+        except Exception as e:
+            logger.warning(
+                issue_log(
+                    action.issue_number,
+                    "cleanup event publish failed (disposal already done): %s",
+                ),
+                e,
             )
-        return self.apply(action)
-
-    # -- the owners a disposal touches ---------------------------------
-
-    def _cancel_review_exchange(
-        self, action: CleanupSessionAction
-    ) -> "ReviewExchangeCancellation | None":
-        ref = self._session_ref(action)
-        if ref.session_type not in {SessionType.ISSUE, SessionType.REWORK}:
-            return None
-        return cancel_issue_review_exchange(
-            issue_number=ref.number,
-            reason="session-cleanup",
-            pair_registry=self.pair_registry,
-            job_supervisor=self.job_supervisor,
-        )
-
-    def _session_ref(self, action: CleanupSessionAction) -> SessionRef:
-        if action.terminal_id:
-            return SessionRef(
-                session_type=session_type_of(action.terminal_id),
-                number=action.issue_number,
-            )
-        logger.warning(
-            "[APPLIER] CleanupSessionAction missing terminal_id; assuming "
-            "issue session for review-exchange cleanup issue=%s pr=%s worktree=%s",
-            action.issue_number,
-            action.pr_number,
-            action.worktree_path or "(none)",
-        )
-        return SessionRef(session_type=SessionType.ISSUE, number=action.issue_number)
 
     def _close_terminal(
         self, action: CleanupSessionAction, errors: list[str]
@@ -269,6 +241,134 @@ class SessionDisposal:
                     issue_log(action.issue_number, "worktree-removed callback failed (worktree already gone): %s"),
                     e,
                 )
+
+
+@dataclass(frozen=True)
+class TeardownOutcome:
+    """What :meth:`TerminalTeardown.tear_down` could not do.
+
+    Shaping the :class:`ActionResult` lives here so both disposal paths report
+    a completed-or-failed teardown identically, and differ only in the details
+    they attach.
+    """
+
+    errors: tuple[str, ...] = ()
+
+    def as_result(
+        self,
+        action: CleanupSessionAction,
+        **details: str | int | bool | list[str] | None,
+    ) -> ActionResult:
+        if self.errors:
+            return ActionResult.fail(action, "; ".join(self.errors), **details)
+        return ActionResult.ok(action, **details)
+
+
+@dataclass(frozen=True)
+class SessionDisposal:
+    """Ordinary disposal: the issue's review-exchange teardown, then the tab and
+    the checkout.
+
+    Unconditional, because the plan that produced the cleanup owns everything
+    else happening to that issue this tick — so the exchange is torn down on the
+    way past. This is the ONLY disposal path that holds the review-exchange
+    owners, and therefore the only one that can cancel.
+    """
+
+    teardown: TerminalTeardown
+    pair_registry: Optional["PersistentExchangePairRegistry"] = None
+    job_supervisor: Optional["BackgroundJobSupervisor"] = None
+
+    def apply(self, action: CleanupSessionAction) -> ActionResult:
+        """Dispose of the session: lifecycle teardown, tab, checkout."""
+        cancellation = self._cancel_review_exchange(action)
+        return self.teardown.tear_down(action).as_result(
+            action,
+            issue_number=action.issue_number,
+            pr_number=action.pr_number,
+            review_exchange_lifecycle_checked=cancellation is not None,
+            cancelled_review_exchange_jobs=list(cancellation.cancelled_job_ids)
+            if cancellation is not None
+            else [],
+        )
+
+    def _cancel_review_exchange(
+        self, action: CleanupSessionAction
+    ) -> "ReviewExchangeCancellation | None":
+        ref = _session_ref(action)
+        if ref.session_type not in {SessionType.ISSUE, SessionType.REWORK}:
+            return None
+        return cancel_issue_review_exchange(
+            issue_number=ref.number,
+            reason="session-cleanup",
+            pair_registry=self.pair_registry,
+            job_supervisor=self.job_supervisor,
+        )
+
+
+@dataclass(frozen=True)
+class PausedSessionDisposal:
+    """The same disposal for a paused engine, with cancellation out of reach.
+
+    A pause is a barrier to starting work, never a cancellation (#161). Work
+    admitted before the pause keeps running and must finish on its own terms —
+    including in the instants either side of any check this path performs. So
+    the paused path does not decide *whether* to cancel; it has nothing to
+    cancel with. Its two collaborators are a :class:`TerminalTeardown`, which
+    holds no review-exchange owner, and ``review_exchange_is_live``, a closure
+    over those owners exposing one boolean question and no way to mutate them
+    (:func:`~.review_exchange_lifecycle.live_review_exchange_probe`).
+    :func:`~.review_exchange_lifecycle.cancel_issue_review_exchange` takes the
+    owners as arguments and cannot be reached from either.
+
+    The predicate is a fail-safe withholding guard only: it decides whether the
+    tab and the checkout may be disposed at all, not whether something gets torn
+    down. A liveness change immediately after it is answered therefore costs at
+    most one deferred disposal, never a cancelled exchange. Withholding defers
+    rather than fails: the caller keeps the fact and retries once that work
+    reaches terminal, or leaves it for ordinary planning after a resume.
+    """
+
+    teardown: TerminalTeardown
+    review_exchange_is_live: Callable[[int], bool]
+
+    def apply(self, action: CleanupSessionAction) -> ActionResult:
+        if self.review_exchange_is_live(action.issue_number):
+            logger.info(issue_log(
+                action.issue_number,
+                "Withholding paused terminal disposal: review-exchange work "
+                "predating the pause is still live",
+            ))
+            return ActionResult.skip(
+                action, "review exchange still live; pause is not cancellation"
+            )
+        return self.teardown.tear_down(action).as_result(
+            action,
+            issue_number=action.issue_number,
+            pr_number=action.pr_number,
+            # Machine-readable proof of the contract, not a summary of what was
+            # attempted: this path cannot run the cancellation lifecycle, so a
+            # consumer reading these two keys can tell a paused disposal from an
+            # ordinary one and never sees a cancelled job from a paused tick.
+            review_exchange_lifecycle_checked=False,
+            cancelled_review_exchange_jobs=[],
+        )
+
+
+def _session_ref(action: CleanupSessionAction) -> SessionRef:
+    if action.terminal_id:
+        return SessionRef(
+            session_type=session_type_of(action.terminal_id),
+            number=action.issue_number,
+        )
+    logger.warning(
+        "[APPLIER] CleanupSessionAction missing terminal_id; assuming "
+        "issue session for review-exchange cleanup issue=%s pr=%s worktree=%s",
+        action.issue_number,
+        action.pr_number,
+        action.worktree_path or "(none)",
+    )
+    return SessionRef(session_type=SessionType.ISSUE, number=action.issue_number)
 
 
 def session_type_of(terminal_id: str) -> SessionType:

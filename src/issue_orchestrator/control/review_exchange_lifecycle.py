@@ -143,6 +143,38 @@ def has_live_issue_review_exchange(
     return any(_owner_active_or_unverifiable(probe) for probe in probes)
 
 
+def live_review_exchange_probe(
+    *,
+    pair_registry: "PersistentExchangePairRegistry | None",
+    job_supervisor: "BackgroundJobSupervisor | None",
+) -> Callable[[int], bool]:
+    """Hand out the liveness question without handing out the owners.
+
+    :func:`has_live_issue_review_exchange` and
+    :func:`cancel_issue_review_exchange` take the same two owners, so a caller
+    holding what it needs to ASK also holds what it needs to CANCEL. For a
+    lifecycle boundary that must never cancel — the paused terminal disposal of
+    #167, where in-flight work admitted before the pause is explicitly allowed to
+    keep running — that is exactly the capability to withhold: with the owners in
+    hand, "check, then dispose without cancelling" is a discipline, and a
+    discipline can be raced or edited away.
+
+    The returned closure exposes one boolean question and no reference a caller
+    can cancel through, so a holder of it is structurally incapable of tearing
+    down review-exchange work. It carries the same fail-safe reading as the
+    predicate it wraps: an owner that raises reads as live.
+    """
+
+    def is_live(issue_number: int) -> bool:
+        return has_live_issue_review_exchange(
+            issue_number=issue_number,
+            pair_registry=pair_registry,
+            job_supervisor=job_supervisor,
+        )
+
+    return is_live
+
+
 def terminate_issue_runtime(
     *,
     issue_number: int,

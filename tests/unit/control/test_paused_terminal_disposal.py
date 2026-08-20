@@ -19,7 +19,7 @@ phase from a tick that does not.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
@@ -43,6 +43,11 @@ from issue_orchestrator.control.orchestrator_support import (
 )
 from issue_orchestrator.control.planner import Planner
 from issue_orchestrator.control.scheduler import Scheduler
+from issue_orchestrator.control.terminal_disposal import (
+    PausedSessionDisposal,
+    SessionDisposal,
+    TerminalTeardown,
+)
 from issue_orchestrator.domain.attempt import StoredIssueKey
 from issue_orchestrator.domain.control_operation import (
     ControlOperationKey,
@@ -123,13 +128,25 @@ class FakeSessions:
 
 @dataclass
 class FakePairRegistry:
-    """The persistent coder/reviewer pair registry, as the applier sees it."""
+    """The persistent coder/reviewer pair registry, as the applier sees it.
+
+    ``goes_live_when_probed`` makes the check-then-act interleaving explicit and
+    deterministic: the issue reads as idle to the probe and is live immediately
+    afterwards, which is exactly the window a paused path that cancelled would
+    lose work in.
+    """
 
     active: set[int] = field(default_factory=set)
     released: list[tuple[int, str]] = field(default_factory=list)
+    probed: list[int] = field(default_factory=list)
+    goes_live_when_probed: set[int] = field(default_factory=set)
 
     def has_active_pair(self, issue_key: Any) -> bool:
-        return issue_key in self.active
+        self.probed.append(issue_key)
+        was_active = issue_key in self.active
+        if issue_key in self.goes_live_when_probed:
+            self.active.add(issue_key)
+        return was_active
 
     def release(self, issue_key: Any, *, reason: str) -> None:
         self.active.discard(issue_key)
@@ -600,20 +617,28 @@ class TestPauseIsNotCancellation:
         assert engine.worktrees.paths == [WORKTREE]
         assert engine.state.paused is True
 
-    def test_a_settled_exchange_is_still_torn_down_by_the_disposal(
+    def test_a_settled_exchange_is_not_cancelled_either(
         self, engine: Engine
     ) -> None:
-        """The existing terminal-cleanup contract is intact for dead work.
+        """The paused path never cancels — not even work it believes is dead.
 
-        Nothing is live, so the cleanup's own lifecycle release still runs —
-        the withholding above is about live work, not about skipping teardown.
+        Ordinary cleanup releases the pair on its way past. While paused that
+        release is not merely skipped when something is live, it is unreachable:
+        the disposal owner holds no pair registry at all. Nothing is lost by it.
+        ``has_active_pair`` reports true for exactly the membership ``release``
+        pops, so on the branch reached here — probe said nothing is live — the
+        release would have been a no-op.
         """
         engine.actor_finished_while_paused()
         engine.pause()
 
         engine.tick()
 
-        assert engine.pairs.released == [(ISSUE, "session-cleanup")]
+        assert engine.pairs.released == []
+        engine.supervisor.cancel_matching.assert_not_called()
+        # The disposal itself still happened in full.
+        assert engine.worktrees.paths == [WORKTREE]
+        assert engine.sessions.stopped == [TERMINAL]
 
     def test_an_unverifiable_owner_withholds_rather_than_tearing_down(
         self, engine: Engine
@@ -627,6 +652,127 @@ class TestPauseIsNotCancellation:
 
         assert engine.worktrees.paths == []
         assert engine.cleanup_issue_numbers == [ISSUE]
+
+
+# ======================================================================
+# 7b. The probe is a guard, never the first half of a check-then-cancel
+# ======================================================================
+
+
+class TestLivenessArrivingAfterTheProbeCancelsNothing:
+    """The race a paused path that cancelled would have.
+
+    A continuation or review exchange admitted before the pause is explicitly
+    allowed by #161 to keep running, and it can become live at any instant —
+    including between "is anything live?" and whatever follows. If the paused
+    path answered that question and then cancelled, this interleaving would kill
+    work that predates the pause. It cannot: cancellation is not reachable from
+    the paused disposal owner, so there is no call for the race to land on.
+
+    ``FakePairRegistry`` / the supervisor mock make the interleaving explicit and
+    deterministic — the exchange comes alive as a side effect of being asked.
+    """
+
+    def test_a_pair_that_goes_live_during_the_probe_is_never_released(
+        self, engine: Engine
+    ) -> None:
+        engine.actor_finished_while_paused()
+        engine.pairs.goes_live_when_probed.add(ISSUE)
+        engine.pause()
+
+        engine.tick()
+
+        # The probe saw nothing; the exchange was live by the time disposal ran.
+        assert engine.pairs.probed == [ISSUE]
+        assert engine.pairs.active == {ISSUE}
+        # Nothing cancelled it, which is the whole point.
+        assert engine.pairs.released == []
+        engine.supervisor.cancel_matching.assert_not_called()
+
+    def test_a_job_that_goes_live_during_the_probe_is_never_cancelled(
+        self, engine: Engine
+    ) -> None:
+        live_after_probe: list[bool] = []
+
+        def has_matching(_predicate: Any) -> bool:
+            live_after_probe.append(True)
+            return False
+
+        engine.actor_finished_while_paused()
+        engine.supervisor.has_matching.side_effect = has_matching
+        engine.pause()
+
+        engine.tick()
+
+        assert live_after_probe == [True]
+        engine.supervisor.cancel_matching.assert_not_called()
+        assert engine.pairs.released == []
+
+    def test_the_worst_the_race_can_cost_is_the_terminal_session_itself(
+        self, engine: Engine
+    ) -> None:
+        """The accepted outcome of the interleaving, stated as an assertion.
+
+        Work that came alive after the probe keeps running; only the finished
+        Actor's own tab and checkout — what the disposal was always for — are
+        gone. Nothing else about the issue is torn down, and the engine is still
+        paused.
+        """
+        engine.actor_finished_while_paused()
+        engine.pairs.goes_live_when_probed.add(ISSUE)
+        engine.pause()
+
+        engine.tick()
+
+        assert engine.pairs.active == {ISSUE}
+        assert engine.worktrees.paths == [WORKTREE]
+        assert engine.sessions.stopped == [TERMINAL]
+        assert engine.state.paused is True
+
+    def test_the_paused_disposal_owner_holds_nothing_that_could_cancel(
+        self,
+    ) -> None:
+        """Structural, not behavioural: the capability is simply absent.
+
+        The guarantee above is only as good as the paused owner's reach. Its
+        collaborators are a teardown that holds no review-exchange owner and a
+        boolean predicate — so no future edit can reintroduce the race without
+        first widening this constructor, which this test would catch.
+        """
+        paused_fields = {f.name for f in fields(PausedSessionDisposal)}
+        assert paused_fields == {"teardown", "review_exchange_is_live"}
+
+        teardown_fields = {f.name for f in fields(TerminalTeardown)}
+        assert "pair_registry" not in teardown_fields
+        assert "job_supervisor" not in teardown_fields
+
+        # The ordinary path is the one that keeps the cancellation capability.
+        assert {"pair_registry", "job_supervisor"} <= {
+            f.name for f in fields(SessionDisposal)
+        }
+
+    def test_the_result_reports_that_no_cancellation_ran(
+        self, engine: Engine
+    ) -> None:
+        """Machine-readable, per the repo's "react to events, not log text" rule."""
+        engine.actor_finished_while_paused()
+        engine.pause()
+
+        result = engine.applier.dispose_terminal_session(
+            CleanupSessionAction(
+                issue_number=ISSUE,
+                pr_number=0,
+                terminal_id=TERMINAL,
+                worktree_path=WORKTREE,
+                close_tabs=True,
+                remove_worktrees=True,
+                reason="session failed",
+            )
+        )
+
+        assert result.success
+        assert result.details["review_exchange_lifecycle_checked"] is False
+        assert result.details["cancelled_review_exchange_jobs"] == []
 
 
 # ======================================================================

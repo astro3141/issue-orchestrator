@@ -10,6 +10,7 @@ import pytest
 from issue_orchestrator.control.review_exchange_lifecycle import (
     has_active_issue_runtime,
     has_live_issue_review_exchange,
+    live_review_exchange_probe,
     terminate_issue_runtime,
 )
 
@@ -194,3 +195,73 @@ class TestHasLiveIssueReviewExchange:
         assert has_active_issue_runtime(
             issue_number=230, pair_registry=None, job_supervisor=job_supervisor
         )
+
+
+class TestLiveReviewExchangeProbe:
+    """The liveness question, handed out without the owners that answer it (#167).
+
+    ``has_live_issue_review_exchange`` and ``cancel_issue_review_exchange`` take
+    the same two owners, so a boundary that must never cancel cannot be given
+    them — "ask, then don't cancel" is a discipline, and a discipline can be
+    raced or edited away. This factory is what makes that boundary structural.
+    """
+
+    def test_it_answers_the_same_question_as_the_predicate(self) -> None:
+        pair_registry = Mock()
+        pair_registry.has_active_pair.return_value = True
+
+        probe = live_review_exchange_probe(
+            pair_registry=pair_registry, job_supervisor=None
+        )
+
+        assert probe(230) is True
+        assert probe(230) == has_live_issue_review_exchange(
+            issue_number=230, pair_registry=pair_registry, job_supervisor=None
+        )
+
+    def test_nothing_wired_is_nothing_live(self) -> None:
+        probe = live_review_exchange_probe(pair_registry=None, job_supervisor=None)
+
+        assert probe(230) is False
+
+    def test_asking_never_tears_anything_down(self) -> None:
+        pair_registry = Mock()
+        pair_registry.has_active_pair.return_value = False
+        job_supervisor = Mock()
+        job_supervisor.has_matching.return_value = False
+
+        probe = live_review_exchange_probe(
+            pair_registry=pair_registry, job_supervisor=job_supervisor
+        )
+        probe(230)
+
+        pair_registry.release.assert_not_called()
+        job_supervisor.cancel_matching.assert_not_called()
+
+    def test_an_owner_that_raises_reads_as_live(self) -> None:
+        """The fail-safe reading survives being wrapped."""
+        job_supervisor = Mock()
+        job_supervisor.has_matching.side_effect = RuntimeError("supervisor down")
+
+        probe = live_review_exchange_probe(
+            pair_registry=None, job_supervisor=job_supervisor
+        )
+
+        assert probe(230) is True
+
+    def test_the_owners_are_not_reachable_through_what_it_returns(self) -> None:
+        """The point of the factory: a holder cannot get at the registry.
+
+        Whatever the probe closes over, its public surface is one call taking an
+        issue number and returning a bool — there is no attribute a caller could
+        follow to ``release`` or ``cancel_matching``.
+        """
+        pair_registry = Mock()
+        job_supervisor = Mock()
+
+        probe = live_review_exchange_probe(
+            pair_registry=pair_registry, job_supervisor=job_supervisor
+        )
+
+        public_attributes = [name for name in dir(probe) if not name.startswith("_")]
+        assert public_attributes == []

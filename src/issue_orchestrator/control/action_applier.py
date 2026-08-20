@@ -73,9 +73,14 @@ from .reconciliation import ReconciliationRequired
 from .claim_gate import ClaimGate, ClaimLostError
 from .review_exchange_lifecycle import (
     cancel_issue_review_exchange,
+    live_review_exchange_probe,
     terminate_issue_runtime,
 )
-from .terminal_disposal import SessionDisposal
+from .terminal_disposal import (
+    PausedSessionDisposal,
+    SessionDisposal,
+    TerminalTeardown,
+)
 from .close_on_merge import run_close_on_merge_fallback
 from .actions import (
     Action,
@@ -1572,30 +1577,46 @@ class ActionApplier:
         )
 
     @property
-    def _disposal(self) -> SessionDisposal:
-        """The owner that carries out one finished session's disposal.
+    def _teardown(self) -> TerminalTeardown:
+        """The tab-and-checkout disposal both paths execute.
 
         Built per call rather than at construction: the runtime owners it needs
-        (``pair_registry``, ``on_worktree_removed``) are wired onto this applier
-        post-construction by the composition root, and a disposal must act on
-        whatever is wired NOW, not on whatever was wired first.
+        (``on_worktree_removed``) are wired onto this applier post-construction
+        by the composition root, and a disposal must act on whatever is wired
+        NOW, not on whatever was wired first.
         """
-        return SessionDisposal(
+        return TerminalTeardown(
             sessions=self.sessions,
             events=self.events,
             worktree_manager=self.worktree_manager,
+            on_worktree_removed=self.on_worktree_removed,
+        )
+
+    @property
+    def _disposal(self) -> SessionDisposal:
+        """The owner that carries out one finished session's disposal."""
+        return SessionDisposal(
+            teardown=self._teardown,
             pair_registry=self.pair_registry,
             job_supervisor=self.background_job_supervisor,
-            on_worktree_removed=self.on_worktree_removed,
         )
 
     def dispose_terminal_session(self, action: CleanupSessionAction) -> ActionResult:
         """Terminal disposal for a PAUSED engine — the one action it may run (#167).
 
         Typed to the cleanup action rather than to ``Action``: the paused pass
-        can hand this nothing else.
+        can hand this nothing else. The owner it builds is handed the teardown
+        and a read-only liveness probe, never the pair registry or the job
+        supervisor, so nothing downstream of this call can cancel review-exchange
+        work that predates the pause.
         """
-        return self._disposal.while_paused(action)
+        return PausedSessionDisposal(
+            teardown=self._teardown,
+            review_exchange_is_live=live_review_exchange_probe(
+                pair_registry=self.pair_registry,
+                job_supervisor=self.background_job_supervisor,
+            ),
+        ).apply(action)
 
     def _apply_cleanup_session(self, action: Action) -> ActionResult:
         """Clean up a completed session."""
