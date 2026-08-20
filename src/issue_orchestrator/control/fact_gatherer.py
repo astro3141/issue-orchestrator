@@ -29,8 +29,12 @@ from typing import Any, Callable, Optional, TYPE_CHECKING
 
 from ..infra.config import Config
 from ..events import EventName
-from ..ports.repository_host import RepositoryHost, RepositoryHostError
+from ..ports.repository_host import RepositoryHost
 from ..ports import EventSink,  make_trace_event
+from .cleanup_facts import (
+    gather_cleanup_facts,
+    gather_terminal_disposal_facts,
+)
 from .provider_launch_readiness import ProviderLaunchReadiness
 from .health_review_trigger import (
     classify_tech_lead_anchor_issues,
@@ -44,7 +48,6 @@ from .tech_lead_finding_promotion import (
 )
 from .tech_lead_artifact_retention import (
     clear_discovered_facts as _clear_discovered_facts,
-    tech_lead_problem_artifact_hold_issue_numbers,
 )
 from .tech_lead_reaction import storm_possible
 
@@ -689,72 +692,24 @@ class FactGatherer:
         self,
         state: "OrchestratorState",
     ) -> Optional["CleanupFacts"]:
-        """Gather facts for cleanup decision.
+        """Both cleanup readings, for the Planner to decide on.
 
-        Returns immutable facts for the Planner to decide which cleanups to process.
-        Does NOT perform cleanup - that's the Planner's job.
-
-        Handles two types of cleanups:
-        1. Deferred cleanups (pending_cleanups) - waiting for review label
-        2. Immediate cleanups (immediate_cleanups) - ready to execute now
-
-        Args:
-            state: Current orchestrator state with pending_cleanups and immediate_cleanups
-
-        Returns:
-            CleanupFacts if there are any cleanups to process, else None
+        Owned by ``cleanup_facts``; this is the gatherer's seam onto it.
         """
-        from ..domain.models import CleanupFacts
-
-        # Check if there's anything to clean up
-        has_pending = bool(state.pending_cleanups)
-        has_immediate = bool(state.immediate_cleanups)
-
-        if not has_pending and not has_immediate:
-            return None
-
-        # Determine cleanup settings based on workflow
-        if self.config.tech_lead_enabled:
-            cleanup_label = self.config.tech_lead_reviewed_label
-            close_tabs = self.config.cleanup.with_tech_lead.close_ai_session_tabs
-            remove_wt = self.config.cleanup.with_tech_lead.remove_worktrees
-        elif self.config.code_review_agent:
-            cleanup_label = self.config.code_reviewed_label
-            close_tabs = self.config.cleanup.without_tech_lead.close_ai_session_tabs
-            remove_wt = self.config.cleanup.without_tech_lead.remove_worktrees
-        else:
-            # No review workflow - use defaults for immediate cleanups
-            cleanup_label = None
-            close_tabs = self.config.cleanup.without_tech_lead.close_ai_session_tabs
-            remove_wt = self.config.cleanup.without_tech_lead.remove_worktrees
-
-        # Get reviewed PRs for deferred cleanups (only if we have pending cleanups)
-        reviewed_pr_numbers: frozenset[int] = frozenset()
-        if has_pending and cleanup_label:
-            try:
-                reviewed_prs = self.repository_host.get_prs_with_label(cleanup_label)
-                reviewed_pr_numbers = frozenset(pr.number for pr in reviewed_prs)
-            except RepositoryHostError:
-                raise
-            except Exception as e:
-                logger.warning(f"[CLEANUP] Failed to fetch PRs with label {cleanup_label}: {e}")
-
-        # Build immutable tuples of pending cleanup info
-        pending_tuples = tuple(
-            (c.issue_number, c.pr_number, c.terminal_id, str(c.worktree_path))
-            for c in state.pending_cleanups
+        return gather_cleanup_facts(
+            state, self.config, self.repository_host, self.tech_lead_authority
         )
 
-        # Build immutable tuple of immediate cleanups
-        immediate_tuples = tuple(state.immediate_cleanups)
+    def gather_terminal_disposal_facts(
+        self,
+        state: "OrchestratorState",
+    ) -> Optional["CleanupFacts"]:
+        """ONLY the terminal disposal a finished session already earned (#167).
 
-        return CleanupFacts(
-            pending_cleanups=pending_tuples,
-            reviewed_pr_numbers=reviewed_pr_numbers,
-            close_tabs=close_tabs,
-            remove_worktrees=remove_wt,
-            immediate_cleanups=immediate_tuples,
-            held_issue_numbers=tech_lead_problem_artifact_hold_issue_numbers(
-                state, self.config, self.tech_lead_authority
-            ),
+        The reading a PAUSED engine may act on: no deferred cleanup queue and
+        no repository read. Owned by ``cleanup_facts``, like its wider sibling,
+        so both obey one reading of the cleanup configuration.
+        """
+        return gather_terminal_disposal_facts(
+            state, self.config, self.tech_lead_authority
         )

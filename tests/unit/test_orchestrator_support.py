@@ -30,6 +30,7 @@ from issue_orchestrator.control.orchestrator_support import (
     _select_hot_issue_numbers,
     _track_stale_ticks,
 )
+from issue_orchestrator.control.terminal_disposal import PausedDisposal
 from issue_orchestrator.adapters.github.http_client import GitHubHttpError
 from issue_orchestrator.control.issue_fetch_resilience import (
     IssueFetchResilience,
@@ -2599,6 +2600,7 @@ class TestRunTick:
             process_active_sessions_fn=Mock(),
             check_health_fn=Mock(return_value=HealthDecision.ok()),
             run_planning_cycle_fn=Mock(),
+            dispose_terminal_sessions_fn=Mock(return_value=PausedDisposal()),
             emit_heartbeat_fn=Mock(),
         )
 
@@ -2620,6 +2622,7 @@ class TestRunTick:
             process_active_sessions_fn=Mock(),
             check_health_fn=Mock(return_value=HealthDecision.ok()),
             run_planning_cycle_fn=Mock(),
+            dispose_terminal_sessions_fn=Mock(return_value=PausedDisposal()),
             emit_heartbeat_fn=Mock(),
         )
 
@@ -2641,6 +2644,7 @@ class TestRunTick:
             process_active_sessions_fn=Mock(),
             check_health_fn=Mock(return_value=HealthDecision.ok()),
             run_planning_cycle_fn=Mock(),
+            dispose_terminal_sessions_fn=Mock(return_value=PausedDisposal()),
             emit_heartbeat_fn=Mock(),
         )
 
@@ -2678,6 +2682,7 @@ class TestRunTick:
             process_active_sessions_fn=slow_active,
             check_health_fn=Mock(return_value=HealthDecision.ok()),
             run_planning_cycle_fn=Mock(),
+            dispose_terminal_sessions_fn=Mock(return_value=PausedDisposal()),
             emit_heartbeat_fn=Mock(),
         )
 
@@ -2702,6 +2707,7 @@ class TestRunTick:
             process_active_sessions_fn=Mock(),
             check_health_fn=Mock(return_value=HealthDecision.ok()),
             run_planning_cycle_fn=Mock(),
+            dispose_terminal_sessions_fn=Mock(return_value=PausedDisposal()),
             emit_heartbeat_fn=Mock(),
         )
 
@@ -2724,6 +2730,7 @@ class TestRunTick:
             process_active_sessions_fn=Mock(),
             check_health_fn=Mock(return_value=HealthDecision.blocked("rate_limit_low")),
             run_planning_cycle_fn=planning_fn,
+            dispose_terminal_sessions_fn=Mock(return_value=PausedDisposal()),
             emit_heartbeat_fn=Mock(),
         )
 
@@ -2756,6 +2763,7 @@ class TestRunTick:
                 paused=sample_orchestrator_state.paused,
             ),
             run_planning_cycle_fn=planning_fn,
+            dispose_terminal_sessions_fn=Mock(return_value=PausedDisposal()),
             emit_heartbeat_fn=Mock(),
         )
 
@@ -2782,6 +2790,7 @@ class TestRunTick:
             process_active_sessions_fn=Mock(),
             check_health_fn=Mock(return_value=HealthDecision.blocked("paused")),
             run_planning_cycle_fn=planning_fn,
+            dispose_terminal_sessions_fn=Mock(return_value=PausedDisposal()),
             emit_heartbeat_fn=Mock(),
         )
 
@@ -2818,6 +2827,7 @@ class TestRunTick:
                 paused=sample_orchestrator_state.paused,
             ),
             run_planning_cycle_fn=planning_fn,
+            dispose_terminal_sessions_fn=Mock(return_value=PausedDisposal()),
             emit_heartbeat_fn=Mock(),
         )
 
@@ -2844,6 +2854,7 @@ class TestRunTick:
             process_active_sessions_fn=Mock(),
             check_health_fn=Mock(return_value=HealthDecision.ok()),
             run_planning_cycle_fn=Mock(),
+            dispose_terminal_sessions_fn=Mock(return_value=PausedDisposal()),
             emit_heartbeat_fn=Mock(),
         )
 
@@ -3173,6 +3184,7 @@ class TestRunTickHeartbeat:
             process_active_sessions_fn=Mock(),
             check_health_fn=Mock(return_value=HealthDecision.ok()),
             run_planning_cycle_fn=Mock(),
+            dispose_terminal_sessions_fn=Mock(return_value=PausedDisposal()),
             emit_heartbeat_fn=Mock(),
         )
 
@@ -3210,7 +3222,8 @@ class TestRunTickHeartbeat:
                 process_active_sessions_fn=boom,
                 check_health_fn=Mock(return_value=HealthDecision.ok()),
                 run_planning_cycle_fn=Mock(),
-                emit_heartbeat_fn=Mock(),
+                dispose_terminal_sessions_fn=Mock(return_value=PausedDisposal()),
+            emit_heartbeat_fn=Mock(),
             )
 
         # Started was written before boom ran; phase is still the one that

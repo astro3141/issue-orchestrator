@@ -421,6 +421,34 @@ terms, as does an ordinary agent session, which `Orchestrator.tick()` processes
 before it consults the paused health gate at all. After a resume, the next
 reconciliation starts whatever is still live.
 
+### A paused engine still disposes of what finished
+
+An ordinary session that was already running when the pause took effect may
+still reach terminal, and the disposal it earned — close its terminal tab,
+remove its worktree under the configured cleanup policy — belongs to that
+session's lifecycle, not to the new work the pause blocks ([#167]). That
+disposal is planner-owned, and planning does not run while paused, so a paused
+engine used to hold a finished session's worktree until an operator either
+resumed (reopening continuation execution) or edited state by hand.
+
+`run_tick` therefore runs one phase while the health gate reads `paused`:
+`control/terminal_disposal.py`, the owner that also supplies the planner's
+immediate-cleanup actions, so both paths dispose on identical terms. Its input
+is the immediate-cleanup fact the completion handoff files for a terminal
+session, never the deferred PR-reviewed queue — "has this PR been reviewed
+yet?" is a live review-workflow decision and stays behind the pause gate, which
+is also why the paused pass reads nothing from the repository host. Tech-lead
+artifact holds still withhold disposal, an ordinary coding worktree is still
+removed non-forced, and the fact is consumed only when its disposal actually
+happened, so a resume finds neither a duplicate nor a silently dropped cleanup.
+
+Disposal is still not cancellation. Ordinary cleanup tears down the issue's
+review exchange on its way past; while paused, anything still live for that
+issue predates the pause and is finishing on its own terms, so
+`ActionApplier.dispose_terminal_session` refuses rather than killing it —
+asking `has_live_issue_review_exchange`, the non-mutating counterpart of the
+cancellation it guards. A refusal defers the disposal rather than failing it.
+
 ## Worktree readiness is a precondition of a meaningful verdict
 
 Every gate above runs *inside a worktree*. A worktree that lacks the

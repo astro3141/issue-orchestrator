@@ -44,6 +44,7 @@ from .queue_cache import (
 from .blocked_front_queue import front_queue_newly_unblocked, release_blocked_front_on_launch
 from .dependency_gate_snapshot import build_refresh_snapshot
 from .tech_lead_artifact_retention import clear_discovered_facts
+from .terminal_disposal import PausedDisposal, PausedTerminalDisposal
 from .tech_lead_run_ownership import TechLeadRunOwnership, single_instance_run_ownership
 from .tech_lead_run_wiring import tech_lead_state_handlers
 from .issue_fetch_resilience import IssueFetchResilience, TransientIssueFetchError
@@ -222,6 +223,20 @@ class OrchestratorSupport:
                        len(inflight_stable_ids), sorted(inflight_stable_ids))
         else:
             logger.info("[REFRESH] Manual refresh requested")
+
+    def dispose_terminal_sessions_while_paused(self) -> "PausedDisposal":
+        """Run the disposal a session that finished under the pause earned (#167).
+
+        The paused tick's counterpart to planning: planning is withheld, so the
+        immediate cleanup filed by the completion handoff would otherwise sit
+        unowned until a resume reopened continuation execution. The owner reads
+        terminal-disposal facts only and can execute nothing but a disposal.
+        """
+        return PausedTerminalDisposal(
+            state=self.state,
+            facts=self.fact_gatherer,
+            seam=self.action_applier,
+        ).dispose()
 
     def apply_plan(self, plan: "Plan", pause_issue_callback: Callable[[int, str], None]) -> None:
         if plan.action_count == 0:
@@ -1290,6 +1305,7 @@ def run_tick(
     process_active_sessions_fn: Callable[[], None],
     check_health_fn: Callable[[], "HealthDecision"],
     run_planning_cycle_fn: Callable[[], None],
+    dispose_terminal_sessions_fn: Callable[[], "PausedDisposal"],
     emit_heartbeat_fn: Callable[[], None],
 ) -> tuple[int, bool]:
     """Execute one orchestration tick - extracted from Orchestrator per move map.
@@ -1358,11 +1374,16 @@ def run_tick(
     # projection after labels change in GitHub; planning remains safe because
     # the paused snapshot produces no launch actions.
     health_decision = check_health_fn()
-    refresh_while_paused = (
-        not health_decision.can_proceed
-        and health_decision.reason == "paused"
-        and bool(state.queue_refresh_requested)
-    )
+    paused = not health_decision.can_proceed and health_decision.reason == "paused"
+    if paused:
+        # A session that was already running when the pause took effect can
+        # still reach terminal, and the disposal it earned is planner-owned —
+        # so on a paused tick nothing else would ever run it (#167). This is
+        # disposal only: it admits no work, and it is the sole action a paused
+        # tick executes.
+        state.current_tick_phase = "paused_disposal"
+        dispose_terminal_sessions_fn()
+    refresh_while_paused = paused and bool(state.queue_refresh_requested)
     if health_decision.can_proceed or refresh_while_paused:
         state.current_tick_phase = "planning"
         plan_start = time.monotonic()
