@@ -14,7 +14,7 @@ ownership and exclusion                 :class:`~.control_operation_ownership.Co
 
 What is left here is the decision of *which* owned operation to advance now,
 and the re-entry of a run that already exists into the completion pipeline.
-Six rules keep that from becoming a second lifecycle.
+Seven rules keep that from becoming a second lifecycle.
 
 **It never decides admission.** A ``RETRY_PENDING`` operation is handed whole
 to #139, which re-checks the contract, the allowance and the reserve-before-
@@ -57,6 +57,19 @@ completes, and the PR carries no code-review label, so none of the three writers
 of ``pr-pending`` observe it. Handing that result to the finalizer is what makes
 the operation terminate; logging it and dropping it is what made
 ``APPROVED_PENDING_PR`` re-run a full reviewer exchange on every reconciliation.
+
+**It never infers review authority.** The one artifact that says a candidate was
+approved is the :class:`~..domain.review_verdict_binding.BoundReviewVerdict` the
+review exchange bound to an exact commit, and it lives in the run directory of
+the exchange that wrote it — a run of its own, or, on a reused approval, the
+cached exchange's. So the promotion below reads the run the completion pipeline
+*reports* as the owner and no other, and a completion that concluded an exchange
+but cannot produce that binding settles nothing at all: the intent stays
+undischarged and the next reconciliation opens another run against the same
+bounded allowance, exactly as a halted exchange has always left it. Neither an
+open pull request, a reviewer's prose, a summary record nor a label is ever read
+as approval; the alternative to durable evidence is refusal, not a weaker
+source.
 
 **It never outlives its own run.** ``process`` is not necessarily finished when
 it returns: with a background supervisor wired — the only configuration in which
@@ -428,46 +441,85 @@ class ControlContinuationRunner:
                 run.assets.run_id,
             )
             return False
-        self._record_review_verdict(operation, run.assets.run_dir)
         # The verdict first, then the settlement: both are facts this run
         # produced, and the ordering is the crash window. Settled-without-a-
         # verdict loses only evidence about a PR that demonstrably exists;
         # verdict-without-settlement re-enters the pipeline, finds the open PR
         # and reuses it. Only the first ordering can lose the review outcome
-        # for good.
-        self._finalizer.finalize(operation, result)
+        # for good. And a promotion that could not be made refuses the
+        # settlement outright, which is why it is asked FIRST rather than
+        # reported afterwards.
+        if self._record_review_verdict(operation, result):
+            self._finalizer.finalize(operation, result)
         return True
 
     def _record_review_verdict(
-        self, operation: LiveContinuation, run_dir: Path
-    ) -> None:
-        """Promote this run's exact-``A`` verdict binding into durable truth.
+        self, operation: LiveContinuation, result: "ProcessingResult"
+    ) -> bool:
+        """Promote the owning run's exact-``A`` verdict binding into durable truth.
 
-        The binding the exchange writes lives in the run directory, inside the
-        worktree this run is about to delete — durable enough for the session
-        that made it, and gone before anything could read it back. Copying it
-        onto the attempt is what makes ``EXIT_TO_REWORK``, ``SETTLED_NO_PR``
-        and ``APPROVED_PENDING_PR`` reconstructible after a restart, which is
-        the whole of §8's review half.
+        The binding lives in the run directory of the review exchange that
+        WROTE it, which is never this continuation's own run: the exchange
+        allocates a ``review-exchange-<issue>-<timestamp>`` run of its own, and
+        a reused approval keeps the cached exchange's older one. Asking this
+        run's directory found nothing every time, and a continuation that
+        recorded "no review verdict this run" went on to settle a pull request
+        whose approval it had just thrown away (#178). So the owner is not
+        guessed here — the completion pipeline reports it, and the report is
+        what is read.
 
-        A verdict bound to another commit is dropped rather than filed: the
-        attempt would refuse it anyway, and refusing here says why.
+        Copying the binding onto the attempt is what makes ``EXIT_TO_REWORK``,
+        ``SETTLED_NO_PR`` and ``APPROVED_PENDING_PR`` reconstructible after a
+        restart, which is the whole of §8's review half — the run directory is
+        inside a worktree this run is about to delete.
+
+        Returns:
+            Whether settlement may proceed. ``False`` is the fail-closed
+            refusal: this run concluded a review exchange, and the owner it
+            named holds no binding this candidate can be settled on — none at
+            all, or one rendered against another commit. Nothing durable is
+            written, so the operation stays live, its recorded intent stays
+            undischarged and the next reconciliation opens another run against
+            the same bounded allowance. It is deliberately the same outcome a
+            max-rounds halt has always produced, because it is the same fact:
+            a concluded exchange that promoted no verdict settles nothing.
+
+        A corrupt binding is not caught at all. The port raises on one by
+        contract, and a raised promotion cannot reach the settlement below —
+        which is the same refusal arriving by the louder route the damaged
+        artifact deserves.
+
+        A completion that concluded NO exchange owes no verdict and settles as
+        it always did: a recorded intent that asked for no review is not review
+        evidence gone missing.
         """
-        binding = self._review_verdicts.for_run(run_dir)
-        if binding is None:
+        completed = result.completed_review_exchange
+        if completed is None:
             logger.info(
-                "[CONTINUATION] %s recorded no review verdict this run",
+                "[CONTINUATION] %s completed no review exchange: no verdict to"
+                " promote",
                 operation.key,
             )
-            return
+            return True
+        binding = self._review_verdicts.for_run(completed.run_assets.run_dir)
+        if binding is None:
+            logger.warning(
+                "[CONTINUATION] %s settles nothing: its review exchange"
+                " concluded in run %s and bound no verdict, so there is no"
+                " durable evidence this candidate was reviewed",
+                operation.key,
+                completed.run_assets.run_dir,
+            )
+            return False
         if not binding.covers(operation.key.head_sha):
             logger.warning(
-                "[CONTINUATION] discarding %s verdict bound to %s: it is"
-                " evidence about other work",
+                "[CONTINUATION] %s settles nothing: the verdict its review"
+                " exchange bound is about %s, which is evidence about other"
+                " work",
                 operation.key,
                 binding.reviewed_sha[:12],
             )
-            return
+            return False
         # The attempt's OWN key, not a third spelling rebuilt from the issue and
         # the operation. ``LiveContinuation`` already carries the record this
         # operation is about, and the binding between candidate and evidence
@@ -477,10 +529,12 @@ class ControlContinuationRunner:
             lambda attempt: attempt.with_continuation_review_verdict(binding),
         )
         logger.info(
-            "[CONTINUATION] %s durable review verdict=%s",
+            "[CONTINUATION] %s durable review verdict=%s from owning run %s",
             operation.key,
             binding.verdict.value,
+            completed.run_assets.run_dir,
         )
+        return True
 
 
 def _already_executing(operation: LiveContinuation) -> None:

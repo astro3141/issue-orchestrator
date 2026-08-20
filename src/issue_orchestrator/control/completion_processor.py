@@ -107,6 +107,7 @@ from .completion_validation_evidence import CompletionValidationEvidence
 from .completion_ports import GitAdapter, LabelAdapter, PRAdapter
 from .completion_pr_labels import apply_pr_labels, reserved_pr_label_error
 from .completion_types import (
+    CompletedReviewExchange,
     ERROR_PREFIX_CREATE_PR,
     ERROR_PREFIX_PUBLISH_BLOCKED,
     ERROR_PREFIX_PUSH,
@@ -813,7 +814,7 @@ class CompletionProcessor:
         (
             branch,
             pr_url,
-            review_exchange_completed,
+            completed_exchange,
             deferred,
             early_result,
         ) = self._execute_actions(
@@ -865,7 +866,7 @@ class CompletionProcessor:
             issue_title=issue_title,
             branch=branch,
             pr_url=pr_url,
-            review_exchange_completed=review_exchange_completed,
+            completed_exchange=completed_exchange,
             actions_taken=actions_taken,
             errors=errors,
             error_details=error_details,
@@ -1616,13 +1617,15 @@ class CompletionProcessor:
         error_details: list[dict[str, Any]],
         run_assets: SessionRunAssets,
         issue_key: "IssueKey | None",
-    ) -> tuple[str | None, str | None, bool, bool, ProcessingResult | None]:
+    ) -> tuple[str | None, str | None, CompletedReviewExchange | None, bool, ProcessingResult | None]:
         """Execute all requested actions from completion record.
 
         Returns:
-            Tuple of (final_branch, pr_url, review_exchange_completed, deferred, early_result).
-            When ``deferred`` is True the review exchange is running in the
-            background — callers must NOT treat the completion as finished.
+            Tuple of (final_branch, pr_url, completed_exchange, deferred,
+            early_result). ``completed_exchange`` names the exchange this
+            completion concluded and the run owning its verdict binding, or
+            ``None`` when none ran (#178). ``deferred`` True means it runs in
+            the background — the completion is NOT finished.
         """
         pr_url: str | None = None
         requested_actions = tuple(record.requested_actions)
@@ -1634,7 +1637,7 @@ class CompletionProcessor:
             plan,
             exchange_mode,
             exchange_result,
-            review_exchange_completed,
+            completed_exchange,
             should_halt,
             deferred,
         ) = self._review_exchange.prepare_review_exchange(
@@ -1660,9 +1663,9 @@ class CompletionProcessor:
             ),
         )
         if deferred:
-            return branch, pr_url, review_exchange_completed, True, None
+            return branch, pr_url, completed_exchange, True, None
         if should_halt:
-            return branch, pr_url, review_exchange_completed, False, None
+            return branch, pr_url, completed_exchange, False, None
 
         pre_publish_failure = self._run_pre_publish_gate_if_required(
             plan=plan,
@@ -1676,12 +1679,12 @@ class CompletionProcessor:
             run_assets=run_assets,
         )
         if pre_publish_failure is not None:
-            return branch, pr_url, review_exchange_completed, False, pre_publish_failure
+            return branch, pr_url, completed_exchange, False, pre_publish_failure
 
         (
             branch,
             pr_url,
-            review_exchange_completed,
+            completed_exchange,
             action_result,
         ) = self._execute_planned_actions(
             plan=plan,
@@ -1698,7 +1701,7 @@ class CompletionProcessor:
             error_details=error_details,
             exchange_mode=exchange_mode,
             exchange_result=exchange_result,
-            review_exchange_completed=review_exchange_completed,
+            completed_exchange=completed_exchange,
             # Bound here because this is where the run is owned: the retry can
             # then re-run the very same check for the commit it rewrote (#45).
             recertify_rewritten_head=partial(
@@ -1706,7 +1709,7 @@ class CompletionProcessor:
                 worktree, record, issue_number, run_assets, issue_key,
             ),
         )
-        return branch, pr_url, review_exchange_completed, False, action_result
+        return branch, pr_url, completed_exchange, False, action_result
 
     def _execute_planned_actions(
         self,
@@ -1725,9 +1728,9 @@ class CompletionProcessor:
         error_details: list[dict[str, Any]],
         exchange_mode: str | None,
         exchange_result: Any | None,
-        review_exchange_completed: bool,
+        completed_exchange: CompletedReviewExchange | None,
         recertify_rewritten_head: RepublicationCheck,
-    ) -> tuple[str | None, str | None, bool, ProcessingResult | None]:
+    ) -> tuple[str | None, str | None, CompletedReviewExchange | None, ProcessingResult | None]:
         pr_url: str | None = None
         early_result: ProcessingResult | None = None
 
@@ -1755,8 +1758,8 @@ class CompletionProcessor:
                 branch = result.branch
             if result.pr_url:
                 pr_url = result.pr_url
-            if result.review_exchange_completed:
-                review_exchange_completed = True
+            if result.completed_exchange is not None:
+                completed_exchange = result.completed_exchange
             if result.early_result is not None:
                 early_result = result.early_result
             if result.skip_remaining:
@@ -1767,7 +1770,7 @@ class CompletionProcessor:
                     issue_number,
                 )
                 break
-        return branch, pr_url, review_exchange_completed, early_result
+        return branch, pr_url, completed_exchange, early_result
 
     def _execute_action_with_observability(
         self,
@@ -1869,7 +1872,8 @@ class CompletionProcessor:
         skip_remaining: bool = False  # Skip to next action (used by continue)
         branch: str | None = None  # Updated branch name
         pr_url: str | None = None  # PR URL if created
-        review_exchange_completed: bool = False
+        # The exchange this action concluded, and its binding's owner (#178).
+        completed_exchange: CompletedReviewExchange | None = None
         # The completion's whole outcome, when an action refused publication
         # rather than merely failing: reported as the gate failure it is (#45).
         early_result: "ProcessingResult | None" = None
@@ -2374,21 +2378,20 @@ class CompletionProcessor:
             )
             if settle_failure is not None:
                 return settle_failure
-            review_exchange_completed = False
-            if exchange_mode in {"via-mcp", "via-local-loop"} and exchange_result:
-                review_exchange_completed = True
+            completed = self._review_exchange.completed_review_exchange(exchange_mode, exchange_result)
+            if completed is not None:
                 self._finalize_review_exchange_pr(
                     issue_number=issue_number,
                     pr_number=pr.number,
-                    exchange_mode=exchange_mode,
+                    exchange_mode=completed.mode,
                     exchange_result=exchange_result,
                     actions_taken=actions_taken,
-                    run_assets=exchange_result.run_assets,
+                    run_assets=completed.run_assets,
                 )
             return self._ActionResult(
                 branch=branch,
                 pr_url=pr.url,
-                review_exchange_completed=review_exchange_completed,
+                completed_exchange=completed,
             )
         # Route None-without-raise through publish-failed observability, not a generic failure.
         reason = "PR creation returned no result"
@@ -2446,21 +2449,20 @@ class CompletionProcessor:
             issue_number,
             existing_pr.url,
         )
-        review_exchange_completed = False
-        if exchange_mode in {"via-mcp", "via-local-loop"} and exchange_result:
-            review_exchange_completed = True
+        completed = self._review_exchange.completed_review_exchange(exchange_mode, exchange_result)
+        if completed is not None:
             self._finalize_review_exchange_pr(
                 issue_number=issue_number,
                 pr_number=existing_pr.number,
-                exchange_mode=exchange_mode,
+                exchange_mode=completed.mode,
                 exchange_result=exchange_result,
                 actions_taken=actions_taken,
-                run_assets=exchange_result.run_assets,
+                run_assets=completed.run_assets,
             )
         return self._ActionResult(
             pr_url=existing_pr.url,
             skip_remaining=True,
-            review_exchange_completed=review_exchange_completed,
+            completed_exchange=completed,
         )
 
     def _enforce_created_pr_base(

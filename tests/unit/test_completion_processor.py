@@ -1178,6 +1178,62 @@ class TestReviewExchangeExecution:
         processor._run_review_exchange_loop.assert_called_once()  # noqa: SLF001
         mock_pr_adapter.create_pr.assert_not_called()
 
+    def test_a_completion_that_runs_no_review_exchange_names_no_owner(
+        self,
+        tmp_path,
+        mock_label_adapter,
+        mock_pr_adapter,
+        mock_git_adapter,
+        event_bus,
+        worktree_with_completion,
+    ) -> None:
+        """A mode that reviews nothing owes no verdict, and says so (#178).
+
+        ``completed_review_exchange`` is ``None`` here — not "an exchange that
+        bound nothing" — which is the distinction the continuation's promotion
+        seam turns on: this path must keep its existing no-verdict semantics
+        and settle, while a concluded exchange with no binding must not.
+        """
+        config = self._make_config(tmp_path)
+        config.review_exchange_mode = "off"
+        processor = CompletionProcessor(
+            agent_callback_endpoint=ready_callback_endpoint(),
+            label_adapter=mock_label_adapter,
+            pr_adapter=mock_pr_adapter,
+            git_adapter=mock_git_adapter,
+            session_output=FileSystemSessionOutput(),
+            event_bus=event_bus,
+            label_config={
+                "code_reviewed": "code-reviewed",
+                "code_review": "needs-code-review",
+            },
+            config=config,
+        )
+        record = make_record(
+            outcome=CompletionOutcome.COMPLETED,
+            requested_actions=[
+                RequestedAction.PUSH_BRANCH,
+                RequestedAction.CREATE_PR,
+            ],
+        )
+        worktree = worktree_with_completion(record)
+        processor._run_review_exchange_loop = MagicMock(  # noqa: SLF001
+            side_effect=AssertionError("no exchange may run in this mode")
+        )
+
+        result = processor.process(
+            worktree,
+            run_assets=make_session_run_assets(worktree),
+            issue_number=123,
+            issue_title="Test Issue",
+            agent_label="agent:coder",
+            issue_key=None,
+        )
+
+        assert result.success is True
+        assert result.review_exchange_completed is False
+        assert result.completed_review_exchange is None
+
     def test_existing_pr_reuse_after_local_loop_success_marks_review_complete(
         self,
         tmp_path,
@@ -1231,9 +1287,10 @@ class TestReviewExchangeExecution:
             )
         )
 
+        session_run_assets = make_session_run_assets(worktree)
         result = processor.process(
             worktree,
-            run_assets=make_session_run_assets(worktree),
+            run_assets=session_run_assets,
             issue_number=123,
             issue_title="Test Issue",
             agent_label="agent:coder",
@@ -1243,6 +1300,16 @@ class TestReviewExchangeExecution:
         assert result.success is True
         assert result.pr_url == "https://github.com/owner/repo/pull/99"
         assert result.review_exchange_completed is True
+        # Fresh/inline review obeys the SAME ownership rule the cache path
+        # does: the authority is the exchange run this completion allocated,
+        # never the run the completion itself was processed under (#178).
+        exchange_run = processor._run_review_exchange_loop.call_args.kwargs[  # noqa: SLF001
+            "exchange_run"
+        ]
+        assert result.completed_review_exchange is not None
+        owner = result.completed_review_exchange.run_assets
+        assert owner == exchange_run.assets
+        assert owner.run_dir != session_run_assets.run_dir
         processor._run_review_exchange_loop.assert_called_once()  # noqa: SLF001
         mock_pr_adapter.create_pr.assert_not_called()
         mock_label_adapter.add_label.assert_any_call(99, "code-reviewed")
@@ -1866,6 +1933,10 @@ class TestReviewExchangeExecution:
 
         assert result.success is True
         assert result.review_exchange_completed is True
+        # Same ownership rule as the fresh path: the binding's owner is the
+        # cached exchange's run, which is not the processing run (#178).
+        assert result.completed_review_exchange is not None
+        assert result.completed_review_exchange.run_assets.run_dir == run_dir
         # Cache-replay must be tagged so the timeline narrates it as a
         # replay rather than claiming a fresh 2-round review happened
         # in this run (issue #228 regression).
@@ -2272,9 +2343,10 @@ class TestReviewExchangeExecution:
             side_effect=AssertionError("exchange should not re-run")
         )
 
+        session_run_assets = make_session_run_assets(worktree)
         result = processor.process(
             worktree,
-            run_assets=make_session_run_assets(worktree),
+            run_assets=session_run_assets,
             issue_number=123,
             issue_title="Test Issue",
             agent_label="agent:coder",
@@ -2284,6 +2356,14 @@ class TestReviewExchangeExecution:
 
         assert result.success is True
         assert result.review_exchange_completed is True
+        # The reused approval's authority belongs to the CACHED exchange run,
+        # not to the run this completion was processed under — the promotion
+        # seam reads it from here, and the processing run holds no binding
+        # (#178).
+        assert result.completed_review_exchange is not None
+        owner = result.completed_review_exchange.run_assets
+        assert owner.run_dir == exchange_run_dir
+        assert owner.run_dir != session_run_assets.run_dir
 
     def test_auto_mode_falls_back_to_local_loop(self, tmp_path, monkeypatch):
         config = self._make_config(tmp_path)

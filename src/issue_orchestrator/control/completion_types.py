@@ -3,6 +3,8 @@
 from collections.abc import Callable
 from dataclasses import dataclass
 
+from ..domain.review_exchange_run import ReviewExchangeRunAssets
+
 ERROR_PREFIX_PUSH = "push_branch"
 ERROR_PREFIX_CREATE_PR = "create_pr"
 ERROR_PREFIX_PUBLISH_BLOCKED = "publish_blocked"
@@ -25,6 +27,27 @@ ERROR_PREFIX_GOVERNED_LABEL = "governed_label"
 REVIEW_EXCHANGE_ERROR_PREFIX = "review_exchange:"
 
 
+@dataclass(frozen=True, slots=True)
+class CompletedReviewExchange:
+    """A review exchange that concluded, and the run that owns its authority.
+
+    One value rather than a mode, a boolean and a directory travelling
+    separately: the three cannot then disagree about whether an exchange ran,
+    which one it was, or where the ``review-verdict.json`` it bound now lives
+    (#178). Derived in exactly one place —
+    ``CompletionReviewExchange.completed_review_exchange`` — so every consumer
+    inherits the same answer.
+
+    ``run_assets`` is the EXCHANGE's own run: allocated fresh for an inline or
+    background exchange, retained from the cached exchange for a reused
+    approval, and never the run the completion itself was processed under,
+    which holds no binding and never did.
+    """
+
+    mode: str
+    run_assets: ReviewExchangeRunAssets
+
+
 @dataclass
 class ProcessingResult:
     """Result of processing a completion record."""
@@ -38,6 +61,16 @@ class ProcessingResult:
     completion_record_path: str | None = None
     errors: list[str] | None = None
     review_exchange_completed: bool = False
+    # The exchange this completion concluded, carrying the run that owns its
+    # ``review-verdict.json`` binding. Present exactly when
+    # ``review_exchange_completed`` is True — both are read off the same value,
+    # so the fact and the artifacts that prove it cannot disagree.
+    #
+    # ``None`` means this completion performed no review exchange at all, which
+    # is a different fact from "performed one and bound no verdict" — the first
+    # owes no verdict, the second is missing authority evidence and must fail
+    # closed at the promotion seam (#178).
+    completed_review_exchange: CompletedReviewExchange | None = None
     review_exchange_halted: bool = False
     # True when the review exchange is running asynchronously and completion
     # processing for this record must retry on a future tick. Callers must NOT

@@ -338,7 +338,7 @@ and nothing about what to do with it, so [#149] adds the missing half:
 | Fact | Where it lives | Written by |
 |------|----------------|------------|
 | Recorded intent (`requested_actions`, `implementation`, `problems`) plus the contract identity | `Attempt.continuation_descriptor` | `control/continuation_descriptor_writer.py`, at the gate's verdict, **only when the verdict refuses** |
-| The exact-`A` review outcome | `Attempt.continuation_review_verdict` | `control/continuation_runner.py`, promoted from the run's own verdict binding before its worktree is discarded |
+| The exact-`A` review outcome | `Attempt.continuation_review_verdict` | `control/continuation_runner.py`, promoted before settlement from the binding held by the review-exchange run that **owns** it — the exchange's own run, or the cached one a reused approval kept, never the continuation's run (#178) — and before that worktree is discarded. A concluded exchange whose owner holds no usable binding settles nothing rather than settling without review evidence |
 | What the continuation run produced — the pull request, or that none was asked for | `Attempt.continuation_settlement` | `control/continuation_finalize.py`, from the `ProcessingResult` the run's own completion pipeline returned |
 | How many runs the continuation has opened for this candidate | `Attempt.continuation_runs_used` | `control/continuation_run_open.py`, spent before a run is opened |
 

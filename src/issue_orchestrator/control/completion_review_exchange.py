@@ -21,7 +21,7 @@ from .background_job_supervisor import (
     BackgroundJobTimeoutError,
     BackgroundJobSupervisor,
 )
-from .completion_types import REVIEW_EXCHANGE_ERROR_PREFIX
+from .completion_types import CompletedReviewExchange, REVIEW_EXCHANGE_ERROR_PREFIX
 from .review_exchange_cache_resolution import (
     ResumeResolution,
     ReuseResumeResolution,
@@ -240,17 +240,26 @@ class CompletionReviewExchange:
         approval_gate: "ReviewExchangeApprovalGate | None" = None,
         review_cache_boundary_started_at: str | None = None,
         current_head_sha: str | None = None,
-    ) -> tuple[Any, str | None, ReviewExchangeOutcome | None, bool, bool, bool]:
+    ) -> tuple[
+        Any,
+        str | None,
+        ReviewExchangeOutcome | None,
+        CompletedReviewExchange | None,
+        bool,
+        bool,
+    ]:
         """Resolve mode, run/poll review exchange, and report status.
 
-        Returns (plan, exchange_mode, exchange_result, review_exchange_completed,
-        exchange_halt, deferred). ``deferred=True`` means the exchange is
-        running in the background and completion processing must retry on a
-        later tick — the caller MUST NOT proceed to push/PR creation.
+        Returns (plan, exchange_mode, exchange_result, completed_exchange,
+        exchange_halt, deferred). ``completed_exchange`` names the exchange that
+        concluded and the run owning its verdict binding, or ``None`` when no
+        exchange ran — see :meth:`completed_review_exchange`. ``deferred=True``
+        means the exchange is running in the background and completion
+        processing must retry on a later tick — the caller MUST NOT proceed to
+        push/PR creation.
         """
         exchange_mode: str | None = None
         exchange_result: ReviewExchangeOutcome | None = None
-        review_exchange_completed = False
 
         if RequestedAction.CREATE_PR in requested_actions:
             try:
@@ -258,7 +267,7 @@ class CompletionReviewExchange:
             except ValueError as exc:
                 errors.append(f"{REVIEW_EXCHANGE_ERROR_PREFIX} {exc}")
                 pipeline = resolve_review_publish_pipeline(None)
-                return pipeline.plan(requested_actions), None, None, False, True, False
+                return pipeline.plan(requested_actions), None, None, None, True, False
 
         pipeline = resolve_review_publish_pipeline(exchange_mode)
         plan = pipeline.plan(requested_actions)
@@ -267,7 +276,7 @@ class CompletionReviewExchange:
                 plan,
                 exchange_mode,
                 exchange_result,
-                review_exchange_completed,
+                None,
                 False,
                 False,
             )
@@ -296,13 +305,11 @@ class CompletionReviewExchange:
             run_review_exchange_loop=run_review_exchange_loop,
             approval_gate=approval_gate,
         )
-        if exchange_mode in {"via-mcp", "via-local-loop"} and exchange_result:
-            review_exchange_completed = True
         return (
             plan,
             exchange_mode,
             exchange_result,
-            review_exchange_completed,
+            self.completed_review_exchange(exchange_mode, exchange_result),
             exchange_halt,
             deferred,
         )
@@ -329,6 +336,38 @@ class CompletionReviewExchange:
     ) -> bool:
         return (
             exchange_mode in {"via-mcp", "via-local-loop"} and exchange_result is None
+        )
+
+    def completed_review_exchange(
+        self,
+        exchange_mode: str | None,
+        exchange_result: ReviewExchangeOutcome | None,
+    ) -> CompletedReviewExchange | None:
+        """The exchange that concluded here, and the run that owns its authority.
+
+        One derivation of "a review exchange concluded here", and one answer to
+        "whose directory holds its ``review-verdict.json``", so the fact and the
+        artifacts that prove it can never be reported by different rules. The
+        assets are the EXCHANGE's own — allocated by
+        :meth:`_start_review_exchange_run` for a fresh or inline run, retained
+        from the cached exchange for a reused approval — and never the
+        completion run's, which owns no binding and never did (#178).
+
+        The reuse and fresh paths are deliberately not distinguished: the
+        binding's owner is ``outcome.run_assets`` either way, and a rule that
+        special-cased the cache would be the second ownership rule this exists
+        to remove.
+
+        ``None`` says no exchange ran: a mode that does not review, or no
+        outcome to attribute. It never means "ran and bound nothing" — that is
+        an exchange with an owner whose binding is missing, and only the owner
+        can be asked about it.
+        """
+        if exchange_mode not in {"via-mcp", "via-local-loop"} or exchange_result is None:
+            return None
+        return CompletedReviewExchange(
+            mode=exchange_mode,
+            run_assets=exchange_result.run_assets,
         )
 
     def is_review_exchange_running(

@@ -25,6 +25,7 @@ import pytest
 
 from issue_orchestrator.adapters.sidecar_attempt_store import SidecarAttemptStore
 from issue_orchestrator.control.actions import AddLabelAction
+from issue_orchestrator.control.completion_types import CompletedReviewExchange
 from issue_orchestrator.control.continuation_finalize import ContinuationFinalizer
 from issue_orchestrator.control.continuation_in_flight import ContinuationsInFlight
 from issue_orchestrator.control.continuation_runs import ContinuationRuns
@@ -74,6 +75,7 @@ from issue_orchestrator.domain.models import (
     OrchestratorState,
     RequestedAction,
 )
+from issue_orchestrator.domain.review_exchange_run import ReviewExchangeRunAssets
 from issue_orchestrator.domain.review_verdict_binding import (
     BoundReviewVerdict,
     ReviewVerdictOutcome,
@@ -83,6 +85,9 @@ from issue_orchestrator.domain.validation_profile import ValidationGateKind
 from issue_orchestrator.domain.validation_verdict_receipt import (
     ValidationVerdict,
     ValidationVerdictReceipt,
+)
+from issue_orchestrator.execution.run_review_verdict_bindings import (
+    RunReviewVerdictBindings,
 )
 from issue_orchestrator.infra.config import AgentConfig, Config
 from issue_orchestrator.ports.command_runner import CommandResult
@@ -350,6 +355,11 @@ class ProcessingOutcome:
     pr_url: str | None = None
     review_exchange_deferred: bool = False
     validation_failed_rerouted: bool = False
+    #: The exchange this completion concluded, carrying the run that owns its
+    #: verdict binding, as the pipeline reports it. ``None`` — the default — is
+    #: a completion that concluded no exchange, which is most of these tests:
+    #: they are about the runner's composition, not about review.
+    completed_review_exchange: CompletedReviewExchange | None = None
 
     @property
     def is_non_terminal(self) -> bool:
@@ -403,18 +413,41 @@ class FakeActionApplier:
 
     applied: list[AddLabelAction] = field(default_factory=list)
     result: LabelResult = field(default_factory=LabelResult)
+    #: Run while the settlement is in progress. The finalizer applies this
+    #: label BEFORE it writes the settlement, so a callback here observes
+    #: durable truth at the one instant that separates promotion from
+    #: settlement — which is how "the verdict is promoted first" is proved as
+    #: an ordering rather than as an end state.
+    during_apply: Callable[[], None] | None = None
 
     def apply(self, action: AddLabelAction) -> LabelResult:
         self.applied.append(action)
+        if self.during_apply is not None:
+            self.during_apply()
         return self.result
 
 
 @dataclass
 class FakeVerdicts:
-    binding: BoundReviewVerdict | None = None
+    """Bindings, filed under the run directory that actually owns each one.
+
+    Keyed rather than constant on purpose: a fake that answered the same
+    binding for every directory could not tell a reader asking the OWNING
+    exchange run from one asking the continuation's own run, which is the whole
+    of #178. ``raises`` stands in for a corrupt artifact, which the real port
+    raises on rather than reading as absent.
+    """
+
+    by_run_dir: dict[Path, BoundReviewVerdict] = field(default_factory=dict)
+    raises: dict[Path, Exception] = field(default_factory=dict)
+    asked: list[Path] = field(default_factory=list)
 
     def for_run(self, run_dir: Path) -> BoundReviewVerdict | None:
-        return self.binding
+        self.asked.append(run_dir)
+        error = self.raises.get(run_dir)
+        if error is not None:
+            raise error
+        return self.by_run_dir.get(run_dir)
 
 
 @dataclass
@@ -515,6 +548,46 @@ def _operation(
 def _worktree_name_for(attempt: Attempt) -> str:
     """The deterministic per-candidate checkout name the runner asks for."""
     return f"continuation-{ISSUE_NUMBER}-{attempt.key.head_sha[:12]}"
+
+
+def _review_run(
+    harness: Harness,
+    name: str = "review-exchange-149-20260819T010000Z",
+) -> ReviewExchangeRunAssets:
+    """The review exchange's OWN run, as the real one names and places it.
+
+    Deliberately outside the continuation's worktree and under its own
+    ``review-exchange-<issue>-<timestamp>`` name: every test that uses it is
+    about a binding whose owner is NOT the run the continuation opened, and a
+    helper that shared a directory with that run could not tell the two apart.
+    """
+    return ReviewExchangeRunAssets.from_run_dir(
+        harness.repo_root.parent / "review-runs" / name
+    )
+
+
+def _concluded(run_assets: ReviewExchangeRunAssets) -> CompletedReviewExchange:
+    """A review exchange that concluded in ``run_assets``, as the pipeline says."""
+    return CompletedReviewExchange(mode="via-local-loop", run_assets=run_assets)
+
+
+def _approval(reviewed_sha: str) -> BoundReviewVerdict:
+    return BoundReviewVerdict(
+        verdict=ReviewVerdictOutcome.APPROVED,
+        reviewed_sha=reviewed_sha,
+        decided_at="2026-08-19T01:00:00Z",
+        completed_rounds=1,
+    )
+
+
+def _durable_review_facts(harness: Harness, key: AttemptKey) -> tuple[bool, bool]:
+    """``(a verdict is durable, a settlement is durable)`` right now."""
+    stored = harness.attempts.for_key(key)
+    assert stored is not None
+    return (
+        stored.continuation_review_verdict is not None,
+        stored.continuation_settlement is not None,
+    )
 
 
 def _owned(*operations: LiveContinuation) -> ContinuationReconciliation:
@@ -981,20 +1054,31 @@ class TestRecordedIntentIsReplayedNotInvented:
 
 
 class TestDurableReviewVerdict:
-    def test_an_exact_a_verdict_is_promoted_onto_the_attempt(
+    """The verdict is read from the run that OWNS it, or nothing settles (#178).
+
+    The review exchange allocates a run of its own, and a reused approval keeps
+    the cached exchange's older one. Neither is the continuation's run, so a
+    promotion that asked the continuation's own directory found nothing every
+    time and settled a pull request whose approval it had just discarded. These
+    tests are written against that: the owning run and the continuation's run
+    are always distinct directories, and the fake answers only the one that
+    genuinely holds each binding.
+    """
+
+    def test_a_reused_approval_is_promoted_from_the_run_that_owns_it(
         self, harness: Harness
     ) -> None:
         attempt = _attempt(RequestedAction.CREATE_PR)
         harness.attempts.update(attempt.key, lambda _current: attempt)
-        harness.verdicts.binding = BoundReviewVerdict(
-            verdict=ReviewVerdictOutcome.CHANGES_REQUESTED,
-            reviewed_sha=SHA_A,
-            decided_at="2026-08-19T01:00:00Z",
-            completed_rounds=1,
+        owner = _review_run(harness)
+        harness.verdicts.by_run_dir[owner.run_dir] = _approval(SHA_A)
+        harness.completion.outcome = ProcessingOutcome(
+            pr_url=PR_URL,
+            completed_review_exchange=_concluded(owner),
         )
 
         harness.runner.advance(
-            _owned(_operation(attempt, ContinuationPhase.PASS_PENDING_REVIEW))
+            _owned(_operation(attempt, ContinuationPhase.APPROVED_PENDING_PR))
         )
 
         stored = harness.attempts.for_key(attempt.key)
@@ -1002,20 +1086,220 @@ class TestDurableReviewVerdict:
         assert stored.continuation_review_verdict is not None
         assert (
             stored.continuation_review_verdict.verdict
-            is ReviewVerdictOutcome.CHANGES_REQUESTED
+            is ReviewVerdictOutcome.APPROVED
+        )
+        assert stored.continuation_review_verdict.reviewed_sha == SHA_A
+        assert stored.continuation_settlement is not None
+
+    def test_the_verdict_is_durable_before_the_settlement_is_recorded(
+        self, harness: Harness
+    ) -> None:
+        """Ordering, not end state: the crash window must lose the PR, not the review."""
+        attempt = _attempt(RequestedAction.CREATE_PR)
+        harness.attempts.update(attempt.key, lambda _current: attempt)
+        owner = _review_run(harness)
+        harness.verdicts.by_run_dir[owner.run_dir] = _approval(SHA_A)
+        harness.completion.outcome = ProcessingOutcome(
+            pr_url=PR_URL,
+            completed_review_exchange=_concluded(owner),
+        )
+        midway: list[tuple[bool, bool]] = []
+        harness.labels.during_apply = lambda: midway.append(
+            _durable_review_facts(harness, attempt.key)
         )
 
-    def test_a_verdict_bound_to_another_commit_is_discarded(
+        harness.runner.advance(
+            _owned(_operation(attempt, ContinuationPhase.APPROVED_PENDING_PR))
+        )
+
+        assert midway == [(True, False)], (
+            "the verdict must already be durable, and the settlement must not"
+            " yet be, at the instant the board is told about the pull request"
+        )
+
+    def test_a_continuation_run_never_hides_a_binding_owned_elsewhere(
+        self, harness: Harness
+    ) -> None:
+        """The bug itself: C holds no binding, and asking C is asking nobody."""
+        attempt = _attempt(RequestedAction.CREATE_PR)
+        harness.attempts.update(attempt.key, lambda _current: attempt)
+        owner = _review_run(harness)
+        harness.verdicts.by_run_dir[owner.run_dir] = _approval(SHA_A)
+        harness.completion.outcome = ProcessingOutcome(
+            pr_url=PR_URL,
+            completed_review_exchange=_concluded(owner),
+        )
+
+        harness.runner.advance(
+            _owned(_operation(attempt, ContinuationPhase.APPROVED_PENDING_PR))
+        )
+
+        continuation_run_dir = harness.session_output.runs[0].run_dir
+        assert harness.verdicts.asked == [owner.run_dir]
+        assert continuation_run_dir not in harness.verdicts.asked
+        stored = harness.attempts.for_key(attempt.key)
+        assert stored is not None
+        assert stored.continuation_review_verdict is not None
+
+    def test_a_verdict_bound_to_another_commit_cannot_settle_this_candidate(
         self, harness: Harness
     ) -> None:
         attempt = _attempt(RequestedAction.CREATE_PR)
         harness.attempts.update(attempt.key, lambda _current: attempt)
-        harness.verdicts.binding = BoundReviewVerdict(
-            verdict=ReviewVerdictOutcome.APPROVED,
-            reviewed_sha=SHA_A_PRIME,
-            decided_at="2026-08-19T01:00:00Z",
-            completed_rounds=1,
+        owner = _review_run(harness)
+        harness.verdicts.by_run_dir[owner.run_dir] = _approval(SHA_A_PRIME)
+        harness.completion.outcome = ProcessingOutcome(
+            pr_url=PR_URL,
+            completed_review_exchange=_concluded(owner),
         )
+
+        harness.runner.advance(
+            _owned(_operation(attempt, ContinuationPhase.APPROVED_PENDING_PR))
+        )
+
+        stored = harness.attempts.for_key(attempt.key)
+        assert stored is not None
+        assert stored.continuation_review_verdict is None
+        assert stored.continuation_settlement is None
+        assert harness.labels.applied == []
+
+    def test_a_concluded_exchange_that_bound_no_verdict_cannot_settle(
+        self, harness: Harness
+    ) -> None:
+        """An exchange ran and left no authority artifact: refuse, do not assume."""
+        attempt = _attempt(RequestedAction.CREATE_PR)
+        harness.attempts.update(attempt.key, lambda _current: attempt)
+        harness.completion.outcome = ProcessingOutcome(
+            pr_url=PR_URL,
+            completed_review_exchange=_concluded(_review_run(harness)),
+        )
+
+        harness.runner.advance(
+            _owned(_operation(attempt, ContinuationPhase.APPROVED_PENDING_PR))
+        )
+
+        stored = harness.attempts.for_key(attempt.key)
+        assert stored is not None
+        assert stored.continuation_review_verdict is None
+        assert stored.continuation_settlement is None
+        assert harness.labels.applied == []
+        # The run still closes, so the operation retries on the ordinary
+        # cadence against the bounded run allowance rather than pinning a
+        # worktree open — the same shape a halted exchange has always had.
+        assert harness.worktrees.removed == [
+            harness.session_output.runs[0].worktree_path
+        ]
+
+    def test_a_corrupt_binding_cannot_settle(self, harness: Harness) -> None:
+        """The port raises on a damaged artifact; a settlement must not survive it."""
+        attempt = _attempt(RequestedAction.CREATE_PR)
+        harness.attempts.update(attempt.key, lambda _current: attempt)
+        owner = _review_run(harness)
+        harness.verdicts.raises[owner.run_dir] = ValueError(
+            "review verdict binding must be a JSON object"
+        )
+        harness.completion.outcome = ProcessingOutcome(
+            pr_url=PR_URL,
+            completed_review_exchange=_concluded(owner),
+        )
+
+        with pytest.raises(ValueError, match="must be a JSON object"):
+            harness.runner.advance(
+                _owned(_operation(attempt, ContinuationPhase.APPROVED_PENDING_PR))
+            )
+
+        stored = harness.attempts.for_key(attempt.key)
+        assert stored is not None
+        assert stored.continuation_review_verdict is None
+        assert stored.continuation_settlement is None
+
+    def test_an_open_pull_request_is_never_read_as_approval(
+        self, harness: Harness
+    ) -> None:
+        """A created PR, a successful run and a reviewer's prose prove nothing."""
+        attempt = _attempt(RequestedAction.CREATE_PR)
+        harness.attempts.update(attempt.key, lambda _current: attempt)
+        harness.completion.outcome = ProcessingOutcome(
+            success=True,
+            message="Review exchange passed (cached): reviewer said APPROVED",
+            pr_url=PR_URL,
+            completed_review_exchange=_concluded(_review_run(harness)),
+        )
+
+        harness.runner.advance(
+            _owned(_operation(attempt, ContinuationPhase.APPROVED_PENDING_PR))
+        )
+
+        stored = harness.attempts.for_key(attempt.key)
+        assert stored is not None
+        assert stored.continuation_review_verdict is None
+        assert stored.continuation_settlement is None
+        assert harness.labels.applied == []
+
+    def test_a_summary_record_alone_synthesizes_no_verdict(
+        self, tmp_path: Path
+    ) -> None:
+        """Through the real reader: only ``review-verdict.json`` is authority.
+
+        The summary is the record an approved exchange also writes, and it names
+        the terminal state in as many words. The binding reader must still
+        answer ``None`` — otherwise the fail-closed refusal above could be
+        walked around by the very record that sits beside the missing one.
+        """
+        owner = ReviewExchangeRunAssets.from_run_dir(
+            tmp_path / "review-exchange-149-20260819T010000Z"
+        )
+        owner.exchange_dir.mkdir(parents=True)
+        owner.summary_path.write_text(
+            json.dumps({"status": "ok", "reason": "reviewer_ok", "head_sha": SHA_A}),
+            encoding="utf-8",
+        )
+
+        assert RunReviewVerdictBindings().for_run(owner.run_dir) is None
+
+    def test_re_entry_after_promotion_and_before_settlement_is_idempotent(
+        self, harness: Harness
+    ) -> None:
+        """A settlement that could not be recorded leaves a retryable, not doubled, run."""
+        attempt = _attempt(RequestedAction.CREATE_PR)
+        harness.attempts.update(attempt.key, lambda _current: attempt)
+        owner = _review_run(harness)
+        harness.verdicts.by_run_dir[owner.run_dir] = _approval(SHA_A)
+        harness.completion.outcome = ProcessingOutcome(
+            pr_url=PR_URL,
+            completed_review_exchange=_concluded(owner),
+        )
+        harness.labels.result = LabelResult(success=False, error="label API refused")
+        operation = _operation(attempt, ContinuationPhase.APPROVED_PENDING_PR)
+
+        with pytest.raises(RuntimeError, match="label API refused"):
+            harness.runner.advance(_owned(operation))
+
+        promoted = harness.attempts.for_key(attempt.key)
+        assert promoted is not None
+        assert promoted.continuation_review_verdict is not None
+        assert promoted.continuation_settlement is None
+
+        harness.labels.result = LabelResult(success=True)
+        harness.runner.advance(_owned(operation))
+
+        stored = harness.attempts.for_key(attempt.key)
+        assert stored is not None
+        assert stored.continuation_review_verdict == promoted.continuation_review_verdict
+        assert stored.continuation_settlement is not None
+        assert stored.continuation_settlement.pr_url == PR_URL
+        # The same open run was re-entered, so the pull request the first pass
+        # created is the one the pipeline reuses — no second exchange, no
+        # second checkout, and one promotion per binding.
+        assert len(harness.session_output.runs) == 1
+        assert len(harness.completion.calls) == 2
+
+    def test_a_completion_that_concluded_no_review_owes_no_verdict(
+        self, harness: Harness
+    ) -> None:
+        """A path that genuinely reviewed nothing keeps its existing semantics."""
+        attempt = _attempt(RequestedAction.PUSH_BRANCH)
+        harness.attempts.update(attempt.key, lambda _current: attempt)
 
         harness.runner.advance(
             _owned(_operation(attempt, ContinuationPhase.PASS_PENDING_REVIEW))
@@ -1024,20 +1308,12 @@ class TestDurableReviewVerdict:
         stored = harness.attempts.for_key(attempt.key)
         assert stored is not None
         assert stored.continuation_review_verdict is None
-
-    def test_a_run_that_bound_no_verdict_records_none(
-        self, harness: Harness
-    ) -> None:
-        attempt = _attempt(RequestedAction.CREATE_PR)
-        harness.attempts.update(attempt.key, lambda _current: attempt)
-
-        harness.runner.advance(
-            _owned(_operation(attempt, ContinuationPhase.PASS_PENDING_REVIEW))
+        assert harness.verdicts.asked == []
+        assert stored.continuation_settlement is not None
+        assert (
+            stored.continuation_settlement.kind
+            is ContinuationSettlementKind.NOTHING_FURTHER_REQUESTED
         )
-
-        stored = harness.attempts.for_key(attempt.key)
-        assert stored is not None
-        assert stored.continuation_review_verdict is None
 
 
 class TestFailureLeavesTruthUnchanged:
@@ -2033,14 +2309,17 @@ class TestTheFirstReviewersEvidenceIsGenuinelyProduced:
 
         The reviewer now answers about the code. A ``CHANGES_REQUESTED`` it
         reaches on that basis is promoted onto the candidate exactly as
-        before, and no pull request is created.
+        before — from the exchange run that bound it (#178) — and no pull
+        request is created.
         """
-        harness.verdicts.binding = BoundReviewVerdict(
+        owner = _review_run(harness)
+        harness.verdicts.by_run_dir[owner.run_dir] = BoundReviewVerdict(
             verdict=ReviewVerdictOutcome.CHANGES_REQUESTED,
             reviewed_sha=SHA_A,
             decided_at="2026-08-19T01:00:00Z",
             completed_rounds=2,
         )
+        harness.completion.outcome = ProcessingOutcome(completed_review_exchange=_concluded(owner))
 
         stored = self._open(harness)
 

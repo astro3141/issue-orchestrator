@@ -139,6 +139,20 @@ presented commit, it records **no** binding rather than guessing — an
 unbound verdict is one no later gate can admit, and an unusable observation
 never changes the outcome of the review it describes.
 
+**It is read back from the run that wrote it.** An exchange allocates a
+`review-exchange-<issue>-<timestamp>` run of its own, and a reused approval
+(#159) keeps the cached exchange's older one; neither is the run whose
+completion is being processed, which holds no binding at all. So the completion
+pipeline reports the owning run on its `ProcessingResult`
+(`CompletedReviewExchange`), and the control continuation promotes the binding
+onto the durable `Attempt` from *that* run before it records any settlement
+(#178). A completion that concluded an exchange whose owner holds no usable
+binding — absent, corrupt, or bound to another commit — settles nothing: the
+recorded intent stays undischarged and the next reconciliation opens another run
+against the bounded continuation allowance, which is the same shape a max-rounds
+halt has always had. Nothing weaker is ever read as approval: not the open pull
+request, the reviewer's prose, `summary.json`, or a label.
+
 ### Candidate execution identities — who ran, bound to what they ran against
 
 `review-verdict.json` answers "was this commit approved". Foundation admission

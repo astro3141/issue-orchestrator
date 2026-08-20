@@ -19,6 +19,7 @@ from .completion_failure_reporting import (
     write_failure_diagnostic,
 )
 from .completion_types import (
+    CompletedReviewExchange,
     ERROR_PREFIX_CREATE_PR,
     ERROR_PREFIX_GOVERNED_LABEL,
     ERROR_PREFIX_PUSH,
@@ -46,7 +47,7 @@ def build_processing_result(
     issue_title: str,
     branch: str | None,
     pr_url: str | None,
-    review_exchange_completed: bool,
+    completed_exchange: CompletedReviewExchange | None,
     actions_taken: list[str],
     errors: list[str],
     error_details: list[dict[str, Any]],
@@ -150,7 +151,10 @@ def build_processing_result(
         diagnostic_path=diagnostic_path,
         completion_record_path=preserved_completion_path,
         errors=errors if errors else None,
-        review_exchange_completed=review_exchange_completed,
+        # Derived from the concluded exchange rather than carried alongside
+        # it: the two cannot then disagree about whether one ran (#178).
+        review_exchange_completed=completed_exchange is not None,
+        completed_review_exchange=completed_exchange,
         review_exchange_halted=review_exchange_halted,
     )
 

@@ -443,7 +443,7 @@ def test_first_pass_submits_background_job_and_returns_deferred(tmp_path: Path) 
         _plan,
         mode,
         outcome,
-        completed,
+        authority,
         halt,
         deferred,
     ) = review.prepare_review_exchange(
@@ -462,7 +462,7 @@ def test_first_pass_submits_background_job_and_returns_deferred(tmp_path: Path) 
 
     assert deferred is True
     assert halt is False
-    assert completed is False
+    assert authority is None
     assert outcome is None
     assert mode == "via-local-loop"
     # The job was submitted but the caller's loop did NOT run on this thread.
@@ -659,7 +659,7 @@ def test_running_background_job_without_deadline_halts(tmp_path: Path) -> None:
         run_review_exchange_loop=fake_loop,
     )
 
-    (_, _, outcome, completed, halt, deferred) = review.prepare_review_exchange(
+    (_, _, outcome, authority, halt, deferred) = review.prepare_review_exchange(
         requested_actions=(RequestedAction.CREATE_PR,),
         worktree=tmp_path,
         issue_number=230,
@@ -675,7 +675,7 @@ def test_running_background_job_without_deadline_halts(tmp_path: Path) -> None:
 
     assert deferred is False
     assert halt is True
-    assert completed is False
+    assert authority is None
     assert outcome is None
     assert len(job_runner.submitted) == 1
     assert cancellations == [
@@ -873,7 +873,7 @@ def test_background_deadline_failure_cancels_runtime(tmp_path: Path) -> None:
     )
 
     now = 1002.0
-    (_, _, outcome, completed, halt, deferred) = review.prepare_review_exchange(
+    (_, _, outcome, authority, halt, deferred) = review.prepare_review_exchange(
         requested_actions=(RequestedAction.CREATE_PR,),
         worktree=tmp_path,
         issue_number=230,
@@ -889,7 +889,7 @@ def test_background_deadline_failure_cancels_runtime(tmp_path: Path) -> None:
 
     assert deferred is False
     assert halt is True
-    assert completed is False
+    assert authority is None
     assert outcome is None
     assert cancellations == [
         (
@@ -955,7 +955,7 @@ def test_tick_after_completion_resolves_cached_outcome(
 
     # Tick N+k — cached summary present, exchange resolves.
     actions_taken: list[str] = []
-    (_, _mode, outcome, completed, halt, deferred) = review.prepare_review_exchange(
+    (_, _mode, outcome, authority, halt, deferred) = review.prepare_review_exchange(
         requested_actions=(RequestedAction.CREATE_PR,),
         worktree=tmp_path,
         issue_number=230,
@@ -971,7 +971,8 @@ def test_tick_after_completion_resolves_cached_outcome(
 
     assert deferred is False
     assert halt is False
-    assert completed is True
+    assert outcome is not None and authority is not None
+    assert authority.run_assets == outcome.run_assets
     assert outcome is not None and outcome.status == "ok"
     assert "Review exchange passed (cached)" in actions_taken
     assert started, "emit_review_started must fire when the typed run is allocated"
@@ -1017,7 +1018,7 @@ def test_cached_review_is_reused_when_validation_sha_matches(
         raise AssertionError("matching cached approval should be reused")
 
     actions_taken: list[str] = []
-    (_, _, outcome, completed, halt, deferred) = review.prepare_review_exchange(
+    (_, _, outcome, authority, halt, deferred) = review.prepare_review_exchange(
         requested_actions=(RequestedAction.CREATE_PR,),
         worktree=tmp_path,
         issue_number=230,
@@ -1033,7 +1034,8 @@ def test_cached_review_is_reused_when_validation_sha_matches(
 
     assert deferred is False
     assert halt is False
-    assert completed is True
+    assert outcome is not None and authority is not None
+    assert authority.run_assets == outcome.run_assets
     assert outcome is not None and outcome.status == "ok"
     assert outcome.summary is not None
     assert not any(key.startswith("_cache_") for key in outcome.summary.to_payload())
@@ -1095,7 +1097,7 @@ def test_cached_review_reuses_rework_head_when_completion_validation_is_stale(
     _store_cached_approval(session_output, tmp_path, cached_rework_validation)
 
     actions_taken: list[str] = []
-    (_, _, outcome, completed, halt, deferred) = review.prepare_review_exchange(
+    (_, _, outcome, authority, halt, deferred) = review.prepare_review_exchange(
         requested_actions=(RequestedAction.CREATE_PR,),
         worktree=tmp_path,
         issue_number=277,
@@ -1114,7 +1116,8 @@ def test_cached_review_reuses_rework_head_when_completion_validation_is_stale(
 
     assert deferred is False
     assert halt is False
-    assert completed is True
+    assert outcome is not None and authority is not None
+    assert authority.run_assets == outcome.run_assets
     assert outcome is not None and outcome.status == "ok"
     assert actions_taken == ["Review exchange passed (cached)"]
     assert job_runner.submitted == []
@@ -1136,7 +1139,7 @@ def test_cached_review_ignored_when_actual_worktree_head_moves_past_cache(
     _write_validation_record(cached_rework_validation, head_sha="rework-sha")
     _store_cached_approval(session_output, tmp_path, cached_rework_validation)
 
-    (_, _, outcome, completed, halt, deferred) = review.prepare_review_exchange(
+    (_, _, outcome, authority, halt, deferred) = review.prepare_review_exchange(
         requested_actions=(RequestedAction.CREATE_PR,),
         worktree=tmp_path,
         issue_number=277,
@@ -1155,7 +1158,7 @@ def test_cached_review_ignored_when_actual_worktree_head_moves_past_cache(
 
     assert deferred is True
     assert halt is False
-    assert completed is False
+    assert authority is None
     assert outcome is None
     assert len(job_runner.submitted) == 1
 
@@ -1185,7 +1188,7 @@ def test_cached_review_halt_is_logged_when_reused(
 
     errors: list[str] = []
     actions_taken: list[str] = []
-    (_, _, outcome, completed, halt, deferred) = review.prepare_review_exchange(
+    (_, _, outcome, authority, halt, deferred) = review.prepare_review_exchange(
         requested_actions=(RequestedAction.CREATE_PR,),
         worktree=tmp_path,
         issue_number=230,
@@ -1203,7 +1206,8 @@ def test_cached_review_halt_is_logged_when_reused(
 
     assert deferred is False
     assert halt is True
-    assert completed is True
+    assert outcome is not None and authority is not None
+    assert authority.run_assets == outcome.run_assets
     assert outcome is not None and outcome.status == "stopped"
     assert actions_taken == []
     assert errors == [
@@ -1248,7 +1252,7 @@ def test_cached_review_is_ignored_when_validation_sha_differs(tmp_path: Path) ->
         raise AssertionError("fresh exchange should be deferred to background job")
 
     actions_taken: list[str] = []
-    (_, _, outcome, completed, halt, deferred) = review.prepare_review_exchange(
+    (_, _, outcome, authority, halt, deferred) = review.prepare_review_exchange(
         requested_actions=(RequestedAction.CREATE_PR,),
         worktree=tmp_path,
         issue_number=230,
@@ -1264,7 +1268,7 @@ def test_cached_review_is_ignored_when_validation_sha_differs(tmp_path: Path) ->
 
     assert deferred is True
     assert halt is False
-    assert completed is False
+    assert authority is None
     assert outcome is None
     assert actions_taken == []
     assert len(job_runner.submitted) == 1
@@ -1298,7 +1302,7 @@ def test_stale_no_completion_summary_still_trips_loop_budget(tmp_path: Path) -> 
     )
 
     errors: list[str] = []
-    (_, _, outcome, completed, halt, deferred) = review.prepare_review_exchange(
+    (_, _, outcome, authority, halt, deferred) = review.prepare_review_exchange(
         requested_actions=(RequestedAction.CREATE_PR,),
         worktree=tmp_path,
         issue_number=230,
@@ -1316,7 +1320,7 @@ def test_stale_no_completion_summary_still_trips_loop_budget(tmp_path: Path) -> 
 
     assert deferred is False
     assert halt is True
-    assert completed is False
+    assert authority is None
     assert outcome is None
     assert job_runner.submitted == []
     assert any(
@@ -1344,7 +1348,7 @@ def test_cached_review_before_scratch_boundary_is_ignored(tmp_path: Path) -> Non
         raise AssertionError("fresh exchange should be deferred to background job")
 
     actions_taken: list[str] = []
-    (_, _, outcome, completed, halt, deferred) = review.prepare_review_exchange(
+    (_, _, outcome, authority, halt, deferred) = review.prepare_review_exchange(
         requested_actions=(RequestedAction.CREATE_PR,),
         worktree=tmp_path,
         issue_number=230,
@@ -1361,7 +1365,7 @@ def test_cached_review_before_scratch_boundary_is_ignored(tmp_path: Path) -> Non
 
     assert deferred is True
     assert halt is False
-    assert completed is False
+    assert authority is None
     assert outcome is None
     assert actions_taken == []
     assert len(job_runner.submitted) == 1
@@ -1401,7 +1405,7 @@ def test_cached_review_is_ignored_without_matching_cached_sha_even_when_validati
         raise AssertionError("fresh exchange should be deferred to background job")
 
     actions_taken: list[str] = []
-    (_, _, outcome, completed, halt, deferred) = review.prepare_review_exchange(
+    (_, _, outcome, authority, halt, deferred) = review.prepare_review_exchange(
         requested_actions=(RequestedAction.CREATE_PR,),
         worktree=tmp_path,
         issue_number=230,
@@ -1417,7 +1421,7 @@ def test_cached_review_is_ignored_without_matching_cached_sha_even_when_validati
 
     assert deferred is True
     assert halt is False
-    assert completed is False
+    assert authority is None
     assert outcome is None
     assert actions_taken == []
     assert len(job_runner.submitted) == 1
@@ -1445,7 +1449,7 @@ def test_cached_review_is_ignored_when_current_validation_sha_is_unavailable(
         raise AssertionError("fresh exchange should be deferred to background job")
 
     actions_taken: list[str] = []
-    (_, _, outcome, completed, halt, deferred) = review.prepare_review_exchange(
+    (_, _, outcome, authority, halt, deferred) = review.prepare_review_exchange(
         requested_actions=(RequestedAction.CREATE_PR,),
         worktree=tmp_path,
         issue_number=230,
@@ -1461,7 +1465,7 @@ def test_cached_review_is_ignored_when_current_validation_sha_is_unavailable(
 
     assert deferred is True
     assert halt is False
-    assert completed is False
+    assert authority is None
     assert outcome is None
     assert actions_taken == []
     assert len(job_runner.submitted) == 1
@@ -1495,7 +1499,7 @@ def test_cached_review_is_ignored_when_current_validation_failed_on_same_sha(
         )
 
     actions_taken: list[str] = []
-    (_, _, outcome, completed, halt, deferred) = review.prepare_review_exchange(
+    (_, _, outcome, authority, halt, deferred) = review.prepare_review_exchange(
         requested_actions=(RequestedAction.CREATE_PR,),
         worktree=tmp_path,
         issue_number=230,
@@ -1511,7 +1515,7 @@ def test_cached_review_is_ignored_when_current_validation_failed_on_same_sha(
 
     assert deferred is True
     assert halt is False
-    assert completed is False
+    assert authority is None
     assert outcome is None
     assert actions_taken == []
     assert len(job_runner.submitted) == 1
@@ -1558,7 +1562,7 @@ def test_no_job_runner_falls_back_to_inline_execution(
             ),
         )
 
-    (_, _, outcome, completed, halt, deferred) = review.prepare_review_exchange(
+    (_, _, outcome, authority, halt, deferred) = review.prepare_review_exchange(
         requested_actions=(RequestedAction.CREATE_PR,),
         worktree=tmp_path,
         issue_number=230,
@@ -1574,7 +1578,8 @@ def test_no_job_runner_falls_back_to_inline_execution(
 
     assert deferred is False
     assert halt is False
-    assert completed is True
+    assert outcome is not None and authority is not None
+    assert authority.run_assets == outcome.run_assets
     assert outcome is not None
     approval_message = next(
         record.getMessage()
@@ -1628,7 +1633,7 @@ def test_inline_review_exchange_halt_is_logged(
         )
 
     errors: list[str] = []
-    (_, _, outcome, completed, halt, deferred) = review.prepare_review_exchange(
+    (_, _, outcome, authority, halt, deferred) = review.prepare_review_exchange(
         requested_actions=(RequestedAction.CREATE_PR,),
         worktree=tmp_path,
         issue_number=230,
@@ -1644,7 +1649,8 @@ def test_inline_review_exchange_halt_is_logged(
 
     assert deferred is False
     assert halt is True
-    assert completed is True
+    assert outcome is not None and authority is not None
+    assert authority.run_assets == outcome.run_assets
     assert outcome is not None and outcome.status == "stopped"
     assert errors == [
         "review_exchange: stopped (max_rounds_exceeded)",
@@ -1736,7 +1742,7 @@ def test_retry_does_not_reconsume_prior_run_timeout_cancellation(
     # Retry: same session name, fresh run (run-b). Must NOT halt on the stale
     # run-a cancellation; must start its own run-scoped exchange and defer.
     retry_errors: list[str] = []
-    (_, _, retry_outcome, retry_completed, retry_halt, retry_deferred) = (
+    (_, _, retry_outcome, retry_authority, retry_halt, retry_deferred) = (
         review.prepare_review_exchange(
             requested_actions=(RequestedAction.CREATE_PR,),
             worktree=tmp_path,
@@ -1754,7 +1760,7 @@ def test_retry_does_not_reconsume_prior_run_timeout_cancellation(
 
     assert retry_halt is False
     assert retry_deferred is True
-    assert retry_completed is False
+    assert retry_authority is None
     assert retry_outcome is None
     # No stale cancellation leaked into the retry's error surface.
     assert not any("background job cancelled" in err for err in retry_errors)
