@@ -48,16 +48,23 @@ class StubCommandRunner:
 
 
 class StubWorkingCopy:
-    """Reports a scripted HEAD/dirty history for the checkpoint comparison."""
+    """Reports a scripted HEAD/dirt history for the checkpoint comparison.
+
+    ``dirty_paths`` scripts what the enumeration returns on each read, in
+    order: the candidate's own tracked content, which is what the postflight
+    is about. Untracked build output never appears here because the
+    enumeration the postflight asks for excludes it — that is the rule, not an
+    omission from the script.
+    """
 
     def __init__(
         self,
         *,
         head_shas: list[str | None] | None = None,
-        dirty: list[bool] | None = None,
+        dirty_paths: list[list[str] | None] | None = None,
     ) -> None:
         self._head_shas = list(head_shas or [])
-        self._dirty = list(dirty or [])
+        self._dirty_paths = list(dirty_paths or [])
 
     def get_head_sha(self, worktree: Path) -> str | None:
         if self._head_shas:
@@ -65,9 +72,12 @@ class StubWorkingCopy:
         return "sha-unchanged"
 
     def has_uncommitted_changes(self, worktree: Path) -> bool:
-        if self._dirty:
-            return self._dirty.pop(0)
         return False
+
+    def list_dirty_files(self, worktree: Path, mode: str) -> list[str] | None:
+        if self._dirty_paths:
+            return self._dirty_paths.pop(0)
+        return []
 
 
 def _runnability(
@@ -156,6 +166,30 @@ class TestRefusalsAreReturned:
         assert core.make_runnable(tmp_path) is None
         assert runner.commands == [SETUP]
 
+    def test_a_recipe_that_only_installs_untracked_tooling_is_runnable(self, tmp_path):
+        """What provisioning is FOR: `.venv`, `node_modules`, caches.
+
+        The enumeration the postflight asks for reads tracked content, so a
+        recipe that writes nothing but untracked output has nothing to answer
+        for — including in a repository that has not gitignored it.
+        """
+        core, _ = _runnability(
+            commands=[SETUP], working_copy=StubWorkingCopy(dirty_paths=[[], []])
+        )
+
+        assert core.make_runnable(tmp_path) is None
+
+    def test_a_candidate_whose_dirt_cannot_be_read_is_refused(self, tmp_path):
+        """Unknown is not clean; an unprovable candidate fails closed."""
+        core, _ = _runnability(
+            commands=[SETUP], working_copy=StubWorkingCopy(dirty_paths=[[], None])
+        )
+
+        failure = core.make_runnable(tmp_path)
+
+        assert isinstance(failure, WorktreeProvisioningError)
+        assert "could not be enumerated" in str(failure)
+
 
 class TestFailureAndAlterationCompose:
     """A failing command must not suppress the candidate it damaged on the way.
@@ -186,10 +220,11 @@ class TestFailureAndAlterationCompose:
         core, _ = _runnability(
             commands=[SETUP],
             runner=_failing_runner(),
-            working_copy=StubWorkingCopy(dirty=[False, True]),
+            working_copy=StubWorkingCopy(dirty_paths=[[], ["src/app.py"]]),
         )
 
         failure = core.make_runnable(tmp_path)
 
         assert isinstance(failure, WorktreeProvisioningError)
-        assert "uncommitted changes" in str(failure)
+        assert "modified tracked content" in str(failure)
+        assert "src/app.py" in str(failure)

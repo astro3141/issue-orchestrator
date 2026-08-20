@@ -33,11 +33,14 @@ or coder turn:
 * **The candidate is left exactly as it was found.** The same
   :class:`~.candidate_integrity.CandidateIntegrity` reads
   :class:`~.worktree_runnability.WorktreeRunnability` takes around the
-  operator's recipe are taken around the gate. On top of that, the record names
-  the commit it ran at, which is the binding the exchange's mirror re-checks
-  against the coder worktree's current HEAD before every round — evidence that
-  does not name the candidate reads as stale there and refuses the round rather
-  than passing silently.
+  operator's recipe are taken around the gate — the candidate's *tracked*
+  content and its commit, which is what a suite must not touch, and not the
+  report files, coverage databases and caches a suite is expected to emit and
+  that ``junit_xml_paths`` is configured on the premise of. On top of that,
+  the record names the commit it ran at, which is the binding the exchange's
+  mirror re-checks against the coder worktree's current HEAD before every
+  round — evidence that does not name the candidate reads as stale there and
+  refuses the round rather than passing silently.
 * **What the gate found is recorded where the run's readers look.** The run
   itself is told the outcome, the record and the logs, through the same
   :class:`~..ports.run_evidence.ValidationEvidenceRecorder` an agent's
@@ -216,6 +219,14 @@ class ContinuationQuickValidation:
         # refusal is decided: the manifest is what every reader of this run
         # starts from, and a run that recorded nothing reads as one that
         # validated nothing rather than as one that failed.
+        #
+        # That reason holds for the pass, where the run survives to be read.
+        # On a refusal today's sole caller deletes the whole checkout, manifest
+        # included, so the write is unobserved — recorded anyway because this
+        # leaf does not know which caller it has, and a gate result its own run
+        # never heard about is the failure mode worth being unconditional
+        # about. What must outlive a refused checkout is filed outside it, by
+        # the diagnostics store above.
         self._evidence.record_gate_result(
             artifacts=run_assets.validation_artifacts,
             worktree=worktree,

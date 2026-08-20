@@ -383,9 +383,12 @@ class MockWorkingCopy:
         self.commits_ahead: list[CommitInfo] = []
         self.current_branch: str | None = "main"
         self.head_sha: str | None = None
-        # Sequenced dirty answers let a test model a worktree that provisioning
-        # dirtied; the default is a clean worktree that stays clean.
-        self.uncommitted_changes: list[bool] = []
+        # Sequenced dirt answers let a test model a worktree whose TRACKED
+        # content provisioning edited; the default is a clean worktree that
+        # stays clean. Untracked output a setup step installs (`.venv`,
+        # `node_modules`) is not dirt the postflight enumerates, so it never
+        # appears here.
+        self.tracked_dirt: list[list[str]] = []
 
     def get_commits_ahead_of_main(self, worktree: Path) -> list[CommitInfo]:
         return self.commits_ahead
@@ -397,9 +400,12 @@ class MockWorkingCopy:
         return self.head_sha
 
     def has_uncommitted_changes(self, worktree: Path) -> bool:
-        if self.uncommitted_changes:
-            return self.uncommitted_changes.pop(0)
         return False
+
+    def list_dirty_files(self, worktree: Path, mode: str) -> list[str] | None:
+        if self.tracked_dirt:
+            return self.tracked_dirt.pop(0)
+        return []
 
 
 class MockCommandRunner:
@@ -3574,12 +3580,13 @@ class TestEveryLaunchPathProvisionsItsWorktree:
     ):
         """Installing tooling must not become editing the change under test."""
         launcher_bundle.launcher.config.setup_worktree = ["make worktree-setup"]
-        mock_working_copy.uncommitted_changes = [False, True]
+        mock_working_copy.tracked_dirt = [[], ["src/app.py"]]
 
         result = launcher_bundle.launcher.launch_rework_session(rework, active_sessions=[])
 
         assert result.success is False
-        assert "uncommitted changes" in result.reason
+        assert "modified tracked content" in result.reason
+        assert "src/app.py" in result.reason
         assert launcher_bundle.create_session_calls == []
 
     def test_unconfigured_setup_leaves_every_path_launching(

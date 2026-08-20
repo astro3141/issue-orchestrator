@@ -81,16 +81,35 @@ ISSUE = GitHubIssueKey(repo="acme/repo", external_id="149")
 
 @dataclass
 class FakeWorkingCopy:
-    """Reports whatever the test says the checkout currently holds."""
+    """Reports whatever the test says the checkout currently holds.
+
+    Tracked and untracked dirt are separate fields because the postflight's
+    whole rule is that they are different facts: a suite is expected to write
+    untracked report files into the checkout it ran in, and is not allowed to
+    edit the candidate's tracked content. A fake carrying one boolean could
+    not tell the test which of the two it had set up.
+
+    ``enumeration_fails`` plays the git error that leaves the dirty state
+    unknown, which the real adapter reports as ``None`` and not as "clean".
+    """
 
     head: str | None = SHA_A
-    dirty: bool = False
+    tracked_dirt: tuple[str, ...] = ()
+    untracked_dirt: tuple[str, ...] = ()
+    enumeration_fails: bool = False
 
     def get_head_sha(self, worktree: Path) -> str | None:
         return self.head
 
     def has_uncommitted_changes(self, worktree: Path) -> bool:
-        return self.dirty
+        return bool(self.tracked_dirt or self.untracked_dirt)
+
+    def list_dirty_files(self, worktree: Path, mode: str) -> list[str] | None:
+        if self.enumeration_fails:
+            return None
+        if mode == "all":
+            return sorted([*self.tracked_dirt, *self.untracked_dirt])
+        return sorted(self.tracked_dirt)
 
 
 @dataclass
@@ -430,25 +449,97 @@ class TestThePreparationMustNotAlterTheCandidate:
     ) -> None:
         """HEAD unmoved, tracked content modified: the dirty postflight."""
         harness.commands.while_running = lambda: setattr(
-            harness.working_copy, "dirty", True
+            harness.working_copy, "tracked_dirt", ("src/app.py",)
         )
 
         prepared = _prepare(harness)
 
         assert isinstance(prepared, RefusedQuickValidation)
-        assert "uncommitted changes" in prepared.reason
+        assert "modified tracked content" in prepared.reason
+        assert "src/app.py" in prepared.reason
         assert harness.working_copy.head == SHA_A
 
-    def test_a_checkout_that_was_already_dirty_is_not_blamed_on_the_gate(
-        self, tmp_path: Path
+    def test_a_gate_that_leaves_its_own_report_file_behind_still_produces_evidence(
+        self, harness: Harness
     ) -> None:
-        """Only a clean-to-dirty transition is the operation's doing."""
-        harness = _harness(tmp_path)
-        harness.working_copy.dirty = True
+        """The suite's output is not the candidate being altered.
+
+        A quick contract configured as ``pytest -q --junitxml=test-results.xml``
+        writes an untracked file into the checkout it ran in, and the report is
+        the point — ``junit_xml_paths`` names it so the run can carry it. A
+        postflight that read raw porcelain would refuse every such run, spend
+        the allowance, and blame the candidate for a suite that passed.
+        """
+        harness.commands.while_running = lambda: setattr(
+            harness.working_copy, "untracked_dirt", ("test-results.xml", ".coverage")
+        )
 
         prepared = _prepare(harness)
 
         assert isinstance(prepared, PreparedQuickValidation)
+        assert prepared.record_path is not None
+
+    def test_a_gate_that_touches_an_operator_declared_runtime_path_is_not_refused(
+        self, harness: Harness
+    ) -> None:
+        """``runtime-ignore`` means the same thing here as at every other guard.
+
+        The operator's declaration is what stops repo-local runtime files
+        blocking the completion guard and the pre-push check; a postflight with
+        its own private answer would refuse the run anyway.
+        """
+        runtime_ignore = harness.worktree / ".issue-orchestrator" / "runtime-ignore"
+        runtime_ignore.parent.mkdir(parents=True, exist_ok=True)
+        runtime_ignore.write_text("build/test-results/\n", encoding="utf-8")
+        harness.commands.while_running = lambda: setattr(
+            harness.working_copy,
+            "tracked_dirt",
+            ("build/test-results/report.xml",),
+        )
+
+        prepared = _prepare(harness)
+
+        assert isinstance(prepared, PreparedQuickValidation)
+
+    def test_a_checkout_whose_dirt_cannot_be_read_is_refused(
+        self, harness: Harness
+    ) -> None:
+        """Unknown is not clean: an unprovable candidate opens no run."""
+        harness.commands.while_running = lambda: setattr(
+            harness.working_copy, "enumeration_fails", True
+        )
+
+        prepared = _prepare(harness)
+
+        assert isinstance(prepared, RefusedQuickValidation)
+        assert "could not be enumerated" in prepared.reason
+
+    def test_a_checkout_that_was_already_dirty_is_not_blamed_on_the_gate(
+        self, tmp_path: Path
+    ) -> None:
+        """Only dirt that appeared during the gate is the operation's doing."""
+        harness = _harness(tmp_path)
+        harness.working_copy.tracked_dirt = ("src/app.py",)
+
+        prepared = _prepare(harness)
+
+        assert isinstance(prepared, PreparedQuickValidation)
+
+    def test_dirt_the_gate_added_to_an_already_dirty_checkout_is_still_refused(
+        self, tmp_path: Path
+    ) -> None:
+        """A path already dirty must not cover for one that was not."""
+        harness = _harness(tmp_path)
+        harness.working_copy.tracked_dirt = ("src/app.py",)
+        harness.commands.while_running = lambda: setattr(
+            harness.working_copy, "tracked_dirt", ("src/app.py", "src/gate_edited.py")
+        )
+
+        prepared = _prepare(harness)
+
+        assert isinstance(prepared, RefusedQuickValidation)
+        assert "src/gate_edited.py" in prepared.reason
+        assert "src/app.py" not in prepared.reason
 
     def test_an_altered_candidate_outranks_a_gate_failure(
         self, harness: Harness
@@ -456,13 +547,13 @@ class TestThePreparationMustNotAlterTheCandidate:
         """Two separate facts, and the first must not suppress the second."""
         harness.commands.failing = True
         harness.commands.while_running = lambda: setattr(
-            harness.working_copy, "dirty", True
+            harness.working_copy, "tracked_dirt", ("src/app.py",)
         )
 
         prepared = _prepare(harness)
 
         assert isinstance(prepared, RefusedQuickValidation)
-        assert "uncommitted changes" in prepared.reason
+        assert "modified tracked content" in prepared.reason
 
 
 class TestAFailedOrUnprovableGateIsRefused:

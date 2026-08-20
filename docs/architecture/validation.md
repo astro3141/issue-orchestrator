@@ -196,6 +196,13 @@ keeps two contracts' explanations for one candidate from erasing each other.
 (`publish_gate_failure`, `agent_gate_failure`), so a diagnostic cannot name a
 contract other than the one that ran.
 
+The directory was `diagnostics/publish-gate-failures/` while the publish gate
+was the only writer (#173 de-scoped it). Nothing migrates: the store is
+diagnostic-only and nothing reads it programmatically, so an install that
+predates the rename keeps its older publish-gate explanations under the old
+name and writes new ones under this one. Look in both if you are chasing a
+failure from that era.
+
 Three properties are the whole design:
 
 - **Written at gate-execution time**, from the bytes the runner already holds

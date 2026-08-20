@@ -166,19 +166,30 @@ class FakeWorkingCopy:
     """Reports whatever HEAD the test says the branch currently stands at.
 
     Also answers the candidate-integrity questions the runnability core asks
-    around the recipe. Both are read from the same fields, so a recipe that
-    moves ``HEAD`` or dirties the checkout says so here exactly as a real one
-    would in a real worktree.
+    around the recipe, and the quick gate asks around the suite. All are read
+    from the same fields, so a program that moves ``HEAD`` or dirties the
+    checkout says so here exactly as a real one would in a real worktree.
+
+    Tracked and untracked dirt are separate, because the postflight treats them
+    differently on purpose: a setup step installing ``.venv`` and a suite
+    writing ``test-results.xml`` leave untracked files behind and neither is
+    the candidate being altered.
     """
 
     head: str | None = SHA_A
-    dirty: bool = False
+    tracked_dirt: tuple[str, ...] = ()
+    untracked_dirt: tuple[str, ...] = ()
 
     def get_head_sha(self, worktree: Path) -> str | None:
         return self.head
 
     def has_uncommitted_changes(self, worktree: Path) -> bool:
-        return self.dirty
+        return bool(self.tracked_dirt or self.untracked_dirt)
+
+    def list_dirty_files(self, worktree: Path, mode: str) -> list[str] | None:
+        if mode == "all":
+            return sorted([*self.tracked_dirt, *self.untracked_dirt])
+        return sorted(self.tracked_dirt)
 
 
 @dataclass
@@ -1714,7 +1725,7 @@ class TestAnUnrunnableWorktreeOpensNoRun:
         self, harness: Harness
     ) -> None:
         harness.commands.while_running = lambda: setattr(
-            harness.working_copy, "dirty", True
+            harness.working_copy, "tracked_dirt", ("src/app.py",)
         )
 
         self._unrunnable(harness)
@@ -2118,7 +2129,7 @@ class TestEvidenceThatCannotBeProducedOpensNoRun:
     ) -> None:
         """HEAD unmoved, tracked content left modified: the dirty postflight."""
         harness.commands.while_validating = lambda: setattr(
-            harness.working_copy, "dirty", True
+            harness.working_copy, "tracked_dirt", ("src/app.py",)
         )
 
         self._refused(harness)
@@ -2260,6 +2271,57 @@ def _approved(attempt: Attempt) -> Attempt:
             completed_rounds=1,
         )
     )
+
+
+class TestUntrackedOutputIsNotTheCandidateBeingAltered:
+    """The boundary of the two postflights, asserted where the cost lands.
+
+    Both programs the runner executes inside a candidate's checkout *emit
+    files* — a setup step installs a toolchain, a suite writes its report — and
+    a postflight that read those as the candidate being altered would refuse
+    every run this repository ever attempts. That refusal is not free: it
+    discards the checkout and keeps the #149 allowance spent, so the candidate
+    walks to ``RUNS_EXHAUSTED`` blamed for programs that succeeded. Hence these
+    live at the runner, next to the refusals they are the boundary of, and not
+    only at the leaves.
+    """
+
+    def test_setup_that_only_installs_untracked_tooling_opens_the_run(
+        self, harness: Harness
+    ) -> None:
+        """``.venv`` and ``node_modules`` are what provisioning is FOR."""
+        harness.commands.while_running = lambda: setattr(
+            harness.working_copy, "untracked_dirt", (".venv/bin/python",)
+        )
+        candidate = _twice_evaluated(RequestedAction.CREATE_PR)
+        harness.attempts.update(candidate.key, lambda _current: candidate)
+
+        harness.runner.advance(
+            _owned(_operation(candidate, ContinuationPhase.PASS_PENDING_REVIEW))
+        )
+
+        assert len(harness.completion.calls) == 1
+
+    def test_a_suite_that_writes_its_report_into_the_checkout_opens_the_run(
+        self, harness: Harness
+    ) -> None:
+        """A quick contract that emits ``test-results.xml``.
+
+        The shape ``examples/config.example.yaml`` ships and
+        ``junit_xml_paths`` is configured for: an untracked file left in the
+        checkout on every pass, including the passes.
+        """
+        harness.commands.while_validating = lambda: setattr(
+            harness.working_copy, "untracked_dirt", ("test-results.xml",)
+        )
+        candidate = _twice_evaluated(RequestedAction.CREATE_PR)
+        harness.attempts.update(candidate.key, lambda _current: candidate)
+
+        harness.runner.advance(
+            _owned(_operation(candidate, ContinuationPhase.PASS_PENDING_REVIEW))
+        )
+
+        assert len(harness.completion.calls) == 1
 
 
 class TestPauseWithholdsNewExecution:

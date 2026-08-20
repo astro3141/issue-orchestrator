@@ -171,6 +171,31 @@ class WorkingCopy(Protocol):
         """
         ...
 
+    def list_dirty_files(self, worktree: Path, mode: str) -> list[str] | None:
+        """Enumerate the dirty paths a guard should judge, by mode.
+
+        ``mode`` selects which dirt is enumerated, matching
+        ``validation.publish.dirty_check``'s vocabulary:
+
+        * ``"tracked"`` — tracked content changed against ``HEAD``, staged or
+          not. Untracked files are excluded, so build output a command wrote
+          into the checkout does not appear here.
+        * ``"unstaged"`` — tracked content changed in the working tree only.
+        * ``"all"`` — the above plus untracked, non-ignored files.
+
+        Returns:
+            The repo-relative paths on success, or ``None`` when the
+            enumeration itself failed. Callers MUST distinguish ``None`` from
+            an empty list and fail closed on it: an empty list is the
+            legitimate "nothing dirty" answer, while ``None`` means the dirty
+            state is unknown and no guard may pass on it.
+
+        Implementations enumerate per file rather than letting Git collapse an
+        untracked subtree to its topmost directory, so callers may classify
+        each path individually.
+        """
+        ...
+
     def get_commits_ahead_of_main(self, worktree: Path) -> list[CommitInfo]:
         """Get commits that are ahead of main branch.
 

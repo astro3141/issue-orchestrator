@@ -100,16 +100,23 @@ def _failed_provision(
 
 
 class StubWorkingCopy:
-    """Reports a scripted HEAD/dirty history for the checkpoint comparison."""
+    """Reports a scripted HEAD/dirt history for the checkpoint comparison.
+
+    ``dirty_paths`` scripts what the enumeration returns on each read, in
+    order: the candidate's own tracked content, which is what the postflight
+    is about. Untracked build output never appears here because the
+    enumeration the postflight asks for excludes it — that is the rule, not an
+    omission from the script.
+    """
 
     def __init__(
         self,
         *,
         head_shas: list[str | None] | None = None,
-        dirty: list[bool] | None = None,
+        dirty_paths: list[list[str] | None] | None = None,
     ) -> None:
         self._head_shas = list(head_shas or [])
-        self._dirty = list(dirty or [])
+        self._dirty_paths = list(dirty_paths or [])
         self.head_sha_reads = 0
         self.dirty_reads = 0
 
@@ -120,10 +127,13 @@ class StubWorkingCopy:
         return "sha-unchanged"
 
     def has_uncommitted_changes(self, worktree: Path) -> bool:
-        self.dirty_reads += 1
-        if self._dirty:
-            return self._dirty.pop(0)
         return False
+
+    def list_dirty_files(self, worktree: Path, mode: str) -> list[str] | None:
+        self.dirty_reads += 1
+        if self._dirty_paths:
+            return self._dirty_paths.pop(0)
+        return []
 
 
 class RecordingEscalation:
@@ -358,18 +368,21 @@ class TestProvisioningLeavesTheCandidateAlone:
     def test_dirtying_a_clean_worktree_is_refused(self, tmp_path):
         provisioner, _, _ = _provisioner(
             commands=["make worktree-setup"],
-            working_copy=StubWorkingCopy(dirty=[False, True]),
+            working_copy=StubWorkingCopy(dirty_paths=[[], ["src/app.py"]]),
         )
 
         with pytest.raises(WorktreeProvisioningError) as excinfo:
             provisioner.provision(tmp_path, issue_number=ISSUE)
 
-        assert "uncommitted changes" in str(excinfo.value)
+        assert "modified tracked content" in str(excinfo.value)
+        assert "src/app.py" in str(excinfo.value)
 
     def test_an_already_dirty_worktree_is_not_blamed_on_provisioning(self, tmp_path):
         provisioner, runner, _ = _provisioner(
             commands=["make worktree-setup"],
-            working_copy=StubWorkingCopy(dirty=[True, True]),
+            working_copy=StubWorkingCopy(
+                dirty_paths=[["src/app.py"], ["src/app.py"]]
+            ),
         )
 
         provisioner.provision(tmp_path, issue_number=ISSUE)
@@ -377,10 +390,15 @@ class TestProvisioningLeavesTheCandidateAlone:
         assert len(runner.calls) == 1
 
     def test_ignored_build_output_keeps_the_worktree_clean(self, tmp_path):
-        """The real prerequisites (`.venv`, `node_modules`) are gitignored."""
+        """The real prerequisites (`.venv`, `node_modules`) are untracked.
+
+        Which is why the enumeration the postflight asks for never sees them:
+        it reads tracked content only, so a setup step that installs a
+        toolchain has nothing to report even before anything is gitignored.
+        """
         provisioner, _, working_copy = _provisioner(
             commands=["make worktree-setup"],
-            working_copy=StubWorkingCopy(dirty=[False, False]),
+            working_copy=StubWorkingCopy(dirty_paths=[[], []]),
         )
 
         provisioner.provision(tmp_path, issue_number=ISSUE)
@@ -408,7 +426,7 @@ class TestProvisioningLeavesTheCandidateAlone:
                     )
                 ]
             ),
-            working_copy=StubWorkingCopy(dirty=[False, True]),
+            working_copy=StubWorkingCopy(dirty_paths=[[], ["src/app.py"]]),
         )
 
         with pytest.raises(WorktreeProvisioningError) as excinfo:
@@ -417,7 +435,7 @@ class TestProvisioningLeavesTheCandidateAlone:
         message = str(excinfo.value)
         assert "exit_code=1" in message
         assert "patched then died" in message
-        assert "uncommitted changes" in message
+        assert "modified tracked content" in message
 
     def test_the_candidate_is_re_read_even_when_a_command_fails(self, tmp_path):
         provisioner, _, working_copy = _provisioner(
