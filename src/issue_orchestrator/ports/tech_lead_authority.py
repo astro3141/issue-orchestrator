@@ -19,6 +19,7 @@ from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Protocol
 
 if TYPE_CHECKING:
+    from ..domain.canonical_context import CanonicalContextSnapshot
     from ..domain.models import DiscoveredFailure
     from ..domain.tech_lead_findings import (
         PatternEvidence,
@@ -35,7 +36,13 @@ if TYPE_CHECKING:
 
 
 class TechLeadAuthorityConflictError(RuntimeError):
-    """A different launch authority already exists for this session run."""
+    """A different launch-time record already exists for this session run.
+
+    Raised by both run-keyed create-once ledgers — the launch authority and
+    the canonical-context descriptor (#183) — for the same reason: a session
+    run's launch-time truth is written once and must never be silently
+    rewritten afterwards.
+    """
 
 
 class TechLeadStormCohortConflictError(RuntimeError):
@@ -97,6 +104,42 @@ class TechLeadAuthorityStore(Protocol):
 
     def discard(self, *, run_id: str, session_name: str) -> None:
         """Remove a run's authority row. No-op if absent (retention owner)."""
+        ...
+
+    # -- Canonical context provenance (#183) --------------------------------
+    #
+    # What governed a planning run, keyed by the SAME run identity as the
+    # launch authority — and deliberately a sibling of it, never part of it.
+    # The launch authority is "the sole authority for the session's flavor,
+    # focus issue, manifest PR set, and anchor issue"; a list of sources
+    # travelling inside that record would be indistinguishable from an
+    # authority grant. This descriptor grants nothing: it names, by issue,
+    # revision and digest, the canonical text the run was handed.
+    #
+    # Retention: rows are NEVER discarded. The whole point is that the
+    # provenance outlives the disposable planning worktree, so it can still
+    # answer "which sources governed that run" after the run-dir copy is
+    # reaped. A row is inert — it authorizes nothing, and no reader turns it
+    # into scope — so a row left by a launch that later failed grants nothing
+    # either (the same argument the storm-cohort ledger's retention rests on).
+
+    def record_canonical_context(
+        self, *, run_id: str, session_name: str, snapshot: "CanonicalContextSnapshot"
+    ) -> None:
+        """Persist what governed one planning run (create-once).
+
+        Recording an identical payload for an existing key is a no-op;
+        recording a DIFFERENT payload for an existing key must raise
+        :class:`TechLeadAuthorityConflictError` — a run's staged context is a
+        historical fact, and a re-run takes its newer snapshot under its own
+        run identity rather than rewriting the original.
+        """
+        ...
+
+    def load_canonical_context(
+        self, *, run_id: str, session_name: str
+    ) -> "CanonicalContextSnapshot | None":
+        """Return what governed a run, or None when nothing was staged for it."""
         ...
 
     # -- Gated proposal ops (#6778, ADR-0031 §2 amendment) -----------------
@@ -422,6 +465,9 @@ class InMemoryTechLeadAuthorityStore:
         self._pending_promotions: dict[str, "PendingPromotion"] = {}
         self._shipped_fixes: dict[int, "TechLeadShippedFixSummary"] = {}
         self._storm_cohorts: dict[int, tuple["DiscoveredFailure", ...]] = {}
+        self._canonical_contexts: dict[
+            tuple[str, str], "CanonicalContextSnapshot"
+        ] = {}
 
     def record(
         self, *, run_id: str, session_name: str, authority: "TechLeadLaunchAuthority"
@@ -443,6 +489,24 @@ class InMemoryTechLeadAuthorityStore:
 
     def discard(self, *, run_id: str, session_name: str) -> None:
         self._rows.pop((run_id, session_name), None)
+
+    def record_canonical_context(
+        self, *, run_id: str, session_name: str, snapshot: "CanonicalContextSnapshot"
+    ) -> None:
+        existing = self._canonical_contexts.get((run_id, session_name))
+        if existing is not None:
+            if existing == snapshot:
+                return
+            raise TechLeadAuthorityConflictError(
+                f"canonical context already recorded for run_id={run_id!r} "
+                f"session={session_name!r} with a different payload"
+            )
+        self._canonical_contexts[(run_id, session_name)] = snapshot
+
+    def load_canonical_context(
+        self, *, run_id: str, session_name: str
+    ) -> "CanonicalContextSnapshot | None":
+        return self._canonical_contexts.get((run_id, session_name))
 
     def record_op(self, *, issue_number: int, op: "StoredTechLeadOp") -> None:
         existing = self._ops.get(issue_number)

@@ -10,6 +10,7 @@ These tests verify:
 Tests mock at port boundaries, not internal patches, following the hexagonal architecture.
 """
 
+import hashlib
 import json
 import os
 import shlex
@@ -222,6 +223,11 @@ class MockRepositoryHost:
         self.get_prs_with_label_calls: list[tuple[str, str]] = []
         self.list_issues_calls: list[tuple[list[str] | None, str, int]] = []
         self.comments: list[tuple[int, str]] = []
+        # Issue-conversation reads, and per-issue fetch failures a test wants
+        # get_issue to raise (a source the canonical-context staging owner
+        # cannot reach, #183).
+        self.issue_comments: dict[int, list[dict]] = {}
+        self.issue_fetch_errors: dict[int, Exception] = {}
         self.get_issue_labels_fresh = MagicMock(
             side_effect=lambda issue_number: sorted(
                 self.labels.get(issue_number, set())
@@ -290,6 +296,8 @@ class MockRepositoryHost:
         return None
 
     def get_issue(self, issue_number: int) -> Issue | None:
+        if issue_number in self.issue_fetch_errors:
+            raise self.issue_fetch_errors[issue_number]
         issue = self.issues.get(issue_number)
         if issue is not None:
             return issue
@@ -302,6 +310,9 @@ class MockRepositoryHost:
             labels=labels,
             repo="test/repo",
         )
+
+    def get_issue_comments(self, issue_number: int) -> list[dict]:
+        return self.issue_comments.get(issue_number, [])
 
     def get_pr_reviews(self, pr_number: int) -> list[dict]:
         return self.pr_reviews.get(pr_number, [])
@@ -5275,6 +5286,124 @@ class TestLaunchTechLeadIssueSessionFlavors:
         assert "failure_investigation" in comments[0].comment
         assert str(TECH_LEAD_LAUNCH_RETRY_LIMIT) in comments[0].comment
         assert "boom" in comments[0].comment
+
+    @staticmethod
+    def _queue_planning(state, mock_repo_host, body: str) -> None:
+        """Queue a planning investigation of #903, declaring *body*'s sources."""
+        mock_repo_host.issues[903] = Issue(
+            number=903,
+            title="Prepare the thing",
+            labels=["agent:tech-lead"],
+            repo="test/repo",
+            body=body,
+            updated_at="2026-08-20T09:00:00Z",
+        )
+        PendingSessionQueues(state).queue_planning_investigation(
+            903, "Prepare the thing"
+        )
+
+    def test_planning_launch_stages_the_declared_canonical_context(
+        self, launcher_bundle, mock_repo_host, mock_events, tmp_path
+    ):
+        """#183: the ordinary lane hands the run its governing sources itself.
+
+        Control queues the subject, the launcher stages the exact sources the
+        subject DECLARES, and the run reads them from its own run-dir — no
+        Human step anywhere between the two, and no bundle assumed for a
+        subject that declared none.
+        """
+        config = launcher_bundle.launcher.config
+        self._enable_tech_lead_agent(config, tmp_path)
+        state = OrchestratorState()
+        self._queue_planning(
+            state, mock_repo_host, "Plan this.\nGoverned-by: #21\n"
+        )
+        mock_repo_host.issues[21] = Issue(
+            number=21,
+            title="Working procedure",
+            labels=[],
+            repo="test/repo",
+            body="The working procedure.",
+            updated_at="2026-08-19T08:00:00Z",
+        )
+
+        session = self._launch(state.pending_tech_lead_reviews[0], state, launcher_bundle)
+
+        assert session is not None
+        run_dir = self._started_run_dir(mock_events)
+        descriptor = json.loads(
+            (run_dir / "tech-lead-data" / "canonical-context.json").read_text()
+        )
+        assert descriptor["subject_issue_number"] == 903
+        assert [entry["issue_number"] for entry in descriptor["sources"]] == [903, 21]
+        assert descriptor["sources"][1]["updated_at"] == "2026-08-19T08:00:00Z"
+        staged_body = (
+            run_dir / "tech-lead-data" / "canonical-context" / "issue-21" / "body.md"
+        )
+        assert staged_body.read_text() == "The working procedure."
+        assert (
+            descriptor["sources"][1]["body_sha256"]
+            == hashlib.sha256(staged_body.read_bytes()).hexdigest()
+        )
+        # The manifest points at the descriptor, and the durable ledger answers
+        # for the run by its typed identity.
+        run_manifest = json.loads((run_dir / "manifest.json").read_text())
+        assert run_manifest["canonical_context"].endswith("canonical-context.json")
+        store = SqliteTechLeadAuthorityStore.for_repo(config.repo_root)
+        recorded = store.load_canonical_context(
+            run_id=run_manifest["run_id"], session_name=run_manifest["session_name"]
+        )
+        assert recorded is not None
+        assert [source.issue_number for source in recorded.sources] == [903, 21]
+
+    def test_planning_launch_fails_closed_on_an_unreachable_required_source(
+        self, launcher_bundle, mock_repo_host, mock_worktree_manager, mock_events,
+        tmp_path,
+    ):
+        """#183: a required source that cannot be staged starts no session.
+
+        It fails through the SAME typed owner a missing board snapshot uses
+        (``_fail_launch_for_tech_lead_prep``): SESSION_START_FAILED with
+        reason ``tech_lead_session_data_failed``, the pre-active worktree
+        cleaned, the queued item retained for retry, and NO authority row left
+        behind for a run that never started.
+        """
+        config = launcher_bundle.launcher.config
+        self._enable_tech_lead_agent(config, tmp_path)
+        state = OrchestratorState()
+        self._queue_planning(state, mock_repo_host, "Governed-by: #21\n")
+        mock_repo_host.issue_fetch_errors[21] = RuntimeError("github down")
+
+        session = orchestrator_launch_tech_lead_session(
+            state.pending_tech_lead_reviews[0],
+            state,
+            config,
+            launcher_bundle.launcher,
+            MagicMock(),
+            _claims_store(),
+        )
+
+        assert session is None
+        assert not any(str(e.name) == "session.started" for e in mock_events.events)
+        failed = [
+            e for e in mock_events.events
+            if str(e.name) == str(EventName.SESSION_START_FAILED)
+        ]
+        assert failed and failed[-1].data["reason"] == "tech_lead_session_data_failed"
+        assert "#21" in failed[-1].data["error"]
+        assert mock_worktree_manager.remove_calls, "worktree must be cleaned up"
+        assert len(state.pending_tech_lead_reviews) == 1, "retryable, so retained"
+        store = SqliteTechLeadAuthorityStore.for_repo(config.repo_root)
+        identities = self._run_identities(tmp_path)
+        assert identities, "no run manifest found - cannot verify by typed identity"
+        for run_id, session_name in identities:
+            assert store.load(run_id=run_id, session_name=session_name) is None
+            assert (
+                store.load_canonical_context(
+                    run_id=run_id, session_name=session_name
+                )
+                is None
+            ), "nothing may be recorded for a bundle that was never staged"
 
     def _drive_to_exhaustion(
         self, state, config, launcher_bundle

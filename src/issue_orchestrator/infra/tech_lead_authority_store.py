@@ -39,6 +39,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterator
 
+from ..domain.canonical_context import CanonicalContextSnapshot
 from ..domain.models import DiscoveredFailure
 from ..domain.tech_lead_findings import (
     VALID_PROMOTION_STATES,
@@ -64,6 +65,7 @@ from ..ports.tech_lead_authority import (
     UnknownTechLeadPatternError,
 )
 from .repo_identity import state_dir
+from . import tech_lead_canonical_context_rows as canonical_context_rows
 from . import tech_lead_pending_intents as pending_intents
 from .sqlite_connection import open_sqlite
 from .tech_lead_authority_schema import initialize_tech_lead_authority_schema
@@ -236,6 +238,23 @@ class SqliteTechLeadAuthorityStore:
                 run_id,
                 session_name,
             )
+
+    def record_canonical_context(
+        self, *, run_id: str, session_name: str, snapshot: CanonicalContextSnapshot
+    ) -> None:
+        """Persist what governed one planning run (create-once, #183)."""
+        with self._transaction() as tx:
+            canonical_context_rows.insert(
+                tx, run_id=run_id, session_name=session_name, snapshot=snapshot
+            )
+
+    def load_canonical_context(
+        self, *, run_id: str, session_name: str
+    ) -> CanonicalContextSnapshot | None:
+        """Load what governed a run, or None when nothing was staged for it."""
+        return canonical_context_rows.select(
+            self._get_connection(), run_id=run_id, session_name=session_name
+        )
 
     # -- Gated proposal ops (#6778, ADR-0031 §2 amendment) -----------------
 

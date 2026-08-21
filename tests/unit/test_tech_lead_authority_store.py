@@ -5,6 +5,12 @@ from pathlib import Path
 
 import pytest
 
+from issue_orchestrator.domain.canonical_context import (
+    CanonicalContextSnapshot,
+    CanonicalSource,
+    CanonicalSourceKind,
+    content_digest,
+)
 from issue_orchestrator.domain.models import DiscoveredFailure
 from issue_orchestrator.domain.tech_lead_findings import (
     PatternClassificationConflictError,
@@ -208,13 +214,140 @@ def test_discard_is_a_noop_when_absent(tmp_path: Path) -> None:
     assert store.load(run_id="never-recorded", session_name="issue-7") is None
 
 
+def _canonical_context(digest_body: str = "procedure") -> CanonicalContextSnapshot:
+    """A planning subject staged with one required governing source (#183)."""
+    return CanonicalContextSnapshot(
+        subject_issue_number=183,
+        sources=(
+            CanonicalSource(
+                kind=CanonicalSourceKind.SUBJECT,
+                issue_number=183,
+                required=True,
+                fetched_at="2026-08-21T00:00:00+00:00",
+                staged=True,
+                title="Stage canonical governing context",
+                state="open",
+                updated_at="2026-08-20T09:00:00Z",
+                body_sha256=content_digest("subject"),
+            ),
+            CanonicalSource(
+                kind=CanonicalSourceKind.GOVERNING,
+                issue_number=21,
+                required=True,
+                fetched_at="2026-08-21T00:00:00+00:00",
+                staged=True,
+                title="Working procedure",
+                state="open",
+                updated_at="2026-08-19T08:00:00Z",
+                body_sha256=content_digest(digest_body),
+            ),
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    "make_store",
+    [
+        lambda tmp_path: SqliteTechLeadAuthorityStore.for_repo(tmp_path),
+        lambda _tmp_path: InMemoryTechLeadAuthorityStore(),
+    ],
+)
+def test_canonical_context_is_keyed_by_run_identity(tmp_path: Path, make_store) -> None:
+    """#183: provenance is a SIBLING of the launch authority, same key."""
+    store = make_store(tmp_path)
+    store.record_canonical_context(
+        run_id="r1", session_name="issue-183", snapshot=_canonical_context()
+    )
+
+    assert (
+        store.load_canonical_context(run_id="r1", session_name="issue-183")
+        == _canonical_context()
+    )
+    assert store.load_canonical_context(run_id="r2", session_name="issue-183") is None
+    # It is not the launch authority, and does not become one.
+    assert store.load(run_id="r1", session_name="issue-183") is None
+
+
+@pytest.mark.parametrize(
+    "make_store",
+    [
+        lambda tmp_path: SqliteTechLeadAuthorityStore.for_repo(tmp_path),
+        lambda _tmp_path: InMemoryTechLeadAuthorityStore(),
+    ],
+)
+def test_canonical_context_is_create_once(tmp_path: Path, make_store) -> None:
+    """A run's staged context is history; a re-run records under its own key."""
+    store = make_store(tmp_path)
+    store.record_canonical_context(
+        run_id="r1", session_name="issue-183", snapshot=_canonical_context()
+    )
+
+    # Identical payload: no-op (crash-retry safe).
+    store.record_canonical_context(
+        run_id="r1", session_name="issue-183", snapshot=_canonical_context()
+    )
+    with pytest.raises(TechLeadAuthorityConflictError):
+        store.record_canonical_context(
+            run_id="r1",
+            session_name="issue-183",
+            snapshot=_canonical_context("procedure v2"),
+        )
+
+    # The newer snapshot lands under the NEW run's identity without rewriting.
+    store.record_canonical_context(
+        run_id="r2", session_name="issue-183", snapshot=_canonical_context("procedure v2")
+    )
+    assert (
+        store.load_canonical_context(run_id="r1", session_name="issue-183")
+        == _canonical_context()
+    )
+
+
+def test_canonical_context_survives_reopen_and_authority_discard(
+    tmp_path: Path,
+) -> None:
+    """Durable replay (#183): provenance outlives the run it describes.
+
+    The launch authority is discarded at the run's terminal and the planning
+    worktree is reaped with it; the descriptor must still answer which sources
+    governed that run, from a fresh process.
+    """
+    store = SqliteTechLeadAuthorityStore.for_repo(tmp_path)
+    store.record(
+        run_id="r1",
+        session_name="issue-183",
+        authority=TechLeadLaunchAuthority(
+            flavor=TechLeadSessionFlavor.PLANNING_INVESTIGATION,
+            anchor_issue_number=183,
+            focus_issue_number=183,
+        ),
+    )
+    store.record_canonical_context(
+        run_id="r1", session_name="issue-183", snapshot=_canonical_context()
+    )
+
+    store.discard(run_id="r1", session_name="issue-183")
+
+    reopened = SqliteTechLeadAuthorityStore.for_repo(tmp_path)
+    assert reopened.load(run_id="r1", session_name="issue-183") is None
+    replayed = reopened.load_canonical_context(run_id="r1", session_name="issue-183")
+    assert replayed == _canonical_context()
+    assert [source.issue_number for source in replayed.sources] == [183, 21]
+
+
 def test_sqlite_adapter_satisfies_the_port() -> None:
     """The adapter must implement every method the port declares."""
     from issue_orchestrator.ports.tech_lead_authority import (
         TechLeadAuthorityStore as TechLeadAuthorityStorePort,
     )
 
-    for method in ("record", "load", "discard"):
+    for method in (
+        "record",
+        "load",
+        "discard",
+        "record_canonical_context",
+        "load_canonical_context",
+    ):
         assert callable(getattr(SqliteTechLeadAuthorityStore, method))
         assert callable(getattr(TechLeadAuthorityStorePort, method))
 

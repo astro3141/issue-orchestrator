@@ -35,6 +35,7 @@ from ..domain.tech_lead_session import (
     TechLeadSessionFlavor,
 )
 from .completion_pr_collision import NoCommitsBetweenError
+from .tech_lead_canonical_context import stage_canonical_context
 from .tech_lead_evidence import build_evidence_map, write_evidence_map
 from .tech_lead_manifest_builder import TechLeadCandidatePolicy, TechLeadManifestBuilder
 
@@ -317,6 +318,12 @@ def prepare_tech_lead_session_data(
     their OWNED problem cohort (#6780); act-level proposals may target only
     that cohort.
 
+    A PLANNING_INVESTIGATION additionally receives the canonical governing
+    context of its subject (#183) — the exact sources the subject declares,
+    staged with their revision identity and digests so no Human has to carry
+    that text across the boundary. Its owner is
+    :mod:`.tech_lead_canonical_context`.
+
     Flavor resolution: an explicit ``tech_lead_scope`` wins (the pending-queue
     launch path forwards the producer-declared grant); otherwise the
     ADR-0031 §4 marker label on the anchor issue selects HEALTH_REVIEW
@@ -383,6 +390,17 @@ def prepare_tech_lead_session_data(
         ctx,
         run_dir,
         board_snapshot,
+    )
+    # A planning run's canonical governing context (#183): a REQUIRED input
+    # like the board snapshot, so a source it cannot stage raises here and the
+    # launcher fails the launch closed. Every other flavor stages nothing.
+    stage_canonical_context(
+        repository_host=repository_host,
+        tech_lead_authority=tech_lead_authority,
+        ctx=ctx,
+        run_dir=run_dir,
+        flavor=flavor,
+        subject_issue=issue,
     )
     return _stage_evidence_map(
         config=config,
