@@ -1337,6 +1337,33 @@ def test_an_ordinary_session_at_the_threshold_still_escalates(tmp_path: Path) ->
     assert f"marked as `{labels.needs_human}`" in comment
 
 
+def test_a_publish_failure_releases_the_claim_only_after_labeling(
+    tmp_path: Path,
+) -> None:
+    """The claim outlives every label mutation on this path (#182 review N5).
+
+    Moving the publish-failure policy to its own owner reordered the result:
+    the label mutations land first, then the comment, then the in-progress
+    release. That ordering is pinned rather than left incidental, because it is
+    the recoverable one — an applier that stopped partway through leaves the
+    issue claimed and unlabeled, not unclaimed and unlabeled, which the next
+    tick would pick up as if nothing had happened.
+    """
+    config = Config()
+    labels = LabelManager(config)
+
+    actions = make_planner(config).generate_completion_actions(
+        make_session(tmp_path),
+        SessionStatus.COMPLETED,
+        processing_errors=list(_PUSH_FAILURE),
+    )
+
+    last = actions[-1]
+    assert isinstance(last, RemoveLabelAction)
+    assert last.label == labels.in_progress
+    assert labels.publish_failed in added_labels(actions[:-1])
+
+
 def test_a_halted_exchange_never_blocks_a_planning_subject(tmp_path: Path) -> None:
     """Door 6 (#182 review F1): the halt markers are raised during CREATE_PR.
 

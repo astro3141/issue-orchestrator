@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
-from pathlib import Path
 from typing import Any, Callable, Optional
 
 from ..domain.models import RETROSPECTIVE_REVIEW_TERMINAL_PREFIX, Session, SessionStatus
@@ -39,6 +37,7 @@ from .invalid_record_actions import (
 from .label_manager import LabelManager
 from .provider_availability import ProviderAvailabilityPolicy
 from .provider_blocked_completion import provider_blocked_actions
+from .publish_failure_completion import publish_failure_actions
 from .reconciliation import ExpectedState, build_expected_for_mutation
 from .tech_lead_session_policy import is_tech_lead_session
 from ..ports.provider_resilience import ProviderErrorType
@@ -92,60 +91,6 @@ def critical_processing_errors(
             downgraded,
         )
     return critical, downgraded
-
-
-@dataclass(frozen=True, slots=True)
-class _PublishFailureVerdict:
-    """What a failed publish does to its subject: the effects AND the words.
-
-    One value because they are one decision (#182 review F1). A suppressed
-    escalation announced as an escalation, or a counter rolled by a comment
-    telling the operator the issue was left alone, is precisely the drift
-    :mod:`.subject_recovery_authority` exists to prevent — so the arm that
-    decides the label actions is the arm that writes the comment describing
-    them, and nothing downstream re-derives either.
-    """
-
-    label_actions: tuple[Action, ...]
-    comment: str
-    comment_reason: str
-
-
-# The publish-failure diagnosis every arm opens with. The escalating arm
-# replaces it with the consecutive-failure count, which only it has earned the
-# right to state.
-_PUBLISH_FAILURE_INTRO = (
-    "The agent completed its work, but the orchestrator could not push or"
-    " create a PR."
-)
-
-
-def _publish_failure_comment(
-    *,
-    headline: str,
-    intro: str,
-    error_label: str,
-    first_error: str,
-    diagnostic_info: str,
-    session: Session,
-    note: str,
-) -> str:
-    """One shape for all three publish-failure comments (#182 review F1).
-
-    The arms differ in their headline, their opening line, and their closing
-    note; the diagnosis in between is the same facts about the same failure, so
-    it is written once. The note always lands last, which is where every other
-    recovery-state path puts the sentence about the label.
-    """
-    return (
-        f"{headline}\n\n"
-        f"{intro}\n\n"
-        f"**{error_label}:** {first_error}\n"
-        f"{diagnostic_info}\n"
-        f"- Runtime: {session.runtime_minutes:.1f} minutes\n"
-        f"- Session: `{session.terminal_id}`\n"
-        f"\n{note}"
-    )
 
 
 def has_review_exchange_errors(processing_errors: Optional[list[str]]) -> bool:
@@ -385,11 +330,13 @@ class CompletionActionPlanner:
                 )
             )
         return tuple(
-            self._generate_processing_failure_actions(
+            publish_failure_actions(
                 session,
-                critical_errors,
-                diagnostic_path,
                 expected,
+                critical_errors=critical_errors,
+                diagnostic_path=diagnostic_path,
+                label_manager=self._lm,
+                max_consecutive_publish_failures=self.config.max_consecutive_publish_failures,
                 subject_recovery=self._subject_recovery(session),
             )
         )
@@ -499,202 +446,6 @@ class CompletionActionPlanner:
 
         # NEEDS_HUMAN keeps in-progress to maintain the ownership claim.
         return ()
-
-    def _generate_processing_failure_actions(
-        self,
-        session: Session,
-        critical_errors: list[str],
-        diagnostic_path: Optional[str],
-        expected: ExpectedState,
-        *,
-        subject_recovery: SubjectRecoveryAuthority,
-    ) -> list[Action]:
-        """Generate actions when agent said completed but push/PR creation failed.
-
-        Tracks consecutive publish failures via publish-fail-count-N labels.
-        After max_consecutive_publish_failures, escalates to needs-human.
-
-        The fifth door onto a subject's recovery state, and the only one a run
-        reaches by SUCCEEDING at its own job (#182 review F1): a focused
-        tech_lead run publishes onto its disposable branch — ``PUSH_BRANCH`` and
-        ``CREATE_PR`` are deliberately kept for it — and a failed push lands
-        ``publish-failed``, or past the counter ``needs-human``, on
-        ``issue-{N}``, which for a focused flavor IS the subject. Whether this
-        run's role may make that change is the owner's question, so the verdict
-        below is asked before any of it. What is unconditional is the diagnosis
-        and the released claim: the operator still learns publishing failed.
-        """
-        issue_number = session.issue.number
-        first_error = critical_errors[0][:100] if critical_errors else "Unknown error"
-        if len(first_error) == 100:
-            first_error += "..."
-
-        diagnostic_info = ""
-        if diagnostic_path and session.worktree_path:
-            worktree_name = Path(session.worktree_path).name
-            diagnostic_info = (
-                f"\n**Diagnostic file:** `{worktree_name}/{diagnostic_path}`\n"
-            )
-
-        verdict = self._publish_failure_verdict(
-            session,
-            expected,
-            subject_recovery=subject_recovery,
-            first_error=first_error,
-            diagnostic_info=diagnostic_info,
-        )
-        return [
-            *verdict.label_actions,
-            AddCommentAction(
-                number=issue_number,
-                comment=verdict.comment,
-                reason=verdict.comment_reason,
-                expected=expected,
-            ),
-            RemoveLabelAction(
-                issue_number=issue_number,
-                label=self._lm.in_progress,
-                reason="Publishing failed - releasing claim",
-                expected=expected,
-            ),
-        ]
-
-    def _publish_failure_verdict(
-        self,
-        session: Session,
-        expected: ExpectedState,
-        *,
-        subject_recovery: SubjectRecoveryAuthority,
-        first_error: str,
-        diagnostic_info: str,
-    ) -> _PublishFailureVerdict:
-        """Escalate, mark, or leave the subject untouched — one decision (#182 F1).
-
-        A run that holds no recovery authority over its subject does not merely
-        lose the blocking label: it never reads the publish counter, let alone
-        rolls it. That counter is the SUBJECT's publish history, and a bounded
-        role adding to it would hasten a LATER escalation to ``needs-human`` —
-        achieving through a successor exactly the recovery action its capability
-        row forbids it from proposing. Dropping the whole mutation is also what
-        the owner's suppression note already promises an operator: that the
-        issue is left exactly as it was.
-
-        The three arms are mutually exclusive and each writes its own comment,
-        so an escalation that did not happen can never be announced as one.
-        """
-        if not subject_recovery.may_leave_recovery_label:
-            return _PublishFailureVerdict(
-                label_actions=(),
-                comment=_publish_failure_comment(
-                    headline="❌ **Publishing Failed**",
-                    intro=_PUBLISH_FAILURE_INTRO,
-                    error_label="Error",
-                    first_error=first_error,
-                    diagnostic_info=diagnostic_info,
-                    session=session,
-                    note=subject_recovery.suppression_note(
-                        self._lm.publish_failed, self._lm.needs_human
-                    ),
-                ),
-                comment_reason="Report the publish failure without blocking its subject",
-            )
-
-        issue_number = session.issue.number
-        # Count previous consecutive publish failures from issue labels.
-        prev_count = self._lm.extract_publish_fail_count(session.issue.labels)
-        new_count = prev_count + 1
-        max_failures = self.config.max_consecutive_publish_failures
-
-        if new_count >= max_failures:
-            logger.info(
-                "[COMPLETION] Publish failure count %d >= max %d, escalating to needs-human: issue=%d",
-                new_count,
-                max_failures,
-                issue_number,
-            )
-            return _PublishFailureVerdict(
-                label_actions=(
-                    AddLabelAction(
-                        issue_number=issue_number,
-                        label=self._lm.needs_human,
-                        reason=f"Publishing failed {new_count} consecutive times — escalating to needs-human",
-                        needs_human_cause=NeedsHumanCause.SESSION_LIFECYCLE,
-                        expected=expected,
-                    ),
-                    RemoveLabelAction(
-                        issue_number=issue_number,
-                        label=self._lm.needs_rework,
-                        reason="Publishing failed - clearing needs-rework to prevent re-queuing loop",
-                        expected=expected,
-                    ),
-                ),
-                comment=_publish_failure_comment(
-                    headline="❌ **Publishing Failed — Escalated**",
-                    intro=(
-                        f"Publishing has failed **{new_count} consecutive times** "
-                        f"(max: {max_failures})."
-                    ),
-                    error_label="Latest error",
-                    first_error=first_error,
-                    diagnostic_info=diagnostic_info,
-                    session=session,
-                    note=(
-                        f"This issue has been marked as `{self._lm.needs_human}`"
-                        " and needs human investigation.\nRemove the label after"
-                        " investigating to allow reprocessing."
-                    ),
-                ),
-                comment_reason="Escalate repeated publish failure to human",
-            )
-
-        label_actions: list[Action] = [
-            AddLabelAction(
-                issue_number=issue_number,
-                label=self._lm.publish_failed,
-                reason="Publishing failed after agent completion (push/PR creation failed)",
-                expected=expected,
-            ),
-            RemoveLabelAction(
-                issue_number=issue_number,
-                label=self._lm.needs_rework,
-                reason="Publishing failed - clearing needs-rework to prevent re-queuing loop",
-                expected=expected,
-            ),
-        ]
-        if prev_count > 0:
-            label_actions.append(
-                RemoveLabelAction(
-                    issue_number=issue_number,
-                    label=self._lm.publish_fail_count_label(prev_count),
-                    reason="Updating publish failure count",
-                    expected=expected,
-                )
-            )
-        label_actions.append(
-            AddLabelAction(
-                issue_number=issue_number,
-                label=self._lm.publish_fail_count_label(new_count),
-                reason=f"Publish failure #{new_count}",
-                expected=expected,
-            )
-        )
-        return _PublishFailureVerdict(
-            label_actions=tuple(label_actions),
-            comment=_publish_failure_comment(
-                headline=f"❌ **Publishing Failed** (attempt {new_count}/{max_failures})",
-                intro=_PUBLISH_FAILURE_INTRO,
-                error_label="Error",
-                first_error=first_error,
-                diagnostic_info=diagnostic_info,
-                session=session,
-                note=(
-                    f"This issue has been marked as `{self._lm.publish_failed}`"
-                    " and will not be automatically retried.\nRemove the label"
-                    " to retry."
-                ),
-            ),
-            comment_reason="Notify about processing failure",
-        )
 
     def _generate_timeout_actions(
         self,
