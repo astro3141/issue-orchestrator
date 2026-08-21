@@ -165,18 +165,28 @@ def _stage_one_source(
     tells a short conversation from a clipped one off the two numbers.
     Fetching the remaining pages is a separate concern and deliberately not
     done here.
+
+    The COMMENTS ARE READ FIRST and the total second, and that order is load-
+    bearing: the two reads are not atomic, and this orchestrator posts comments
+    on the very issues it plans against. Reading the total first would let a
+    comment landing in the window between them produce a total SMALLER than the
+    page already in hand — a descriptor the domain rightly rejects, which on a
+    required source (the subject always is one) would kill an otherwise healthy
+    launch over a benign interleaving. Read in this order, a comment arriving
+    mid-stage can only make the later total LARGER, which reads as "clipped" —
+    the honest answer, because that comment is genuinely not in the bundle.
     """
     fetched_at = _now()
     try:
-        issue = repository_host.get_issue(issue_number)
-        if issue is None:
-            raise ValueError(f"issue #{issue_number} was not found")
         source_dir = _source_dir(bodies_dir, issue_number)
-        body = issue.body or ""
-        body_sha256 = _write_staged_file(source_dir / "body.md", body)
         comments = _stage_comments(
             source_dir, repository_host.get_issue_comments(issue_number)
         )
+        issue = repository_host.get_issue(issue_number)
+        if issue is None:
+            raise ValueError(f"issue #{issue_number} was not found")
+        body = issue.body or ""
+        body_sha256 = _write_staged_file(source_dir / "body.md", body)
         return _StagedSource(
             source=CanonicalSource(
                 kind=kind,
@@ -315,7 +325,8 @@ def stage_canonical_context(
             " part of some conversations: %s",
             subject_issue.number,
             ", ".join(
-                f"#{source.issue_number} {len(source.comments)}/{source.comment_count}"
+                f"#{source.issue_number} staged {len(source.comments)} of"
+                f" {source.comment_count} ({source.missing_comment_count} missing)"
                 for source in clipped
             ),
         )

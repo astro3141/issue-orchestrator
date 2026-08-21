@@ -84,15 +84,20 @@ class _Host:
         self._errors = errors or {}
         self.issue_calls: list[int] = []
         self.comment_calls: list[int] = []
+        # Both fetches in one ordered log, for the tests that care which of
+        # the two non-atomic reads happens first.
+        self.calls: list[str] = []
 
     def get_issue(self, issue_number: int) -> SimpleNamespace | None:
         self.issue_calls.append(issue_number)
+        self.calls.append(f"issue:{issue_number}")
         if issue_number in self._errors:
             raise self._errors[issue_number]
         return self._issues.get(issue_number)
 
     def get_issue_comments(self, issue_number: int) -> list[dict[str, Any]]:
         self.comment_calls.append(issue_number)
+        self.calls.append(f"comments:{issue_number}")
         return self._comments.get(issue_number, [])
 
     # Only reached by the best-effort evidence map, never by this owner.
@@ -351,6 +356,104 @@ class TestConversationCompleteness:
         governing = replayed.source(POLICY)
         assert governing is not None and governing.comments_truncated is True
 
+    def test_the_conversation_is_read_before_its_total(self, tmp_path: Path) -> None:
+        """The two reads are not atomic, so their ORDER decides the failure.
+
+        A total read first could be smaller than the page read second, which
+        is a descriptor the domain rejects — and on a required source that
+        kills the launch. Reading the page first makes the later total the
+        larger of the two by construction.
+        """
+        subject = _issue(SUBJECT, body=f"Governed-by: #{POLICY}\n", comment_count=0)
+        host = _Host(
+            issues={
+                SUBJECT: subject,
+                POLICY: _issue(POLICY, body="policy", comment_count=2),
+            },
+            comments={POLICY: self._comments(2)},
+        )
+
+        _stage(tmp_path / "run", host, subject=subject)
+
+        assert host.calls == [
+            f"comments:{SUBJECT}",
+            f"issue:{SUBJECT}",
+            f"comments:{POLICY}",
+            f"issue:{POLICY}",
+        ]
+
+    def test_a_comment_landing_mid_stage_reads_as_clipped_not_as_a_failure(
+        self, tmp_path: Path
+    ) -> None:
+        """The orchestrator comments on the issues it plans against.
+
+        One landing between the two reads of a REQUIRED source must not fail
+        the launch: it is simply a comment the bundle does not contain.
+        """
+
+        class _CommentsWhileStaging(_Host):
+            """A conversation that grows the instant its page is handed over."""
+
+            def get_issue_comments(
+                self, issue_number: int
+            ) -> list[dict[str, Any]]:
+                page = list(super().get_issue_comments(issue_number))
+                if issue_number == POLICY:
+                    # The new comment arrives too late for the page and in
+                    # time for the total, exactly as a live interleaving does.
+                    self._issues[POLICY].comment_count += 1
+                return page
+
+        subject = _issue(SUBJECT, body=f"Governed-by: #{POLICY}\n", comment_count=0)
+        host = _CommentsWhileStaging(
+            issues={
+                SUBJECT: subject,
+                POLICY: _issue(POLICY, body="policy", comment_count=2),
+            },
+            comments={POLICY: self._comments(2)},
+        )
+
+        snapshot, manifest = _stage(tmp_path / "run", host, subject=subject)
+
+        assert snapshot is not None
+        governing = snapshot.source(POLICY)
+        assert governing is not None
+        assert governing.staged is True
+        assert len(governing.comments) == 2
+        assert governing.comment_count == 3
+        assert governing.comments_truncated is True
+        assert governing.missing_comment_count == 1
+        # The launch lives: the descriptor is written and manifested.
+        assert manifest["canonical_context"]
+
+    def test_a_comment_landing_mid_stage_on_the_subject_launches_too(
+        self, tmp_path: Path
+    ) -> None:
+        """The subject is always required, and is re-read live like the rest."""
+
+        class _CommentsWhileStagingSubject(_Host):
+            def get_issue_comments(
+                self, issue_number: int
+            ) -> list[dict[str, Any]]:
+                page = list(super().get_issue_comments(issue_number))
+                if issue_number == SUBJECT:
+                    self._issues[SUBJECT].comment_count += 1
+                return page
+
+        subject = _issue(SUBJECT, body="No declarations here.", comment_count=1)
+        host = _CommentsWhileStagingSubject(
+            issues={SUBJECT: subject}, comments={SUBJECT: self._comments(1)}
+        )
+
+        snapshot, _ = _stage(tmp_path / "run", host, subject=subject)
+
+        assert snapshot is not None
+        staged_subject = snapshot.sources[0]
+        assert staged_subject.staged is True
+        assert len(staged_subject.comments) == 1
+        assert staged_subject.comment_count == 2
+        assert staged_subject.comments_truncated is True
+
 
 class TestFailClosedOnRequired:
     """Direction 2: a required source that cannot be staged kills the launch."""
@@ -450,6 +553,40 @@ class TestOptionalDegradesHonestly:
         bodies = run_dir / "tech-lead-data" / CANONICAL_CONTEXT_BODIES_DIRNAME
         assert not (bodies / f"issue-{POLICY}").exists()
         assert (bodies / f"issue-{SUBJECT}" / "body.md").is_file()
+
+    def test_comments_staged_before_a_failed_issue_read_are_dropped(
+        self, tmp_path: Path
+    ) -> None:
+        """The half-staged direction the read order actually produces.
+
+        Comments are written first, so the source that fails is one whose
+        comment files are already on disk. Nothing may survive that the
+        descriptor no longer attributes to anybody.
+        """
+        subject = _issue(SUBJECT, body=f"Governed-by-optional: #{POLICY}\n")
+        host = _Host(
+            issues={SUBJECT: subject},
+            comments={
+                POLICY: [
+                    {
+                        "id": 5365348999,
+                        "updated_at": "2026-08-19T09:00:00Z",
+                        "body": "policy discussion",
+                    }
+                ]
+            },
+            errors={POLICY: RuntimeError("github down")},
+        )
+        run_dir = tmp_path / "run"
+
+        snapshot, _ = _stage(run_dir, host, subject=subject)
+
+        assert snapshot is not None
+        recorded = snapshot.source(POLICY)
+        assert recorded is not None and recorded.staged is False
+        assert recorded.comments == () and recorded.comment_count == 0
+        bodies = run_dir / "tech-lead-data" / CANONICAL_CONTEXT_BODIES_DIRNAME
+        assert not (bodies / f"issue-{POLICY}").exists()
 
 
 class TestNoHardcodedBundle:

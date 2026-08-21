@@ -183,6 +183,7 @@ class TestCanonicalSourceStates:
         assert absent.comment_count == 0
         assert absent.comments == ()
         assert absent.comments_truncated is False
+        assert absent.missing_comment_count == 0
 
     def test_an_absent_source_must_say_why(self) -> None:
         with pytest.raises(ValueError, match="must record why"):
@@ -220,8 +221,9 @@ class TestConversationCompleteness:
         assert clipped.comments_truncated is True
         assert len(clipped.comments) == 100
         assert clipped.comment_count == 137
-        # Not merely "something is missing" - exactly 37 comments are.
-        assert clipped.comment_count - len(clipped.comments) == 37
+        # Not merely "something is missing" - exactly 37 comments are, and the
+        # arithmetic lives with the pair rather than in every reader.
+        assert clipped.missing_comment_count == 37
 
     def test_a_complete_conversation_reads_as_complete(self) -> None:
         complete = _governing(
@@ -229,6 +231,7 @@ class TestConversationCompleteness:
         )
 
         assert complete.comments_truncated is False
+        assert complete.missing_comment_count == 0
         assert complete.comment_count == len(complete.comments)
 
     def test_a_silent_source_is_not_mistaken_for_a_clipped_one(self) -> None:
@@ -237,6 +240,7 @@ class TestConversationCompleteness:
         silent = _governing(21, comments=(), comment_count=0)
 
         assert silent.comments_truncated is False
+        assert silent.missing_comment_count == 0
 
     def test_no_stored_flag_can_disagree_with_the_counts(self) -> None:
         # The failure CompletedReviewExchange was reshaped to remove: two

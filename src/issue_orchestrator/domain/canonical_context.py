@@ -289,6 +289,18 @@ class CanonicalSource:
             )
 
     @property
+    def missing_comment_count(self) -> int:
+        """How many of the source's comments are NOT in this bundle.
+
+        The arithmetic lives with the pair that owns it so no reader has to
+        re-derive it: ``0`` means the whole conversation was staged, and any
+        positive number is exactly how much of it the run was not given.
+        Never negative — ``__post_init__`` rejects a source reporting fewer
+        comments in total than it handed over.
+        """
+        return self.comment_count - len(self.comments)
+
+    @property
     def comments_truncated(self) -> bool:
         """Whether the source's conversation is longer than what was staged.
 
@@ -298,7 +310,7 @@ class CanonicalSource:
         nothing and reports nothing, so it is never "truncated" — it is
         absent, which its own ``staged``/``absent_reason`` already say.
         """
-        return len(self.comments) < self.comment_count
+        return self.missing_comment_count > 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
