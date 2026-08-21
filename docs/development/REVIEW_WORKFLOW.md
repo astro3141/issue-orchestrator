@@ -257,7 +257,8 @@ CLI, or an operator's click started it — is admitted by one control-layer owne
 | Scope | Requested from | Concurrency |
 |---|---|---|
 | Global health review (whole board) | Dashboard actions menu → **Run board health review** | Exclusive: no other tech-lead run executes alongside it |
-| Issue investigation (one focus issue) | A blocked card's actions menu and the issue detail drawer → **Investigate with tech lead** | Up to `tech_lead.max_concurrent`, one run per issue |
+| Issue investigation (one blocked focus issue) | A blocked card's actions menu and the issue detail drawer → **Investigate with tech lead**; `issue-orchestrator tech_lead <issue#>` | Up to `tech_lead.max_concurrent`, one run per issue |
+| Planning investigation (one open, non-blocked issue) | `POST /api/tech-lead/runs` with `"flavor": "planning_investigation"`; `issue-orchestrator tech_lead <issue#> --flavor planning_investigation` | Same as above; a distinct `planning:<n>` run from an investigation of the same issue |
 
 A queued global run acts as a **barrier**: targeted work queued behind it waits
 until it completes, and the global run itself waits for active tech-lead
@@ -269,16 +270,35 @@ Both dashboard actions POST one discriminated command to `/api/tech-lead/runs`:
 
 ```json
 {"scope": {"kind": "issue", "issue_number": 42}}
+{"scope": {"kind": "issue", "issue_number": 42, "flavor": "planning_investigation"}}
 {"scope": {"kind": "global_health_review"}}
 ```
+
+`flavor` names WHICH focused role an issue-scoped request wants. It is optional
+and defaults to `failure_investigation`, so a request that omits it is exactly
+the request it was before the field existed. The two focused roles admit
+**opposite** subject states — an investigation requires a blocked subject, a
+planning run requires an open, non-blocked one — and they are separate
+identities (`issue:42` vs `planning:42`) that never coalesce onto each other.
+
+**Every planning run is operator-initiated.** No timer, label route, or
+scheduler path can produce one; the only producers are this endpoint and the
+`tech_lead` CLI. That is deliberate until a real pilot has established how the
+role behaves.
 
 The response is a typed admission outcome — `queued`, `already_queued`,
 `already_running`, `paused`, `not_configured`, `not_eligible`, `claim_conflict`,
 or `failed` — with a machine-readable `reason` and human `detail` the dashboard
-surfaces as a durable toast. Repeated clicks coalesce onto one logical run
-(`run_key`), and an issue-scoped request is revalidated against GitHub right
-before it is queued, so a closed or no-longer-blocked target is refused rather
-than launched.
+surfaces as a durable toast. A blocked subject requested as a planning run is
+refused with `issue_blocked`; an unblocked subject requested as an investigation
+is refused with `no_longer_blocked`. Repeated clicks coalesce onto one logical
+run (`run_key`), and an issue-scoped request is revalidated against GitHub right
+before it is queued, so a closed or ineligible target is refused rather than
+launched.
+
+A planning run stages its subject's declared canonical context before the agent
+starts — see [`Governed-by:` in the FAQ](../user/faq.md) (Q26) for the syntax an
+issue author writes.
 
 Admission only ENQUEUES. The planner still launches, so a hand-aimed run gets
 byte-for-byte the same evidence map, launch authority, and sandboxing an

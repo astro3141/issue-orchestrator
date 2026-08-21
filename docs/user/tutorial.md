@@ -374,6 +374,37 @@ Each issue needs a stable identity for session tracking, dependency resolution, 
 
 The prefix format is `[M<digits>-<3 digits>]` — for example `[M1-010]`, `[M2-005]`, `[M10-999]`. It must appear at the very start of the title.
 
+### Governing Sources (`Governed-by:`)
+
+`Depends-on:` says *when* an issue may run. `Governed-by:` says *what the tech lead must read before planning it* — the working procedure or standing policy the issue has to honour. When you ask for a tech-lead **planning investigation** of an issue (`issue-orchestrator tech_lead <issue#> --flavor planning_investigation`, or the dashboard's equivalent request), each declared source's body and comments are fetched and staged into the session before the agent starts.
+
+Write one directive per line in the **subject issue's body**:
+
+```text
+Governed-by: #21                    # required — the run refuses to start without it
+Governed-by-optional: #23           # optional — recorded as absent if it can't be read
+```
+
+| Keyword | If the source cannot be read | Use it for |
+|---|---|---|
+| `Governed-by:` | **The launch fails** — no session starts | The procedure the plan is worthless without |
+| `Governed-by-optional:` | Recorded as absent, with the reason; the run continues | Helpful background, working notes |
+
+Rules, all of which fail **loudly** rather than silently dropping the line:
+
+| What you wrote | What happens |
+|---|---|
+| `Governed-by: #21` | Same-repo issue #21 is staged |
+| `Governed-by: 21` | **Rejected** — the value must start with `#` |
+| `Governed-by: M1-010` | **Rejected** — external IDs are not governing-source references; use `#<number>` |
+| `Governed-by: org/other-repo#5` | **Rejected** — governing sources must be in the same repository |
+| `Governed-by: #21` on issue #21 | **Rejected** — the subject is always staged as itself |
+| `Governed-by: #21` twice, or `Governed-by: #21` plus `Governed-by-optional: #21` | **Rejected** — one line per source, or "required" is ambiguous |
+
+The keyword is case-insensitive and the line may be indented; a trailing `#` comment after the reference is fine. Unlike `Depends-on:`, there is **no milestone restriction** — a governing source is reading material, not an ordering edge, so it never blocks or schedules anything.
+
+A rejected declaration is a defect in the issue body: fix the line and request the run again.
+
 ### Example Issue
 
 **Title**: `[P1-010] Add user profile endpoint`

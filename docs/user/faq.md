@@ -221,3 +221,35 @@ A: There are two levels.
 An issue is only *eligible* in the first place once its `Depends-on:` dependencies are closed (see Q22).
 
 **Gotcha:** the `priority:high` / `priority:medium` / `priority:low` **labels do not affect this order** — they exist for human/tech lead organization. Scheduling priority comes from the milestone and the `[P<n>-nnn]` title prefix, not the labels. So two issues in the same milestone with no `[P…]` prefix run in **issue-number order**, regardless of their priority labels — a newer issue (higher number) runs later even if it's labeled `priority:high`.
+
+**Q26: What do `Governed-by:` and `Governed-by-optional:` do, and how do I write them?**
+A: They declare the issues a **tech-lead planning investigation** must read before it prepares this issue — the working procedure or standing policy the plan has to honour. Put them in the **subject issue's body**, one per line, exactly like `Depends-on:`:
+
+```text
+Governed-by: #21                    # required
+Governed-by-optional: #23           # optional
+```
+
+When you request a planning run for that issue (`issue-orchestrator tech_lead 42 --flavor planning_investigation`, or the dashboard's equivalent request), each declared source's body and comments are fetched and staged into the session's run directory before the agent starts, along with a `canonical-context.json` recording each source's issue number, revision and content digest.
+
+The two keywords differ in **one** way — what happens when a source cannot be read:
+
+| Keyword | Source unreadable | Use it for |
+|---|---|---|
+| `Governed-by:` | **The launch fails.** No session starts; the run is retry-queued | The procedure the plan would be worthless without |
+| `Governed-by-optional:` | Recorded in the descriptor as absent, with the reason; the run continues | Helpful background, working notes |
+
+A source that was declared and could not be staged is a *different fact* from a source that was never declared: the first appears in `canonical-context.json` with `staged: false`, the second does not appear at all.
+
+**Syntax rules.** Every one of these is **rejected loudly** (the run does not start) rather than being silently ignored — the opposite of `Depends-on:`, where an unrecognized value is skipped:
+
+| What you wrote | What happens | Fix |
+|---|---|---|
+| `Governed-by: #21` | Same-repo issue #21 is staged | — |
+| `Governed-by: 21` | **Rejected** — the value must begin with `#` | `Governed-by: #21` |
+| `Governed-by: M1-010` | **Rejected** — external IDs are not governing-source references | Look up that issue's number and write `Governed-by: #42` |
+| `Governed-by: org/other-repo#5` | **Rejected** — governing sources must live in the same repository | Copy the text into a same-repo issue |
+| `Governed-by: #21` on issue #21 | **Rejected** — the subject is always staged as itself | Delete the line |
+| `Governed-by: #21` and `Governed-by-optional: #21` | **Rejected** — two lines for one source leave "required" ambiguous | Keep exactly one |
+
+The keyword is case-insensitive, the line may be indented, and a trailing `# comment` after the reference is fine. Unlike `Depends-on:` (Q22) there is **no milestone restriction** and no scheduling effect at all: a governing source is reading material, never an ordering edge, so it neither blocks the issue nor changes when it runs.

@@ -29,12 +29,13 @@ from ..contracts.ui_openapi_models import (
 )
 from ..domain.tech_lead_run import (
     GlobalHealthReviewScope,
-    IssueInvestigationScope,
     TechLeadRunAdmission,
     TechLeadRunOutcome,
     TechLeadRunRequest,
     TechLeadRunScope,
     TechLeadRunTrigger,
+    focused_run_flavor,
+    scope_for_flavor,
 )
 from .web_session_context import WebOrchestratorDependency
 
@@ -64,10 +65,20 @@ _OUTCOME_STATUS: dict[TechLeadRunOutcome, int] = {
 
 
 def _domain_scope(payload: TechLeadRunRequestPayload) -> TechLeadRunScope:
-    """Project the wire scope onto the control-layer scope value."""
+    """Project the wire scope onto the control-layer scope value.
+
+    An issue-scoped request names WHICH focused role it wants (#189): the two
+    focused flavors share one shape and one wire ``kind``, and differ by
+    identity — a recovery investigation of a blocked subject, or a planning
+    investigation of an open one. Naming nothing still means failure
+    investigation, so every request built before the discriminator existed
+    projects onto exactly the scope it did before.
+    """
     scope = payload.scope
     if isinstance(scope, TechLeadIssueScopePayload):
-        return IssueInvestigationScope(scope.issue_number)
+        return scope_for_flavor(
+            focused_run_flavor(scope.flavor), issue_number=scope.issue_number
+        )
     return GlobalHealthReviewScope()
 
 

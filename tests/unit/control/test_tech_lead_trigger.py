@@ -488,3 +488,83 @@ def test_unclean_facade_termination_survives_into_health_review_result() -> None
     assert result.termination.clean is False
     assert result.termination.leaked_worktree == "/wt/repo-tech-lead-200-xyz"
     assert "cleanup INCOMPLETE" in result.detail
+
+
+# ---------------------------------------------------------------------------
+# The focused flavor an operator aims (#189)
+# ---------------------------------------------------------------------------
+
+
+def test_the_cli_owner_dispatches_a_failure_investigation_by_default() -> None:
+    """Omitting ``flavor`` is byte-identical to the behaviour before #189."""
+    host = _FakeHost(issue=_issue(5980), ticks_to_complete=2)
+
+    results = run_targeted_investigations(
+        host, [5980], now=_clock([0, 1, 2, 3, 4]), sleep=_noop_sleep
+    )
+
+    assert host.launched[0].flavor is TechLeadSessionFlavor.FAILURE_INVESTIGATION
+    assert results[0].detail == "investigation completed for issue #5980"
+
+
+def test_the_cli_owner_dispatches_a_planning_investigation_when_aimed() -> None:
+    """#189: the CLI half of the focused-flavor discriminator.
+
+    The queue entry proves it reached ``_admit_planning``: only that branch
+    produces a PLANNING_INVESTIGATION item, and it manufactures no failure
+    context for a subject that never failed.
+    """
+    host = _FakeHost(issue=_issue(5980, labels=()), ticks_to_complete=2)
+
+    results = run_targeted_investigations(
+        host,
+        [5980],
+        flavor=TechLeadSessionFlavor.PLANNING_INVESTIGATION,
+        now=_clock([0, 1, 2, 3, 4]),
+        sleep=_noop_sleep,
+    )
+
+    tech_lead = host.launched[0]
+    assert tech_lead.flavor is TechLeadSessionFlavor.PLANNING_INVESTIGATION
+    assert tech_lead.failure is None
+    assert results[0].status is TechLeadOutcomeStatus.COMPLETED
+    # The result names the role that ran, not "investigation" for both.
+    assert results[0].detail == "planning investigation completed for issue #5980"
+
+
+def test_a_planning_dispatch_at_a_blocked_subject_is_refused_by_its_own_rule() -> None:
+    """The blocked subject belongs to the recovery role, and says so.
+
+    ``issue_blocked`` — the PLANNING refusal — not the investigation's
+    ``no_longer_blocked``, so the operator learns which role they aimed wrongly.
+    """
+    host = _FakeHost(issue=_issue(5980, labels=("blocked-failed",)))
+
+    results = run_targeted_investigations(
+        host,
+        [5980],
+        flavor=TechLeadSessionFlavor.PLANNING_INVESTIGATION,
+        now=_clock([0]),
+        sleep=_noop_sleep,
+    )
+
+    assert host.launched == []
+    assert results[0].status is TechLeadOutcomeStatus.NOT_LAUNCHED
+    assert "issue_blocked" in results[0].detail
+    assert "planning investigation of issue #5980 not admitted" in results[0].detail
+
+
+def test_a_whole_board_flavor_cannot_be_aimed_at_an_issue() -> None:
+    """A global flavor here would admit an exclusive review as one issue's run."""
+    host = _FakeHost(issue=_issue(5980, labels=()))
+
+    with pytest.raises(ValueError, match="focused tech-lead run flavor"):
+        run_targeted_investigations(
+            host,
+            [5980],
+            flavor=TechLeadSessionFlavor.HEALTH_REVIEW,
+            now=_clock([0]),
+            sleep=_noop_sleep,
+        )
+
+    assert host.pause_calls == 0  # refused before the planner was halted

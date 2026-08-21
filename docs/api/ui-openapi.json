@@ -3322,7 +3322,8 @@
         "required": ["kind", "issue_number"],
         "properties": {
           "kind": {"const": "issue"},
-          "issue_number": {"type": "integer", "minimum": 1}
+          "issue_number": {"type": "integer", "minimum": 1},
+          "flavor": {"enum": ["failure_investigation", "planning_investigation"]}
         }
       },
       "TechLeadRunScopePayload": {

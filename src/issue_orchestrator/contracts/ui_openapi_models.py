@@ -1215,6 +1215,7 @@ class TechLeadGlobalHealthReviewScopePayload(BaseModel):
 
 class TechLeadIssueScopePayload(BaseModel):
     model_config = ConfigDict(extra="forbid")
+    flavor: Literal['failure_investigation', 'planning_investigation'] | None = None
     issue_number: int = Field(..., ge=1, strict=True)
     kind: Literal['issue']
 

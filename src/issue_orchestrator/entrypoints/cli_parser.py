@@ -6,6 +6,11 @@ from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 
+from ..domain.tech_lead_run import (
+    DEFAULT_FOCUSED_RUN_FLAVOR,
+    FOCUSED_RUN_FLAVOR_NAMES,
+)
+
 CommandHandler = Callable[[argparse.Namespace], int]
 
 
@@ -361,7 +366,17 @@ def _register_runtime_commands(subparsers, handlers: CLICommandHandlers) -> None
         "issues",
         nargs="+",
         type=int,
-        help="Issue number(s) for the tech lead to investigate",
+        help="Issue number(s) for the tech lead to work, one run each",
+    )
+    tech_lead_parser.add_argument(
+        "--flavor",
+        choices=FOCUSED_RUN_FLAVOR_NAMES,
+        default=DEFAULT_FOCUSED_RUN_FLAVOR.value,
+        help=(
+            "Which focused tech-lead role to aim: failure_investigation"
+            " (default) recovers a blocked issue; planning_investigation"
+            " prepares an open, non-blocked one"
+        ),
     )
     tech_lead_parser.add_argument(
         "--advise-only",
@@ -372,7 +387,7 @@ def _register_runtime_commands(subparsers, handlers: CLICommandHandlers) -> None
         "--timeout",
         type=float,
         default=1800.0,
-        help="Per-issue seconds to wait for the investigation (default: 1800)",
+        help="Per-issue seconds to wait for the run (default: 1800)",
     )
     tech_lead_parser.set_defaults(func=handlers.tech_lead)
 

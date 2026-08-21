@@ -1190,6 +1190,7 @@ export interface TechLeadGlobalHealthReviewScopePayload {
 }
 
 export interface TechLeadIssueScopePayload {
+  flavor?: "failure_investigation" | "planning_investigation";
   issue_number: number;
   kind: "issue";
 }

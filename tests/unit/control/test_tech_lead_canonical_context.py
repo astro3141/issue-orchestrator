@@ -528,6 +528,37 @@ class TestOptionalDegradesHonestly:
         # Degradation is honest, not silent: the run still launches.
         assert manifest["canonical_context"]
 
+    @pytest.mark.parametrize(
+        "message", ["", "   ", "\n", "\t\n "], ids=["empty", "spaces", "newline", "mixed"]
+    )
+    def test_a_blank_exception_message_still_yields_an_honest_absent_record(
+        self, tmp_path: Path, message: str
+    ) -> None:
+        """PR #184 N3: a whitespace-only message must not become a ValueError.
+
+        ``CanonicalSource`` rejects an absence reason that is only whitespace,
+        so recording ``str(exc)`` verbatim turned an OPTIONAL source's honest
+        degradation into an unhandled crash — the exact failure direction the
+        required/optional split exists to prevent. The exception class name is
+        the fallback, because "something failed and said nothing" still has to
+        read as a reason.
+        """
+        subject = _issue(SUBJECT, body=f"Governed-by-optional: #{POLICY}\n")
+        host = _Host(
+            issues={SUBJECT: subject}, errors={POLICY: TimeoutError(message)}
+        )
+        run_dir = tmp_path / "run"
+
+        snapshot, manifest = _stage(run_dir, host, subject=subject)
+
+        assert snapshot is not None
+        recorded = snapshot.source(POLICY)
+        assert recorded is not None
+        assert recorded.staged is False
+        assert recorded.absent_reason == "TimeoutError"
+        # The run still launches: an optional source degrades, never crashes.
+        assert manifest["canonical_context"]
+
     def test_a_half_staged_optional_source_leaves_nothing_behind(
         self, tmp_path: Path
     ) -> None:
