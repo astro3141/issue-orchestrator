@@ -14,6 +14,13 @@ path — see :mod:`..control.tech_lead_trigger`, whose owners reuse
 lifecycle) so evidence-map staging + authority are identical to a reactive
 launch. Extracted from ``cli.py`` (a line-budgeted hotspot) alongside the other
 per-area command modules (``cli_queue_commands``, ``cli_utility_commands``).
+
+Both also carry the obligation ``cli_run_modes`` names for the three ``start``
+modes: a mode either binds a Control API and publishes the bound port, or says
+it serves none. These commands serve none, and until they said so no session
+launch of any flavor could proceed (#193) — see
+:func:`_build_one_shot_orchestrator`, which is why building the one-shot
+orchestrator and answering that question are one step.
 """
 
 from __future__ import annotations
@@ -34,6 +41,12 @@ if TYPE_CHECKING:
     from ..infra.repo_lock import AlreadyRunning
 
 console = Console()
+
+#: The Control API port a one-shot tech-lead command requests: none. Neither
+#: command exposes ``--api-port`` and neither binds a server, so this is the
+#: value that makes the shared ``declare_no_control_api`` owner declare the
+#: endpoint unavailable rather than leave it unresolved (#193).
+_ONE_SHOT_CONTROL_API_PORT: int | None = None
 
 
 def cmd_tech_lead(args: argparse.Namespace) -> int:
@@ -67,7 +80,7 @@ def cmd_tech_lead(args: argparse.Namespace) -> int:
         with held_repo_lock(config.repo_root):
             _configure_one_shot_tech_lead_run(config, label="tech_lead")
             _apply_advise_only_authority(args, config)
-            orchestrator = _build_orchestrator(config)
+            orchestrator = _build_one_shot_orchestrator(config)
             console.print(
                 f"[green]Dispatching a tech-lead {focused_run_label(flavor)}"
                 " at:[/green] " + ", ".join(f"#{n}" for n in args.issues)
@@ -126,7 +139,7 @@ def cmd_health_review(args: argparse.Namespace) -> int:
         with held_repo_lock(config.repo_root):
             _configure_one_shot_tech_lead_run(config, label="health-review")
             _apply_advise_only_authority(args, config)
-            orchestrator = _build_orchestrator(config)
+            orchestrator = _build_one_shot_orchestrator(config)
             console.print(
                 "[green]Running an on-demand whole-board health review"
                 " (walk the floor)...[/green]"
@@ -267,6 +280,44 @@ def _build_orchestrator(config: "Config") -> "Orchestrator":
     from .bootstrap import build_orchestrator
 
     return build_orchestrator(config=config)
+
+
+def _build_one_shot_orchestrator(config: "Config") -> "Orchestrator":
+    """Build the one-shot orchestrator AND answer its callback-endpoint question.
+
+    Both halves in one owner, because a one-shot orchestrator that skips the
+    second half cannot launch anything at all: every session launch is gated on
+    :meth:`AgentCallbackEndpoint.is_ready`, which stays false until a run mode
+    either publishes a bound Control API port or declares that it serves none.
+    These commands did neither, so the guard refused every attempt before the
+    launcher reached its first log line (#193).
+
+    The answer is ``declare_no_control_api(..., None)`` — the SAME owner
+    ``run_no_dashboard`` uses for a mode started without ``--api-port``, given
+    the port these commands request: none. That is not a shortcut past the
+    guard, it is the truth about this mode. Neither ``tech_lead`` nor
+    ``health-review`` exposes ``--api-port``, neither binds a
+    ``ControlAPIServer``, and both hold the repo lock for their whole lifetime,
+    so no other engine is serving one either.
+
+    Declaring it is also the SAFER of the two answers, not merely the cheaper
+    one. ``resolve_port`` treats "unavailable" as absolute, so the agent
+    environment simply omits ``ISSUE_ORCHESTRATOR_API_PORT``; leaving the
+    question unanswered would instead resolve the CONFIGURED port and hand the
+    agent an address with nothing listening on it — the dead endpoint that made
+    callbacks fail in #6913 / #6924. And nothing on this path needs one: a
+    tech-lead run completes by writing its completion record to
+    ``ISSUE_ORCHESTRATOR_COMPLETION_PATH``, which the drive loop's ``tick()``
+    observes from the filesystem. ``coding-done``'s only Control API calls are
+    the preflight-push check (explicitly skipped when no port is set — and this
+    role pushes nothing) and the opt-in ``--resume``; review-exchange verdict
+    delivery belongs to review sessions, which a one-shot run never launches.
+    """
+    from .cli_run_modes import declare_no_control_api
+
+    orchestrator = _build_orchestrator(config)
+    declare_no_control_api(orchestrator, _ONE_SHOT_CONTROL_API_PORT)
+    return orchestrator
 
 
 def _release(orchestrator: "Orchestrator") -> None:

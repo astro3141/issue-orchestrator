@@ -18,6 +18,9 @@ from issue_orchestrator.control.tech_lead_trigger import (
     TechLeadOutcomeStatus,
 )
 from issue_orchestrator.entrypoints import cli_tech_lead
+from issue_orchestrator.infra.agent_callback_endpoint import (
+    RuntimeAgentCallbackEndpoint,
+)
 from issue_orchestrator.infra.config import Config
 from issue_orchestrator.infra.repo_lock import AlreadyRunning
 
@@ -158,3 +161,96 @@ class TestCmdHealthReview:
         assert "TERMINATION INCOMPLETE" in out  # not a bare "session terminated"
         assert "/wt/repo-tech-lead-200-abc" in out  # the exact leaked path
         assert "remove it manually" in out
+
+
+class TestTheOneShotAnswersTheCallbackEndpointQuestion:
+    """A one-shot run mode owes the same answer the three ``start`` modes owe.
+
+    Every session launch is gated on the agent-callback endpoint having
+    been resolved either way. These commands published no port and
+    declared no unavailability, so the gate refused every attempt before
+    the launcher reached its first log line and the operator saw only
+    "launch declined" (#193).
+    """
+
+    def _dispatch(self, command, args, *, on_dispatch):
+        """Run ``command`` with a real endpoint, observing it AT dispatch time.
+
+        ``on_dispatch`` runs where the driver would launch a session, which
+        is the only moment the assertion is about: answering the question
+        after the launch attempt would be no answer at all.
+        """
+        config = Config()
+        orchestrator = Mock()
+        orchestrator.deps.agent_callback_endpoint = RuntimeAgentCallbackEndpoint()
+        load_p, log_p = _patches(config)
+        driver = {
+            cli_tech_lead.cmd_tech_lead: "run_targeted_investigations",
+            cli_tech_lead.cmd_health_review: "run_health_review",
+        }[command]
+        with load_p, log_p, _lock_held_ok(), patch.object(
+            cli_tech_lead, "_build_orchestrator", return_value=orchestrator
+        ), patch(
+            f"issue_orchestrator.control.tech_lead_trigger.{driver}",
+            side_effect=lambda *a, **k: on_dispatch(orchestrator),
+        ) as run:
+            command(args)
+        run.assert_called_once()
+        return orchestrator
+
+    def test_targeted_dispatch_finds_the_endpoint_resolved(self) -> None:
+        """The live-proof path: a targeted ``tech_lead`` run (#193)."""
+        seen: list[bool] = []
+
+        self._dispatch(
+            cli_tech_lead.cmd_tech_lead,
+            _args(issues=[23], flavor="planning_investigation"),
+            on_dispatch=lambda orch: seen.append(
+                orch.deps.agent_callback_endpoint.is_ready()
+            )
+            or [],
+        )
+
+        assert seen == [True], "the launch gate would refuse every attempt"
+
+    def test_health_review_shares_the_same_answer(self) -> None:
+        """Same owner, so the whole-board command cannot drift from it.
+
+        This pins the shared wiring only; it is not a claim that the
+        one-shot ``health-review`` path is proven end to end.
+        """
+        seen: list[bool] = []
+
+        self._dispatch(
+            cli_tech_lead.cmd_health_review,
+            _args(),
+            on_dispatch=lambda orch: seen.append(
+                orch.deps.agent_callback_endpoint.is_ready()
+            )
+            or HealthReviewResult(
+                200, status=TechLeadOutcomeStatus.COMPLETED, detail="done"
+            ),
+        )
+
+        assert seen == [True]
+
+    def test_agents_are_told_there_is_no_endpoint_rather_than_a_dead_one(
+        self,
+    ) -> None:
+        """Ready is not enough: the resolved port must not be a lie.
+
+        Nothing binds a Control API here, so resolving the CONFIGURED
+        port would hand every spawned agent an address with nothing
+        listening on it — the dead endpoint of #6913 / #6924. Declared
+        unavailability wins over the configured fallback, so the agent
+        environment omits the variable instead.
+        """
+        orchestrator = self._dispatch(
+            cli_tech_lead.cmd_tech_lead,
+            _args(issues=[23], flavor="planning_investigation"),
+            on_dispatch=lambda _orch: [],
+        )
+
+        endpoint = orchestrator.deps.agent_callback_endpoint
+        assert endpoint.resolve_port(19080) is None
+        assert endpoint.resolve_port(0) is None
