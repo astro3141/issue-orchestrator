@@ -19,9 +19,11 @@ session without asking whose session it is, and the rejection path below used
 to add ``blocked-failed`` unconditionally. For a role whose capability row
 omits every recovery kind (#136's ``planning_investigation``), both are a
 recovery-state change the role may not propose — reached by crashing, or by
-proposing the very action the capability gate refused. ``permits_recovery`` on
-the capability policy is the single owner of the answer;
-:func:`_may_leave_recovery_label_on_subject` is the single place it is asked.
+proposing the very action the capability gate refused.
+:class:`~.subject_recovery_authority.SubjectRecoveryAuthority` owns the answer
+for every path that asks; this module is where a tech_lead session's run is
+resolved into one (:func:`resolve_subject_recovery_authority`), for its own two
+paths and for the generic ones that cannot resolve it themselves (#182).
 
 Everything else a failure produces is untouched: the rejection surface, the
 operator comment, the manifest labels, the anchor close, and the released
@@ -35,7 +37,6 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from ..domain.models import Session, SessionStatus
-from ..domain.tech_lead_capabilities import TECH_LEAD_ACTION_CAPABILITIES
 from ..domain.tech_lead_session import TechLeadLaunchAuthority, TechLeadSessionFlavor
 from .actions import (
     Action,
@@ -45,6 +46,10 @@ from .actions import (
     RemoveLabelAction,
 )
 from .label_manager import LabelManager
+from .subject_recovery_authority import (
+    SUBJECT_RECOVERY_UNBOUNDED,
+    SubjectRecoveryAuthority,
+)
 from .tech_lead_completion import (
     manifest_label_actions,
     resolve_launch_authority_for_session,
@@ -98,8 +103,22 @@ def generate_tech_lead_decision_failure_actions(
     # owner: may this run leave a recovery label on its own subject? Without an
     # authority record the role is unproven, so the generic label stands — the
     # conservative direction, matching plan_tech_lead_terminal_effects.
-    bounded_role = authority is not None and not _may_leave_recovery_label_on_subject(
-        authority.flavor
+    subject_recovery = (
+        SUBJECT_RECOVERY_UNBOUNDED
+        if authority is None
+        else SubjectRecoveryAuthority.for_flavor(authority.flavor)
+    )
+    rejection_block = subject_recovery.recovery_label_outcome(
+        add_label=AddLabelAction(
+            issue_number=session.issue.number,
+            label=labels.blocked_failed,
+            reason=f"Tech Lead completion rejected ({failure})",
+            expected=expected,
+        ),
+        note_when_added=(
+            f"The session is recorded as failed and `{labels.blocked_failed}`"
+            " was added. Remove the label to allow reprocessing."
+        ),
     )
     if (
         authority is not None
@@ -116,23 +135,7 @@ def generate_tech_lead_decision_failure_actions(
         )
     )
     detail_text = detail or "no detail recorded"
-    outcome_note = (
-        _no_recovery_authority_note(suppressed=(labels.blocked_failed,))
-        if bounded_role
-        else (
-            f"The session is recorded as failed and `{labels.blocked_failed}`"
-            " was added. Remove the label to allow reprocessing."
-        )
-    )
-    if not bounded_role:
-        actions.append(
-            AddLabelAction(
-                issue_number=session.issue.number,
-                label=labels.blocked_failed,
-                reason=f"Tech Lead completion rejected ({failure})",
-                expected=expected,
-            )
-        )
+    actions.extend(rejection_block.label_actions)
     actions.extend(
         (
             AddCommentAction(
@@ -144,7 +147,7 @@ def generate_tech_lead_decision_failure_actions(
                     f"> {detail_text}\n\n"
                     f"- Session: `{session.terminal_id}`\n"
                     f"- Runtime: {session.runtime_minutes:.1f} minutes\n\n"
-                    f"{outcome_note}"
+                    f"{rejection_block.note}"
                 ),
                 reason="Durable operator record of the rejected tech_lead completion",
                 expected=expected,
@@ -241,40 +244,36 @@ def plan_tech_lead_terminal_effects(
     )
 
 
-def _may_leave_recovery_label_on_subject(flavor: TechLeadSessionFlavor) -> bool:
-    """May a run of *flavor* change its own SUBJECT's recovery state? (#136 A1/A2)
+def resolve_subject_recovery_authority(
+    config: "Config",
+    session: Session,
+    *,
+    tech_lead_authority: "TechLeadAuthorityStore",
+) -> SubjectRecoveryAuthority:
+    """The threaded answer for a session the GENERIC paths must plan for (#182).
 
-    The SINGLE owner of that question, asked by both paths that would otherwise
-    answer it separately: the crash path (session died) and the rejection path
-    (session completed with a decision the contract refused). Two enforcement
-    points for one rule is how the boundary ended up half-enforced in the first
-    place — advertised by the capability row, the target scope, and the prompt,
-    and then bypassed by whichever effect path nobody re-read.
+    ``invalid_record_actions`` and the BLOCKED completion path are session
+    machinery with no notion of tech_lead roles, and they never receive a
+    :class:`TechLeadLaunchAuthority`. This is the one place their answer is
+    resolved — same store, same session-shaped read, and the same predicate the
+    crash and rejection paths ask — so closing those two doors adds no second
+    copy of the rule.
 
-    True for a non-focused run: its "subject" is a bookkeeping anchor, not a
-    work item, and the label is part of how that anchor is retired. True for any
-    focused role that may propose a recovery action — its subject's recovery
-    state is already its business. False only for a bounded focused role, whose
-    subject admission accepted precisely because it was OPEN and unblocked.
+    Unbounded, so the generic recovery label stands, for a non-tech_lead
+    session and for a tech_lead session whose launch authority cannot be
+    resolved: an unproven role gets the conservative direction, matching
+    :func:`plan_tech_lead_terminal_effects`. That absence is not logged here —
+    the paths that can reach it either log it already or surface it as a
+    rejection, and a second warning per completion would only be noise.
     """
-    if not flavor.is_issue_focused:
-        return True
-    return TECH_LEAD_ACTION_CAPABILITIES.permits_recovery(flavor)
-
-
-def _no_recovery_authority_note(*, suppressed: tuple[str, ...]) -> str:
-    """Why the subject carries no blocking label, in ONE voice for both paths.
-
-    The crash path suppresses two labels and the rejection path one, so the
-    names are passed in — but an operator reading either issue gets the same
-    explanation, because it is the same rule that produced both.
-    """
-    names = " or ".join(f"`{name}`" for name in suppressed)
-    return (
-        "This role holds no recovery authority over the issue it was sent to"
-        f" work on, so **no {names} label was added** — the issue is left"
-        " exactly as it was and remains available for normal work."
+    if not is_tech_lead_session(config.tech_lead_review_agent, session.issue.agent_type):
+        return SUBJECT_RECOVERY_UNBOUNDED
+    authority, _tamper = resolve_launch_authority_for_session(
+        tech_lead_authority, session
     )
+    if authority is None:
+        return SUBJECT_RECOVERY_UNBOUNDED
+    return SubjectRecoveryAuthority.for_flavor(authority.flavor)
 
 
 # How each TERMINAL status reads in the subject's obituary. A map rather than a
@@ -313,7 +312,8 @@ def _bounded_subject_terminal_actions(
     the same edit.
     """
     flavor = authority.flavor
-    if _may_leave_recovery_label_on_subject(flavor):
+    subject_recovery = SubjectRecoveryAuthority.for_flavor(flavor)
+    if subject_recovery.may_leave_recovery_label:
         return None
     # Faithful stand-in for the generic issue-session terminal effects minus the
     # label: comment, then claim release (``_generate_timeout_actions`` /
@@ -330,8 +330,8 @@ def _bounded_subject_terminal_actions(
                 f" {_TERMINAL_STATUS_PHRASES[status]}.\n\n"
                 f"- Session: `{session.terminal_id}`\n"
                 f"- Runtime: {session.runtime_minutes:.1f} minutes\n\n"
-                + _no_recovery_authority_note(
-                    suppressed=(labels.blocked_failed, labels.needs_human)
+                + subject_recovery.suppression_note(
+                    labels.blocked_failed, labels.needs_human
                 )
             ),
             reason=(

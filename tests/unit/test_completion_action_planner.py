@@ -979,6 +979,237 @@ def test_a_dead_failure_investigation_still_reports_its_subject(
     assert labels.in_progress in removed_labels(actions)
 
 
+# --- #182: the two remaining doors onto a subject's recovery state ------------
+#
+# The crash and rejection paths ask the owner (above). ``invalid_record_actions``
+# and the BLOCKED completion path are GENERIC session machinery that never
+# learns whose session it is, so the answer is threaded to them as a value.
+# Both are reachable for a planning run: every tech_lead flavor runs in an
+# ``issue-`` terminal, a rejected record is an incidental malfunction of any
+# session, and the tech_lead prompt itself instructs the agent to report a
+# missing workspace via ``coding-done blocked``.
+
+_REJECTED_RECORD_DETAIL: dict[str, str] = {
+    "failure_kind": "invalid_completion_record",
+    "failure_reason": "Completion record rejected: unknown field",
+    "completion_load_failure": "invalid_schema",
+    "completion_parse_error": "unknown field",
+}
+
+_NO_RECOVERY_AUTHORITY_PHRASE = "holds no recovery authority over the issue"
+
+
+def test_a_planning_run_with_a_rejected_record_never_blocks_its_subject(
+    tmp_path: Path,
+) -> None:
+    """Door 3 (#182): a malfunctioning record must not do what the role may not.
+
+    A rejected completion record is an incidental malfunction, not the role's
+    designed failure route — but the generic path stamps ``needs-human`` on
+    every ``issue-`` session's issue, which for a planning run is the live,
+    unblocked subject its admission required to be exactly that.
+    """
+    config = make_tech_lead_config(tmp_path)
+    config.retry.interrupted_sessions.enabled = False
+    session = make_tech_lead_session(tmp_path)
+    arm_planning_session(config, session)
+    labels = LabelManager(config)
+
+    actions = make_planner(config).generate_completion_actions(
+        session,
+        SessionStatus.FAILED,
+        completion_detail=dict(_REJECTED_RECORD_DETAIL),
+    )
+
+    assert labels.needs_human not in added_labels(actions)
+    # The claim is still released and the operator still gets the obituary,
+    # with the rejection detail and the one-voice explanation of the absence.
+    assert labels.in_progress in removed_labels(actions)
+    (comment,) = comments(actions)
+    assert "Completion Record Rejected" in comment
+    assert "unknown field" in comment
+    assert _NO_RECOVERY_AUTHORITY_PHRASE in comment
+    assert f"marked as `{labels.needs_human}`" not in comment
+
+
+def test_a_failure_investigation_with_a_rejected_record_still_escalates(
+    tmp_path: Path,
+) -> None:
+    """The suppression is scoped to roles with no recovery authority (#182).
+
+    A failure investigation holds the recovery kinds, so door 3 behaves for it
+    exactly as it did before the bounded flavor existed.
+    """
+    config = make_tech_lead_config(tmp_path)
+    config.retry.interrupted_sessions.enabled = False
+    session = make_tech_lead_session(tmp_path)
+    arm_investigation_session(config, session)
+    labels = LabelManager(config)
+
+    actions = make_planner(config).generate_completion_actions(
+        session,
+        SessionStatus.FAILED,
+        completion_detail=dict(_REJECTED_RECORD_DETAIL),
+    )
+
+    assert labels.needs_human in added_labels(actions)
+    assert labels.in_progress in removed_labels(actions)
+    assert _NO_RECOVERY_AUTHORITY_PHRASE not in comments(actions)[0]
+
+
+def test_a_batch_review_with_a_rejected_record_still_escalates(
+    tmp_path: Path,
+) -> None:
+    """A non-focused run's "subject" is its own anchor, so door 3 is unchanged."""
+    config = make_tech_lead_config(tmp_path)
+    config.retry.interrupted_sessions.enabled = False
+    session = make_tech_lead_session(tmp_path)
+    arm_batch_session(config, session, tmp_path)
+    labels = LabelManager(config)
+
+    actions = make_planner(config).generate_completion_actions(
+        session,
+        SessionStatus.FAILED,
+        completion_detail=dict(_REJECTED_RECORD_DETAIL),
+    )
+
+    assert labels.needs_human in added_labels(actions)
+
+
+def test_an_ordinary_issue_session_with_a_rejected_record_still_escalates(
+    tmp_path: Path,
+) -> None:
+    """No tech_lead configured at all: door 3 keeps its generic behavior (#182)."""
+    config = Config()
+    config.retry.interrupted_sessions.enabled = False
+    labels = LabelManager(config)
+
+    actions = make_planner(config).generate_completion_actions(
+        make_session(tmp_path),
+        SessionStatus.FAILED,
+        completion_detail=dict(_REJECTED_RECORD_DETAIL),
+    )
+
+    assert labels.needs_human in added_labels(actions)
+    assert labels.in_progress in removed_labels(actions)
+    assert _NO_RECOVERY_AUTHORITY_PHRASE not in comments(actions)[0]
+
+
+def test_a_blocked_planning_run_never_blocks_its_subject(tmp_path: Path) -> None:
+    """Door 4 (#182): traced to a conclusion, and it IS reachable.
+
+    #136's exchange left this door untraced. It is reachable: a planning run
+    occupies an ``issue-`` terminal like every other flavor, and the tech_lead
+    prompt tells the agent to report a broken workspace with ``coding-done
+    blocked``. Left open, an agent saying "I could not prepare this" would
+    block the very issue it was sent to prepare.
+    """
+    config = make_tech_lead_config(tmp_path)
+    session = make_tech_lead_session(tmp_path)
+    arm_planning_session(config, session)
+    labels = LabelManager(config)
+
+    actions = make_planner(config).generate_completion_actions(
+        session,
+        SessionStatus.BLOCKED,
+        blocked_reason="tech-lead-data directory missing",
+    )
+
+    assert labels.blocked not in added_labels(actions)
+    assert added_labels(actions) == set()
+    assert labels.in_progress in removed_labels(actions)
+    (comment,) = comments(actions)
+    assert "Session Blocked" in comment
+    assert "tech-lead-data directory missing" in comment
+    assert _NO_RECOVERY_AUTHORITY_PHRASE in comment
+    assert "will not be automatically retried" not in comment
+
+
+def test_a_blocked_planning_run_suppresses_a_reported_blocked_label(
+    tmp_path: Path,
+) -> None:
+    """The suppression follows the label the block would have used (#182).
+
+    A caller-supplied ``blocked_label`` is still a blocking label on the
+    subject, so the rule applies to it and the operator note names it.
+    """
+    config = make_tech_lead_config(tmp_path)
+    session = make_tech_lead_session(tmp_path)
+    arm_planning_session(config, session)
+
+    actions = make_planner(config).generate_completion_actions(
+        session,
+        SessionStatus.BLOCKED,
+        blocked_label="blocked-upstream",
+        blocked_reason="Waiting on dependency",
+    )
+
+    assert added_labels(actions) == set()
+    assert "`blocked-upstream` label was added" in comments(actions)[0]
+
+
+def test_a_blocked_failure_investigation_still_blocks_its_subject(
+    tmp_path: Path,
+) -> None:
+    """Door 4 is unchanged for a role that holds the recovery kinds (#182)."""
+    config = make_tech_lead_config(tmp_path)
+    session = make_tech_lead_session(tmp_path)
+    arm_investigation_session(config, session)
+    labels = LabelManager(config)
+
+    actions = make_planner(config).generate_completion_actions(
+        session,
+        SessionStatus.BLOCKED,
+        blocked_reason="Cannot reproduce",
+    )
+
+    assert labels.blocked in added_labels(actions)
+    assert labels.in_progress in removed_labels(actions)
+    assert _NO_RECOVERY_AUTHORITY_PHRASE not in comments(actions)[0]
+
+
+def test_a_blocked_health_review_still_blocks_its_anchor(tmp_path: Path) -> None:
+    """A non-focused run's blocking label is bookkeeping on its own anchor."""
+    config = make_tech_lead_config(tmp_path)
+    session = make_tech_lead_session(tmp_path)
+    arm_health_review_session(config, session)
+    labels = LabelManager(config)
+
+    actions = make_planner(config).generate_completion_actions(
+        session,
+        SessionStatus.BLOCKED,
+        blocked_reason="Board snapshot unreadable",
+    )
+
+    assert labels.blocked in added_labels(actions)
+
+
+def test_a_provider_blocked_planning_run_records_the_outage(tmp_path: Path) -> None:
+    """The provider route is untouched by #182: it is not a recovery verdict.
+
+    A dead credential says nothing about the issue's substance, and the outage
+    is recorded through its own owner rather than as a blocking label on the
+    subject — so there is no recovery-state change for the threaded answer to
+    suppress, and the claim release must survive.
+    """
+    from issue_orchestrator.ports.provider_resilience import ProviderErrorType
+
+    config = make_tech_lead_config(tmp_path)
+    session = make_tech_lead_session(tmp_path)
+    arm_planning_session(config, session)
+    labels = LabelManager(config)
+
+    actions = make_planner(config).generate_completion_actions(
+        session,
+        SessionStatus.BLOCKED,
+        blocked_reason="Provider not authenticated",
+        provider_error_type=ProviderErrorType.AUTH,
+    )
+
+    assert labels.blocked not in added_labels(actions)
+    assert labels.in_progress in removed_labels(actions)
+
+
 def test_tech_lead_session_without_launch_authority_is_rejected(
     tmp_path: Path, caplog
 ) -> None:

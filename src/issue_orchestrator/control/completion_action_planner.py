@@ -11,14 +11,17 @@ from ..infra.config import Config
 from ..ports import RepositoryHost
 from ..ports.tech_lead_authority import TechLeadAuthorityStore
 from .actions import Action, AddCommentAction, AddLabelAction, RemoveLabelAction
+from .agent_blocked_completion import agent_blocked_actions
 from .open_issue_corpus import OpenIssueCorpusManager
 from .tech_lead_completion import (
     generate_tech_lead_completion_actions,
     has_tech_lead_decision_errors,
 )
+from .subject_recovery_authority import SubjectRecoveryAuthority
 from .tech_lead_terminal_effects import (
     generate_tech_lead_decision_failure_actions,
     plan_tech_lead_terminal_effects,
+    resolve_subject_recovery_authority,
 )
 from .completion_types import (
     ERROR_PREFIX_CREATE_PR,
@@ -228,6 +231,20 @@ class CompletionActionPlanner:
             self.config.tech_lead_review_agent, session.issue.agent_type
         )
 
+    def _subject_recovery(self, session: Session) -> SubjectRecoveryAuthority:
+        """May this run leave a recovery label on its own subject? (#182)
+
+        The two generic paths that stamp one — the rejected-record path and the
+        BLOCKED completion path — are session machinery that never receives a
+        ``TechLeadLaunchAuthority``. Threading the ANSWER from the owner is what
+        closes those doors without giving generic code a flavor to match on.
+        Resolved per branch rather than for every completion so a non-tech_lead
+        session still costs nothing but the agent-type check.
+        """
+        return resolve_subject_recovery_authority(
+            self.config, session, tech_lead_authority=self._tech_lead_authority
+        )
+
     def _generate_tech_lead_actions(
         self, session: Session, expected: ExpectedState
     ) -> list[Action]:
@@ -375,6 +392,7 @@ class CompletionActionPlanner:
                 labels=self._lm,
                 detail=completion_detail,
                 diagnostic_path=diagnostic_path,
+                subject_recovery=self._subject_recovery(session),
             )
             if invalid_actions is not None:
                 return tuple(invalid_actions)
@@ -392,6 +410,7 @@ class CompletionActionPlanner:
                     blocked_label=blocked_label,
                     blocked_reason=blocked_reason,
                     provider_error_type=provider_error_type,
+                    subject_recovery=self._subject_recovery(session),
                 )
             )
 
@@ -683,12 +702,17 @@ class CompletionActionPlanner:
         blocked_label: Optional[str] = None,
         blocked_reason: Optional[str] = None,
         provider_error_type: ProviderErrorType | None = None,
+        *,
+        subject_recovery: SubjectRecoveryAuthority,
     ) -> list[Action]:
-        """Generate actions for a BLOCKED completion.
+        """Route a BLOCKED completion to the owner of that kind of block.
 
-        Two routes, decided here rather than by the caller so "what a block
+        The split is decided here rather than by the caller so "what a block
         means" has one owner: a typed provider verdict is an outage impacting
         the issue, and anything else is the agent reporting it cannot proceed.
+        Each route then owns its own effects — the outage's durable transition,
+        or the issue-blocking label and whether this run's role may leave it
+        (#182).
         """
         if provider_error_type is not None:
             return provider_blocked_actions(
@@ -697,44 +721,14 @@ class CompletionActionPlanner:
                 label_manager=self._lm,
                 provider_availability=self._provider_availability,
             )
-        is_issue_session = session.terminal_id.startswith("issue-")
-        label = blocked_label or self._lm.blocked
-
-        if is_issue_session:
-            reason_text = (
-                blocked_reason.strip() if blocked_reason else "No reason provided."
-            )
-            return [
-                AddLabelAction(
-                    issue_number=session.issue.number,
-                    label=label,
-                    reason="Agent reported issue as blocked",
-                    expected=expected,
-                ),
-                AddCommentAction(
-                    number=session.issue.number,
-                    comment=(
-                        "🚧 **Session Blocked**\n\n"
-                        "The agent reported this issue as blocked.\n\n"
-                        f"**Reason:** {reason_text}\n"
-                        f"- Runtime: {session.runtime_minutes:.1f} minutes\n"
-                        f"- Session: `{session.terminal_id}`\n\n"
-                        f"This issue has been marked as `{label}` and will not be automatically retried.\n"
-                        "Remove the label to allow reprocessing."
-                    ),
-                    reason="Notify about blocked session and reason",
-                    expected=expected,
-                ),
-                RemoveLabelAction(
-                    issue_number=session.issue.number,
-                    label=self._lm.in_progress,
-                    reason="Session blocked - releasing claim",
-                    expected=expected,
-                ),
-            ]
-        # Review/rework BLOCKED completions do not map to issue-blocking labels;
-        # their parent workflows own any PR/review state transitions.
-        return []
+        return agent_blocked_actions(
+            session,
+            expected,
+            label_manager=self._lm,
+            blocked_label=blocked_label,
+            blocked_reason=blocked_reason,
+            subject_recovery=subject_recovery,
+        )
 
     def _generate_review_exchange_halted_actions(
         self,

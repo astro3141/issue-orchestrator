@@ -9,6 +9,7 @@ from ..domain.models import Session
 from .actions import Action, AddCommentAction, AddLabelAction, RemoveLabelAction
 from .completion_record_validation import CompletionRecordLoadFailure
 from .needs_human_block import NeedsHumanCause
+from .subject_recovery_authority import SubjectRecoveryAuthority
 
 if TYPE_CHECKING:
     from .label_manager import LabelManager
@@ -81,8 +82,19 @@ def invalid_record_actions(
     labels: "LabelManager",
     detail: Mapping[str, Any] | None,
     diagnostic_path: str | None,
+    subject_recovery: SubjectRecoveryAuthority,
 ) -> list[Action] | None:
-    """Return actions for a rejected record, or None for ordinary failures."""
+    """Return actions for a rejected record, or None for ordinary failures.
+
+    ``subject_recovery`` is the caller-threaded answer to "may this run change
+    its own subject's recovery state?" (#182). This module is generic session
+    machinery — it never learns whose session it is — so it receives the ANSWER
+    rather than the role, and asks nothing about flavors. A run that may not
+    leave a recovery label keeps everything else this path does: the operator
+    still gets the obituary comment, and the claim is still released. It is a
+    REQUIRED argument because a default would silently re-open the door for any
+    future caller that forgot it.
+    """
     if not _is_invalid_record(detail):
         return None
 
@@ -98,6 +110,21 @@ def invalid_record_actions(
     )
     diagnostic = _non_empty_str(diagnostic_path) or _field(detail, "diagnostic_path")
 
+    # An issue session's rejected record escalates to needs-human — unless the
+    # run holds no recovery authority over its subject, which is the owner's
+    # call, not this module's (#182). The label and the sentence that describes
+    # it come back together so the comment cannot disagree with the action list.
+    escalation = subject_recovery.recovery_label_outcome(
+        add_label=AddLabelAction(
+            issue_number=issue_number,
+            label=labels.needs_human,
+            reason="Completion record could not be accepted by orchestrator",
+            needs_human_cause=NeedsHumanCause.SESSION_LIFECYCLE,
+            expected=expected,
+        ),
+        note_when_added=_needs_human_note(labels.needs_human),
+    )
+
     comment = _comment(
         title=(
             "Completion Record Rejected"
@@ -110,18 +137,12 @@ def invalid_record_actions(
         diagnostic_path=diagnostic,
         runtime_minutes=session.runtime_minutes,
         session_id=session.terminal_id,
-        needs_human_label=labels.needs_human if issue_work else None,
+        terminal_note=escalation.note if issue_work else _PR_PENDING_NOTE,
     )
 
     if issue_work:
         return [
-            AddLabelAction(
-                issue_number=issue_number,
-                label=labels.needs_human,
-                reason="Completion record could not be accepted by orchestrator",
-                needs_human_cause=NeedsHumanCause.SESSION_LIFECYCLE,
-                expected=expected,
-            ),
+            *escalation.label_actions,
             AddCommentAction(
                 number=issue_number,
                 comment=comment,
@@ -172,7 +193,7 @@ def _comment(
     diagnostic_path: str | None,
     runtime_minutes: float,
     session_id: str,
-    needs_human_label: str | None,
+    terminal_note: str,
 ) -> str:
     lines = [
         f"**{title}**",
@@ -191,7 +212,7 @@ def _comment(
             "",
         ]
     )
-    lines.append(_terminal_note(needs_human_label))
+    lines.append(terminal_note)
     return "\n".join(lines)
 
 
@@ -212,14 +233,18 @@ def _append_optional(lines: list[str], label: str, value: str | None) -> None:
         lines.append(f"- {label}: `{value}`")
 
 
-def _terminal_note(needs_human_label: str | None) -> str:
-    if needs_human_label:
-        return (
-            f"This issue has been marked as `{needs_human_label}` because "
-            "the orchestrator could not safely apply the agent's requested "
-            "outcome.\nRemove the label after correcting or rerunning the task."
-        )
+# How the comment ends for a non-issue session: nothing on the board changed,
+# so there is no recovery state to describe.
+_PR_PENDING_NOTE = (
+    "The PR remains pending because the orchestrator could not safely apply "
+    "the agent's requested outcome."
+)
+
+
+def _needs_human_note(needs_human_label: str) -> str:
+    """How the comment ends when the escalation label WAS added."""
     return (
-        "The PR remains pending because the orchestrator could not safely apply "
-        "the agent's requested outcome."
+        f"This issue has been marked as `{needs_human_label}` because "
+        "the orchestrator could not safely apply the agent's requested "
+        "outcome.\nRemove the label after correcting or rerunning the task."
     )
