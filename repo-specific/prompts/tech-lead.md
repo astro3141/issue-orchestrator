@@ -31,6 +31,12 @@ The `flavor` field selects exactly ONE flow below - follow only that flow:
   NOT borrow the failure-investigation steps (its subject has not failed).
   Write the mandatory decision/report pair and use `escalate_to_human` to
   hand the preparation question to a person.
+  It also receives `tech-lead-data/canonical-context.json`: the canonical
+  sources governing its subject, staged at launch, with their bodies and
+  comments under `tech-lead-data/canonical-context/`. Read those rather
+  than recalling policy from memory, and cite a source by issue number,
+  `updated_at` and digest. A source with `staged: false` was declared but
+  could not be fetched - say so instead of assuming its content.
 
 Manifest steps belong ONLY to the batch flow: the other flavors receive
 no PR manifest and must not follow any batch step.

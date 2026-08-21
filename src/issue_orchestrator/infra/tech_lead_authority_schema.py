@@ -24,6 +24,21 @@ CREATE TABLE IF NOT EXISTS tech_lead_launch_authority (
     recorded_at TEXT NOT NULL,
     PRIMARY KEY (run_id, session_name)
 );
+-- Sibling of the launch authority, keyed by the SAME run identity: what
+-- CANONICAL CONTEXT governed a planning run (#183), by issue, revision and
+-- digest. Kept out of ``tech_lead_launch_authority`` on purpose — that row is
+-- the sole authority for a session's flavor, focus, manifest PR set and
+-- anchor, and a source list riding inside it would read as an authority
+-- grant. This one grants nothing; it is provenance, and it is never deleted,
+-- so it still answers "which sources governed that run" after the run's
+-- disposable worktree has been reaped.
+CREATE TABLE IF NOT EXISTS tech_lead_canonical_context (
+    run_id TEXT NOT NULL,
+    session_name TEXT NOT NULL,
+    context TEXT NOT NULL,
+    recorded_at TEXT NOT NULL,
+    PRIMARY KEY (run_id, session_name)
+);
 CREATE TABLE IF NOT EXISTS tech_lead_proposal_ops (
     issue_number INTEGER PRIMARY KEY,
     op TEXT NOT NULL,
