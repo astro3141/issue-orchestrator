@@ -447,6 +447,33 @@ def test_a_globally_scoped_queued_run_is_never_re_read_as_a_subject():
     assert repository_host.get_issue_calls == []
 
 
+def test_a_queued_planning_subject_is_read_authoritatively_too():
+    """Both FOCUSED runs are revalidated against their subject's lifecycle.
+
+    A planning run left out of this read would never see its subject close
+    while it waited, and would launch to prepare a closed issue (#136).
+    """
+    closed = _issue(109, ["agent:backend"], state="closed")
+    repository_host = _RecordingRepositoryHost([closed])
+    state = OrchestratorState()
+    state.pending_tech_lead_reviews.append(
+        PendingTechLeadReview(
+            109,
+            "Prepare the thing",
+            flavor=TechLeadSessionFlavor.PLANNING_INVESTIGATION,
+        )
+    )
+
+    board = repository_host.list_issues()
+    assert board == []
+
+    subjects = _fact_gatherer(repository_host).gather_tech_lead_subject_facts(
+        state, board
+    )
+
+    assert [issue.number for issue in subjects] == [109]
+
+
 def test_an_unreadable_subject_keeps_its_run_rather_than_cancelling_it():
     """Absence still proves nothing — including the absence of a read."""
 

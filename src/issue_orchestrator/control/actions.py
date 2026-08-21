@@ -265,7 +265,7 @@ class DropTechLeadAction(Action):
 
     Emitted when launch-time revalidation finds the subject closed or no longer
     blocked. ``reason``/``detail`` carry the typed refusal produced by
-    :func:`.tech_lead_run_admission.issue_run_eligibility`, so the withdrawal
+    :func:`.tech_lead_launch_planning.subject_run_eligibility`, so the withdrawal
     event names the same machine-readable cause a rejected REQUEST would have.
     """
 

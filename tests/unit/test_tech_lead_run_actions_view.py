@@ -12,6 +12,8 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
+import pytest
+
 from issue_orchestrator.domain.models import (
     DiscoveredFailure,
     OrchestratorState,
@@ -84,6 +86,24 @@ def _investigation(number: int) -> PendingTechLeadReview:
     )
 
 
+def _planning(number: int) -> PendingTechLeadReview:
+    """A queued planning investigation — no failure context by construction."""
+    return PendingTechLeadReview(
+        number,
+        f"Prepare #{number}",
+        flavor=TechLeadSessionFlavor.PLANNING_INVESTIGATION,
+    )
+
+
+def _focused_pending(
+    number: int, flavor: TechLeadSessionFlavor
+) -> PendingTechLeadReview:
+    """The queued item each focused flavor is actually created with."""
+    if flavor is TechLeadSessionFlavor.PLANNING_INVESTIGATION:
+        return _planning(number)
+    return _investigation(number)
+
+
 def _health_review(anchor: int = 900) -> PendingTechLeadReview:
     return PendingTechLeadReview(
         anchor, "Health Review", flavor=TechLeadSessionFlavor.HEALTH_REVIEW
@@ -142,14 +162,27 @@ def test_a_running_health_review_reads_as_running():
     assert view.running_issue_numbers == ()
 
 
-def test_targeted_runs_are_reported_per_issue():
+@pytest.mark.parametrize(
+    "flavor",
+    [f for f in TechLeadSessionFlavor if f.is_issue_focused],
+    ids=lambda flavor: flavor.value,
+)
+def test_targeted_runs_are_reported_per_issue(flavor: TechLeadSessionFlavor):
+    """Every FOCUSED flavor's subject is a board card, not a whole-board anchor.
+
+    Parametrized over the focused flavors rather than naming
+    ``FAILURE_INVESTIGATION`` (#136 review F1): the projection asks the flavor
+    for its focused-ness, so a regression that narrowed it back to one flavor
+    would file a running planning subject among the whole-board anchors — the
+    per-issue affordances would detach from the card the run is happening on,
+    and the board would offer a targeted action admission then refuses as
+    ``subject_slot_held``.
+    """
     view = read_tech_lead_run_actions(
         _config(),
         _state(
-            pending_tech_lead_reviews=[_investigation(42)],
-            active_sessions=[
-                FakeSession(73, flavor=TechLeadSessionFlavor.FAILURE_INVESTIGATION)
-            ],
+            pending_tech_lead_reviews=[_focused_pending(42, flavor)],
+            active_sessions=[FakeSession(73, flavor=flavor)],
         ),
     )
 
@@ -159,6 +192,9 @@ def test_targeted_runs_are_reported_per_issue():
     assert view.issue_status(73) == STATUS_RUNNING
     assert view.issue_status(7) == STATUS_IDLE
     assert view.global_barrier_active is False
+    # A focused run is not a whole-board run, so neither status text moves.
+    assert view.global_status == STATUS_IDLE
+    assert view.health_review_available is True
 
 
 def test_non_tech_lead_sessions_are_not_reported_as_tech_lead_runs():

@@ -400,3 +400,169 @@ class TestStageEvidenceMap:
             board_snapshot=self._board(),
         )
         assert "evidence_map" not in manifest
+
+
+class TestFocusedScratchWorktree:
+    """A focused run reads its subject's branch; it must never write to it."""
+
+    @staticmethod
+    def _config(tmp_path: Path):
+        return SimpleNamespace(repo_root=tmp_path / "repo")
+
+    @staticmethod
+    def _issue(number: int = 109):
+        return SimpleNamespace(number=number, title="Prepare the thing")
+
+    @pytest.mark.parametrize(
+        ("flavor", "branch_stem"),
+        [
+            (
+                TechLeadSessionFlavor.FAILURE_INVESTIGATION,
+                "tech-lead-investigation-109-",
+            ),
+            (
+                TechLeadSessionFlavor.PLANNING_INVESTIGATION,
+                "tech-lead-planning-109-",
+            ),
+        ],
+    )
+    def test_a_focused_run_gets_a_disposable_worktree(
+        self, tmp_path: Path, flavor: TechLeadSessionFlavor, branch_stem: str
+    ) -> None:
+        from issue_orchestrator.control.tech_lead_session_policy import (
+            focused_tech_lead_scratch_identity,
+        )
+        from issue_orchestrator.domain.tech_lead_session import TechLeadLaunchScope
+
+        identity = focused_tech_lead_scratch_identity(
+            self._config(tmp_path),
+            self._issue(),
+            TechLeadLaunchScope(flavor=flavor),
+        )
+
+        assert identity is not None
+        assert identity.branch_name.startswith(branch_stem)
+        # The disposable branch must not look like the subject's own branch to
+        # ``extract_issue_number_from_branch``.
+        assert not identity.branch_name[0].isdigit()
+        assert "tech-lead-109-" in identity.worktree_name
+
+    @pytest.mark.parametrize(
+        "flavor",
+        [TechLeadSessionFlavor.BATCH_REVIEW, TechLeadSessionFlavor.HEALTH_REVIEW],
+    )
+    def test_whole_board_runs_keep_their_anchor_worktree(
+        self, tmp_path: Path, flavor: TechLeadSessionFlavor
+    ) -> None:
+        from issue_orchestrator.control.tech_lead_session_policy import (
+            focused_tech_lead_scratch_identity,
+        )
+        from issue_orchestrator.domain.tech_lead_session import TechLeadLaunchScope
+
+        assert (
+            focused_tech_lead_scratch_identity(
+                self._config(tmp_path),
+                self._issue(),
+                TechLeadLaunchScope(flavor=flavor),
+            )
+            is None
+        )
+
+    def test_two_planning_runs_of_one_issue_do_not_collide(
+        self, tmp_path: Path
+    ) -> None:
+        from issue_orchestrator.control.tech_lead_session_policy import (
+            focused_tech_lead_scratch_identity,
+        )
+        from issue_orchestrator.domain.tech_lead_session import TechLeadLaunchScope
+
+        scope = TechLeadLaunchScope(
+            flavor=TechLeadSessionFlavor.PLANNING_INVESTIGATION
+        )
+        first = focused_tech_lead_scratch_identity(
+            self._config(tmp_path), self._issue(), scope
+        )
+        second = focused_tech_lead_scratch_identity(
+            self._config(tmp_path), self._issue(), scope
+        )
+
+        assert first is not None and second is not None
+        assert first.branch_name != second.branch_name
+        assert first.worktree_name != second.worktree_name
+
+
+class TestRecoveredLaunchScope:
+    """A restarted session comes back as the run it was launched as (#136)."""
+
+    @staticmethod
+    def _config():
+        return SimpleNamespace(tech_lead_review_agent="agent:tech-lead")
+
+    @staticmethod
+    def _run():
+        return SimpleNamespace(run_id="run-1", session_name="issue-109")
+
+    @staticmethod
+    def _issue():
+        # An ordinary board issue: no marker label, no batch title signature —
+        # indistinguishable from a failure investigation's subject.
+        return SimpleNamespace(
+            number=109,
+            title="Prepare the thing",
+            labels=["agent:tech-lead"],
+            agent_type="agent:tech-lead",
+        )
+
+    class _Authority:
+        def __init__(self, recorded=None):
+            self._recorded = recorded
+
+        def load(self, *, run_id, session_name):
+            assert (run_id, session_name) == ("run-1", "issue-109")
+            return self._recorded
+
+        def load_storm_cohort(self, *, anchor_issue_number):
+            return None
+
+    def test_a_restored_planning_run_is_not_downgraded_to_an_investigation(
+        self,
+    ) -> None:
+        """The recorded authority is the only signal that can tell them apart.
+
+        Guessing from labels would restore the least-authority role holding the
+        recovery role's scope.
+        """
+        from issue_orchestrator.control.tech_lead_session_policy import (
+            recover_tech_lead_launch_scope,
+        )
+        from issue_orchestrator.domain.tech_lead_session import (
+            TechLeadLaunchAuthority,
+        )
+
+        recovered = recover_tech_lead_launch_scope(
+            self._config(),
+            self._issue(),
+            self._Authority(
+                TechLeadLaunchAuthority(
+                    flavor=TechLeadSessionFlavor.PLANNING_INVESTIGATION,
+                    anchor_issue_number=109,
+                    focus_issue_number=109,
+                )
+            ),
+            run=self._run(),
+        )
+
+        assert recovered is not None
+        assert recovered.flavor is TechLeadSessionFlavor.PLANNING_INVESTIGATION
+
+    def test_a_run_predating_the_ledger_still_falls_back_to_inference(self) -> None:
+        from issue_orchestrator.control.tech_lead_session_policy import (
+            recover_tech_lead_launch_scope,
+        )
+
+        recovered = recover_tech_lead_launch_scope(
+            self._config(), self._issue(), self._Authority(None), run=self._run()
+        )
+
+        assert recovered is not None
+        assert recovered.flavor is TechLeadSessionFlavor.FAILURE_INVESTIGATION

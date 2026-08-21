@@ -312,20 +312,21 @@ class FactGatherer:
         unreachable in production.
 
         So the gap is closed HERE, where fact gathering belongs, and only for
-        the subjects that actually need it: a queued FAILURE_INVESTIGATION whose
-        subject the board did not carry. GitHub API discipline is why the read
-        is scoped that narrowly — a tick with no queued investigations, or whose
+        the subjects that actually need it: a queued FOCUSED run — an
+        investigation or a planning run (#136) — whose subject the board did not
+        carry. Both are revalidated against their subject's live lifecycle, so
+        both need the same authoritative read; a global run has no subject and
+        is deliberately excluded. GitHub API discipline is why the read is
+        scoped that narrowly — a tick with no queued focused runs, or whose
         subjects are all on the board, makes ZERO extra calls, and the queue is
         bounded by ``tech_lead.max_concurrent`` plus its backlog.
         """
-        from ..domain.tech_lead_session import TechLeadSessionFlavor
-
         on_board = {issue.number for issue in board}
         wanted = sorted(
             {
                 item.issue_number
                 for item in state.pending_tech_lead_reviews
-                if item.flavor is TechLeadSessionFlavor.FAILURE_INVESTIGATION
+                if item.flavor.is_issue_focused
                 and item.issue_number not in on_board
             }
         )

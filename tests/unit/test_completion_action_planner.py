@@ -298,6 +298,29 @@ def arm_investigation_session(
     )
 
 
+def arm_planning_session(
+    config: Config, session: Session, *, focus: int = 1
+) -> None:
+    """Plant the worktree copies AND launch authority for a planning run (#136)."""
+    plant_tech_lead_assignment(
+        session,
+        TechLeadAssignment(
+            flavor=TechLeadSessionFlavor.PLANNING_INVESTIGATION,
+            focus_issue_number=focus,
+            focus_reason="Prepare: open and unblocked",
+        ),
+    )
+    record_authority(
+        config,
+        session,
+        TechLeadLaunchAuthority(
+            flavor=TechLeadSessionFlavor.PLANNING_INVESTIGATION,
+            anchor_issue_number=session.issue.number,
+            focus_issue_number=focus,
+        ),
+    )
+
+
 def arm_health_review_session(
     config: Config,
     session: Session,
@@ -871,6 +894,89 @@ def test_failed_health_review_closes_anchor_without_labels(
     assert _tech_lead_failed_labels(actions) == []
     assert _tech_lead_labels(actions) == []
     assert actions.index(close) == len(actions) - 1
+
+
+@pytest.mark.parametrize("status", [SessionStatus.FAILED, SessionStatus.TIMED_OUT])
+def test_a_failed_planning_run_never_closes_its_subject(
+    tmp_path: Path, status: SessionStatus
+) -> None:
+    """A focused run's "anchor" is a live work item (#136).
+
+    Batch and health anchors are bookkeeping issues that MUST close when their
+    session dies. A planning run is aimed at an ordinary open issue the
+    orchestrator still owes work on, so a terminal-effects guard that missed
+    this flavor would close real work because a tech-lead session crashed.
+    """
+    config = make_tech_lead_config(tmp_path)
+    config.retry.interrupted_sessions.enabled = False
+    session = make_tech_lead_session(tmp_path)
+    arm_planning_session(config, session)
+
+    actions = make_planner(config).generate_completion_actions(session, status)
+
+    assert [a for a in actions if isinstance(a, CloseIssueAction)] == []
+    assert _tech_lead_failed_labels(actions) == []
+
+
+@pytest.mark.parametrize("status", [SessionStatus.FAILED, SessionStatus.TIMED_OUT])
+def test_a_dead_planning_run_never_blocks_its_healthy_subject(
+    tmp_path: Path, status: SessionStatus
+) -> None:
+    """A crash must not do what the role itself may not (#136 review A1).
+
+    The generic session-terminal path stamps ``blocked-failed`` (TIMED_OUT) or
+    ``needs-human`` (FAILED) on every ``issue-`` session's issue without asking
+    whose session it is. Admission accepts only an OPEN, non-blocked subject for
+    a planning run, and the role's capability row omits every recovery kind — so
+    letting that path stand would block healthy work nobody asked this role to
+    recover, and make it eligible for the failure investigation the role was
+    specifically built not to be able to invoke.
+    """
+    config = make_tech_lead_config(tmp_path)
+    config.retry.interrupted_sessions.enabled = False
+    session = make_tech_lead_session(tmp_path)
+    arm_planning_session(config, session)
+    labels = LabelManager(config)
+
+    actions = make_planner(config).generate_completion_actions(session, status)
+
+    assert labels.blocked_failed not in added_labels(actions)
+    assert labels.needs_human not in added_labels(actions)
+    # The claim is still released and the operator still gets the obituary:
+    # the subject is left untouched, not left silently claimed.
+    assert labels.in_progress in removed_labels(actions)
+    assert any(
+        "planning_investigation` session on this issue" in comment
+        for comment in comments(actions)
+    )
+
+
+@pytest.mark.parametrize("status", [SessionStatus.FAILED, SessionStatus.TIMED_OUT])
+def test_a_dead_failure_investigation_still_reports_its_subject(
+    tmp_path: Path, status: SessionStatus
+) -> None:
+    """The substitution is scoped to roles with no recovery authority (#136 A1).
+
+    A failure investigation holds the recovery kinds and its subject is blocked
+    by definition, so the generic terminal effects stand exactly as they did
+    before the bounded flavor existed. Without this, a fix aimed at planning
+    would silently stop reporting every focused run's death.
+    """
+    config = make_tech_lead_config(tmp_path)
+    config.retry.interrupted_sessions.enabled = False
+    session = make_tech_lead_session(tmp_path)
+    arm_investigation_session(config, session)
+    labels = LabelManager(config)
+    expected = (
+        labels.blocked_failed
+        if status is SessionStatus.TIMED_OUT
+        else labels.needs_human
+    )
+
+    actions = make_planner(config).generate_completion_actions(session, status)
+
+    assert expected in added_labels(actions)
+    assert labels.in_progress in removed_labels(actions)
 
 
 def test_tech_lead_session_without_launch_authority_is_rejected(
@@ -1584,6 +1690,8 @@ class TestFlavorActionKindCapabilities:
             arm_batch_session(config, session, tmp_path)
         elif flavor is TechLeadSessionFlavor.FAILURE_INVESTIGATION:
             arm_investigation_session(config, session)
+        elif flavor is TechLeadSessionFlavor.PLANNING_INVESTIGATION:
+            arm_planning_session(config, session)
         else:
             arm_health_review_session(
                 config, session, problem_issue_numbers=(41, 42, 43)
@@ -1649,6 +1757,54 @@ class TestFlavorActionKindCapabilities:
         assert error is not None
         assert f"A2 ({action_type}) is not an action kind" in error
         assert "batch_review" in error
+
+    @pytest.mark.parametrize("action_type", ["reset_retry", "kill_hung_session"])
+    def test_planning_investigation_may_not_propose_recovery_kinds(
+        self, tmp_path: Path, action_type: str
+    ) -> None:
+        """The bounded flavor's whole point (#136 acceptance 3).
+
+        A planning run's subject is an open issue nobody asked it to recover, so
+        its row omits every recovery kind and the proposal dies at the CAPABILITY
+        gate — before authority translation and before effect planning. Granting
+        the row one of these kinds is what makes this test fail, which is the
+        failure direction #136 asks to be provable.
+        """
+        config, session = self._armed(
+            tmp_path, TechLeadSessionFlavor.PLANNING_INVESTIGATION
+        )
+        # Neither execute authority nor a legitimately-owned focus issue is
+        # enough: capability is a separate axis from both.
+        config.tech_lead.authority.reset_retry = "execute"
+        config.tech_lead.authority.kill_hung_session = "execute"
+        _plant_decision_with_actions(
+            session,
+            _capability_probe_actions(
+                TechLeadSessionFlavor.PLANNING_INVESTIGATION, action_type
+            ),
+        )
+
+        error = self._processing_error(config, session)
+
+        assert error is not None
+        assert f"A2 ({action_type}) is not an action kind" in error
+        assert "planning_investigation" in error
+
+    def test_planning_investigation_keeps_the_escalation_floor(
+        self, tmp_path: Path
+    ) -> None:
+        """A least-authority role still reaches a human (#136 acceptance 4)."""
+        config, session = self._armed(
+            tmp_path, TechLeadSessionFlavor.PLANNING_INVESTIGATION
+        )
+        _plant_decision_with_actions(
+            session,
+            _capability_probe_actions(
+                TechLeadSessionFlavor.PLANNING_INVESTIGATION, "escalate_to_human"
+            ),
+        )
+
+        assert self._processing_error(config, session) is None
 
     def test_forbidden_kind_produces_zero_sibling_effects(
         self, tmp_path: Path
@@ -2174,6 +2330,61 @@ class TestTechLeadDecisionFailureTransition:
         assert rejection.issue_number == session.issue.number
         assert any(
             "Tech Lead completion rejected" in comment for comment in comments(actions)
+        )
+
+    def test_a_rejected_planning_run_never_blocks_its_healthy_subject(
+        self, tmp_path: Path
+    ) -> None:
+        """The bounded role's DESIGNED failure route (#136 review F2).
+
+        End-to-end through the real capability gate: the agent proposes
+        ``reset_retry``, the #133 table refuses the whole decision, and the
+        rejection lands here. Blocking the subject would let the role that may
+        not PROPOSE a recovery action cause one by proposing it — taking an
+        open, unblocked issue (admission accepted it for exactly that reason)
+        off the board and making it eligible for the failure investigation this
+        role was built not to be able to invoke.
+
+        Everything that makes the rejection visible stays: the surfaced
+        rejection, the operator comment, the released claim.
+        """
+        config = make_tech_lead_config(tmp_path)
+        session = make_tech_lead_session(tmp_path)
+        arm_planning_session(config, session)
+        labels = LabelManager(config)
+        _plant_decision_with_actions(
+            session,
+            _capability_probe_actions(
+                TechLeadSessionFlavor.PLANNING_INVESTIGATION, "reset_retry"
+            ),
+        )
+        error = tech_lead_decision_processing_error(
+            config,
+            tech_lead_authority=SqliteTechLeadAuthorityStore.for_repo(config.repo_root),
+            run_dir=session.run_dir,
+            run_id=session.run_assets.run_id,
+            session_name=session.run_assets.session_name,
+        )
+        assert error is not None and "reset_retry" in error
+
+        actions = make_planner(config).generate_completion_actions(
+            session,
+            SessionStatus.COMPLETED,
+            processing_errors=[error],
+        )
+
+        assert labels.blocked_failed not in added_labels(actions)
+        assert labels.needs_human not in added_labels(actions)
+        assert "tech-lead-failed" not in added_labels(actions)
+        # ...and the rejection is still fully surfaced.
+        [rejection] = _rejections(actions)
+        assert rejection.issue_number == session.issue.number
+        assert labels.in_progress in removed_labels(actions)
+        assert any(
+            "Tech Lead completion rejected" in comment for comment in comments(actions)
+        )
+        assert any(
+            "no recovery authority" in comment for comment in comments(actions)
         )
 
 

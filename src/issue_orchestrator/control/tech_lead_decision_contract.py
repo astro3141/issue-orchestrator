@@ -54,7 +54,7 @@ def _launch_scope_description(
     authority: TechLeadLaunchAuthority, allowed: frozenset[int]
 ) -> str:
     """Human-readable launch scope for out-of-scope violation messages."""
-    if authority.flavor is TechLeadSessionFlavor.FAILURE_INVESTIGATION:
+    if authority.flavor.is_issue_focused:
         return f"the originating issue #{authority.focus_issue_number}"
     if authority.flavor is TechLeadSessionFlavor.HEALTH_REVIEW:
         return (
@@ -72,13 +72,14 @@ def _launch_scope_description(
 def _act_level_scope_description(authority: TechLeadLaunchAuthority) -> str:
     """Human-readable ISSUE-only scope for an out-of-scope act-level violation.
 
-    The batch branch is the independent second guard on the target axis (#133):
-    a batch review's act-level proposal is now rejected one step earlier by the
-    role capability gate, and this text stands behind it so the scope rule
-    keeps stating its own conclusion. Under the SHIPPED capability table that
-    branch is therefore unreachable — no test exercises this string, and none
-    should; it becomes reachable only if a future table grants a batch review
-    an act-level kind. The invariant it describes is covered directly by
+    The fall-through branch is the independent second guard on the target axis
+    (#133): an act-level proposal from a batch review — or from a planning
+    investigation (#136) — is rejected one step earlier by the role capability
+    gate, and this text stands behind it so the scope rule keeps stating its own
+    conclusion. Under the SHIPPED capability table that branch is therefore
+    unreachable for both — no test exercises this string, and none should; it
+    becomes reachable only if a future table grants one of those roles an
+    act-level kind. The invariant it describes is covered directly by
     ``tests/unit/test_tech_lead_authority_store.py::
     test_allowed_act_level_targets_are_issue_only``.
     """

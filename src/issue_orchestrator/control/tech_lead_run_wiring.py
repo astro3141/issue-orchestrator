@@ -309,7 +309,7 @@ def withdraw_revalidated_tech_lead_run(
     """Remove one queued investigation that launch-time revalidation refused.
 
     The apply seam owns the mutation, but not the RULE: the planner already
-    asked :func:`..control.tech_lead_run_admission.issue_run_eligibility`, and
+    asked :func:`..control.tech_lead_launch_planning.subject_run_eligibility`, and
     the typed refusal it produced rides on the action. Removal goes through
     :class:`PendingSessionQueues`, the single writer for this queue, and the
     withdrawal is published so a run that vanished between queueing and launch
@@ -476,7 +476,7 @@ def _withdraw_lost_queued_runs(
     orchestrator: TechLeadFacadeHost, lost: set[str]
 ) -> None:
     from .pending_session_queues import PendingSessionQueues
-    from .tech_lead_run_admission import run_key_of_pending
+    from .tech_lead_run_scopes import run_key_of_pending
 
     queues = PendingSessionQueues(orchestrator.state)
     for item in list(orchestrator.state.pending_tech_lead_reviews):
@@ -499,7 +499,7 @@ def _stop_unowned_active_sessions(
     most is the one already executing, and leaving it running is what let two
     engines audit the same repository at once.
     """
-    from .tech_lead_run_admission import active_tech_lead_sessions, scope_of_session
+    from .tech_lead_run_scopes import active_tech_lead_sessions, scope_of_session
 
     for session in active_tech_lead_sessions(
         orchestrator.config, list(orchestrator.state.active_sessions)

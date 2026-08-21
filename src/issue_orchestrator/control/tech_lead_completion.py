@@ -1,10 +1,17 @@
 """Tech Lead session completion planning (ADR-0031).
 
-Single home for what happens when a tech_lead session ends: launch-authority
-verification, assignment-driven label policy, and decision-artifact
-processing. Extracted from ``completion_action_planner`` so the tech_lead owner
-boundary (``tech_lead_session_policy`` / ``TechLeadLaunchAuthority`` on the
-launch side, this module on the completion side) lives in one cohesive seam.
+What a tech_lead session that LANDED produces: launch-authority verification,
+assignment-driven label policy, and decision-artifact processing. Extracted
+from ``completion_action_planner`` so the tech_lead owner boundary
+(``tech_lead_session_policy`` / ``TechLeadLaunchAuthority`` on the launch side,
+this module on the completion side) lives in one cohesive seam.
+
+The dead-or-rejected half lives in ``tech_lead_terminal_effects``: what a
+FAILED/TIMED_OUT session, or a COMPLETED session whose decision the contract
+refused, does to its anchor and to its subject. It shares this module's trusted
+reads (``resolve_launch_authority_for_session``, ``manifest_label_actions``,
+``split_tech_lead_decision_error``) so the two halves cannot disagree about
+what a run was.
 
 Policy summary:
 
@@ -53,10 +60,8 @@ from ..domain.tech_lead_manifest import TechLeadManifest
 from ..domain.tech_lead_session import TechLeadLaunchAuthority, TechLeadSessionFlavor
 from .actions import (
     Action,
-    AddCommentAction,
     AddLabelAction,
     CloseIssueAction,
-    RemoveLabelAction,
 )
 from .completion_types import (
     ERROR_PREFIX_TECH_LEAD_AUTHORITY,
@@ -279,7 +284,7 @@ def has_tech_lead_decision_errors(processing_errors: list[str] | None) -> bool:
     )
 
 
-def _split_tech_lead_decision_error(processing_errors: list[str]) -> tuple[str, str]:
+def split_tech_lead_decision_error(processing_errors: list[str]) -> tuple[str, str]:
     """Parse (failure, detail) back out of the recorded processing error."""
     for error in processing_errors:
         for prefix in _TECH_LEAD_ERROR_PREFIXES:
@@ -291,9 +296,15 @@ def _split_tech_lead_decision_error(processing_errors: list[str]) -> tuple[str, 
     return ("unknown", "")
 
 
-def _resolve_launch_authority_for_session(
+def resolve_launch_authority_for_session(
     tech_lead_authority: "TechLeadAuthorityStore", session: Session
 ) -> tuple[TechLeadLaunchAuthority | None, str | None]:
+    """The session-shaped read of the trusted launch scope.
+
+    Shared with ``tech_lead_terminal_effects``: the landed path and the
+    dead-or-rejected path must resolve the SAME record the same way, from the
+    session's own run identity, or they would disagree about what a run was.
+    """
     return resolve_tech_lead_launch_authority(
         tech_lead_authority,
         run_dir=session.run_dir,
@@ -342,7 +353,7 @@ def discard_tech_lead_authority_after_completion(
     tech_lead_authority.discard_storm_cohort(anchor_issue_number=session.issue.number)
 
 
-def _manifest_label_actions(
+def manifest_label_actions(
     config: "Config",
     authority: TechLeadLaunchAuthority,
     expected: "ExpectedState",
@@ -402,7 +413,7 @@ def generate_tech_lead_completion_actions(
     if not is_tech_lead_session(config.tech_lead_review_agent, session.issue.agent_type):
         return actions
 
-    authority, tamper = _resolve_launch_authority_for_session(
+    authority, tamper = resolve_launch_authority_for_session(
         tech_lead_authority, session
     )
     if authority is None or tamper is not None:
@@ -437,7 +448,7 @@ def generate_tech_lead_completion_actions(
 
     if authority.flavor is TechLeadSessionFlavor.BATCH_REVIEW:
         actions.extend(
-            _manifest_label_actions(config, authority, expected, success=succeeded)
+            manifest_label_actions(config, authority, expected, success=succeeded)
         )
 
     if load_result is None:
@@ -512,135 +523,4 @@ def generate_tech_lead_completion_actions(
                 expected=expected,
             )
         )
-    return actions
-
-def generate_tech_lead_decision_failure_actions(
-    config: "Config",
-    session: Session,
-    expected: "ExpectedState",
-    *,
-    processing_errors: list[str],
-    labels: LabelManager,
-    tech_lead_authority: "TechLeadAuthorityStore",
-) -> list[Action]:
-    """Completion effects when a COMPLETED tech_lead session was rejected.
-
-    The completion processing path recorded a tech_lead authority/decision
-    error (findings 1/3); history is FAILED via the critical-error seam.
-    This plans the label/comment effects for every flavor:
-
-    * batch review — the AUTHORITY manifest PRs get the tech-lead-failed label;
-    * both flavors — the rejection is surfaced as an event AND durably on the
-      session's own issue (blocked-failed label + explanatory comment, the
-      operator-facing escalation surface — #6761 finding 6), and the
-      in-progress claim is released. The batch tracking issue stays open for
-      re-audit.
-    """
-    failure, detail = _split_tech_lead_decision_error(processing_errors)
-    actions: list[Action] = []
-    authority, _tamper = _resolve_launch_authority_for_session(
-        tech_lead_authority, session
-    )
-    if (
-        authority is not None
-        and authority.flavor is TechLeadSessionFlavor.BATCH_REVIEW
-    ):
-        actions.extend(
-            _manifest_label_actions(config, authority, expected, success=False)
-        )
-    actions.append(
-        plan_tech_lead_rejection_action(
-            anchor_issue_number=session.issue.number,
-            failure=failure,
-            detail=detail,
-        )
-    )
-    detail_text = detail or "no detail recorded"
-    actions.extend(
-        (
-            AddLabelAction(
-                issue_number=session.issue.number,
-                label=labels.blocked_failed,
-                reason=f"Tech Lead completion rejected ({failure})",
-                expected=expected,
-            ),
-            AddCommentAction(
-                number=session.issue.number,
-                comment=(
-                    "## ❌ Tech Lead completion rejected\n\n"
-                    "The tech_lead session completed, but its output was"
-                    f" rejected (`{failure}`):\n\n"
-                    f"> {detail_text}\n\n"
-                    f"- Session: `{session.terminal_id}`\n"
-                    f"- Runtime: {session.runtime_minutes:.1f} minutes\n\n"
-                    f"The session is recorded as failed and `{labels.blocked_failed}`"
-                    " was added. Remove the label to allow reprocessing."
-                ),
-                reason="Durable operator record of the rejected tech_lead completion",
-                expected=expected,
-            ),
-            RemoveLabelAction(
-                issue_number=session.issue.number,
-                label=labels.in_progress,
-                reason="Tech Lead completion rejected - releasing claim",
-                expected=expected,
-            ),
-        )
-    )
-    return actions
-
-
-def generate_tech_lead_failure_actions(
-    config: "Config",
-    session: Session,
-    expected: "ExpectedState",
-    *,
-    tech_lead_authority: "TechLeadAuthorityStore",
-) -> list[Action]:
-    """Batch/health FAILED/TIMED_OUT terminal effects (#6768 round 5, ADR-0031 §4).
-
-    Batch: the AUTHORITY manifest PRs get the operator-visible tech-lead-failed
-    label and the tracking issue closes after the generic failure diagnosis
-    and the PR labels: an open failed tracker would be requeued at restart
-    with an empty manifest (its PRs are now candidate-filtered as
-    tech-lead-failed), looping forever. Health reviews close their anchor the
-    same way — an open dead anchor would both be requeued at restart and
-    dedupe the next interval's trigger — but have no manifest to label.
-    Failure investigations produce nothing here — their anchor is the
-    original failed work issue. A session without a launch authority record
-    produces nothing (the session already failed; closing or labeling from
-    untrusted worktree copies would hand the agent authority).
-    """
-    if not is_tech_lead_session(config.tech_lead_review_agent, session.issue.agent_type):
-        return []
-    authority, _tamper = _resolve_launch_authority_for_session(
-        tech_lead_authority, session
-    )
-    if authority is None:
-        logger.warning(
-            "[tech_lead] No launch authority for session %s; "
-            "skipping terminal tech_lead effects",
-            session.terminal_id,
-        )
-        return []
-    if authority.flavor is TechLeadSessionFlavor.FAILURE_INVESTIGATION:
-        return []
-    if authority.flavor is TechLeadSessionFlavor.HEALTH_REVIEW:
-        return [
-            CloseIssueAction(
-                issue_number=session.issue.number,
-                reason="Health review session failed - closing anchor issue "
-                "(the next interval re-fires a fresh review)",
-                expected=expected,
-            )
-        ]
-    actions = _manifest_label_actions(config, authority, expected, success=False)
-    actions.append(
-        CloseIssueAction(
-            issue_number=session.issue.number,
-            reason="Batch tech_lead review failed - closing tracking issue "
-            "(manifest PRs carry tech-lead-failed)",
-            expected=expected,
-        )
-    )
     return actions

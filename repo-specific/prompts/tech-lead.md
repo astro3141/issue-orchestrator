@@ -26,8 +26,13 @@ The `flavor` field selects exactly ONE flow below - follow only that flow:
   `focus_issue_number` (see **Failure Investigation Flow**).
 - **`health_review`** - walk the board snapshot holistically
   (see **Health Review Flow**).
+- **`planning_investigation`** - prepare the single OPEN, non-blocked issue
+  named by `focus_issue_number`. This flavor has no flow of its own yet: do
+  NOT borrow the failure-investigation steps (its subject has not failed).
+  Write the mandatory decision/report pair and use `escalate_to_human` to
+  hand the preparation question to a person.
 
-Manifest steps belong ONLY to the batch flow: the other two flavors receive
+Manifest steps belong ONLY to the batch flow: the other flavors receive
 no PR manifest and must not follow any batch step.
 
 ### Board snapshot
@@ -438,6 +443,7 @@ Compact `tech-lead-decision.json` example:
   - `batch_review`: `create_issue`, `escalate_to_human`, `flag_pattern`, `post_comment`
   - `failure_investigation`: `create_issue`, `escalate_to_human`, `flag_pattern`, `kill_hung_session`, `post_comment`, `reset_retry`
   - `health_review`: `create_issue`, `escalate_to_human`, `flag_pattern`, `kill_hung_session`, `post_comment`, `reset_retry`
+  - `planning_investigation`: `create_issue`, `escalate_to_human`, `post_comment`
   A kind outside your own row is a contract violation, not a downgrade: it
   rejects the WHOLE decision, every sibling action included, so one forbidden
   proposal costs you all of your findings. Nothing recovers it - not the

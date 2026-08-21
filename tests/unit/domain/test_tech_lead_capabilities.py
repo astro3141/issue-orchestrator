@@ -23,7 +23,7 @@ from issue_orchestrator.domain.tech_lead_session import TechLeadSessionFlavor
 # production table has to be restated here deliberately. Measured from the
 # completion contract: a batch review has never had a valid act-level target
 # (``TechLeadLaunchAuthority.allowed_act_level_targets`` is empty for it), the
-# other two flavors do.
+# investigation and health roles do.
 _COMMENT_AND_ROUTING = {
     "post_comment",
     "create_issue",
@@ -31,10 +31,13 @@ _COMMENT_AND_ROUTING = {
     "flag_pattern",
 }
 _RECOVERY = {"reset_retry", "kill_hung_session"}
+# The least-authority row (#136): no recovery kind, and no flag_pattern either.
+_PLANNING = {"post_comment", "create_issue", "escalate_to_human"}
 EXPECTED_SHIPPED_CAPABILITIES = {
     TechLeadSessionFlavor.BATCH_REVIEW: _COMMENT_AND_ROUTING,
     TechLeadSessionFlavor.FAILURE_INVESTIGATION: _COMMENT_AND_ROUTING | _RECOVERY,
     TechLeadSessionFlavor.HEALTH_REVIEW: _COMMENT_AND_ROUTING | _RECOVERY,
+    TechLeadSessionFlavor.PLANNING_INVESTIGATION: _PLANNING,
 }
 
 # Minimal contract-valid fields per action kind, so each single-action decision
@@ -113,6 +116,45 @@ class TestShippedCapabilities:
         """Every shipped role keeps its escalation channel (#133 property 5)."""
         for flavor in TechLeadSessionFlavor:
             assert TECH_LEAD_ACTION_CAPABILITIES.permits(flavor, "escalate_to_human")
+
+    @pytest.mark.parametrize(
+        "action_type", ["reset_retry", "kill_hung_session", "flag_pattern"]
+    )
+    def test_the_planning_role_is_bounded_to_report_and_route(
+        self, action_type: str
+    ) -> None:
+        """#136's whole bound, stated as its own property.
+
+        The parametrized rows above already cover it by construction; this says
+        it by name, because "which kinds does the least-authority role NOT
+        have" is the question a reviewer of a future table change asks — and
+        granting the row one of these is what makes it fail.
+        """
+        assert not TECH_LEAD_ACTION_CAPABILITIES.permits(
+            TechLeadSessionFlavor.PLANNING_INVESTIGATION, action_type
+        )
+
+    @pytest.mark.parametrize(
+        ("flavor", "holds_recovery"),
+        [
+            (TechLeadSessionFlavor.FAILURE_INVESTIGATION, True),
+            (TechLeadSessionFlavor.HEALTH_REVIEW, True),
+            (TechLeadSessionFlavor.BATCH_REVIEW, False),
+            (TechLeadSessionFlavor.PLANNING_INVESTIGATION, False),
+        ],
+    )
+    def test_recovery_authority_is_read_from_the_table(
+        self, flavor: TechLeadSessionFlavor, holds_recovery: bool
+    ) -> None:
+        """"Does this role hold recovery authority?" has one answer (#136 A1).
+
+        The terminal-effects owner asks this to decide whether a DEAD session
+        may leave a blocking label on its own subject — a role that may not
+        propose a recovery action must not achieve one by crashing. Asking the
+        table means a future bounded role inherits that the moment it declares
+        its row, instead of the rule being re-derived per caller.
+        """
+        assert TECH_LEAD_ACTION_CAPABILITIES.permits_recovery(flavor) is holds_recovery
 
 
 class TestAgentFacingDescription:

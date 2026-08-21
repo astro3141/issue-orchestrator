@@ -28,7 +28,7 @@ from issue_orchestrator.control.tech_lead_launch_authority import (
 from issue_orchestrator.control.tech_lead_launch_planning import (
     plan_tech_lead_launch_gate,
 )
-from issue_orchestrator.control.tech_lead_run_admission import live_run_scopes
+from issue_orchestrator.control.tech_lead_run_scopes import live_run_scopes
 from issue_orchestrator.domain.models import (
     DiscoveredFailure,
     OrchestratorState,
@@ -147,7 +147,7 @@ class _Engine:
 
     def complete(self, number: int) -> None:
         """Finish the running session for ``number`` and hand its hold back."""
-        from issue_orchestrator.control.tech_lead_run_admission import (
+        from issue_orchestrator.control.tech_lead_run_scopes import (
             scope_of_session,
         )
 

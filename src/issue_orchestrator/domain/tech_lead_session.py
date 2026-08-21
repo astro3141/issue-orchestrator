@@ -1,11 +1,12 @@
 """Tech Lead session flavor, assignment, and launch authority (ADR-0031).
 
-Three tech_lead variants share one launch path: batch PR review (audit the
+Four tech_lead variants share one launch path: batch PR review (audit the
 orchestrator-prepared PR manifest), failure investigation (diagnose one
-failed issue), and the periodic health review (walk the board snapshot,
-ADR-0031 §4). The :class:`TechLeadAssignment` written at launch tells the
-*agent* which variant its session is (all variants run in ``issue-{N}``
-terminals).
+failed issue), the periodic health review (walk the board snapshot,
+ADR-0031 §4), and planning investigation (prepare one open, non-blocked
+issue — #136, the least-authority variant). The :class:`TechLeadAssignment`
+written at launch tells the *agent* which variant its session is (all
+variants run in ``issue-{N}`` terminals).
 
 Trust boundary: the assignment file and the PR manifest live inside the
 agent-writable worktree, so completion must never treat them as orchestrator
@@ -113,6 +114,38 @@ class TechLeadSessionFlavor(str, Enum):
     BATCH_REVIEW = "batch_review"
     FAILURE_INVESTIGATION = "failure_investigation"
     HEALTH_REVIEW = "health_review"
+    # Preparation of ONE open, non-blocked issue (#136). Least authority: its
+    # capability row in :mod:`.tech_lead_capabilities` omits every recovery
+    # kind, so the completion contract refuses a reset/kill from this role
+    # before effect planning. It is issue-FOCUSED like a failure investigation
+    # — same shape, different subject state and different authority.
+    PLANNING_INVESTIGATION = "planning_investigation"
+
+    @property
+    def is_issue_focused(self) -> bool:
+        """True when this flavor's subject is ONE named work issue (#136).
+
+        The single owner of "focused-ness", asked wherever the two focused
+        flavors must be treated alike: the assignment/authority records require
+        a ``focus_issue_number``, targeted proposals are confined to it, the
+        launch path runs the session in a DISPOSABLE scratch worktree so the
+        subject's branch stays read-only evidence, and terminal failure effects
+        must not close the subject (it is a live work item, not a tech_lead
+        anchor). Asked as one question so a second focused flavor cannot be
+        missing from one of those call sites — a guard that omitted it would
+        close a real work issue or let an agent commit onto its branch.
+        """
+        return self in _ISSUE_FOCUSED_FLAVORS
+
+
+# Declared after the enum so the property reads one authority rather than
+# restating a member list at each call site.
+_ISSUE_FOCUSED_FLAVORS: frozenset[TechLeadSessionFlavor] = frozenset(
+    (
+        TechLeadSessionFlavor.FAILURE_INVESTIGATION,
+        TechLeadSessionFlavor.PLANNING_INVESTIGATION,
+    )
+)
 
 
 class TechLeadCreationKind(str, Enum):
@@ -229,9 +262,10 @@ class TechLeadCreationOrigin:
 class TechLeadAssignment:
     """Launch-time record of a tech_lead session's assignment.
 
-    ``focus_issue_number``/``focus_reason`` name the single issue a
-    failure-investigation session must diagnose; batch and health reviews
-    carry neither (their scope is the PR manifest / the board snapshot).
+    ``focus_issue_number``/``focus_reason`` name the single issue a FOCUSED
+    session works on — the one a failure investigation must diagnose, or the
+    one a planning investigation must prepare; batch and health reviews carry
+    neither (their scope is the PR manifest / the board snapshot).
     """
 
     flavor: TechLeadSessionFlavor
@@ -244,12 +278,9 @@ class TechLeadAssignment:
             raise ValueError(
                 f"Unsupported tech_lead assignment schema_version: {self.schema_version!r}"
             )
-        if (
-            self.flavor is TechLeadSessionFlavor.FAILURE_INVESTIGATION
-            and self.focus_issue_number is None
-        ):
+        if self.flavor.is_issue_focused and self.focus_issue_number is None:
             raise ValueError(
-                "TechLeadAssignment with flavor=failure_investigation requires "
+                f"TechLeadAssignment with flavor={self.flavor.value} requires "
                 "focus_issue_number"
             )
 
@@ -388,12 +419,9 @@ class TechLeadLaunchAuthority:
             raise ValueError(
                 f"Unsupported tech_lead authority schema_version: {self.schema_version!r}"
             )
-        if (
-            self.flavor is TechLeadSessionFlavor.FAILURE_INVESTIGATION
-            and self.focus_issue_number is None
-        ):
+        if self.flavor.is_issue_focused and self.focus_issue_number is None:
             raise ValueError(
-                "TechLeadLaunchAuthority with flavor=failure_investigation requires "
+                f"TechLeadLaunchAuthority with flavor={self.flavor.value} requires "
                 "focus_issue_number"
             )
         if self.flavor is TechLeadSessionFlavor.HEALTH_REVIEW and (
@@ -430,13 +458,14 @@ class TechLeadLaunchAuthority:
     def allowed_targets(self) -> frozenset[int]:
         """Issue/PR numbers a decision from this session may target.
 
-        Failure investigations may only address their focus issue; health
-        reviews may only address their anchor issue (the report's home,
-        ADR-0031 §4); batch reviews may address the audited manifest PRs
-        plus the anchor tracking issue. ``create_issue``/``flag_pattern``
-        proposals carry no target and are scope-free by construction.
+        A FOCUSED session (failure investigation, planning investigation) may
+        only address its focus issue; health reviews may only address their
+        anchor issue (the report's home, ADR-0031 §4); batch reviews may
+        address the audited manifest PRs plus the anchor tracking issue.
+        ``create_issue``/``flag_pattern`` proposals carry no target and are
+        scope-free by construction.
         """
-        if self.flavor is TechLeadSessionFlavor.FAILURE_INVESTIGATION:
+        if self.flavor.is_issue_focused:
             assert self.focus_issue_number is not None  # __post_init__
             return frozenset((self.focus_issue_number,))
         if self.flavor is TechLeadSessionFlavor.HEALTH_REVIEW:
@@ -459,6 +488,12 @@ class TechLeadLaunchAuthority:
         resets. That cohort is empty for a periodic review, which therefore
         owns no act-level target at all. Batch reviews own no resettable work
         issue because manifest entries are PRs and their anchor is bookkeeping.
+
+        A PLANNING investigation is deliberately NOT folded into the focused
+        branch (#136): its subject is an open, non-blocked issue nobody asked
+        it to recover, so it owns no act-level target either. Its capability
+        row refuses reset/kill one step earlier; the empty set here is the
+        second, independent guard on the target axis.
         """
         if self.flavor is TechLeadSessionFlavor.FAILURE_INVESTIGATION:
             assert self.focus_issue_number is not None  # __post_init__

@@ -1883,7 +1883,9 @@ class PendingTechLeadReview:
     so the launch-time board snapshot must read the failure from the queue
     item, not the buffer. It is required for FAILURE_INVESTIGATION (that
     variant exists only because a failure was discovered) and forbidden for
-    BATCH_REVIEW and HEALTH_REVIEW. A storm-triggered HEALTH_REVIEW instead
+    every other variant — the whole-repository reviews, which are threshold- or
+    interval-created, and PLANNING_INVESTIGATION, whose subject is an open issue
+    that has not failed at all (#136). A storm-triggered HEALTH_REVIEW instead
     carries all triggering problems in ``problem_cohort``.
     """
     issue_number: int  # The tech_lead review GitHub issue number
@@ -1932,9 +1934,10 @@ class PendingTechLeadReview:
         ):
             raise ValueError(
                 f"PendingTechLeadReview for issue #{self.issue_number} is a "
-                f"{self.flavor.value} but carries failure context; batch and "
-                "health reviews are threshold-/interval-created and have no "
-                "triggering failure."
+                f"{self.flavor.value} but carries failure context; only a "
+                "failure investigation has a triggering failure — batch and "
+                "health reviews are threshold-/interval-created, and a planning "
+                "investigation's subject has not failed."
             )
         if self.problem_cohort and self.flavor is not TechLeadSessionFlavor.HEALTH_REVIEW:
             raise ValueError(

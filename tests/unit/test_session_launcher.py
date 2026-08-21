@@ -4236,6 +4236,34 @@ class TestPendingSessionQueuesTechLeadIntake:
         # board snapshot still has it after discovered_failures is cleared.
         assert entry.failure is failure
 
+    def test_queue_planning_investigation_constructs_a_failureless_entry(self):
+        """A planning subject has not failed, so no context is manufactured."""
+        state = OrchestratorState()
+
+        outcome = PendingSessionQueues(state).queue_planning_investigation(
+            109, "Prepare: the thing"
+        )
+
+        assert outcome is TechLeadQueueOutcome.QUEUED
+        (entry,) = state.pending_tech_lead_reviews
+        assert entry.issue_number == 109
+        assert entry.title == "Prepare: the thing"
+        assert entry.flavor is TechLeadSessionFlavor.PLANNING_INVESTIGATION
+        assert entry.failure is None
+        assert entry.problem_cohort == ()
+
+    def test_planning_investigation_with_failure_context_fails_fast(self):
+        """Only a failure investigation carries a DiscoveredFailure (#136)."""
+        with pytest.raises(ValueError, match="failure"):
+            PendingTechLeadReview(
+                issue_number=109,
+                title="Prepare: the thing",
+                flavor=TechLeadSessionFlavor.PLANNING_INVESTIGATION,
+                failure=DiscoveredFailure(
+                    issue_number=109, issue_title="x", failure_reason="timed_out"
+                ),
+            )
+
     def test_failure_investigation_without_failure_context_fails_fast(self):
         """The queue item is the only carrier of the triggering failure; a
         failure investigation without it would launch with an empty

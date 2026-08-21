@@ -39,6 +39,7 @@ from .tech_lead_evidence import build_evidence_map, write_evidence_map
 from .tech_lead_manifest_builder import TechLeadCandidatePolicy, TechLeadManifestBuilder
 
 if TYPE_CHECKING:
+    from ..domain.session_run import SessionRunIdentity
     from ..ports.board_snapshot_provider import BoardSnapshotProvider
     from ..infra.config import Config
     from ..ports import ManifestDownloader, RepositoryHost
@@ -60,6 +61,8 @@ def recover_tech_lead_launch_scope(
     config: "Config",
     issue: "Issue",
     tech_lead_authority: "TechLeadAuthorityStore | None",
+    *,
+    run: "SessionRunIdentity",
 ) -> "TechLeadLaunchScope | None":
     """Rebuild a RESTORED tech-lead session's launch grant from durable truth.
 
@@ -75,11 +78,22 @@ def recover_tech_lead_launch_scope(
     (:func:`prepare_tech_lead_session_data`), so a restored run and a fresh one
     can never be classified differently:
 
+    0. the launch authority RECORDED for this run. It is the orchestrator-owned
+       statement of what the session was launched as, so it outranks every
+       inference below. It is also the only signal that can tell the two focused
+       flavors apart (#136): a planning subject and an investigation subject are
+       both ordinary board issues, indistinguishable by label or title, and
+       guessing "investigation" would restore a least-authority session with
+       recovery scope;
     1. the ADR-0031 §4 marker label on the anchor -> ``HEALTH_REVIEW``, whose
        owned cohort comes back from the durable authority ledger;
     2. the batch anchor's title signature -> ``BATCH_REVIEW``;
     3. anything else is an ordinary board issue the tech lead was aimed at, so
        it is a ``FAILURE_INVESTIGATION``.
+
+    ``run`` is required, not optional: the caller restoring a session always
+    holds its run identity, and a run predating the ledger is already covered by
+    a ``load`` that returns None.
 
     Returns ``None`` for a session that is not a tech-lead run at all.
     """
@@ -90,6 +104,16 @@ def recover_tech_lead_launch_scope(
 
     if not is_tech_lead_session(config.tech_lead_review_agent, issue.agent_type):
         return None
+    recorded = (
+        tech_lead_authority.load(run_id=run.run_id, session_name=run.session_name)
+        if tech_lead_authority is not None
+        else None
+    )
+    if recorded is not None:
+        return TechLeadLaunchScope(
+            flavor=recorded.flavor,
+            problem_issue_numbers=recorded.problem_issue_numbers,
+        )
     labels = [str(name).casefold() for name in issue.labels]
     if HEALTH_REVIEW_MARKER_LABEL.casefold() in labels:
         cohort = (
@@ -108,14 +132,14 @@ def recover_tech_lead_launch_scope(
     return TechLeadLaunchScope(flavor=TechLeadSessionFlavor.FAILURE_INVESTIGATION)
 
 
-def failure_investigation_scratch_identity(
+def focused_tech_lead_scratch_identity(
     config: "Config",
     issue: "Issue",
     tech_lead_scope: "TechLeadLaunchScope | None",
 ) -> "ScratchWorktreeIdentity | None":
-    """The disposable scratch worktree identity for a failure investigation (#6823).
+    """The disposable scratch worktree identity for a FOCUSED run (#6823, #136).
 
-    A failure investigation launches as an ``issue-{focus}`` session under the
+    A focused tech-lead run launches as an ``issue-{focus}`` session under the
     focus issue's number, so without this it would run in the focus issue's OWN
     worktree on its branch — and the agent could commit into that branch,
     mutating the very evidence it was sent to read (a live run showed a focus
@@ -124,27 +148,38 @@ def failure_investigation_scratch_identity(
     runs in a throwaway worktree on a fresh branch off the base branch, keyed to
     this run rather than the focus issue: the focus worktree/branch stay pure
     read-only evidence and an agent commit can only ever land on the disposable
-    branch. The name and branch carry a random token so investigations of the
-    same focus issue never collide, and the branch does NOT start with the focus
+    branch. The name and branch carry a random token so runs aimed at the same
+    focus issue never collide, and the branch does NOT start with the focus
     issue number so ``extract_issue_number_from_branch`` never mistakes it for the
     focus branch.
 
-    Returns ``None`` for every other flavor (batch/health reviews run on their
-    own anchor worktrees) and for ordinary non-tech-lead issues, leaving their
-    worktree derivation unchanged.
+    A PLANNING investigation needs this for a stronger reason than an
+    investigation does: its subject is an OPEN, non-blocked issue that ordinary
+    coding work may pick up at any time, so a planning session writing into that
+    issue's worktree would collide with the work it is preparing.
+
+    Returns ``None`` for the whole-repository flavors (batch/health reviews run
+    on their own anchor worktrees) and for ordinary non-tech-lead issues,
+    leaving their worktree derivation unchanged.
     """
     from .worktree_context import ScratchWorktreeIdentity
 
-    if (
-        tech_lead_scope is None
-        or tech_lead_scope.flavor is not TechLeadSessionFlavor.FAILURE_INVESTIGATION
-    ):
+    if tech_lead_scope is None or not tech_lead_scope.flavor.is_issue_focused:
         return None
     token = uuid.uuid4().hex[:12]
     return ScratchWorktreeIdentity(
         worktree_name=f"{config.repo_root.name}-tech-lead-{issue.number}-{token}",
-        branch_name=f"tech-lead-investigation-{issue.number}-{token}",
+        branch_name=f"{_SCRATCH_BRANCH_STEM[tech_lead_scope.flavor]}-{issue.number}-{token}",
     )
+
+
+# The disposable branch stem per focused flavor. Named per role so an operator
+# reading `git branch` can tell a recovery run's throwaway branch from a
+# preparation run's without opening the session.
+_SCRATCH_BRANCH_STEM: dict[TechLeadSessionFlavor, str] = {
+    TechLeadSessionFlavor.FAILURE_INVESTIGATION: "tech-lead-investigation",
+    TechLeadSessionFlavor.PLANNING_INVESTIGATION: "tech-lead-planning",
+}
 
 
 def shape_requested_actions_for_tech_lead(
@@ -270,7 +305,7 @@ def prepare_tech_lead_session_data(
 ) -> tuple[Path, ...]:
     """Prepare per-flavor tech_lead session inputs (ADR-0031).
 
-    BATCH_REVIEW keeps the existing PR-manifest prep; FAILURE_INVESTIGATION
+    BATCH_REVIEW keeps the existing PR-manifest prep; the FOCUSED flavors
     and HEALTH_REVIEW must NOT receive the global batch manifest (auditing
     unrelated PRs from a focused investigation was the #6768 B4 defect; a
     health review walks the board snapshot, not a PR batch). Every flavor
@@ -310,7 +345,7 @@ def prepare_tech_lead_session_data(
             ctx.update_manifest(
                 {"tech_lead_manifest": str(run_dir / "tech-lead-data" / "manifest.json")}
             )
-    focused = flavor is TechLeadSessionFlavor.FAILURE_INVESTIGATION
+    focused = flavor.is_issue_focused
     assignment = TechLeadAssignment(
         flavor=flavor,
         focus_issue_number=issue.number if focused else None,
@@ -421,7 +456,7 @@ def _stage_evidence_map(
     only after a successful write, so it never points at a missing file.
 
     Per flavor: BATCH_REVIEW gets no evidence map (it audits a PR batch, not
-    orchestrator-state facts); FAILURE_INVESTIGATION gets the full focus map
+    orchestrator-state facts); a FOCUSED flavor gets the full focus map
     (the god-view substrate + the focus issue's own run-dirs + a GitHub
     warm-cache); HEALTH_REVIEW gets the full SYSTEM map — the same substrate
     (all SQLite stores, roots) plus whole-system run-dirs enumerated across

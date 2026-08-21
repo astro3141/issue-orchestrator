@@ -50,10 +50,10 @@ from ..domain.tech_lead_run import (
 from ..events import EventName
 from ..ports import make_trace_event
 from .tech_lead_launch_planning import (
-    issue_run_eligibility,
+    subject_run_eligibility,
     plan_tech_lead_launch_gate,
 )
-from .tech_lead_run_admission import scope_of_pending
+from .tech_lead_run_scopes import scope_of_pending
 from .tech_lead_run_ownership import RunExecutionVerdict
 
 if TYPE_CHECKING:
@@ -187,7 +187,7 @@ class TechLeadLaunchAuthority:
         blocking = next(
             (name for name in issue.labels if self._is_blocking_any([name])), ""
         )
-        verdict = issue_run_eligibility(issue, blocking)
+        verdict = subject_run_eligibility(tech_lead.flavor, issue, blocking)
         if verdict is None:
             return None
         return TechLeadLaunchRefusal(

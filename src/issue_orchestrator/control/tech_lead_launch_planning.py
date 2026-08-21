@@ -32,11 +32,13 @@ from ..domain.tech_lead_run import (
     BARRIER_GLOBAL_AWAITING_DRAIN,
     BARRIER_GLOBAL_RUN_ACTIVE,
     BARRIER_GLOBAL_RUN_QUEUED,
+    REASON_ISSUE_BLOCKED,
     REASON_ISSUE_CLOSED,
     REASON_NO_LONGER_BLOCKED,
     global_run_precedence,
 )
-from .tech_lead_run_admission import (
+from ..domain.tech_lead_session import TechLeadSessionFlavor
+from .tech_lead_run_scopes import (
     active_tech_lead_sessions,
     has_active_global_run,
     is_global_pending,
@@ -128,35 +130,79 @@ def plan_tech_lead_launch_gate(
 # ----------------------------------------------------------------------
 
 
-def issue_run_eligibility(
-    issue: "Issue", blocking_label: str
-) -> Optional[tuple[str, str]]:
-    """Is this issue still worth a tech-lead investigation? None when yes.
+@dataclass(frozen=True, slots=True)
+class _SubjectRule:
+    """What one tech-lead role requires of its subject issue.
 
-    The rule: the issue must be OPEN and must still carry a blocking label.
-    Returned as a ``(reason_code, detail)`` pair so both callers report the same
+    A frozen row rather than a per-role function, because the roles differ in
+    exactly one bit — must the subject be blocked, or must it not be — and one
+    implementation of "open, and blocked-ness as required" cannot then drift
+    between them. The refusal vocabulary travels in the row so each role reports
+    its own machine-readable reason.
+    """
+
+    requires_blocking: bool
+    refusal_reason: str
+    refusal_detail: str  # formatted with ``number`` and ``label``
+
+
+# The subject rule per FOCUSED role. Global runs are absent on purpose: a
+# whole-repository anchor is not a work item, and blocked-ness says nothing
+# about whether the board is still worth auditing.
+_SUBJECT_RULES: dict["TechLeadSessionFlavor", _SubjectRule] = {
+    TechLeadSessionFlavor.FAILURE_INVESTIGATION: _SubjectRule(
+        requires_blocking=True,
+        refusal_reason=REASON_NO_LONGER_BLOCKED,
+        refusal_detail=(
+            "Issue #{number} is no longer blocked; nothing to investigate."
+        ),
+    ),
+    TechLeadSessionFlavor.PLANNING_INVESTIGATION: _SubjectRule(
+        requires_blocking=False,
+        refusal_reason=REASON_ISSUE_BLOCKED,
+        refusal_detail=(
+            "Issue #{number} is blocked by {label!r}; a blocked subject is a"
+            " failure investigation's, not a planning run's."
+        ),
+    ),
+}
+
+
+def subject_run_eligibility(
+    flavor: "TechLeadSessionFlavor", issue: "Issue", blocking_label: str
+) -> Optional[tuple[str, str]]:
+    """Is this issue still worth a run of *flavor*? None when yes.
+
+    The single subject rule, parameterised by the role's row above (#136). Both
+    focused roles ask about the same two facts — is the subject open, and is it
+    blocked — and reach OPPOSITE verdicts on the second: an investigation exists
+    because the subject is blocked, a planning run because it is not. Two
+    hand-written rules would be two places for "what counts as open" to drift,
+    and a caller choosing between them by hand would be a third.
+
+    Returned as a ``(reason_code, detail)`` pair so every caller reports the same
     machine-readable refusal.
 
     It is deliberately module-level, because it is asked TWICE about the same
     logical run: once by :meth:`TechLeadRunCoordinator.admit` when the request
-    arrives, and again by :func:`plan_tech_lead_launch_revalidation` immediately
-    before the queued run would launch. A run can sit queued for many ticks
-    behind the global barrier, and in that window its subject can be closed or
-    unblocked by a human — so admitting a run is never a standing licence to
-    launch it. ``blocking_label`` is the label the caller already resolved:
-    classification happens ONCE, so the verdict and the evidence-map context can
-    never disagree about which label blocked it.
+    arrives, and again immediately before the queued run would launch. A run can
+    sit queued for many ticks behind the global barrier, and in that window its
+    subject can be closed, unblocked, or start failing — so admitting a run is
+    never a standing licence to launch it. ``blocking_label`` is the label the
+    caller already resolved: classification happens ONCE, so the verdict and the
+    evidence-map context can never disagree about which label blocked it.
     """
+    rule = _SUBJECT_RULES[flavor]
     lifecycle = (getattr(issue, "state", "") or "").casefold()
     if lifecycle and lifecycle != "open":
         return (
             REASON_ISSUE_CLOSED,
-            f"Issue #{issue.number} is closed; nothing to investigate.",
+            f"Issue #{issue.number} is closed; nothing for a tech lead to do.",
         )
-    if not blocking_label:
+    if bool(blocking_label) is not rule.requires_blocking:
         return (
-            REASON_NO_LONGER_BLOCKED,
-            f"Issue #{issue.number} is no longer blocked; nothing to investigate.",
+            rule.refusal_reason,
+            rule.refusal_detail.format(number=issue.number, label=blocking_label),
         )
     return None
 
@@ -184,7 +230,12 @@ def plan_tech_lead_launch_revalidation(
     is_blocking_any: "Callable[[Sequence[str]], bool]",
     subjects: "Sequence[Issue]" = (),
 ) -> TechLeadRevalidation:
-    """Re-check every queued INVESTIGATION against this tick's live evidence.
+    """Re-check every queued FOCUSED run against this tick's live evidence.
+
+    Each item is re-asked its OWN role's subject rule
+    (:func:`subject_run_eligibility`), so a planning run is not withdrawn for
+    being unblocked — the state it requires — and a failure investigation is
+    not kept alive for being unblocked, the state that ends it (#136).
 
     Two evidence sources, in order:
 
@@ -224,7 +275,7 @@ def plan_tech_lead_launch_revalidation(
         blocking = next(
             (name for name in issue.labels if is_blocking_any([name])), ""
         )
-        verdict = issue_run_eligibility(issue, blocking)
+        verdict = subject_run_eligibility(item.flavor, issue, blocking)
         if verdict is None:
             eligible.append(item)
         else:

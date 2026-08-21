@@ -50,7 +50,7 @@ from ..domain.tech_lead_run import (
     TechLeadRunRequest,
     TechLeadRunTrigger,
 )
-from .tech_lead_run_admission import run_key_of_pending
+from .tech_lead_run_scopes import run_key_of_pending
 
 if TYPE_CHECKING:
     from ..domain.models import OrchestratorState, Session

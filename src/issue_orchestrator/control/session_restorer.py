@@ -308,9 +308,14 @@ class SessionRestorer:
             pr_number=restored_pr_number,
             # Rebuild the tech-lead launch grant from durable truth. Without it
             # a restored whole-board review stops acting as the exclusive
-            # barrier it is, and the dashboard misreports it (#6994 F3).
+            # barrier it is, and the dashboard misreports it (#6994 F3). The
+            # run identity is what lets the recovery read this run's RECORDED
+            # authority rather than inferring a flavor from labels (#136).
             tech_lead_scope=recover_tech_lead_launch_scope(
-                self.config, issue_obj, self.tech_lead_authority
+                self.config,
+                issue_obj,
+                self.tech_lead_authority,
+                run=run_assets.identity,
             ),
         )
 

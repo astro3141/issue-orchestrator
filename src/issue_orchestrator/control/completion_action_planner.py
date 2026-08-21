@@ -14,9 +14,11 @@ from .actions import Action, AddCommentAction, AddLabelAction, RemoveLabelAction
 from .open_issue_corpus import OpenIssueCorpusManager
 from .tech_lead_completion import (
     generate_tech_lead_completion_actions,
-    generate_tech_lead_decision_failure_actions,
-    generate_tech_lead_failure_actions,
     has_tech_lead_decision_errors,
+)
+from .tech_lead_terminal_effects import (
+    generate_tech_lead_decision_failure_actions,
+    plan_tech_lead_terminal_effects,
 )
 from .completion_types import (
     ERROR_PREFIX_CREATE_PR,
@@ -246,13 +248,31 @@ class CompletionActionPlanner:
             active_session_run_id=self._active_session_run_id,
         )
 
-    def _generate_tech_lead_failure_actions(
-        self, session: Session, expected: ExpectedState
+    def _plan_terminal_actions(
+        self, session: Session, expected: ExpectedState, status: SessionStatus
     ) -> list[Action]:
-        """Delegate batch failure/timeout terminal effects to the owner module."""
-        return generate_tech_lead_failure_actions(
-            self.config, session, expected, tech_lead_authority=self._tech_lead_authority
+        """FAILED/TIMED_OUT effects: the subject's, then the tech_lead owner's.
+
+        The tech_lead owner is asked for BOTH halves (#136 review A1). The
+        generic subject effects stamp a recovery label on ``issue-{N}``, and
+        whether the dead session's ROLE may make that state change is the
+        owner's question, not this planner's — a bounded role's crash must not
+        block work the role itself may not touch.
+        """
+        effects = plan_tech_lead_terminal_effects(
+            self.config,
+            session,
+            expected,
+            status=status,
+            labels=self._lm,
+            tech_lead_authority=self._tech_lead_authority,
         )
+        generic = (
+            self._generate_timeout_actions(session, expected)
+            if status == SessionStatus.TIMED_OUT
+            else self._generate_failure_actions(session, expected)
+        )
+        return effects.resolve(generic)
 
     def _generate_completed_with_critical_actions(
         self,
@@ -339,9 +359,7 @@ class CompletionActionPlanner:
             return tuple(self._generate_review_exchange_halted_actions(session, expected))
 
         if status == SessionStatus.TIMED_OUT:
-            timeout_actions = self._generate_timeout_actions(session, expected)
-            timeout_actions.extend(self._generate_tech_lead_failure_actions(session, expected))
-            return tuple(timeout_actions)
+            return tuple(self._plan_terminal_actions(session, expected, status))
 
         if status == SessionStatus.FAILED:
             detail = completion_detail
@@ -364,9 +382,7 @@ class CompletionActionPlanner:
             # no tech_lead failure effects (the retry re-audits the same PRs).
             if retry_actions := self._generate_interrupted_retry_actions(session, expected):
                 return tuple(retry_actions)
-            failure_actions = self._generate_failure_actions(session, expected)
-            failure_actions.extend(self._generate_tech_lead_failure_actions(session, expected))
-            return tuple(failure_actions)
+            return tuple(self._plan_terminal_actions(session, expected, status))
 
         if status == SessionStatus.BLOCKED:
             return tuple(

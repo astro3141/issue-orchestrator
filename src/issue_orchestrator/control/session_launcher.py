@@ -57,7 +57,7 @@ from .worktree_provisioning import build_launch_provisioner, provision_launch_wo
 from ..infra.validation_state import DEFAULT_RETRY_TEMPLATE, _truncate_with_tail
 from ..domain.tech_lead_session import TechLeadLaunchScope
 from .tech_lead_session_policy import (
-    failure_investigation_scratch_identity,
+    focused_tech_lead_scratch_identity,
     is_tech_lead_session,
     prepare_tech_lead_session_data,
 )
@@ -794,13 +794,13 @@ class SessionLauncher:
                 scratch_branch_name,
             )
         phase_name = "coding-1"  # Initial coding session is always attempt 1
-        # A tech_lead FAILURE INVESTIGATION reads its focus issue's worktree/branch
-        # as evidence and must never mutate them (#6823): it runs in a fresh,
+        # A FOCUSED tech_lead run reads its focus issue's worktree/branch as
+        # evidence and must never mutate them (#6823, #136): it runs in a fresh,
         # disposable scratch worktree on a throwaway branch off the base, keyed
         # to this run — not the focus issue. Batch/health reviews keep the
         # existing behaviour (their own anchor worktree, preserve_branch=True so
         # a stranded branch's unpushed work is read rather than rebased away).
-        investigation_scratch = failure_investigation_scratch_identity(
+        investigation_scratch = focused_tech_lead_scratch_identity(
             self.config, issue, tech_lead_scope
         )
         is_scratch_investigation = investigation_scratch is not None
