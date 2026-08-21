@@ -2332,6 +2332,61 @@ class TestTechLeadDecisionFailureTransition:
             "Tech Lead completion rejected" in comment for comment in comments(actions)
         )
 
+    def test_a_rejected_planning_run_never_blocks_its_healthy_subject(
+        self, tmp_path: Path
+    ) -> None:
+        """The bounded role's DESIGNED failure route (#136 review F2).
+
+        End-to-end through the real capability gate: the agent proposes
+        ``reset_retry``, the #133 table refuses the whole decision, and the
+        rejection lands here. Blocking the subject would let the role that may
+        not PROPOSE a recovery action cause one by proposing it — taking an
+        open, unblocked issue (admission accepted it for exactly that reason)
+        off the board and making it eligible for the failure investigation this
+        role was built not to be able to invoke.
+
+        Everything that makes the rejection visible stays: the surfaced
+        rejection, the operator comment, the released claim.
+        """
+        config = make_tech_lead_config(tmp_path)
+        session = make_tech_lead_session(tmp_path)
+        arm_planning_session(config, session)
+        labels = LabelManager(config)
+        _plant_decision_with_actions(
+            session,
+            _capability_probe_actions(
+                TechLeadSessionFlavor.PLANNING_INVESTIGATION, "reset_retry"
+            ),
+        )
+        error = tech_lead_decision_processing_error(
+            config,
+            tech_lead_authority=SqliteTechLeadAuthorityStore.for_repo(config.repo_root),
+            run_dir=session.run_dir,
+            run_id=session.run_assets.run_id,
+            session_name=session.run_assets.session_name,
+        )
+        assert error is not None and "reset_retry" in error
+
+        actions = make_planner(config).generate_completion_actions(
+            session,
+            SessionStatus.COMPLETED,
+            processing_errors=[error],
+        )
+
+        assert labels.blocked_failed not in added_labels(actions)
+        assert labels.needs_human not in added_labels(actions)
+        assert "tech-lead-failed" not in added_labels(actions)
+        # ...and the rejection is still fully surfaced.
+        [rejection] = _rejections(actions)
+        assert rejection.issue_number == session.issue.number
+        assert labels.in_progress in removed_labels(actions)
+        assert any(
+            "Tech Lead completion rejected" in comment for comment in comments(actions)
+        )
+        assert any(
+            "no recovery authority" in comment for comment in comments(actions)
+        )
+
 
 def test_interrupted_retry_adds_guard_and_keeps_retry_loop_bounded(tmp_path: Path) -> None:
     config = Config()

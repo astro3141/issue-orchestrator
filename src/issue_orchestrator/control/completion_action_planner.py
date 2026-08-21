@@ -14,8 +14,10 @@ from .actions import Action, AddCommentAction, AddLabelAction, RemoveLabelAction
 from .open_issue_corpus import OpenIssueCorpusManager
 from .tech_lead_completion import (
     generate_tech_lead_completion_actions,
-    generate_tech_lead_decision_failure_actions,
     has_tech_lead_decision_errors,
+)
+from .tech_lead_terminal_effects import (
+    generate_tech_lead_decision_failure_actions,
     plan_tech_lead_terminal_effects,
 )
 from .completion_types import (
