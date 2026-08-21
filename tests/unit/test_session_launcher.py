@@ -5356,6 +5356,54 @@ class TestLaunchTechLeadIssueSessionFlavors:
         assert recorded is not None
         assert [source.issue_number for source in recorded.sources] == [903, 21]
 
+    def test_planning_launch_records_what_was_staged_and_what_exists(
+        self, launcher_bundle, mock_repo_host, mock_events, tmp_path
+    ):
+        """#185: the ordinary lane tells a short conversation from a clipped one.
+
+        ``get_issue_comments`` answers with one page, so a governing source
+        with a long conversation is staged partially. The descriptor the run
+        receives carries the tracker's total beside the staged comments, so
+        the run reads "37 comments are missing" rather than "this is all of
+        it".
+        """
+        config = launcher_bundle.launcher.config
+        self._enable_tech_lead_agent(config, tmp_path)
+        state = OrchestratorState()
+        self._queue_planning(state, mock_repo_host, "Governed-by: #21\n")
+        mock_repo_host.issues[21] = Issue(
+            number=21,
+            title="Working procedure",
+            labels=[],
+            repo="test/repo",
+            body="The working procedure.",
+            updated_at="2026-08-19T08:00:00Z",
+            comment_count=137,
+        )
+        mock_repo_host.issue_comments[21] = [
+            {"id": 900 + i, "updated_at": "2026-08-19T09:00:00Z", "body": f"c{i}"}
+            for i in range(100)
+        ]
+
+        session = self._launch(state.pending_tech_lead_reviews[0], state, launcher_bundle)
+
+        assert session is not None
+        run_dir = self._started_run_dir(mock_events)
+        descriptor = json.loads(
+            (run_dir / "tech-lead-data" / "canonical-context.json").read_text()
+        )
+        clipped = descriptor["sources"][1]
+        assert clipped["issue_number"] == 21
+        assert len(clipped["comments"]) == 100
+        assert clipped["comment_count"] == 137
+        # The subject itself has no conversation, and reads as complete rather
+        # than as a page that was cut off at zero.
+        subject = descriptor["sources"][0]
+        assert subject["comments"] == [] and subject["comment_count"] == 0
+        # No stored flag to disagree with the counts.
+        assert not any("truncat" in key for key in clipped)
+        assert "comment_count" in descriptor["guidance"]
+
     def test_planning_launch_fails_closed_on_an_unreachable_required_source(
         self, launcher_bundle, mock_repo_host, mock_worktree_manager, mock_events,
         tmp_path,

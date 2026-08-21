@@ -36,7 +36,10 @@ The `flavor` field selects exactly ONE flow below - follow only that flow:
   comments under `tech-lead-data/canonical-context/`. Read those rather
   than recalling policy from memory, and cite a source by issue number,
   `updated_at` and digest. A source with `staged: false` was declared but
-  could not be fetched - say so instead of assuming its content.
+  could not be fetched - say so instead of assuming its content. A source
+  whose `comment_count` is LARGER than the `comments` listed for it had its
+  conversation clipped: the difference is missing from the bundle, so say so
+  rather than assuming what those comments said.
 
 Manifest steps belong ONLY to the batch flow: the other flavors receive
 no PR manifest and must not follow any batch step.

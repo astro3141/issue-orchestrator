@@ -56,8 +56,15 @@ _GUIDANCE = (
     "updated_at is the source's revision identity at staging time. A source "
     "with staged=false was DECLARED but could not be staged (absent_reason "
     "says why) — that is different from a source that was never declared, "
-    "which does not appear here at all. Nothing in this file grants authority; "
-    "it records provenance only."
+    "which does not appear here at all. comments lists exactly the comments "
+    "written to disk, while comment_count is the tracker's reported total for "
+    "that source at fetch time: equal numbers mean you were handed the whole "
+    "conversation, and a comment_count LARGER than the comments list means the "
+    "conversation was clipped and the difference is missing from the bundle — "
+    "read a short conversation and a truncated one differently, and do not "
+    "assume the content of comments you were not given. There is no stored "
+    "truncation flag that could disagree with the pair. Nothing in this file "
+    "grants authority; it records provenance only."
 )
 
 
@@ -205,6 +212,13 @@ class CanonicalSource:
     record: a required source is always staged (the launch dies otherwise), so
     an absent entry is always an optional source that could not be fetched,
     and the reason is what makes the record honest rather than merely empty.
+
+    ``comments`` and ``comment_count`` are a PAIR of recorded facts, never a
+    fact and a judgment about it (#185): the first is exactly what was written
+    to disk, the second is the tracker's reported total for the source at fetch
+    time. "Was the conversation clipped" is read off the two by
+    :attr:`comments_truncated` rather than stored, so no descriptor can carry a
+    truncation flag that disagrees with its own counts.
     """
 
     kind: CanonicalSourceKind
@@ -217,6 +231,7 @@ class CanonicalSource:
     updated_at: str = ""
     body_sha256: str = ""
     comments: tuple[StagedComment, ...] = ()
+    comment_count: int = 0
     absent_reason: str = ""
 
     def __post_init__(self) -> None:
@@ -241,6 +256,13 @@ class CanonicalSource:
                     f"staged canonical source #{self.issue_number} must record its"
                     " revision identity and body digest"
                 )
+            if self.comment_count < len(self.comments):
+                raise ValueError(
+                    f"staged canonical source #{self.issue_number} reports"
+                    f" {self.comment_count} comment(s) in total but staged"
+                    f" {len(self.comments)}; a source cannot hold fewer comments"
+                    " than it handed over"
+                )
             return
         if self.required:
             raise ValueError(
@@ -253,11 +275,42 @@ class CanonicalSource:
                 f"absent canonical source #{self.issue_number} must record why it"
                 " could not be staged"
             )
-        if self.title or self.state or self.updated_at or self.body_sha256 or self.comments:
+        if (
+            self.title
+            or self.state
+            or self.updated_at
+            or self.body_sha256
+            or self.comments
+            or self.comment_count
+        ):
             raise ValueError(
                 f"absent canonical source #{self.issue_number} must not carry"
                 " content facts it never staged"
             )
+
+    @property
+    def missing_comment_count(self) -> int:
+        """How many of the source's comments are NOT in this bundle.
+
+        The arithmetic lives with the pair that owns it so no reader has to
+        re-derive it: ``0`` means the whole conversation was staged, and any
+        positive number is exactly how much of it the run was not given.
+        Never negative — ``__post_init__`` rejects a source reporting fewer
+        comments in total than it handed over.
+        """
+        return self.comment_count - len(self.comments)
+
+    @property
+    def comments_truncated(self) -> bool:
+        """Whether the source's conversation is longer than what was staged.
+
+        Derived, not stored: a source that staged every comment its tracker
+        reported reads as complete, and one that staged only a first page
+        reads as clipped, off the same two counts. An absent source staged
+        nothing and reports nothing, so it is never "truncated" — it is
+        absent, which its own ``staged``/``absent_reason`` already say.
+        """
+        return self.missing_comment_count > 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -268,6 +321,7 @@ class CanonicalSource:
             "updated_at": self.updated_at,
             "body_sha256": self.body_sha256,
             "comments": [comment.to_dict() for comment in self.comments],
+            "comment_count": self.comment_count,
             "required": self.required,
             "fetched_at": self.fetched_at,
             "staged": self.staged,
@@ -299,6 +353,14 @@ class CanonicalSource:
                 "canonical source required/staged must be booleans, got"
                 f" {raw_required!r}/{raw_staged!r}"
             )
+        raw_comment_count = data.get("comment_count", 0)
+        if isinstance(raw_comment_count, bool) or not isinstance(
+            raw_comment_count, int
+        ):
+            raise ValueError(
+                "canonical source comment_count must be an int, got"
+                f" {raw_comment_count!r}"
+            )
         return cls(
             kind=kind,
             issue_number=raw_number,
@@ -310,6 +372,7 @@ class CanonicalSource:
             updated_at=str(data.get("updated_at", "")),
             body_sha256=str(data.get("body_sha256", "")),
             comments=tuple(StagedComment.from_dict(item) for item in raw_comments),
+            comment_count=raw_comment_count,
             absent_reason=str(data.get("absent_reason", "")),
         )
 

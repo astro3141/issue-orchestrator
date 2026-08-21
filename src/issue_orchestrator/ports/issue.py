@@ -101,7 +101,12 @@ class Issue(Protocol):
 
     @property
     def comment_count(self) -> int:
-        """Number of comments present in this issue snapshot."""
+        """The tracker's reported TOTAL number of comments on this issue.
+
+        A total, never a page: canonical-context staging (#185) records it
+        beside the comments it actually staged so a reader can tell a short
+        conversation from one clipped at a page boundary.
+        """
         ...
 
     @property

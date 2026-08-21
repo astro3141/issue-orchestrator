@@ -54,6 +54,7 @@ def _issue(
     state: str = "open",
     updated_at: str = "2026-08-20T09:00:00Z",
     agent_type: str = "agent:tech-lead",
+    comment_count: int = 0,
 ) -> SimpleNamespace:
     return SimpleNamespace(
         number=number,
@@ -63,6 +64,9 @@ def _issue(
         updated_at=updated_at,
         labels=[agent_type],
         agent_type=agent_type,
+        # The tracker's reported conversation total, which rides the same
+        # get_issue payload the body does (#185).
+        comment_count=comment_count,
     )
 
 
@@ -80,15 +84,20 @@ class _Host:
         self._errors = errors or {}
         self.issue_calls: list[int] = []
         self.comment_calls: list[int] = []
+        # Both fetches in one ordered log, for the tests that care which of
+        # the two non-atomic reads happens first.
+        self.calls: list[str] = []
 
     def get_issue(self, issue_number: int) -> SimpleNamespace | None:
         self.issue_calls.append(issue_number)
+        self.calls.append(f"issue:{issue_number}")
         if issue_number in self._errors:
             raise self._errors[issue_number]
         return self._issues.get(issue_number)
 
     def get_issue_comments(self, issue_number: int) -> list[dict[str, Any]]:
         self.comment_calls.append(issue_number)
+        self.calls.append(f"comments:{issue_number}")
         return self._comments.get(issue_number, [])
 
     # Only reached by the best-effort evidence map, never by this owner.
@@ -149,6 +158,7 @@ class TestExactProvenance:
                     body="The working procedure.",
                     title="Working procedure",
                     updated_at="2026-08-19T08:00:00Z",
+                    comment_count=1,
                 ),
             },
             comments={
@@ -187,6 +197,9 @@ class TestExactProvenance:
         assert comment.comment_id == 5365348920
         assert comment.updated_at == "2026-08-19T09:00:00Z"
         assert comment.sha256 == content_digest(comment_file.read_text())
+        # The whole conversation was staged, and the descriptor says so.
+        assert governing.comment_count == 1
+        assert governing.comments_truncated is False
         # The descriptor is on disk and recorded in the run manifest.
         descriptor_path = run_dir / "tech-lead-data" / CANONICAL_CONTEXT_FILENAME
         assert manifest["canonical_context"] == str(descriptor_path)
@@ -217,6 +230,229 @@ class TestExactProvenance:
         assert first is not None and second is not None
         assert first.sources[1].body_sha256 != second.sources[1].body_sha256
         assert first.sources[1].updated_at != second.sources[1].updated_at
+
+
+class TestConversationCompleteness:
+    """#185: what was staged, and what the whole conversation actually is.
+
+    ``get_issue_comments`` answers with one page, so a long conversation is
+    staged partially. The staging owner records the tracker's total beside
+    what it wrote, so a reader of the descriptor can tell the two apart.
+    """
+
+    @staticmethod
+    def _comments(count: int, first_id: int = 5365348920) -> list[dict[str, Any]]:
+        return [
+            {
+                "id": first_id + index,
+                "updated_at": "2026-08-19T09:00:00Z",
+                "body": f"comment {index}",
+            }
+            for index in range(count)
+        ]
+
+    def test_a_clipped_conversation_is_legible_in_the_descriptor(
+        self, tmp_path: Path
+    ) -> None:
+        subject = _issue(SUBJECT, body=f"Governed-by: #{POLICY}\n")
+        host = _Host(
+            issues={
+                SUBJECT: subject,
+                # A long-lived policy document: the tracker reports 137
+                # comments, one page of 100 comes back.
+                POLICY: _issue(POLICY, body="policy", comment_count=137),
+            },
+            comments={POLICY: self._comments(100)},
+        )
+        run_dir = tmp_path / "run"
+
+        snapshot, _ = _stage(run_dir, host, subject=subject)
+
+        assert snapshot is not None
+        governing = snapshot.source(POLICY)
+        assert governing is not None
+        assert governing.staged is True
+        assert len(governing.comments) == 100
+        assert governing.comment_count == 137
+        assert governing.comments_truncated is True
+        payload = json.loads(
+            (run_dir / "tech-lead-data" / CANONICAL_CONTEXT_FILENAME).read_text()
+        )
+        entry = payload["sources"][1]
+        assert entry["comment_count"] == 137
+        assert len(entry["comments"]) == 100
+        # Every digest still names exactly one staged file, and no file was
+        # written for a comment that never arrived.
+        bodies = run_dir / "tech-lead-data" / CANONICAL_CONTEXT_BODIES_DIRNAME
+        staged_files = sorted(
+            path.name for path in (bodies / f"issue-{POLICY}").glob("comment-*.md")
+        )
+        assert len(staged_files) == 100
+        for comment in governing.comments:
+            file = bodies / f"issue-{POLICY}" / f"comment-{comment.comment_id}.md"
+            assert comment.sha256 == content_digest(file.read_text())
+
+    def test_a_complete_conversation_is_legible_as_complete(
+        self, tmp_path: Path
+    ) -> None:
+        subject = _issue(SUBJECT, body=f"Governed-by: #{POLICY}\n", comment_count=0)
+        host = _Host(
+            issues={
+                SUBJECT: subject,
+                POLICY: _issue(POLICY, body="policy", comment_count=3),
+            },
+            comments={POLICY: self._comments(3)},
+        )
+
+        snapshot, _ = _stage(tmp_path / "run", host, subject=subject)
+
+        assert snapshot is not None
+        governing = snapshot.source(POLICY)
+        assert governing is not None
+        assert governing.comment_count == len(governing.comments) == 3
+        assert governing.comments_truncated is False
+        # A subject nobody commented on is complete, not clipped at zero.
+        assert snapshot.sources[0].comments == ()
+        assert snapshot.sources[0].comment_count == 0
+        assert snapshot.sources[0].comments_truncated is False
+
+    def test_an_absent_source_reports_no_conversation_at_all(
+        self, tmp_path: Path
+    ) -> None:
+        subject = _issue(SUBJECT, body=f"Governed-by-optional: #{POLICY}\n")
+        host = _Host(
+            issues={SUBJECT: subject}, errors={POLICY: RuntimeError("github down")}
+        )
+
+        snapshot, _ = _stage(tmp_path / "run", host, subject=subject)
+
+        assert snapshot is not None
+        recorded = snapshot.source(POLICY)
+        assert recorded is not None
+        assert recorded.staged is False
+        assert recorded.comment_count == 0
+        assert recorded.comments_truncated is False
+        # Absent still reads differently from never requested.
+        assert snapshot.source(PROCEDURE) is None
+
+    def test_the_pair_survives_into_the_durable_ledger(self, tmp_path: Path) -> None:
+        subject = _issue(SUBJECT, body=f"Governed-by: #{POLICY}\n")
+        host = _Host(
+            issues={
+                SUBJECT: subject,
+                POLICY: _issue(POLICY, body="policy", comment_count=137),
+            },
+            comments={POLICY: self._comments(100)},
+        )
+        store = InMemoryTechLeadAuthorityStore()
+
+        snapshot, _ = _stage(tmp_path / "run", host, subject=subject, store=store)
+
+        replayed = store.load_canonical_context(
+            run_id="run-1", session_name=f"issue-{SUBJECT}"
+        )
+        assert replayed == snapshot
+        assert replayed is not None
+        governing = replayed.source(POLICY)
+        assert governing is not None and governing.comments_truncated is True
+
+    def test_the_conversation_is_read_before_its_total(self, tmp_path: Path) -> None:
+        """The two reads are not atomic, so their ORDER decides the failure.
+
+        A total read first could be smaller than the page read second, which
+        is a descriptor the domain rejects — and on a required source that
+        kills the launch. Reading the page first makes the later total the
+        larger of the two by construction.
+        """
+        subject = _issue(SUBJECT, body=f"Governed-by: #{POLICY}\n", comment_count=0)
+        host = _Host(
+            issues={
+                SUBJECT: subject,
+                POLICY: _issue(POLICY, body="policy", comment_count=2),
+            },
+            comments={POLICY: self._comments(2)},
+        )
+
+        _stage(tmp_path / "run", host, subject=subject)
+
+        assert host.calls == [
+            f"comments:{SUBJECT}",
+            f"issue:{SUBJECT}",
+            f"comments:{POLICY}",
+            f"issue:{POLICY}",
+        ]
+
+    def test_a_comment_landing_mid_stage_reads_as_clipped_not_as_a_failure(
+        self, tmp_path: Path
+    ) -> None:
+        """The orchestrator comments on the issues it plans against.
+
+        One landing between the two reads of a REQUIRED source must not fail
+        the launch: it is simply a comment the bundle does not contain.
+        """
+
+        class _CommentsWhileStaging(_Host):
+            """A conversation that grows the instant its page is handed over."""
+
+            def get_issue_comments(
+                self, issue_number: int
+            ) -> list[dict[str, Any]]:
+                page = list(super().get_issue_comments(issue_number))
+                if issue_number == POLICY:
+                    # The new comment arrives too late for the page and in
+                    # time for the total, exactly as a live interleaving does.
+                    self._issues[POLICY].comment_count += 1
+                return page
+
+        subject = _issue(SUBJECT, body=f"Governed-by: #{POLICY}\n", comment_count=0)
+        host = _CommentsWhileStaging(
+            issues={
+                SUBJECT: subject,
+                POLICY: _issue(POLICY, body="policy", comment_count=2),
+            },
+            comments={POLICY: self._comments(2)},
+        )
+
+        snapshot, manifest = _stage(tmp_path / "run", host, subject=subject)
+
+        assert snapshot is not None
+        governing = snapshot.source(POLICY)
+        assert governing is not None
+        assert governing.staged is True
+        assert len(governing.comments) == 2
+        assert governing.comment_count == 3
+        assert governing.comments_truncated is True
+        assert governing.missing_comment_count == 1
+        # The launch lives: the descriptor is written and manifested.
+        assert manifest["canonical_context"]
+
+    def test_a_comment_landing_mid_stage_on_the_subject_launches_too(
+        self, tmp_path: Path
+    ) -> None:
+        """The subject is always required, and is re-read live like the rest."""
+
+        class _CommentsWhileStagingSubject(_Host):
+            def get_issue_comments(
+                self, issue_number: int
+            ) -> list[dict[str, Any]]:
+                page = list(super().get_issue_comments(issue_number))
+                if issue_number == SUBJECT:
+                    self._issues[SUBJECT].comment_count += 1
+                return page
+
+        subject = _issue(SUBJECT, body="No declarations here.", comment_count=1)
+        host = _CommentsWhileStagingSubject(
+            issues={SUBJECT: subject}, comments={SUBJECT: self._comments(1)}
+        )
+
+        snapshot, _ = _stage(tmp_path / "run", host, subject=subject)
+
+        assert snapshot is not None
+        staged_subject = snapshot.sources[0]
+        assert staged_subject.staged is True
+        assert len(staged_subject.comments) == 1
+        assert staged_subject.comment_count == 2
+        assert staged_subject.comments_truncated is True
 
 
 class TestFailClosedOnRequired:
@@ -317,6 +553,40 @@ class TestOptionalDegradesHonestly:
         bodies = run_dir / "tech-lead-data" / CANONICAL_CONTEXT_BODIES_DIRNAME
         assert not (bodies / f"issue-{POLICY}").exists()
         assert (bodies / f"issue-{SUBJECT}" / "body.md").is_file()
+
+    def test_comments_staged_before_a_failed_issue_read_are_dropped(
+        self, tmp_path: Path
+    ) -> None:
+        """The half-staged direction the read order actually produces.
+
+        Comments are written first, so the source that fails is one whose
+        comment files are already on disk. Nothing may survive that the
+        descriptor no longer attributes to anybody.
+        """
+        subject = _issue(SUBJECT, body=f"Governed-by-optional: #{POLICY}\n")
+        host = _Host(
+            issues={SUBJECT: subject},
+            comments={
+                POLICY: [
+                    {
+                        "id": 5365348999,
+                        "updated_at": "2026-08-19T09:00:00Z",
+                        "body": "policy discussion",
+                    }
+                ]
+            },
+            errors={POLICY: RuntimeError("github down")},
+        )
+        run_dir = tmp_path / "run"
+
+        snapshot, _ = _stage(run_dir, host, subject=subject)
+
+        assert snapshot is not None
+        recorded = snapshot.source(POLICY)
+        assert recorded is not None and recorded.staged is False
+        assert recorded.comments == () and recorded.comment_count == 0
+        bodies = run_dir / "tech-lead-data" / CANONICAL_CONTEXT_BODIES_DIRNAME
+        assert not (bodies / f"issue-{POLICY}").exists()
 
 
 class TestNoHardcodedBundle:
