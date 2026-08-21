@@ -42,6 +42,7 @@ review stage exactly what they staged before.
 from __future__ import annotations
 
 import logging
+import shutil
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -195,6 +196,10 @@ def _stage_one_source(
             issue_number,
             exc,
         )
+        # A source can fail HALFWAY (its body written, its comments not), and a
+        # half-staged directory is text the descriptor attributes to nobody.
+        # Drop it so what is on disk is exactly what the descriptor names.
+        shutil.rmtree(_source_dir(bodies_dir, issue_number), ignore_errors=True)
         return _StagedSource(
             source=CanonicalSource(
                 kind=kind,

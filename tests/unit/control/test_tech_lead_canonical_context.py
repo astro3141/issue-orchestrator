@@ -292,6 +292,32 @@ class TestOptionalDegradesHonestly:
         # Degradation is honest, not silent: the run still launches.
         assert manifest["canonical_context"]
 
+    def test_a_half_staged_optional_source_leaves_nothing_behind(
+        self, tmp_path: Path
+    ) -> None:
+        """What is on disk must be exactly what the descriptor attributes."""
+
+        class _CommentsDown(_Host):
+            def get_issue_comments(self, issue_number: int) -> list[dict[str, Any]]:
+                if issue_number == POLICY:
+                    raise RuntimeError("comments unavailable")
+                return super().get_issue_comments(issue_number)
+
+        subject = _issue(SUBJECT, body=f"Governed-by-optional: #{POLICY}\n")
+        host = _CommentsDown(
+            issues={SUBJECT: subject, POLICY: _issue(POLICY, body="policy")}
+        )
+        run_dir = tmp_path / "run"
+
+        snapshot, _ = _stage(run_dir, host, subject=subject)
+
+        assert snapshot is not None
+        recorded = snapshot.source(POLICY)
+        assert recorded is not None and recorded.staged is False
+        bodies = run_dir / "tech-lead-data" / CANONICAL_CONTEXT_BODIES_DIRNAME
+        assert not (bodies / f"issue-{POLICY}").exists()
+        assert (bodies / f"issue-{SUBJECT}" / "body.md").is_file()
+
 
 class TestNoHardcodedBundle:
     """Direction 7: only what the subject declares is staged."""
