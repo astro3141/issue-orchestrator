@@ -51,21 +51,17 @@ from __future__ import annotations
 
 import json
 import logging
-from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable
 
-from ..domain.models import Session, SessionStatus
+from ..domain.models import Session
 from ..domain.board_snapshot import BOARD_SNAPSHOT_FILENAME, BoardSnapshot
-from ..domain.tech_lead_capabilities import TECH_LEAD_ACTION_CAPABILITIES
 from ..domain.tech_lead_manifest import TechLeadManifest
 from ..domain.tech_lead_session import TechLeadLaunchAuthority, TechLeadSessionFlavor
 from .actions import (
     Action,
-    AddCommentAction,
     AddLabelAction,
     CloseIssueAction,
-    RemoveLabelAction,
 )
 from .completion_types import (
     ERROR_PREFIX_TECH_LEAD_AUTHORITY,
