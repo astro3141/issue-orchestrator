@@ -44,11 +44,13 @@ from __future__ import annotations
 
 import json
 import logging
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable
 
-from ..domain.models import Session
+from ..domain.models import Session, SessionStatus
 from ..domain.board_snapshot import BOARD_SNAPSHOT_FILENAME, BoardSnapshot
+from ..domain.tech_lead_capabilities import TECH_LEAD_ACTION_CAPABILITIES
 from ..domain.tech_lead_manifest import TechLeadManifest
 from ..domain.tech_lead_session import TechLeadLaunchAuthority, TechLeadSessionFlavor
 from .actions import (
@@ -590,14 +592,164 @@ def generate_tech_lead_decision_failure_actions(
     return actions
 
 
-def generate_tech_lead_failure_actions(
+@dataclass(frozen=True, slots=True)
+class TechLeadTerminalEffects:
+    """Both ends of what a FAILED/TIMED_OUT tech_lead session does (#136 A1).
+
+    A dead tech_lead session has effects on two different things, and only one
+    of them used to be stated here:
+
+    * its ANCHOR — close the tracking/health issue, label the manifest PRs.
+      ``added`` carries these, appended after the generic session-failure
+      effects the way they always were.
+    * its SUBJECT — the recovery labels (``blocked-failed`` / ``needs-human``)
+      the GENERIC session-failure path stamps on ``issue-{N}`` for every
+      ``issue-`` session. That path never asks whose session it is. For a batch
+      or health anchor the label is bookkeeping on an issue that is closing
+      anyway, and a failure investigation's subject is blocked by definition —
+      but for a role with no recovery authority over a live, unblocked subject
+      it is a recovery-state change the role is forbidden to propose, achieved
+      by dying. ``subject_actions`` is that role's own subject effects,
+      substituted for the generic ones; ``None`` means the generic effects
+      stand unchanged.
+    """
+
+    subject_actions: tuple[Action, ...] | None
+    added: tuple[Action, ...]
+
+    def resolve(self, generic_subject_actions: list[Action]) -> list[Action]:
+        """The terminal action list, generic subject effects kept or replaced."""
+        actions = (
+            list(generic_subject_actions)
+            if self.subject_actions is None
+            else list(self.subject_actions)
+        )
+        actions.extend(self.added)
+        return actions
+
+
+_NO_TECH_LEAD_TERMINAL_EFFECTS = TechLeadTerminalEffects(subject_actions=None, added=())
+
+
+def plan_tech_lead_terminal_effects(
     config: "Config",
     session: Session,
     expected: "ExpectedState",
     *,
+    status: SessionStatus,
+    labels: LabelManager,
     tech_lead_authority: "TechLeadAuthorityStore",
+) -> TechLeadTerminalEffects:
+    """FAILED/TIMED_OUT tech_lead terminal effects (#6768 round 5, ADR-0031 §4).
+
+    Resolves the orchestrator-owned launch authority ONCE and answers both
+    halves of :class:`TechLeadTerminalEffects` from it — the anchor's effects
+    and whether this run's role may leave a recovery label on its subject.
+
+    A non-tech_lead session, or a session without a launch authority record,
+    changes nothing: the generic effects stand and no anchor effects are added
+    (the session already failed; closing or labeling from untrusted worktree
+    copies would hand the agent authority).
+    """
+    if not is_tech_lead_session(config.tech_lead_review_agent, session.issue.agent_type):
+        return _NO_TECH_LEAD_TERMINAL_EFFECTS
+    authority, _tamper = _resolve_launch_authority_for_session(
+        tech_lead_authority, session
+    )
+    if authority is None:
+        logger.warning(
+            "[tech_lead] No launch authority for session %s; "
+            "skipping terminal tech_lead effects",
+            session.terminal_id,
+        )
+        return _NO_TECH_LEAD_TERMINAL_EFFECTS
+    return TechLeadTerminalEffects(
+        subject_actions=_bounded_subject_terminal_actions(
+            session, expected, authority=authority, status=status, labels=labels
+        ),
+        added=tuple(
+            _anchor_terminal_actions(config, session, expected, authority=authority)
+        ),
+    )
+
+
+# How each TERMINAL status reads in the subject's obituary. A map rather than a
+# branch: the two statuses this owner is called for are exactly the two the
+# generic path stamps a recovery label for, and an unexpected third raises here
+# instead of being described as the wrong death.
+_TERMINAL_STATUS_PHRASES: dict[SessionStatus, str] = {
+    SessionStatus.TIMED_OUT: "exceeded its timeout",
+    SessionStatus.FAILED: "ended without calling its completion command",
+}
+
+
+def _bounded_subject_terminal_actions(
+    session: Session,
+    expected: "ExpectedState",
+    *,
+    authority: TechLeadLaunchAuthority,
+    status: SessionStatus,
+    labels: LabelManager,
+) -> tuple[Action, ...] | None:
+    """Subject effects for a dead run whose ROLE holds no recovery authority.
+
+    ``None`` — the generic session-failure effects stand — for every role that
+    may propose a recovery action (its subject's recovery state is already its
+    business) and for every non-focused run (its subject is an anchor, not a
+    work item). What is left is the bounded focused role (#136): admission
+    accepts only an OPEN, non-blocked subject for it, its capability row omits
+    every recovery kind, and ``allowed_act_level_targets`` gives it no recovery
+    target — so a crashed session must not be the one path that blocks the
+    issue anyway. The claim is still released, and the operator still gets the
+    session's obituary; what they do not get is work newly marked as failed.
+
+    Recovery authority is read from the capability table rather than matched by
+    flavor so a future bounded role inherits this the moment it declares its
+    row, and a role that later GAINS a recovery kind loses the substitution in
+    the same edit.
+    """
+    flavor = authority.flavor
+    if not flavor.is_issue_focused:
+        return None
+    if TECH_LEAD_ACTION_CAPABILITIES.permits_recovery(flavor):
+        return None
+    return (
+        AddCommentAction(
+            number=session.issue.number,
+            comment=(
+                f"## 🛑 Tech Lead {flavor.value} session ended without a result"
+                "\n\n"
+                f"The `{flavor.value}` session on this issue"
+                f" {_TERMINAL_STATUS_PHRASES[status]}.\n\n"
+                f"- Session: `{session.terminal_id}`\n"
+                f"- Runtime: {session.runtime_minutes:.1f} minutes\n\n"
+                "This role holds no recovery authority over the issue it was"
+                f" sent to work on, so **no `{labels.blocked_failed}` or"
+                f" `{labels.needs_human}` label was added** — the issue is left"
+                " exactly as it was and remains available for normal work."
+            ),
+            reason=(
+                f"Report the dead {flavor.value} run without blocking its subject"
+            ),
+            expected=expected,
+        ),
+        RemoveLabelAction(
+            issue_number=session.issue.number,
+            label=labels.in_progress,
+            reason=f"Tech Lead {flavor.value} session ended - releasing claim",
+            expected=expected,
+        ),
+    )
+
+
+def _anchor_terminal_actions(
+    config: "Config",
+    session: Session,
+    expected: "ExpectedState",
+    *,
+    authority: TechLeadLaunchAuthority,
 ) -> list[Action]:
-    """Batch/health FAILED/TIMED_OUT terminal effects (#6768 round 5, ADR-0031 §4).
+    """Anchor-side terminal effects for a dead tech_lead run.
 
     Batch: the AUTHORITY manifest PRs get the operator-visible tech-lead-failed
     label and the tracking issue closes after the generic failure diagnosis
@@ -610,22 +762,7 @@ def generate_tech_lead_failure_actions(
     (the failed one an investigation was sent to diagnose, or the open one a
     planning run was sent to prepare), and closing it because the tech-lead
     session died would close work the orchestrator still owes (#136).
-    A session without a launch authority record
-    produces nothing (the session already failed; closing or labeling from
-    untrusted worktree copies would hand the agent authority).
     """
-    if not is_tech_lead_session(config.tech_lead_review_agent, session.issue.agent_type):
-        return []
-    authority, _tamper = _resolve_launch_authority_for_session(
-        tech_lead_authority, session
-    )
-    if authority is None:
-        logger.warning(
-            "[tech_lead] No launch authority for session %s; "
-            "skipping terminal tech_lead effects",
-            session.terminal_id,
-        )
-        return []
     if authority.flavor.is_issue_focused:
         return []
     if authority.flavor is TechLeadSessionFlavor.HEALTH_REVIEW:

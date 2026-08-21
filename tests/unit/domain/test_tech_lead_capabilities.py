@@ -134,6 +134,28 @@ class TestShippedCapabilities:
             TechLeadSessionFlavor.PLANNING_INVESTIGATION, action_type
         )
 
+    @pytest.mark.parametrize(
+        ("flavor", "holds_recovery"),
+        [
+            (TechLeadSessionFlavor.FAILURE_INVESTIGATION, True),
+            (TechLeadSessionFlavor.HEALTH_REVIEW, True),
+            (TechLeadSessionFlavor.BATCH_REVIEW, False),
+            (TechLeadSessionFlavor.PLANNING_INVESTIGATION, False),
+        ],
+    )
+    def test_recovery_authority_is_read_from_the_table(
+        self, flavor: TechLeadSessionFlavor, holds_recovery: bool
+    ) -> None:
+        """"Does this role hold recovery authority?" has one answer (#136 A1).
+
+        The terminal-effects owner asks this to decide whether a DEAD session
+        may leave a blocking label on its own subject — a role that may not
+        propose a recovery action must not achieve one by crashing. Asking the
+        table means a future bounded role inherits that the moment it declares
+        its row, instead of the rule being re-derived per caller.
+        """
+        assert TECH_LEAD_ACTION_CAPABILITIES.permits_recovery(flavor) is holds_recovery
+
 
 class TestAgentFacingDescription:
     """``describe_by_flavor`` is the TELLING read the prompt renders from.

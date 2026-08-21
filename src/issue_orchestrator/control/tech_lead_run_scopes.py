@@ -230,13 +230,21 @@ def scope_phrase(scope: TechLeadRunScope) -> str:
     """
     if scope.kind.is_global:
         return f"A {global_run_label(scope.kind)}"
-    return f"{_focused_run_phrase(scope)} of issue #{scope.subject_issue_number}"
+    return (
+        f"{_FOCUSED_RUN_PHRASES[scope.flavor]} of issue"
+        f" #{scope.subject_issue_number}"
+    )
 
 
-def _focused_run_phrase(scope: TechLeadRunScope) -> str:
-    if scope.flavor is TechLeadSessionFlavor.PLANNING_INVESTIGATION:
-        return "A tech-lead planning investigation"
-    return "A tech-lead investigation"
+# The operator-facing name per focused flavor, exhaustive like its neighbour
+# ``_SCRATCH_BRANCH_STEM``: a third focused flavor raises here rather than being
+# quietly described to an operator as an investigation.
+_FOCUSED_RUN_PHRASES: dict[TechLeadSessionFlavor, str] = {
+    TechLeadSessionFlavor.FAILURE_INVESTIGATION: "A tech-lead investigation",
+    TechLeadSessionFlavor.PLANNING_INVESTIGATION: (
+        "A tech-lead planning investigation"
+    ),
+}
 
 
 def already_running_detail(scope: TechLeadRunScope) -> str:

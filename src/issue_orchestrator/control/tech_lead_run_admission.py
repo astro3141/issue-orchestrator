@@ -449,7 +449,16 @@ class TechLeadRunCoordinator:
         from .pending_session_queues import TechLeadQueueOutcome
 
         if outcome is TechLeadQueueOutcome.DUPLICATE:
-            self._ownership.release(scope.run_key)
+            release = self._ownership.release(scope.run_key)
+            if not release.released:
+                # The whole point of this branch is to degrade gracefully if the
+                # ordering regresses; an unlogged UNAVAILABLE would make the
+                # degradation silent and leave the claim held until it expires.
+                logger.warning(
+                    "[tech_lead] Could not release %s after a duplicate enqueue: %s",
+                    scope.run_key,
+                    release.detail or release.status.value,
+                )
             return self._existing(
                 request,
                 TechLeadRunOutcome.ALREADY_QUEUED,

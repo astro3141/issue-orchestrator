@@ -918,6 +918,67 @@ def test_a_failed_planning_run_never_closes_its_subject(
     assert _tech_lead_failed_labels(actions) == []
 
 
+@pytest.mark.parametrize("status", [SessionStatus.FAILED, SessionStatus.TIMED_OUT])
+def test_a_dead_planning_run_never_blocks_its_healthy_subject(
+    tmp_path: Path, status: SessionStatus
+) -> None:
+    """A crash must not do what the role itself may not (#136 review A1).
+
+    The generic session-terminal path stamps ``blocked-failed`` (TIMED_OUT) or
+    ``needs-human`` (FAILED) on every ``issue-`` session's issue without asking
+    whose session it is. Admission accepts only an OPEN, non-blocked subject for
+    a planning run, and the role's capability row omits every recovery kind — so
+    letting that path stand would block healthy work nobody asked this role to
+    recover, and make it eligible for the failure investigation the role was
+    specifically built not to be able to invoke.
+    """
+    config = make_tech_lead_config(tmp_path)
+    config.retry.interrupted_sessions.enabled = False
+    session = make_tech_lead_session(tmp_path)
+    arm_planning_session(config, session)
+    labels = LabelManager(config)
+
+    actions = make_planner(config).generate_completion_actions(session, status)
+
+    assert labels.blocked_failed not in added_labels(actions)
+    assert labels.needs_human not in added_labels(actions)
+    # The claim is still released and the operator still gets the obituary:
+    # the subject is left untouched, not left silently claimed.
+    assert labels.in_progress in removed_labels(actions)
+    assert any(
+        "planning_investigation` session on this issue" in comment
+        for comment in comments(actions)
+    )
+
+
+@pytest.mark.parametrize("status", [SessionStatus.FAILED, SessionStatus.TIMED_OUT])
+def test_a_dead_failure_investigation_still_reports_its_subject(
+    tmp_path: Path, status: SessionStatus
+) -> None:
+    """The substitution is scoped to roles with no recovery authority (#136 A1).
+
+    A failure investigation holds the recovery kinds and its subject is blocked
+    by definition, so the generic terminal effects stand exactly as they did
+    before the bounded flavor existed. Without this, a fix aimed at planning
+    would silently stop reporting every focused run's death.
+    """
+    config = make_tech_lead_config(tmp_path)
+    config.retry.interrupted_sessions.enabled = False
+    session = make_tech_lead_session(tmp_path)
+    arm_investigation_session(config, session)
+    labels = LabelManager(config)
+    expected = (
+        labels.blocked_failed
+        if status is SessionStatus.TIMED_OUT
+        else labels.needs_human
+    )
+
+    actions = make_planner(config).generate_completion_actions(session, status)
+
+    assert expected in added_labels(actions)
+    assert labels.in_progress in removed_labels(actions)
+
+
 def test_tech_lead_session_without_launch_authority_is_rejected(
     tmp_path: Path, caplog
 ) -> None:

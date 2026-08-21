@@ -141,6 +141,20 @@ class TechLeadActionCapabilityPolicy:
         """True when a *flavor* session may propose *action_type* at all."""
         return action_type in self.allowed_kinds_by_flavor[flavor]
 
+    def permits_recovery(self, flavor: TechLeadSessionFlavor) -> bool:
+        """True when *flavor* may propose ANY recovery kind (#136 review A1).
+
+        The recovery kinds are what "may change a work item's recovery state"
+        means for this table, so the question "does this role hold recovery
+        authority?" is answered HERE rather than by re-listing the kinds — or,
+        worse, by naming the one flavor that lacks them — at each caller. The
+        terminal-effects owner (``control.tech_lead_completion``) asks it to
+        decide whether a dead session may stamp a blocking label on its own
+        focused subject: a role the contract forbids from proposing a recovery
+        action must not achieve one by dying.
+        """
+        return bool(self.allowed_kinds(flavor) & _RECOVERY_KINDS)
+
     def describe_by_flavor(
         self,
     ) -> tuple[tuple[TechLeadSessionFlavor, tuple[str, ...]], ...]:
