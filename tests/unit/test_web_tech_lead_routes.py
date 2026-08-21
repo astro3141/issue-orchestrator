@@ -33,6 +33,7 @@ from issue_orchestrator.domain.tech_lead_run import (
     REASON_ORCHESTRATOR_PAUSED,
     GlobalHealthReviewScope,
     IssueInvestigationScope,
+    PlanningInvestigationScope,
     TechLeadRunAdmission,
     TechLeadRunOutcome,
     TechLeadRunScopeKind,
@@ -117,6 +118,100 @@ def test_issue_scope_is_delegated_as_one_typed_command(client, wired_orchestrato
     # The route never invents failure context or a title — those belong to the
     # triggers that actually observed a failure.
     assert request.failure is None
+
+
+@pytest.mark.parametrize(
+    "scope_body",
+    [
+        {"kind": "issue", "issue_number": 42},
+        {"kind": "issue", "issue_number": 42, "flavor": "failure_investigation"},
+    ],
+    ids=["flavor_omitted", "flavor_named_explicitly"],
+)
+def test_an_issue_request_naming_no_planning_flavor_is_unchanged(
+    client, wired_orchestrator, scope_body
+):
+    """#189: the discriminator defaults, so every existing caller is identical."""
+    orchestrator = wired_orchestrator(_admission(TechLeadRunOutcome.QUEUED))
+
+    response = client.post(ENDPOINT, json={"scope": scope_body})
+
+    assert response.status_code == 200
+    assert orchestrator.requests[0].scope == IssueInvestigationScope(42)
+
+
+def test_a_planning_flavored_request_is_delegated_as_a_planning_run(
+    client, wired_orchestrator
+):
+    """#189: the dashboard can now NAME which focused role it wants.
+
+    The route still hands over exactly one typed command — it does not learn
+    the planning subject rule, which stays with the admission owner.
+    """
+    orchestrator = wired_orchestrator(
+        _admission(TechLeadRunOutcome.QUEUED, run_key="planning:42")
+    )
+
+    response = client.post(
+        ENDPOINT,
+        json={
+            "scope": {
+                "kind": "issue",
+                "issue_number": 42,
+                "flavor": "planning_investigation",
+            }
+        },
+    )
+
+    assert response.status_code == 200
+    request = orchestrator.requests[0]
+    assert request.scope == PlanningInvestigationScope(42)
+    assert request.scope.run_key == "planning:42"
+    assert request.trigger is TechLeadRunTrigger.DASHBOARD
+    # Preparation carries no triggering failure, and the route invents none.
+    assert request.failure is None
+
+
+def test_the_two_focused_flavors_of_one_issue_reach_two_run_keys(
+    client, wired_orchestrator
+):
+    """#189: a planning run and an investigation never coalesce (#136)."""
+    orchestrator = wired_orchestrator(_admission(TechLeadRunOutcome.QUEUED))
+
+    client.post(ENDPOINT, json={"scope": {"kind": "issue", "issue_number": 42}})
+    client.post(
+        ENDPOINT,
+        json={
+            "scope": {
+                "kind": "issue",
+                "issue_number": 42,
+                "flavor": "planning_investigation",
+            }
+        },
+    )
+
+    keys = [request.scope.run_key for request in orchestrator.requests]
+    assert keys == ["issue:42", "planning:42"]
+
+
+@pytest.mark.parametrize(
+    "scope_body",
+    [
+        {"kind": "issue", "issue_number": 42, "flavor": "health_review"},
+        {"kind": "issue", "issue_number": 42, "flavor": "planning"},
+        {"kind": "global_health_review", "flavor": "planning_investigation"},
+    ],
+)
+def test_an_undeclared_flavor_never_reaches_the_owner(
+    client, wired_orchestrator, scope_body
+):
+    """The generated contract is the gate — including on the GLOBAL scope."""
+    orchestrator = wired_orchestrator(_admission(TechLeadRunOutcome.QUEUED))
+
+    response = client.post(ENDPOINT, json={"scope": scope_body})
+
+    assert response.status_code == 422
+    assert orchestrator.requests == []
 
 
 def test_global_scope_is_delegated_as_one_typed_command(client, wired_orchestrator):

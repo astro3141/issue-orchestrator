@@ -44,12 +44,14 @@ from typing import TYPE_CHECKING, Protocol
 
 from ..domain.models import PendingTechLeadReview
 from ..domain.tech_lead_run import (
+    DEFAULT_FOCUSED_RUN_FLAVOR,
     GlobalHealthReviewScope,
-    IssueInvestigationScope,
     TechLeadRunAdmission,
     TechLeadRunRequest,
     TechLeadRunTrigger,
+    scope_for_flavor,
 )
+from ..domain.tech_lead_session import TechLeadSessionFlavor
 from .tech_lead_run_scopes import run_key_of_pending
 
 if TYPE_CHECKING:
@@ -65,6 +67,29 @@ logger = logging.getLogger(__name__)
 # investigates regardless of the label. Re-exported from the run-admission owner
 # (#6994) so both hand-aimed surfaces label their context identically.
 _BLOCKED_LABEL_PREFIX = "blocked"
+
+# What each focused role is CALLED in an operator-facing result line (#189). One
+# map, so the "not admitted" line, the timeout line and the "completed" line for
+# a given role can never name it three different things.
+_FOCUSED_RUN_LABELS: dict[TechLeadSessionFlavor, str] = {
+    TechLeadSessionFlavor.FAILURE_INVESTIGATION: "investigation",
+    TechLeadSessionFlavor.PLANNING_INVESTIGATION: "planning investigation",
+}
+
+
+def focused_run_label(flavor: TechLeadSessionFlavor) -> str:
+    """The operator-facing name of a focused run, refusing anything else.
+
+    Fails loudly rather than defaulting to "investigation": a whole-repository
+    flavor reported as a targeted investigation would describe an exclusive
+    board-wide review as one issue's run.
+    """
+    try:
+        return _FOCUSED_RUN_LABELS[flavor]
+    except KeyError:
+        raise ValueError(
+            f"{flavor.value} is not a focused tech-lead run flavor"
+        ) from None
 
 
 class TechLeadDispatchHost(Protocol):
@@ -243,6 +268,7 @@ def run_targeted_investigations(
     *,
     now: Callable[[], float],
     sleep: Callable[[float], None],
+    flavor: TechLeadSessionFlavor = DEFAULT_FOCUSED_RUN_FLAVOR,
     poll_interval: float = 3.0,
     timeout_s: float = 1800.0,
 ) -> list[InvestigationResult]:
@@ -257,14 +283,21 @@ def run_targeted_investigations(
     round 1 F2). Each admitted run is launched through the real facade path and
     ticked until its session leaves ``active_sessions`` or ``timeout_s`` elapses.
 
+    ``flavor`` is which focused role the operator aimed (#189). It changes the
+    SCOPE handed to admission and nothing else: the planning branch of the same
+    admission owner then applies its own subject rule and its own capability
+    row, so this driver never learns either. Omitting it keeps the default
+    failure investigation every caller had before the flag existed.
+
     Returns one :class:`InvestigationResult` per requested issue, in order.
     """
+    label = focused_run_label(flavor)
     admissions = [
         (
             issue_number,
             orchestrator.request_tech_lead_run(
                 TechLeadRunRequest(
-                    scope=IssueInvestigationScope(issue_number),
+                    scope=scope_for_flavor(flavor, issue_number=issue_number),
                     trigger=TechLeadRunTrigger.CLI,
                 )
             ),
@@ -273,14 +306,16 @@ def run_targeted_investigations(
     ]
     orchestrator.pause()
     logger.info(
-        "[TECH_LEAD_TRIGGER] planner paused for %d on-demand investigation(s) (#6823)",
+        "[TECH_LEAD_TRIGGER] planner paused for %d on-demand %s(s) (#6823)",
         len(issue_numbers),
+        label,
     )
     return [
         _investigate_one(
             orchestrator,
             issue_number,
             admission,
+            label=label,
             now=now,
             sleep=sleep,
             poll_interval=poll_interval,
@@ -398,23 +433,25 @@ def _investigate_one(
     issue_number: int,
     admission: TechLeadRunAdmission,
     *,
+    label: str,
     now: Callable[[], float],
     sleep: Callable[[float], None],
     poll_interval: float,
     timeout_s: float,
 ) -> InvestigationResult:
-    """Launch and drive a single already-admitted on-demand investigation."""
+    """Launch and drive a single already-admitted on-demand focused run."""
     tech_lead = _admitted_queue_item(orchestrator, admission)
     if tech_lead is None:
         logger.warning(
-            "[TECH_LEAD_TRIGGER] investigation of #%d not admitted: %s",
+            "[TECH_LEAD_TRIGGER] %s of #%d not admitted: %s",
+            label,
             issue_number,
             admission.reason,
         )
         return InvestigationResult(
             issue_number, status=TechLeadOutcomeStatus.NOT_LAUNCHED,
             detail=(
-                f"investigation of issue #{issue_number} not admitted:"
+                f"{label} of issue #{issue_number} not admitted:"
                 f" {admission.reason} ({admission.detail})"
             ),
         )
@@ -426,7 +463,7 @@ def _investigate_one(
         return InvestigationResult(
             issue_number, status=TechLeadOutcomeStatus.NOT_LAUNCHED,
             detail=(
-                f"investigation of issue #{issue_number} not started: the launch"
+                f"{label} of issue #{issue_number} not started: the launch"
                 " authority held or refused it (scope exclusivity, cross-engine"
                 " ownership, subject no longer eligible, or a launch failure)"
             ),
@@ -442,6 +479,7 @@ def _investigate_one(
         orchestrator,
         issue_number,
         identity,
+        label=label,
         now=now,
         sleep=sleep,
         poll_interval=poll_interval,
@@ -454,12 +492,13 @@ def _drive_to_completion(
     issue_number: int,
     identity: str,
     *,
+    label: str,
     now: Callable[[], float],
     sleep: Callable[[float], None],
     poll_interval: float,
     timeout_s: float,
 ) -> InvestigationResult:
-    """Drive a launched failure investigation to completion and label the result."""
+    """Drive a launched focused run to completion and label the result."""
     termination = _drive_session_to_completion(
         orchestrator,
         identity,
@@ -471,15 +510,15 @@ def _drive_to_completion(
     if termination is not None:
         return InvestigationResult(
             issue_number, status=TechLeadOutcomeStatus.TIMED_OUT,
-            detail=_timeout_detail("investigation", timeout_s, termination),
+            detail=_timeout_detail(label, timeout_s, termination),
             termination=termination,
         )
     logger.info(
-        "[TECH_LEAD_TRIGGER] issue #%d investigation completed", issue_number
+        "[TECH_LEAD_TRIGGER] issue #%d %s completed", issue_number, label
     )
     return InvestigationResult(
         issue_number, status=TechLeadOutcomeStatus.COMPLETED,
-        detail=f"investigation completed for issue #{issue_number}",
+        detail=f"{label} completed for issue #{issue_number}",
     )
 
 

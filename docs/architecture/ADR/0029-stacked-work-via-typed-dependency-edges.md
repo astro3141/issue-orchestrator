@@ -129,6 +129,40 @@ is for **explicitly discoverable same-stack chains**: a chain whose edges are
 declared as stack edges and resolvable as a single stack may span milestones.
 We do not turn every dependency edge into a cross-milestone escape hatch.
 
+### 5. `Governed-by:` is not an edge, and never becomes one
+
+A third body directive family shares this one's *shape* — line-anchored,
+case-insensitive, one keyword per semantic — and must not be mistaken for an
+ordering edge:
+
+| Directive | Answers | Effect on scheduling |
+|---|---|---|
+| `Depends-on: <ref>` | May this issue's work begin? | Blocks until the dependency is closed |
+| `Stack-after: <ref>` | May this slice start on its predecessor's branch? | Relaxes *start*, keeps *merge* ordered |
+| `Governed-by: #<n>` | What must a tech-lead planning run **read** before preparing this issue? | **None** |
+| `Governed-by-optional: #<n>` | Same, but degradable | **None** |
+
+The governing directives are parsed by
+[`domain/canonical_context.py`](../../../src/issue_orchestrator/domain/canonical_context.py)
+(not `domain/dependencies.py`), and are consumed only when a
+`planning_investigation` run stages its canonical context. They create no
+dependency edge, no gate, and no milestone constraint, so nothing in this ADR's
+gate report reads them. Their two deliberate differences from `Depends-on:` are:
+
+- **Same-repo issue references only** (`#<number>`). `owner/repo#n` and
+  `M1-010`-style external IDs are *rejected*, because the staging owner fetches
+  a source through a single-repository `RepositoryHost`.
+- **Malformed declarations fail loudly.** `Depends-on:` skips a value it cannot
+  resolve; a governing declaration that cannot be resolved to an issue number
+  raises, because a source that cannot be *named* is a defect in the subject's
+  body rather than a source that merely failed to load.
+
+The operator-facing syntax lives in
+[`docs/user/faq.md`](../../user/faq.md) (Q26) and
+[`docs/user/tutorial.md`](../../user/tutorial.md); a typo there costs a
+retry-queue burn, so the syntax is written down for the human who authors it
+rather than only for the agent that consumes it.
+
 ## Implementation sequence
 
 These issues are intentionally serialized with `Depends-on:` because the

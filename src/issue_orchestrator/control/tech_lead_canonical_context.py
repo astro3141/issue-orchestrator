@@ -226,7 +226,11 @@ def _stage_one_source(
                 required=False,
                 fetched_at=fetched_at,
                 staged=False,
-                absent_reason=str(exc) or exc.__class__.__name__,
+                # ``.strip()``, because ``CanonicalSource`` rejects an absence
+                # reason that is only whitespace — an exception carrying, say,
+                # a lone newline would otherwise turn an honest optional
+                # degradation into an unhandled ValueError (PR #184 N3).
+                absent_reason=str(exc).strip() or exc.__class__.__name__,
             ),
             body="",
         )

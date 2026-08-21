@@ -40,16 +40,26 @@ def cmd_tech_lead(args: argparse.Namespace) -> int:
     """Dispatch the tech lead at one or more specific issues, on demand.
 
     Runs its own in-process orchestrator (so it cannot share the repo lock with
-    a running one), launches a failure-investigation for each named issue
+    a running one), launches the focused run ``--flavor`` names for each issue
     through the real tech-lead-launch path, and drives each to completion with the
     planner paused so no other board work starts. ``--advise-only`` dials every
     tech_lead authority to ``propose`` so nothing auto-executes (only the
     non-configurable escalate floor can).
+
+    ``--flavor`` is the CLI half of the dashboard's focused-flavor discriminator
+    (#189): it names the ROLE and nothing else, so the shared admission owner
+    still decides whether that role may run against that subject. It defaults to
+    the failure investigation this command has always dispatched.
     """
-    from ..control.tech_lead_trigger import run_targeted_investigations
+    from ..control.tech_lead_trigger import (
+        focused_run_label,
+        run_targeted_investigations,
+    )
+    from ..domain.tech_lead_run import focused_run_flavor
     from ..infra.repo_lock import AlreadyRunning, held_repo_lock
 
     config = load_config(args)
+    flavor = focused_run_flavor(getattr(args, "flavor", None))
     # Hold the repo lock for the ENTIRE build/run/close lifecycle — not a
     # read-only pre-check — so no other command or the engine can start against
     # this repo mid-run (#6824 F6).
@@ -59,13 +69,14 @@ def cmd_tech_lead(args: argparse.Namespace) -> int:
             _apply_advise_only_authority(args, config)
             orchestrator = _build_orchestrator(config)
             console.print(
-                "[green]Dispatching the tech lead at:[/green] "
-                + ", ".join(f"#{n}" for n in args.issues)
+                f"[green]Dispatching a tech-lead {focused_run_label(flavor)}"
+                " at:[/green] " + ", ".join(f"#{n}" for n in args.issues)
             )
             try:
                 results = run_targeted_investigations(
                     orchestrator,
                     args.issues,
+                    flavor=flavor,
                     now=time.monotonic,
                     sleep=time.sleep,
                     timeout_s=float(args.timeout),

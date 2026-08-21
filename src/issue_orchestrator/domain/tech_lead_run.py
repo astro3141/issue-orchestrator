@@ -352,6 +352,53 @@ def scope_for_flavor(
     return _ISSUE_SCOPE_BY_FLAVOR[flavor](issue_number)
 
 
+# The focused roles an OPERATOR may name when aiming a run at one issue (#189).
+# Derived from the flavor enum's own focused-ness rather than restated, so a
+# third focused flavor becomes askable by declaring itself focused — and a
+# whole-repository flavor can never leak into an issue-scoped request.
+FOCUSED_RUN_FLAVORS: tuple[TechLeadSessionFlavor, ...] = tuple(
+    flavor for flavor in TechLeadSessionFlavor if flavor.is_issue_focused
+)
+
+# The wire/CLI spellings of those roles, in the enum's declaration order, so the
+# dashboard payload's discriminator and the CLI flag's choices are one list.
+FOCUSED_RUN_FLAVOR_NAMES: tuple[str, ...] = tuple(
+    flavor.value for flavor in FOCUSED_RUN_FLAVORS
+)
+
+# What an operator surface means when it names no focused flavor at all. Every
+# request path that existed before the discriminator lands on this, so naming
+# nothing is byte-identical to the behaviour those callers already had (#189).
+DEFAULT_FOCUSED_RUN_FLAVOR = TechLeadSessionFlavor.FAILURE_INVESTIGATION
+
+
+def focused_run_flavor(named: Optional[str]) -> TechLeadSessionFlavor:
+    """The focused flavor an operator asked for, by its wire/CLI spelling.
+
+    The SINGLE owner of that projection, shared by the dashboard command
+    surface and the one-shot CLI, so the two cannot disagree about which
+    spellings exist or what naming nothing means. ``None`` (or an empty string)
+    is "no flavor named" and resolves to :data:`DEFAULT_FOCUSED_RUN_FLAVOR`.
+
+    A whole-repository flavor is refused rather than resolved: it would name a
+    run whose subject is the board, and ``scope_for_flavor`` would hand back a
+    GLOBAL scope for what the caller asked to be one issue's run — an exclusive
+    whole-board barrier admitted from an issue-scoped request.
+    """
+    if not named:
+        return DEFAULT_FOCUSED_RUN_FLAVOR
+    try:
+        flavor = TechLeadSessionFlavor(named)
+    except ValueError:
+        flavor = None
+    if flavor is None or not flavor.is_issue_focused:
+        raise ValueError(
+            f"{named!r} is not a focused tech-lead run flavor; an operator may"
+            f" ask for one of {list(FOCUSED_RUN_FLAVOR_NAMES)}"
+        )
+    return flavor
+
+
 class TechLeadRunTrigger(str, Enum):
     """Who asked. Recorded for observability; it never changes the policy.
 
