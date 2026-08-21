@@ -52,23 +52,17 @@ leaf neither narrows nor widens shipped behavior:
   Stating it as a capability says WHY up front ("this role does not do
   recovery") instead of reporting a missing target.
 
-``escalate_to_human`` is deliberately in every shipped role's set: this leaf
-adds a capability boundary and must not move the escalation floor.
+* ``PLANNING_INVESTIGATION`` (#136) — the least-authority role, and the first
+  row whose allowlist is a DECISION rather than a measurement: nothing shipped
+  before it, so there is no accepted-decision set to preserve. It declares
+  comment/routing/escalation only, which is what makes the flavor bounded — the
+  omitted recovery kinds are structurally unreachable for it, and no
+  ``tech_lead.authority.*`` setting, target, or prompt can restore them.
 
-Expressing a least-authority role
----------------------------------
-
-A future planning role declares its strict set the same way, and the recovery
-kinds it omits are then structurally unreachable for it::
-
-    TechLeadActionCapabilityPolicy({
-        ...,
-        TechLeadSessionFlavor.PLANNING: frozenset(
-            ("post_comment", "create_issue", "escalate_to_human")
-        ),
-    })
-
-No planning flavor is added here (#133 non-goals).
+``escalate_to_human`` is deliberately in every shipped role's set: the
+capability boundary must not move the escalation floor, least-authority roles
+included — a role that can see a problem it may not act on is exactly the role
+that needs a way to hand it to a human.
 """
 
 from __future__ import annotations
@@ -188,6 +182,15 @@ _COMMENT_AND_ROUTING_KINDS: frozenset[str] = frozenset(
     ("post_comment", "create_issue", "escalate_to_human", "flag_pattern")
 )
 _RECOVERY_KINDS: frozenset[str] = frozenset(("reset_retry", "kill_hung_session"))
+# The least-authority row (#136): report what preparation found, route follow-up
+# work, and escalate. Every RECOVERY kind is omitted, so the contract rejects a
+# reset/kill from this role before effect planning — no target, authority
+# setting, or prompt edit can restore them. ``flag_pattern`` is omitted too: a
+# durable cross-run pattern ledger is evidence gathered by the roles that WATCH
+# the floor, not by a role preparing one issue.
+_PLANNING_KINDS: frozenset[str] = frozenset(
+    ("post_comment", "create_issue", "escalate_to_human")
+)
 
 # The shipped table. See the module docstring for how each row was measured
 # from the current completion contract.
@@ -200,5 +203,6 @@ TECH_LEAD_ACTION_CAPABILITIES = TechLeadActionCapabilityPolicy(
         TechLeadSessionFlavor.HEALTH_REVIEW: (
             _COMMENT_AND_ROUTING_KINDS | _RECOVERY_KINDS
         ),
+        TechLeadSessionFlavor.PLANNING_INVESTIGATION: _PLANNING_KINDS,
     }
 )

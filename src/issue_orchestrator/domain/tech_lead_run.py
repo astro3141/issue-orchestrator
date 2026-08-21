@@ -18,9 +18,11 @@ The scopes are deliberately asymmetric, because the work is:
   whole board (one walks the issue board, the other the accumulated PR
   manifest). Each is exclusive of every other tech-lead run, and once queued it
   is a barrier later work waits behind.
-* :class:`IssueInvestigationScope` — one focus issue. Different issues may run
-  concurrently, bounded only by the numeric tech-lead capacity that
-  ``worker_budget.tech_lead_slot_availability`` owns.
+* :class:`IssueInvestigationScope` and :class:`PlanningInvestigationScope` —
+  one focus issue each. Different issues may run concurrently, bounded only by
+  the numeric tech-lead capacity that ``worker_budget.tech_lead_slot_availability``
+  owns. The two are separate identities on the SAME issue: one recovers a
+  blocked subject, the other prepares an open one (#136).
 
 The two GLOBAL scopes are separate identities rather than one "global" bucket
 (#6994 round 1 F2). They audit different evidence and produce different verdicts,
@@ -33,7 +35,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import TYPE_CHECKING, Optional, Union
+from typing import TYPE_CHECKING, Callable, Optional, Union
 
 from .tech_lead_session import TechLeadSessionFlavor
 
@@ -44,8 +46,14 @@ if TYPE_CHECKING:
 class TechLeadRunScopeKind(str, Enum):
     """The shapes a tech-lead run can have.
 
+    A KIND is the run's SHAPE — whole-repository or one issue — which is what
+    the conflict matrix and the shared ledger judge exclusivity by. It is not
+    the run's identity: that is the ``run_key``, and two runs of the same shape
+    (an investigation and a planning run on one issue, #136) are two distinct
+    identities that must never coalesce onto each other.
+
     ``is_global`` is asked here rather than by comparing against a list of
-    global members at each call site, so adding a third whole-board flavor
+    global members at each call site, so adding a fourth whole-board flavor
     cannot leave one call site treating it as issue-scoped.
     """
 
@@ -55,8 +63,19 @@ class TechLeadRunScopeKind(str, Enum):
 
     @property
     def is_global(self) -> bool:
-        """True for every whole-repository scope."""
-        return self is not TechLeadRunScopeKind.ISSUE
+        """True for every whole-repository scope.
+
+        Deliberately stated as "not one of the ISSUE-scoped kinds" rather than
+        as a global allowlist: an unclassified kind then reads as GLOBAL, which
+        is the conservative direction (a targeted run waits) instead of letting
+        work run alongside an exclusive whole-board review.
+        """
+        return self not in _ISSUE_SCOPED_KINDS
+
+
+_ISSUE_SCOPED_KINDS: frozenset[TechLeadRunScopeKind] = frozenset(
+    (TechLeadRunScopeKind.ISSUE,)
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -113,15 +132,11 @@ class IssueInvestigationScope:
     kind: TechLeadRunScopeKind = TechLeadRunScopeKind.ISSUE
 
     def __post_init__(self) -> None:
-        if self.issue_number <= 0:
-            raise ValueError(
-                f"IssueInvestigationScope needs a positive issue number, got"
-                f" {self.issue_number}"
-            )
+        _require_subject_issue_number(type(self).__name__, self.issue_number)
 
     @property
     def run_key(self) -> str:
-        return f"issue:{self.issue_number}"
+        return f"{ISSUE_INVESTIGATION_KEY_PREFIX}{self.issue_number}"
 
     @property
     def flavor(self) -> TechLeadSessionFlavor:
@@ -132,8 +147,57 @@ class IssueInvestigationScope:
         return self.issue_number
 
 
+@dataclass(frozen=True, slots=True)
+class PlanningInvestigationScope:
+    """Focused PREPARATION of one open, non-blocked issue (#136).
+
+    The same SHAPE as :class:`IssueInvestigationScope` — one issue, concurrent
+    with other targeted runs, subordinate to the global barrier — and a
+    deliberately DIFFERENT identity. Its ``run_key`` lives in its own
+    ``planning:`` namespace so a planning run and a failure investigation of the
+    same issue never coalesce onto each other: they are asked about opposite
+    subject states (non-blocked vs blocked) and carry opposite authority
+    (least-authority preparation vs recovery), so treating either as a duplicate
+    of the other would silently drop a request an operator or trigger made.
+
+    It is a separate class rather than a flag on the investigation scope because
+    ``IssueInvestigationScope.flavor`` is unconditionally
+    ``FAILURE_INVESTIGATION``: a conditional flavor there would put the two
+    roles' authority behind one mutable field.
+    """
+
+    issue_number: int
+    kind: TechLeadRunScopeKind = TechLeadRunScopeKind.ISSUE
+
+    def __post_init__(self) -> None:
+        _require_subject_issue_number(type(self).__name__, self.issue_number)
+
+    @property
+    def run_key(self) -> str:
+        return f"{PLANNING_INVESTIGATION_KEY_PREFIX}{self.issue_number}"
+
+    @property
+    def flavor(self) -> TechLeadSessionFlavor:
+        return TechLeadSessionFlavor.PLANNING_INVESTIGATION
+
+    @property
+    def subject_issue_number(self) -> Optional[int]:
+        return self.issue_number
+
+
+def _require_subject_issue_number(scope_name: str, issue_number: int) -> None:
+    """Every issue-scoped run names a real issue; one owner for that rule."""
+    if issue_number <= 0:
+        raise ValueError(
+            f"{scope_name} needs a positive issue number, got {issue_number}"
+        )
+
+
 TechLeadRunScope = Union[
-    GlobalHealthReviewScope, GlobalBatchReviewScope, IssueInvestigationScope
+    GlobalHealthReviewScope,
+    GlobalBatchReviewScope,
+    IssueInvestigationScope,
+    PlanningInvestigationScope,
 ]
 
 # The scope each session flavor runs at. One map, so a queued item, a restored
@@ -142,6 +206,17 @@ _SCOPE_BY_FLAVOR: dict[TechLeadSessionFlavor, TechLeadRunScopeKind] = {
     TechLeadSessionFlavor.HEALTH_REVIEW: TechLeadRunScopeKind.GLOBAL_HEALTH_REVIEW,
     TechLeadSessionFlavor.BATCH_REVIEW: TechLeadRunScopeKind.GLOBAL_BATCH_REVIEW,
     TechLeadSessionFlavor.FAILURE_INVESTIGATION: TechLeadRunScopeKind.ISSUE,
+    TechLeadSessionFlavor.PLANNING_INVESTIGATION: TechLeadRunScopeKind.ISSUE,
+}
+
+# The issue-scoped scope VALUE each focused flavor runs as. Kind alone cannot
+# answer this — the two focused flavors share one shape and differ by identity
+# — so the constructor is selected by flavor, in one map.
+_ISSUE_SCOPE_BY_FLAVOR: dict[
+    TechLeadSessionFlavor, "Callable[[int], TechLeadRunScope]"
+] = {
+    TechLeadSessionFlavor.FAILURE_INVESTIGATION: IssueInvestigationScope,
+    TechLeadSessionFlavor.PLANNING_INVESTIGATION: PlanningInvestigationScope,
 }
 
 
@@ -214,10 +289,12 @@ def scope_kind_of_run_key(run_key: str) -> TechLeadRunScopeKind:
     which hold a key and no scope value, recover the kind, so a key can never be
     classified two different ways (#6994 round 2 F7).
     """
-    if run_key.startswith(_ISSUE_KEY_PREFIX):
-        subject = run_key[len(_ISSUE_KEY_PREFIX) :]
+    for prefix, kind in _ISSUE_KIND_BY_KEY_PREFIX.items():
+        if not run_key.startswith(prefix):
+            continue
+        subject = run_key[len(prefix) :]
         if subject.isdigit() and int(subject) > 0:
-            return TechLeadRunScopeKind.ISSUE
+            return kind
         raise ValueError(f"run key {run_key!r} names no positive issue number")
     kind = _GLOBAL_KIND_BY_RUN_KEY.get(run_key)
     if kind is None:
@@ -225,7 +302,15 @@ def scope_kind_of_run_key(run_key: str) -> TechLeadRunScopeKind:
     return kind
 
 
-_ISSUE_KEY_PREFIX = "issue:"
+# One namespace per issue-scoped run FAMILY. Two runs of the same shape on one
+# issue are distinguished by their namespace, never by the number alone, so a
+# key is decodable back to exactly one family (#136).
+ISSUE_INVESTIGATION_KEY_PREFIX = "issue:"
+PLANNING_INVESTIGATION_KEY_PREFIX = "planning:"
+_ISSUE_KIND_BY_KEY_PREFIX: dict[str, TechLeadRunScopeKind] = {
+    ISSUE_INVESTIGATION_KEY_PREFIX: TechLeadRunScopeKind.ISSUE,
+    PLANNING_INVESTIGATION_KEY_PREFIX: TechLeadRunScopeKind.ISSUE,
+}
 _GLOBAL_KIND_BY_RUN_KEY: dict[str, TechLeadRunScopeKind] = {
     GlobalHealthReviewScope().run_key: TechLeadRunScopeKind.GLOBAL_HEALTH_REVIEW,
     GlobalBatchReviewScope().run_key: TechLeadRunScopeKind.GLOBAL_BATCH_REVIEW,
@@ -240,6 +325,31 @@ def global_scope_for_flavor(flavor: TechLeadSessionFlavor) -> TechLeadRunScope:
     if kind is TechLeadRunScopeKind.GLOBAL_BATCH_REVIEW:
         return GlobalBatchReviewScope()
     raise ValueError(f"{flavor!r} is issue-scoped, not a whole-repository run")
+
+
+def scope_for_flavor(
+    flavor: TechLeadSessionFlavor, *, issue_number: Optional[int] = None
+) -> TechLeadRunScope:
+    """The logical run a session flavor belongs to, for a given subject.
+
+    The single flavor -> scope resolver (#136). Before it, every caller that
+    held a flavor and an issue number rebuilt the mapping inline — "is it a
+    failure investigation? then issue-scoped, else global" — and each copy had
+    to be found and amended for a new focused flavor. One of them not being
+    amended is not a cosmetic miss: a planning run classified as global would
+    become an exclusive whole-board barrier, and a queued item classified under
+    the wrong key would be deduplicated against a run it is not.
+
+    ``issue_number`` is required for an issue-scoped flavor and ignored for a
+    whole-repository one, whose subject is the board.
+    """
+    if scope_kind_of_flavor(flavor).is_global:
+        return global_scope_for_flavor(flavor)
+    if issue_number is None:
+        raise ValueError(
+            f"{flavor.value} is issue-scoped and needs the subject issue number"
+        )
+    return _ISSUE_SCOPE_BY_FLAVOR[flavor](issue_number)
 
 
 class TechLeadRunTrigger(str, Enum):
@@ -286,6 +396,14 @@ class TechLeadRunRequest:
                 "A whole-repository review has no single triggering failure;"
                 " pass the problem cohort through the anchor lifecycle instead."
             )
+        if self.failure is not None and isinstance(
+            self.scope, PlanningInvestigationScope
+        ):
+            raise ValueError(
+                "A planning investigation prepares an open, non-blocked issue,"
+                " so it has no triggering failure; a subject that failed is a"
+                " failure investigation's subject, not this role's."
+            )
 
 
 class TechLeadRunOutcome(str, Enum):
@@ -307,6 +425,11 @@ class TechLeadRunOutcome(str, Enum):
     NOT_RUNNING = "not_running"
     NOT_CONFIGURED = "not_configured"
     NOT_ELIGIBLE = "not_eligible"
+    # Something else holds what this run needs: a peer engine's claim on the
+    # logical run, or another run holding the subject's single queue slot
+    # (``REASON_SUBJECT_SLOT_HELD``, #136). One outcome because the operator
+    # remedy is one remedy — retry once the holder finishes — and the reason
+    # code says which holder it was.
     CLAIM_CONFLICT = "claim_conflict"
     FAILED = "failed"
 
@@ -337,6 +460,19 @@ REASON_TECH_LEAD_DISABLED = "tech_lead_disabled"
 REASON_ISSUE_NOT_FOUND = "issue_not_found"
 REASON_ISSUE_CLOSED = "issue_closed"
 REASON_NO_LONGER_BLOCKED = "no_longer_blocked"
+# The subject a PLANNING run was aimed at carries a blocking label, so it is
+# recovery work, not preparation work (#136). The mirror image of
+# ``no_longer_blocked``: each focused role refuses the other's subject state,
+# so the least-authority role can never quietly stand in for the recovery one.
+REASON_ISSUE_BLOCKED = "issue_blocked"
+# Another logical run already holds the subject issue's single tech-lead slot —
+# queued, or already executing as its ``issue-{N}`` session. One issue supports
+# one tech-lead run at a time while a run is identified by its SCOPE, so two
+# different runs — a batch anchor and an investigation, or an investigation and
+# a planning run (#136) — can compete for one subject. Reported as its own
+# reason rather than as a duplicate, because the requested run does NOT exist
+# and never will unless the request is made again.
+REASON_SUBJECT_SLOT_HELD = "subject_slot_held"
 REASON_CLAIMED_BY_PEER = "claimed_by_peer"
 REASON_ANCHOR_UNAVAILABLE = "anchor_unavailable"
 # The whole-repository anchor this queued run points at has been CLOSED — the

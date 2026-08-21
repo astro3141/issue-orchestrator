@@ -134,7 +134,7 @@ def _release_run_hold(deps: object, session: "Session") -> bool:
     composition error, and it fails loudly: reporting it as a clean release
     would claim the repository-wide hold is gone when nothing ever looked.
     """
-    from .tech_lead_run_admission import scope_of_session
+    from .tech_lead_run_scopes import scope_of_session
 
     scope = scope_of_session(session)
     if scope is None:

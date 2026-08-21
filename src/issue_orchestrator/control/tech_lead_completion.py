@@ -606,8 +606,11 @@ def generate_tech_lead_failure_actions(
     tech-lead-failed), looping forever. Health reviews close their anchor the
     same way — an open dead anchor would both be requeued at restart and
     dedupe the next interval's trigger — but have no manifest to label.
-    Failure investigations produce nothing here — their anchor is the
-    original failed work issue. A session without a launch authority record
+    FOCUSED runs produce nothing here — their "anchor" is a live work issue
+    (the failed one an investigation was sent to diagnose, or the open one a
+    planning run was sent to prepare), and closing it because the tech-lead
+    session died would close work the orchestrator still owes (#136).
+    A session without a launch authority record
     produces nothing (the session already failed; closing or labeling from
     untrusted worktree copies would hand the agent authority).
     """
@@ -623,7 +626,7 @@ def generate_tech_lead_failure_actions(
             session.terminal_id,
         )
         return []
-    if authority.flavor is TechLeadSessionFlavor.FAILURE_INVESTIGATION:
+    if authority.flavor.is_issue_focused:
         return []
     if authority.flavor is TechLeadSessionFlavor.HEALTH_REVIEW:
         return [

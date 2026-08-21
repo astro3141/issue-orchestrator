@@ -935,7 +935,7 @@ class TestRestoredTechLeadScope:
         from issue_orchestrator.control.health_review_trigger import (
             HEALTH_REVIEW_MARKER_LABEL,
         )
-        from issue_orchestrator.control.tech_lead_run_admission import (
+        from issue_orchestrator.control.tech_lead_run_scopes import (
             has_active_global_run,
         )
         from issue_orchestrator.domain.tech_lead_session import TechLeadSessionFlavor
@@ -954,7 +954,7 @@ class TestRestoredTechLeadScope:
         assert has_active_global_run(config, restored) is True
 
     def test_a_restored_batch_review_is_still_a_global_run(self, tmp_path):
-        from issue_orchestrator.control.tech_lead_run_admission import (
+        from issue_orchestrator.control.tech_lead_run_scopes import (
             has_active_global_run,
         )
         from issue_orchestrator.domain.tech_lead_session import TechLeadSessionFlavor
@@ -977,7 +977,7 @@ class TestRestoredTechLeadScope:
         A restored FAILURE_INVESTIGATION has to come back issue-scoped, or every
         restart would silently block all other tech-lead work.
         """
-        from issue_orchestrator.control.tech_lead_run_admission import (
+        from issue_orchestrator.control.tech_lead_run_scopes import (
             has_active_global_run,
         )
         from issue_orchestrator.domain.tech_lead_session import TechLeadSessionFlavor
@@ -997,6 +997,11 @@ class TestRestoredTechLeadScope:
         from issue_orchestrator.domain.models import DiscoveredFailure
 
         class _Authority:
+            def load(self, *, run_id, session_name):
+                # This run predates the launch-authority ledger, so recovery
+                # falls through to the marker label and the cohort ledger.
+                return None
+
             def load_storm_cohort(self, *, anchor_issue_number):
                 assert anchor_issue_number == 900
                 return (

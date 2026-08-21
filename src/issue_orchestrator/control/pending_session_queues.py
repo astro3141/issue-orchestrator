@@ -84,11 +84,18 @@ class PendingSessionQueues:
     """Owner for pending session queues: launch-routing removals + tech_lead intake.
 
     Tech Lead intake is behavior-level (#6768 round 3): producers say WHICH
-    variant they are queueing (batch review, failure investigation, or health
-    review) and this owner constructs the ``PendingTechLeadReview``, applies the
-    single deduplication rule (by issue number against the pending queue), and
-    returns an explicit :class:`TechLeadQueueOutcome`. Producers never touch the
-    dataclass or the state list.
+    variant they are queueing (batch review, failure investigation, health
+    review, or planning investigation) and this owner constructs the
+    ``PendingTechLeadReview``, applies the single deduplication rule (by issue
+    number against the pending queue), and returns an explicit
+    :class:`TechLeadQueueOutcome`. Producers never touch the dataclass or the
+    state list.
+
+    That dedup rule is a SLOT rule, not a run-identity rule: at most one queued
+    item per issue number, whichever variant it is. Two different logical runs
+    can therefore contest one issue's slot (#136), which is why the admission
+    owner asks who holds it before claiming a run rather than reading
+    ``DUPLICATE`` as "your run is already queued".
     """
 
     state: "OrchestratorState"
@@ -187,6 +194,25 @@ class PendingSessionQueues:
                 title,
                 flavor=TechLeadSessionFlavor.FAILURE_INVESTIGATION,
                 failure=failure,
+            )
+        )
+
+    def queue_planning_investigation(
+        self, issue_number: int, title: str
+    ) -> TechLeadQueueOutcome:
+        """Queue a bounded planning investigation of one open issue (#136).
+
+        Carries no ``failure``: its subject has not failed, which is the whole
+        distinction between this variant and a failure investigation. The queue
+        item is therefore not the sole carrier of anything perishable — the
+        subject is an ordinary open board issue — so a dropped item costs a
+        re-request, not a lost record.
+        """
+        return self._queue_tech_lead(
+            PendingTechLeadReview(
+                issue_number,
+                title,
+                flavor=TechLeadSessionFlavor.PLANNING_INVESTIGATION,
             )
         )
 

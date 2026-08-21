@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from ..control.tech_lead_run_admission import (
+from ..control.tech_lead_run_scopes import (
     active_tech_lead_sessions,
     has_active_global_run,
     is_global_pending,
@@ -295,7 +295,14 @@ def _global_run_issue_numbers(config: "Config", state: "OrchestratorState") -> s
 
 
 def _is_focus_scope(scope: "TechLeadLaunchScope") -> bool:
-    return scope.flavor is TechLeadSessionFlavor.FAILURE_INVESTIGATION
+    """True when the run's subject is a board card rather than an anchor.
+
+    Asked of the FLAVOR's focused-ness (#136), not of one flavor: a planning
+    run's subject is an ordinary issue an operator sees on the board, so listing
+    its anchor among the whole-board runs would detach the per-issue affordances
+    from the card the work is actually happening on.
+    """
+    return scope.flavor.is_issue_focused
 
 
 __all__ = [

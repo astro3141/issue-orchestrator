@@ -31,20 +31,24 @@ from issue_orchestrator.domain.tech_lead_run import (
     BARRIER_GLOBAL_RUN_ACTIVE,
     BARRIER_GLOBAL_RUN_QUEUED,
     REASON_CLAIMED_BY_PEER,
+    REASON_ISSUE_BLOCKED,
     REASON_ISSUE_CLOSED,
     REASON_ISSUE_NOT_FOUND,
     REASON_NO_LONGER_BLOCKED,
     REASON_NO_TECH_LEAD_AGENT,
     REASON_ORCHESTRATOR_PAUSED,
     REASON_RUN_CLAIM_UNAVAILABLE,
+    REASON_SUBJECT_SLOT_HELD,
     REASON_TECH_LEAD_DISABLED,
     GlobalBatchReviewScope,
     GlobalHealthReviewScope,
     IssueInvestigationScope,
+    PlanningInvestigationScope,
     TechLeadRunOutcome,
     TechLeadRunRequest,
     TechLeadRunScopeKind,
     TechLeadRunTrigger,
+    scope_kind_of_run_key,
 )
 from issue_orchestrator.control.tech_lead_run_ownership import TechLeadRunOwnership
 
@@ -217,11 +221,10 @@ class SharedRunClaimStore:
 
 
 def _scope_kind_of(run_key: str) -> TechLeadRunScopeKind:
-    if run_key.startswith("issue:"):
-        return TechLeadRunScopeKind.ISSUE
-    if run_key == GlobalBatchReviewScope().run_key:
-        return TechLeadRunScopeKind.GLOBAL_BATCH_REVIEW
-    return TechLeadRunScopeKind.GLOBAL_HEALTH_REVIEW
+    # The REAL classifier, like the conflict matrix above it: a double that
+    # re-implemented the key namespaces would classify a run key the ledger
+    # itself would reject (or, worse, differently).
+    return scope_kind_of_run_key(run_key)
 
 
 def _ownership(store: SharedRunClaimStore) -> TechLeadRunOwnership:
@@ -1007,3 +1010,262 @@ def test_a_global_scope_cannot_carry_a_single_triggering_failure():
 def test_issue_scope_requires_a_positive_issue_number():
     with pytest.raises(ValueError):
         IssueInvestigationScope(0)
+
+
+def test_a_planning_scope_cannot_carry_a_triggering_failure():
+    """Preparation has no failure to carry (#136).
+
+    A planning request that arrived with failure context would be a failure
+    investigation wearing the least-authority role's identity.
+    """
+    with pytest.raises(ValueError):
+        TechLeadRunRequest(
+            scope=PlanningInvestigationScope(109),
+            trigger=TechLeadRunTrigger.AUTOMATIC_FAILURE,
+            failure=DiscoveredFailure(109, "t", "failed"),
+            title="t",
+        )
+
+
+def test_planning_scope_requires_a_positive_issue_number():
+    with pytest.raises(ValueError):
+        PlanningInvestigationScope(0)
+
+
+# ---------------------------------------------------------------------------
+# The bounded planning flavor (#136)
+# ---------------------------------------------------------------------------
+
+
+def _planning_request(
+    number: int, trigger: TechLeadRunTrigger = TechLeadRunTrigger.DASHBOARD
+) -> TechLeadRunRequest:
+    return TechLeadRunRequest(
+        scope=PlanningInvestigationScope(number), trigger=trigger
+    )
+
+
+def _open_unblocked(number: int = 109) -> FakeRepositoryHost:
+    """The exact subject state #109 was in when it returned no_longer_blocked."""
+    return FakeRepositoryHost(
+        {number: FakeIssue(number, title="Prepare the thing", labels=())}
+    )
+
+
+def test_planning_admits_an_open_unblocked_issue():
+    """Acceptance 1: the case a failure investigation refuses."""
+    state = _state()
+    admission = _coordinator(state, repository_host=_open_unblocked()).admit(
+        _planning_request(109)
+    )
+
+    assert admission.outcome is TechLeadRunOutcome.QUEUED
+    assert admission.run_key == "planning:109"
+    assert admission.scope_kind is TechLeadRunScopeKind.ISSUE
+    assert admission.issue_number == 109
+    queued = state.pending_tech_lead_reviews
+    assert [item.flavor for item in queued] == [
+        TechLeadSessionFlavor.PLANNING_INVESTIGATION
+    ]
+    # No failure context is manufactured for a subject that never failed.
+    assert queued[0].failure is None
+
+
+def test_an_investigation_of_the_same_subject_is_refused_as_unblocked():
+    """The failure DIRECTION of acceptance 6.
+
+    Routing the planning subject through ``_admit_issue`` — the branch that
+    exists for blocked subjects — refuses it, which is why the new scope needs
+    its own admission branch rather than a parameter on that one.
+    """
+    admission = _coordinator(_state(), repository_host=_open_unblocked()).admit(
+        _issue_request(109)
+    )
+
+    assert admission.outcome is TechLeadRunOutcome.NOT_ELIGIBLE
+    assert admission.reason == REASON_NO_LONGER_BLOCKED
+
+
+def test_planning_refuses_a_blocked_subject():
+    """The mirror image: a blocked subject belongs to the recovery role."""
+    repo = FakeRepositoryHost({109: FakeIssue(109)})  # carries BLOCKING_LABEL
+    state = _state()
+    admission = _coordinator(state, repository_host=repo).admit(
+        _planning_request(109)
+    )
+
+    assert admission.outcome is TechLeadRunOutcome.NOT_ELIGIBLE
+    assert admission.reason == REASON_ISSUE_BLOCKED
+    assert state.pending_tech_lead_reviews == []
+
+
+def test_planning_refuses_a_closed_subject():
+    repo = FakeRepositoryHost({109: FakeIssue(109, labels=(), state="closed")})
+    admission = _coordinator(_state(), repository_host=repo).admit(
+        _planning_request(109)
+    )
+
+    assert admission.outcome is TechLeadRunOutcome.NOT_ELIGIBLE
+    assert admission.reason == REASON_ISSUE_CLOSED
+
+
+def test_planning_refuses_a_subject_that_cannot_be_read():
+    admission = _coordinator(_state(), repository_host=FakeRepositoryHost()).admit(
+        _planning_request(109)
+    )
+
+    assert admission.outcome is TechLeadRunOutcome.NOT_ELIGIBLE
+    assert admission.reason == REASON_ISSUE_NOT_FOUND
+
+
+@pytest.mark.parametrize("repeat", [2, 3])
+def test_repeated_planning_requests_coalesce_onto_one_run(repeat: int):
+    state = _state()
+    coordinator = _coordinator(state, repository_host=_open_unblocked())
+
+    outcomes = [coordinator.admit(_planning_request(109)).outcome for _ in range(repeat)]
+
+    assert outcomes[0] is TechLeadRunOutcome.QUEUED
+    assert all(o is TechLeadRunOutcome.ALREADY_QUEUED for o in outcomes[1:])
+    assert len(state.pending_tech_lead_reviews) == 1
+
+
+def test_planning_and_investigation_of_one_issue_are_distinct_runs():
+    """Acceptance 2: the two run keys never coalesce onto each other.
+
+    The planning request is not reported as "already queued" behind the
+    investigation — it is a different logical run, and saying otherwise would
+    hand the caller a run key that names something it did not ask for.
+    """
+    store = SharedRunClaimStore()
+    state = _state(pending_tech_lead_reviews=[_investigation(109)])
+    admission = _coordinator(
+        state,
+        repository_host=_open_unblocked(),
+        ownership=_ownership(store),
+    ).admit(_planning_request(109))
+
+    assert admission.outcome is TechLeadRunOutcome.CLAIM_CONFLICT
+    assert admission.reason == REASON_SUBJECT_SLOT_HELD
+    assert admission.run_key == "planning:109"
+    assert "investigation of issue #109" in admission.detail
+    # The refusal happens before the shared claim, so nothing is left holding a
+    # run this engine never queued — and the occupant's queue entry is intact.
+    assert store.acquired == []
+    assert [item.flavor for item in state.pending_tech_lead_reviews] == [
+        TechLeadSessionFlavor.FAILURE_INVESTIGATION
+    ]
+
+
+def test_an_investigation_is_refused_while_a_planning_run_holds_the_subject():
+    """The same rule in the other direction, so neither role starves the other.
+
+    Reported as a slot conflict rather than ``already_queued``: the recovery run
+    does NOT exist, and telling the caller it was queued would silently drop it
+    under a run key that will never launch.
+    """
+    store = SharedRunClaimStore()
+    planning = PendingTechLeadReview(
+        109, "Prepare the thing", flavor=TechLeadSessionFlavor.PLANNING_INVESTIGATION
+    )
+    state = _state(pending_tech_lead_reviews=[planning])
+    admission = _coordinator(
+        state,
+        repository_host=FakeRepositoryHost({109: FakeIssue(109)}),
+        ownership=_ownership(store),
+    ).admit(_issue_request(109))
+
+    assert admission.outcome is TechLeadRunOutcome.CLAIM_CONFLICT
+    assert admission.reason == REASON_SUBJECT_SLOT_HELD
+    assert admission.run_key == "issue:109"
+    assert "planning investigation of issue #109" in admission.detail
+    assert store.acquired == []
+    assert [item.flavor for item in state.pending_tech_lead_reviews] == [
+        TechLeadSessionFlavor.PLANNING_INVESTIGATION
+    ]
+
+
+def test_planning_is_refused_while_another_run_holds_the_subject_session():
+    """One issue supports one tech-lead SESSION, whatever run it belongs to."""
+    state = _state(
+        active_sessions=[
+            FakeSession(109, flavor=TechLeadSessionFlavor.FAILURE_INVESTIGATION)
+        ]
+    )
+    admission = _coordinator(state, repository_host=_open_unblocked()).admit(
+        _planning_request(109)
+    )
+
+    assert admission.outcome is TechLeadRunOutcome.CLAIM_CONFLICT
+    assert admission.reason == REASON_SUBJECT_SLOT_HELD
+
+
+def test_a_running_planning_session_coalesces_its_own_repeat_request():
+    state = _state(
+        active_sessions=[
+            FakeSession(109, flavor=TechLeadSessionFlavor.PLANNING_INVESTIGATION)
+        ]
+    )
+    admission = _coordinator(state, repository_host=_open_unblocked()).admit(
+        _planning_request(109)
+    )
+
+    assert admission.outcome is TechLeadRunOutcome.ALREADY_RUNNING
+    assert admission.run_key == "planning:109"
+
+
+def test_a_planning_run_is_not_a_global_barrier():
+    """Its shape is one issue, so it must not serialize the whole board."""
+    from issue_orchestrator.control.tech_lead_run_scopes import has_active_global_run
+
+    config = _config()
+    sessions = [
+        FakeSession(109, flavor=TechLeadSessionFlavor.PLANNING_INVESTIGATION)
+    ]
+
+    assert has_active_global_run(config, sessions) is False
+
+
+def test_a_queued_planning_run_waits_behind_a_queued_global_run():
+    """It is targeted work, so the exclusivity rule applies to it unchanged."""
+    planning = PendingTechLeadReview(
+        109, "Prepare the thing", flavor=TechLeadSessionFlavor.PLANNING_INVESTIGATION
+    )
+    gate = plan_tech_lead_launch_gate(_config(), [_health_review(), planning], [])
+
+    assert gate.launchable == (_health_review(),)
+    assert gate.held == (planning,)
+    assert gate.barrier_reason == BARRIER_GLOBAL_RUN_QUEUED
+
+
+def test_launch_revalidation_keeps_a_planning_run_whose_subject_is_unblocked():
+    """The rule that withdraws an investigation must not withdraw this.
+
+    Both runs are re-asked their OWN role's subject rule at launch time; sharing
+    one rule would withdraw every planning run for the state it requires.
+    """
+    planning = PendingTechLeadReview(
+        109, "Prepare the thing", flavor=TechLeadSessionFlavor.PLANNING_INVESTIGATION
+    )
+    board = [FakeIssue(109, labels=())]
+
+    revalidated = plan_tech_lead_launch_revalidation(
+        [planning], board, lambda labels: any("blocked" in str(x) for x in labels)
+    )
+
+    assert revalidated.still_eligible == (planning,)
+    assert revalidated.withdrawn == ()
+
+
+def test_launch_revalidation_withdraws_a_planning_run_that_became_blocked():
+    planning = PendingTechLeadReview(
+        109, "Prepare the thing", flavor=TechLeadSessionFlavor.PLANNING_INVESTIGATION
+    )
+    board = [FakeIssue(109, labels=(BLOCKING_LABEL,))]
+
+    revalidated = plan_tech_lead_launch_revalidation(
+        [planning], board, lambda labels: any("blocked" in str(x) for x in labels)
+    )
+
+    assert revalidated.still_eligible == ()
+    assert [w.reason for w in revalidated.withdrawn] == [REASON_ISSUE_BLOCKED]
