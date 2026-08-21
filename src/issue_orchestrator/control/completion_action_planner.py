@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-from pathlib import Path
 from typing import Any, Callable, Optional
 
 from ..domain.models import RETROSPECTIVE_REVIEW_TERMINAL_PREFIX, Session, SessionStatus
@@ -11,14 +10,17 @@ from ..infra.config import Config
 from ..ports import RepositoryHost
 from ..ports.tech_lead_authority import TechLeadAuthorityStore
 from .actions import Action, AddCommentAction, AddLabelAction, RemoveLabelAction
+from .agent_blocked_completion import agent_blocked_actions
 from .open_issue_corpus import OpenIssueCorpusManager
 from .tech_lead_completion import (
     generate_tech_lead_completion_actions,
     has_tech_lead_decision_errors,
 )
+from .subject_recovery_authority import SubjectRecoveryAuthority
 from .tech_lead_terminal_effects import (
     generate_tech_lead_decision_failure_actions,
     plan_tech_lead_terminal_effects,
+    resolve_subject_recovery_authority,
 )
 from .completion_types import (
     ERROR_PREFIX_CREATE_PR,
@@ -35,6 +37,7 @@ from .invalid_record_actions import (
 from .label_manager import LabelManager
 from .provider_availability import ProviderAvailabilityPolicy
 from .provider_blocked_completion import provider_blocked_actions
+from .publish_failure_completion import publish_failure_actions
 from .reconciliation import ExpectedState, build_expected_for_mutation
 from .tech_lead_session_policy import is_tech_lead_session
 from ..ports.provider_resilience import ProviderErrorType
@@ -228,6 +231,23 @@ class CompletionActionPlanner:
             self.config.tech_lead_review_agent, session.issue.agent_type
         )
 
+    def _subject_recovery(self, session: Session) -> SubjectRecoveryAuthority:
+        """May this run leave a recovery label on its own subject? (#182)
+
+        The generic paths that stamp one — the rejected-record path, the BLOCKED
+        completion path, the publish-failure path, and the review-exchange halt
+        — are session machinery that never receives a
+        ``TechLeadLaunchAuthority``. Threading the ANSWER from the owner is what
+        closes those doors without giving generic code a flavor to match on.
+        Resolved at the point of use rather than for every completion, so a
+        branch that cannot suppress anything (a provider-caused block) never
+        pays for the store read, and a non-tech_lead session costs nothing but
+        the agent-type check.
+        """
+        return resolve_subject_recovery_authority(
+            self.config, session, tech_lead_authority=self._tech_lead_authority
+        )
+
     def _generate_tech_lead_actions(
         self, session: Session, expected: ExpectedState
     ) -> list[Action]:
@@ -286,7 +306,10 @@ class CompletionActionPlanner:
         Rejected tech_lead decision pairs (#6761 finding 3) go to the tech_lead
         owner (manifest tech-lead-failed labels, rejection surfacing,
         blocked-failed on the session's own issue) — publish-failure copy
-        and publish-fail counters do not apply to them.
+        and publish-fail counters do not apply to them. That owner resolves the
+        run's launch authority itself, so the subject-recovery answer is
+        resolved only on the OTHER arm, where a generic path needs it threaded
+        in (#182 review F1).
         """
         logger.info(
             "[COMPLETION] Agent said completed but processing failed: issue=%d errors=%s",
@@ -307,8 +330,14 @@ class CompletionActionPlanner:
                 )
             )
         return tuple(
-            self._generate_processing_failure_actions(
-                session, critical_errors, diagnostic_path, expected
+            publish_failure_actions(
+                session,
+                expected,
+                critical_errors=critical_errors,
+                diagnostic_path=diagnostic_path,
+                label_manager=self._lm,
+                max_consecutive_publish_failures=self.config.max_consecutive_publish_failures,
+                subject_recovery=self._subject_recovery(session),
             )
         )
 
@@ -356,7 +385,13 @@ class CompletionActionPlanner:
                 "[COMPLETION] Review exchange halted - generating blocked-failed actions: issue=%d",
                 session.issue.number,
             )
-            return tuple(self._generate_review_exchange_halted_actions(session, expected))
+            return tuple(
+                self._generate_review_exchange_halted_actions(
+                    session,
+                    expected,
+                    subject_recovery=self._subject_recovery(session),
+                )
+            )
 
         if status == SessionStatus.TIMED_OUT:
             return tuple(self._plan_terminal_actions(session, expected, status))
@@ -375,6 +410,7 @@ class CompletionActionPlanner:
                 labels=self._lm,
                 detail=completion_detail,
                 diagnostic_path=diagnostic_path,
+                subject_recovery=self._subject_recovery(session),
             )
             if invalid_actions is not None:
                 return tuple(invalid_actions)
@@ -410,136 +446,6 @@ class CompletionActionPlanner:
 
         # NEEDS_HUMAN keeps in-progress to maintain the ownership claim.
         return ()
-
-    def _generate_processing_failure_actions(
-        self,
-        session: Session,
-        critical_errors: list[str],
-        diagnostic_path: Optional[str],
-        expected: ExpectedState,
-    ) -> list[Action]:
-        """Generate actions when agent said completed but push/PR creation failed.
-
-        Tracks consecutive publish failures via publish-fail-count-N labels.
-        After max_consecutive_publish_failures, escalates to needs-human.
-        """
-        issue_number = session.issue.number
-        in_progress_label = self._lm.in_progress
-
-        # Count previous consecutive publish failures from issue labels.
-        prev_count = self._lm.extract_publish_fail_count(session.issue.labels)
-        new_count = prev_count + 1
-        max_failures = self.config.max_consecutive_publish_failures
-
-        first_error = critical_errors[0][:100] if critical_errors else "Unknown error"
-        if len(first_error) == 100:
-            first_error += "..."
-
-        diagnostic_info = ""
-        if diagnostic_path and session.worktree_path:
-            worktree_name = Path(session.worktree_path).name
-            diagnostic_info = (
-                f"\n**Diagnostic file:** `{worktree_name}/{diagnostic_path}`\n"
-            )
-
-        if new_count >= max_failures:
-            logger.info(
-                "[COMPLETION] Publish failure count %d >= max %d, escalating to needs-human: issue=%d",
-                new_count,
-                max_failures,
-                issue_number,
-            )
-            return [
-                AddLabelAction(
-                    issue_number=issue_number,
-                    label=self._lm.needs_human,
-                    reason=f"Publishing failed {new_count} consecutive times — escalating to needs-human",
-                    needs_human_cause=NeedsHumanCause.SESSION_LIFECYCLE,
-                    expected=expected,
-                ),
-                AddCommentAction(
-                    number=issue_number,
-                    comment=(
-                        "❌ **Publishing Failed — Escalated**\n\n"
-                        f"Publishing has failed **{new_count} consecutive times** "
-                        f"(max: {max_failures}). This issue needs human investigation.\n\n"
-                        f"**Latest error:** {first_error}\n"
-                        f"{diagnostic_info}\n"
-                        f"- Runtime: {session.runtime_minutes:.1f} minutes\n"
-                        f"- Session: `{session.terminal_id}`\n"
-                    ),
-                    reason="Escalate repeated publish failure to human",
-                    expected=expected,
-                ),
-                RemoveLabelAction(
-                    issue_number=issue_number,
-                    label=in_progress_label,
-                    reason="Publishing failed - releasing claim",
-                    expected=expected,
-                ),
-                RemoveLabelAction(
-                    issue_number=issue_number,
-                    label=self._lm.needs_rework,
-                    reason="Publishing failed - clearing needs-rework to prevent re-queuing loop",
-                    expected=expected,
-                ),
-            ]
-
-        actions: list[Action] = [
-            AddLabelAction(
-                issue_number=issue_number,
-                label=self._lm.publish_failed,
-                reason="Publishing failed after agent completion (push/PR creation failed)",
-                expected=expected,
-            ),
-            AddCommentAction(
-                number=issue_number,
-                comment=(
-                    f"❌ **Publishing Failed** (attempt {new_count}/{max_failures})\n\n"
-                    "The agent completed its work, but the orchestrator could not push or create a PR.\n\n"
-                    f"**Error:** {first_error}\n"
-                    f"{diagnostic_info}\n"
-                    f"- Runtime: {session.runtime_minutes:.1f} minutes\n"
-                    f"- Session: `{session.terminal_id}`\n\n"
-                    f"This issue has been marked as `{self._lm.publish_failed}` and will not be automatically retried.\n"
-                    "Remove the label to retry."
-                ),
-                reason="Notify about processing failure",
-                expected=expected,
-            ),
-            RemoveLabelAction(
-                issue_number=issue_number,
-                label=in_progress_label,
-                reason="Processing failed - releasing claim",
-                expected=expected,
-            ),
-            RemoveLabelAction(
-                issue_number=issue_number,
-                label=self._lm.needs_rework,
-                reason="Publishing failed - clearing needs-rework to prevent re-queuing loop",
-                expected=expected,
-            ),
-        ]
-
-        if prev_count > 0:
-            actions.append(
-                RemoveLabelAction(
-                    issue_number=issue_number,
-                    label=self._lm.publish_fail_count_label(prev_count),
-                    reason="Updating publish failure count",
-                    expected=expected,
-                )
-            )
-        actions.append(
-            AddLabelAction(
-                issue_number=issue_number,
-                label=self._lm.publish_fail_count_label(new_count),
-                reason=f"Publish failure #{new_count}",
-                expected=expected,
-            )
-        )
-
-        return actions
 
     def _generate_timeout_actions(
         self,
@@ -684,11 +590,17 @@ class CompletionActionPlanner:
         blocked_reason: Optional[str] = None,
         provider_error_type: ProviderErrorType | None = None,
     ) -> list[Action]:
-        """Generate actions for a BLOCKED completion.
+        """Route a BLOCKED completion to the owner of that kind of block.
 
-        Two routes, decided here rather than by the caller so "what a block
+        The split is decided here rather than by the caller so "what a block
         means" has one owner: a typed provider verdict is an outage impacting
         the issue, and anything else is the agent reporting it cannot proceed.
+        Each route then owns its own effects — the outage's durable transition,
+        or the issue-blocking label and whether this run's role may leave it
+        (#182). The subject-recovery answer is resolved on the agent-reported
+        arm only: the outage route leaves no recovery label to suppress, so
+        resolving it before the split would buy an authority-store read that
+        route throws away (#182 review N1).
         """
         if provider_error_type is not None:
             return provider_blocked_actions(
@@ -697,59 +609,48 @@ class CompletionActionPlanner:
                 label_manager=self._lm,
                 provider_availability=self._provider_availability,
             )
-        is_issue_session = session.terminal_id.startswith("issue-")
-        label = blocked_label or self._lm.blocked
-
-        if is_issue_session:
-            reason_text = (
-                blocked_reason.strip() if blocked_reason else "No reason provided."
-            )
-            return [
-                AddLabelAction(
-                    issue_number=session.issue.number,
-                    label=label,
-                    reason="Agent reported issue as blocked",
-                    expected=expected,
-                ),
-                AddCommentAction(
-                    number=session.issue.number,
-                    comment=(
-                        "🚧 **Session Blocked**\n\n"
-                        "The agent reported this issue as blocked.\n\n"
-                        f"**Reason:** {reason_text}\n"
-                        f"- Runtime: {session.runtime_minutes:.1f} minutes\n"
-                        f"- Session: `{session.terminal_id}`\n\n"
-                        f"This issue has been marked as `{label}` and will not be automatically retried.\n"
-                        "Remove the label to allow reprocessing."
-                    ),
-                    reason="Notify about blocked session and reason",
-                    expected=expected,
-                ),
-                RemoveLabelAction(
-                    issue_number=session.issue.number,
-                    label=self._lm.in_progress,
-                    reason="Session blocked - releasing claim",
-                    expected=expected,
-                ),
-            ]
-        # Review/rework BLOCKED completions do not map to issue-blocking labels;
-        # their parent workflows own any PR/review state transitions.
-        return []
+        return agent_blocked_actions(
+            session,
+            expected,
+            label_manager=self._lm,
+            blocked_label=blocked_label,
+            blocked_reason=blocked_reason,
+            subject_recovery=self._subject_recovery(session),
+        )
 
     def _generate_review_exchange_halted_actions(
         self,
         session: Session,
         expected: ExpectedState,
+        *,
+        subject_recovery: SubjectRecoveryAuthority,
     ) -> list[Action]:
-        """Generate hold actions when a review exchange halts without progress."""
+        """Generate hold actions when a review exchange halts without progress.
+
+        The sixth door onto a subject's recovery state (#182 review F1), and the
+        sibling of the publish-failure path: the halt markers are raised while
+        EXECUTING a completion's ``CREATE_PR``, which a focused tech_lead run
+        performs like any other session. Whether the exchange runs at all for
+        the tech lead agent is a deployment's reviewer configuration, so this
+        door is closed rather than argued shut — ``blocked-failed`` on
+        ``issue-{N}`` is a change to the subject's recovery state either way.
+        The halt itself is still reported and the claim still released.
+        """
         issue_number = session.issue.number
-        return [
-            AddLabelAction(
+        hold = subject_recovery.recovery_label_outcome(
+            add_label=AddLabelAction(
                 issue_number=issue_number,
                 label=self._lm.blocked_failed,
                 reason="Review exchange halted with no progress",
                 expected=expected,
             ),
+            note_when_added=(
+                f"This issue has been marked as `{self._lm.blocked_failed}` and will not be retried automatically.\n"
+                "Use Retry/Unblock when you want to run it again."
+            ),
+        )
+        return [
+            *hold.label_actions,
             AddCommentAction(
                 number=issue_number,
                 comment=(
@@ -757,8 +658,7 @@ class CompletionActionPlanner:
                     "The automated review exchange stopped because it could not make further progress.\n\n"
                     f"- Session: `{session.terminal_id}`\n"
                     f"- Runtime: {session.runtime_minutes:.1f} minutes\n\n"
-                    f"This issue has been marked as `{self._lm.blocked_failed}` and will not be retried automatically.\n"
-                    "Use Retry/Unblock when you want to run it again."
+                    f"{hold.note}"
                 ),
                 reason="Notify that review exchange halted and issue is on hold",
                 expected=expected,
