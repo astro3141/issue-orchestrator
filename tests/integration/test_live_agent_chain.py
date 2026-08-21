@@ -59,8 +59,18 @@ def _decoded_output(path: Path) -> str:
 # Markers / skip conditions
 # ---------------------------------------------------------------------------
 
+# `live_agent` is what routes this module: blocking candidate validation
+# deselects the marker and the `test-live-assurance` lane collects it (#194).
+# Before that migration a three-filename Makefile list did the routing, so a
+# module could declare the marker and still gate publication.
+pytestmark = [
+    pytest.mark.integration,
+    pytest.mark.live,
+    pytest.mark.live_agent,
+]
+
 # Import-time probe is acceptable here: this module is only collected by the
-# dedicated live-agent lanes (test-integration-agent / heavy runs), where a
+# dedicated live-agent lanes (test-live-assurance / heavy runs), where a
 # real provider round-trip is proportionate. The whole-suite e2e module
 # (tests/e2e/test_live_agent_transport.py) defers the same probe to runtime.
 _CLAUDE_READY = is_claude_authenticated()

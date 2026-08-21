@@ -71,6 +71,23 @@ class ValidationGateKind(Enum):
                 return kind
         raise ValueError(f"Unknown validation suite: {suite!r}")
 
+    @classmethod
+    def defines(cls, suite: str) -> bool:
+        """Whether this vocabulary owns ``suite`` at all.
+
+        The question :meth:`produced` cannot answer for a *third* lane. A
+        record from a lane that is not validation — live-agent assurance
+        (#194) — must be unable to claim a validation suite label, and the
+        only honest way to check that is to ask the vocabulary that owns the
+        labels rather than to compare against literals a second module would
+        then have to keep in sync.
+        """
+        try:
+            cls.from_suite(suite)
+        except ValueError:
+            return False
+        return True
+
     def produced(self, suite: str) -> bool:
         """Whether a record carrying ``suite`` came from this contract.
 

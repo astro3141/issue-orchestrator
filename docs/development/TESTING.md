@@ -11,6 +11,24 @@ pytest tests/integration/       # Integration tests (requires Claude CLI)
 pytest tests/e2e/ -v            # Live e2e tests (requires gh auth)
 ```
 
+### The live-agent assurance lane
+
+Tests marked `live_agent` drive a real provider CLI, so whether they execute at
+all depends on an external model choosing to issue a tool call. They are
+deselected from every blocking gate by that marker and run on their own:
+
+```bash
+make test-live-assurance        # requires authenticated claude/codex CLIs
+```
+
+The lane does not pass or fail a change. It records `PASS`, `SECURITY_FAIL` or
+`INCONCLUSIVE` against the exact commit it ran on, in
+`.issue-orchestrator/live-assurance/<sha>.json`, and
+`trusted-runtime-promote --head-sha <sha>` refuses a trusted-runtime promotion
+without a `PASS`. Adding a `live_agent` module needs no other edit — there is no
+filename list. See
+[validation.md](../architecture/validation.md#live-agent-assurance-is-not-publication-validation).
+
 ## Test Structure
 
 ```

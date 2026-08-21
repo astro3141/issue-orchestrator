@@ -26,17 +26,23 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
+from .live_assurance import ProbeDidNotRun
+
 # Conventional shell exit code for "killed by a timeout". Synthesised for a
 # timed-out attempt so callers can print a returncode without pretending the
 # process exited on its own.
 TIMEOUT_RETURNCODE = 124
 
 
-class ProbeTimeout(AssertionError):
+class ProbeTimeout(ProbeDidNotRun):
     """Raised when every probe attempt timed out.
 
-    Subclasses ``AssertionError`` so pytest reports it as a test failure with
-    the captured evidence rather than an infrastructure error.
+    Subclasses :class:`~tests.live_assurance.ProbeDidNotRun` — and through it
+    ``AssertionError`` — so pytest reports it as a test failure with the
+    captured evidence, and so the live-assurance lane classifies it as
+    ``INCONCLUSIVE`` (#194). A killed attempt did not exercise the boundary,
+    which is the same statement "the model never issued the operation" makes;
+    both are the absence of a proof, not the presence of a breach.
     """
 
 

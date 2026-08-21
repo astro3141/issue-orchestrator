@@ -63,7 +63,7 @@ The `validate` workflow path-filters Python-impacting changes, then runs two job
 | CI Job | Command | What It Covers |
 |--------|---------|----------------|
 | `validate-fast` | `make validate` | Typecheck, architecture lint, complexity lint, unit tests, simulated core, integration core, web tests, then VS Code tests sequentially |
-| `validate-agent` | `make test-simulated-agent` and `make test-integration-agent` | Agent-backed simulated and integration slices that require real agent CLIs |
+| `validate-agent` | `make test-simulated-agent` | Agent-backed simulated slice that requires real agent CLIs |
 
 Local PR guardrails use `make validate-pr`, the cache-aware wrapper that runs the required PR suite through the raw `make validate-pr-raw` target.
 
@@ -75,8 +75,7 @@ Local PR guardrails use `make validate-pr`, the cache-aware wrapper that runs th
 | `test-unit` | `pytest tests/unit packages/agent_runner/tests` | Unit tests |
 | `test-simulated-core` | `pytest tests/simulated_scenarios/` excluding agent-backed foreign repo cases | Simulated scenario core tests |
 | `test-simulated-agent` | `$(SIMULATED_AGENT_FILES)` | Agent-backed simulated scenarios |
-| `test-integration-core` | `pytest tests/integration -m "not requires_infra"` excluding agent execution files | Integration tests without external infra |
-| `test-integration-agent` | `$(INTEGRATION_AGENT_FILES)` | Agent-backed integration tests |
+| `test-integration-core` | `pytest tests/integration -m "not requires_infra and not live_codex and not live_agent"` | Integration tests without external infra or a live provider |
 | `test-web` | `pytest tests/web/` | Web UI tests |
 | `test-vscode` | VS Code extension tests | VS Code integration, run sequentially after parallel validation |
 
@@ -157,7 +156,7 @@ make test-web
 
 # Agent-backed slices from the validate-agent CI job
 make test-simulated-agent
-make test-integration-agent
+make test-live-assurance
 
 # Run specific failing test
 pytest tests/unit/test_foo.py::test_bar -v
@@ -191,7 +190,7 @@ make test-simulated-agent
 
 # Integration slices
 make test-integration-core
-make test-integration-agent
+make test-live-assurance
 
 # Full validation, including live E2E
 make validate-full

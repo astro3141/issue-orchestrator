@@ -132,6 +132,7 @@ The console scripts installed by the package:
 | `reviewer-done` | Review agents | Supported |
 | `exchange-respond` | Review-exchange agents | Experimental |
 | `prepush-check` | Agents and git hooks | Supported |
+| `trusted-runtime-promote` | Self-hosting operators | Experimental |
 | `verify-agent-sandbox` | Guardrail verification | Internal |
 
 ### Agent completion contracts — supported

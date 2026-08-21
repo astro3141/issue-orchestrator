@@ -54,6 +54,7 @@ Thumbs.db
 
 # Project specific - local state files
 .issue-orchestrator/validation/
+.issue-orchestrator/live-assurance/
 .issue-orchestrator/completion.json
 .issue-orchestrator/completion-*.json
 .issue-orchestrator/state_machines.json

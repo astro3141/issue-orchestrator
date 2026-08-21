@@ -66,6 +66,7 @@ reviewer-done = "issue_orchestrator.entrypoints.cli_tools.reviewer_done:safe_mai
 exchange-respond = "issue_orchestrator.entrypoints.cli_tools.exchange_respond:safe_main"
 verify-agent-sandbox = "issue_orchestrator.execution.sandbox_verify:main"
 prepush-check = "issue_orchestrator.entrypoints.cli_tools.prepush_check:main"
+trusted-runtime-promote = "issue_orchestrator.entrypoints.cli_tools.trusted_runtime_promote:safe_main"
 issue-orchestrator-mcp = "issue_orchestrator.entrypoints.mcp_server:main"
 
 # Plugin entry points - third-party packages can add their own
@@ -111,7 +112,7 @@ markers = [
     "heavy_e2e: Expensive journey-level tests for onboarding or full-stack orchestration flows",
     "integration: Integration tests that may exercise external adapters",
     "live: Tests that require network access and external services",
-    "live_agent: Tests that run real AI provider CLI sessions under the e2e flake-management lane",
+    "live_agent: Tests that run real AI provider CLI sessions. The segregation semantic (#194): blocking validation deselects it, `make test-live-assurance` collects it, and there is no filename list to keep in sync",
     "live_codex: Live Codex CLI smoke tests collected by e2e or dedicated live lanes",
     "xdist_group(name): Group tests to run serially under pytest-xdist --dist=loadgroup",
     "gh_activity_limit: Enforce GH API activity limits per test (test_gh_activity_limit, system_gh_activity_limit)",

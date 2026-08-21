@@ -1,4 +1,4 @@
-.PHONY: help venv venv-fast semgrep-venv worktree-create worktree-setup install upgrade-deps deps-batch release release-pr prepare-release preview-readme typecheck lint-arch lint-complexity quality-guardrails quality-guardrails-stale sync-deps test test-unit test-unit-cov test-unit-cov-html test-integration test-integration-core test-integration-core-local test-integration-core-live-codex test-integration-agent test-simulated test-simulated-core test-simulated-agent test-e2e test-e2e-heavy test-e2e-onboarding-live test-e2e-one test-e2e-live test-real-claude-dev test-real-claude-review test-real-gh-labels test-real-gh test-real-gh-plus-e2e test-real-gh-plus-e2e-subprocess test-web test-web-headed playwright-install validate validate-raw validate-pr validate-pr-raw validate-quick validate-full verify-hooks-all _validate-impl _validate-static-impl _validate-core-tests-impl _validate-pr-impl _validate-agent-impl _validate-full-impl clean demo issues-validate issues-fix issues-fix-dry-run issues-create
+.PHONY: help venv venv-fast semgrep-venv worktree-create worktree-setup install upgrade-deps deps-batch release release-pr prepare-release preview-readme typecheck lint-arch lint-complexity quality-guardrails quality-guardrails-stale sync-deps test test-unit test-unit-cov test-unit-cov-html test-integration test-integration-core test-integration-core-local test-integration-core-live-codex test-live-assurance test-simulated test-simulated-core test-simulated-agent test-e2e test-e2e-heavy test-e2e-onboarding-live test-e2e-one test-e2e-live test-real-claude-dev test-real-claude-review test-real-gh-labels test-real-gh test-real-gh-plus-e2e test-real-gh-plus-e2e-subprocess test-web test-web-headed playwright-install validate validate-raw validate-pr validate-pr-raw validate-quick validate-full verify-hooks-all _validate-impl _validate-static-impl _validate-core-tests-impl _validate-pr-impl _validate-agent-impl _validate-full-impl clean demo issues-validate issues-fix issues-fix-dry-run issues-create
 
 # GNU make detection - required for parallel validation with grouped output
 # On macOS: brew install make (provides gmake)
@@ -33,7 +33,7 @@ help:
 	@echo "  test-unit-cov-html  Run unit tests with HTML coverage (open htmlcov/index.html)"
 	@echo "  test-integration    Run integration tests"
 	@echo "  test-integration-core   Run fast integration slice used by local validate"
-	@echo "  test-integration-agent  Run real agent-backed integration slice"
+	@echo "  test-live-assurance     Run the live-agent assurance lane (PASS/SECURITY_FAIL/INCONCLUSIVE)"
 	@echo "  test-e2e            Run e2e tests (stops on first failure, use NOFAST=1 to run all)"
 	@echo "  test-e2e-heavy      Run expensive journey-level onboarding/orchestration tests"
 	@echo "  test-e2e-onboarding-live  Run opt-in live agent-guided onboarding acceptance"
@@ -300,13 +300,17 @@ endif
 	$(DEPS_MARKER_TOOL) guard $(VENV_DIR) . -- $(UV) sync --frozen --all-extras
 	@$(GMAKE) --no-print-directory semgrep-venv
 	@echo ""
-	@echo "==> Verifying with the full required suite (agent lane + test-vscode)..."
+	@echo "==> Verifying with the full required suite (simulated agent lane + test-vscode)..."
 	@# validate-pr-raw, not validate: `validate` stops at _validate-impl and omits
-	@# _validate-agent-impl, so it would skip the live claude/codex lane -- exactly
-	@# the lane CI already cannot run. That lane is the whole reason this batch is
-	@# verified locally, so skipping it here would leave pexpect-class dependencies
-	@# (agent spawning) covered by nothing at all. -raw avoids seeding the
-	@# SHA-keyed pre-push cache from an uncommitted tree.
+	@# _validate-agent-impl, so it would skip the agent-backed simulated lane --
+	@# exactly the lane CI already cannot run. That lane is the whole reason this
+	@# batch is verified locally, so skipping it here would leave pexpect-class
+	@# dependencies (agent spawning) covered by nothing at all. -raw avoids seeding
+	@# the SHA-keyed pre-push cache from an uncommitted tree.
+	@#
+	@# The live-agent integration probes moved out of every blocking gate in #194
+	@# and are NOT run here. A dependency batch that wants them exercised must run
+	@# `make test-live-assurance` explicitly and read its recorded outcome.
 	@$(GMAKE) --no-print-directory validate-pr-raw
 	@echo ""
 	@echo "==> Upgraded manifests:"
@@ -397,10 +401,20 @@ PARALLEL ?= auto
 UNIT_PARALLEL ?= $(PARALLEL)
 SIMULATED_PARALLEL ?= $(PARALLEL)
 INTEGRATION_PARALLEL ?= $(PARALLEL)
-# Live provider-backed integration tests share authenticated local CLIs and
-# provider account state. Run them serially unless explicitly overridden.
-INTEGRATION_AGENT_PARALLEL ?= 0
-INTEGRATION_AGENT_FILES := tests/integration/test_claude_execution.py tests/integration/test_codex_execution.py tests/integration/test_live_agent_chain.py
+# #194: which tests are "live agent" is decided by ONE semantic — the
+# `live_agent` marker — and nowhere else. There used to be a second mechanism:
+# an INTEGRATION_AGENT_FILES list of three filenames that the blocking
+# integration target `--ignore`d. A file could therefore declare the marker and
+# still run in blocking validation, which is exactly what
+# tests/integration/test_sandbox_os_boundary.py did — putting an external
+# model's choice to issue a tool call in front of every candidate's publication
+# (#109, three recorded occurrences).
+#
+# The list is gone. A file that declares `live_agent` is deselected from
+# blocking validation and collected by `test-live-assurance`, with no second
+# edit anywhere. `live_codex` was already selected this way; this makes the two
+# consistent.
+LIVE_AGENT_MARKER := live_agent
 # Keep this list in sync with the -k exclusion in test-simulated-core.
 # New agent-backed tests added to test_foreign_repo_lifecycle.py must be listed here
 # so they move to test-simulated-agent instead of staying in the fast local slice.
@@ -490,39 +504,49 @@ test-integration-core: test-integration-core-local test-integration-core-live-co
 test-integration-core-local: sync-deps
 ifeq ($(INTEGRATION_PARALLEL),0)
 	$(call TIMED_RUN,test-integration-core,\
-		$(PYTEST) tests/integration -x -q --tb=short -m "not requires_infra and not live_codex" \
-			--ignore=tests/integration/test_claude_execution.py \
-			--ignore=tests/integration/test_codex_execution.py \
-			--ignore=tests/integration/test_live_agent_chain.py \
+		$(PYTEST) tests/integration -x -q --tb=short -m "not requires_infra and not live_codex and not $(LIVE_AGENT_MARKER)" \
 			$(PYTEST_TIMINGS))
 else
 	$(call TIMED_RUN,test-integration-core,\
-		$(PYTEST) tests/integration -x -q --tb=short -m "not requires_infra and not live_codex" -n $(INTEGRATION_PARALLEL) --dist=loadgroup \
-			--ignore=tests/integration/test_claude_execution.py \
-			--ignore=tests/integration/test_codex_execution.py \
-			--ignore=tests/integration/test_live_agent_chain.py \
+		$(PYTEST) tests/integration -x -q --tb=short -m "not requires_infra and not live_codex and not $(LIVE_AGENT_MARKER)" -n $(INTEGRATION_PARALLEL) --dist=loadgroup \
 			$(PYTEST_TIMINGS))
 endif
 
 test-integration-core-live-codex: sync-deps
 	$(call TIMED_RUN,test-integration-core-live-codex,\
-		$(PYTEST) tests/integration -x -q --tb=short -m "live_codex and not requires_infra" \
-			--ignore=tests/integration/test_claude_execution.py \
-			--ignore=tests/integration/test_codex_execution.py \
-			--ignore=tests/integration/test_live_agent_chain.py \
+		$(PYTEST) tests/integration -x -q --tb=short -m "live_codex and not requires_infra and not $(LIVE_AGENT_MARKER)" \
 			$(PYTEST_TIMINGS))
 
 # Backward-compatible alias for existing callers.
 test-integration-no-infra: test-integration-core
 
-test-integration-agent: sync-deps
-ifeq ($(INTEGRATION_AGENT_PARALLEL),0)
-	$(call TIMED_RUN,test-integration-agent,\
-		$(PYTEST) $(INTEGRATION_AGENT_FILES) -x -q --tb=short $(PYTEST_TIMINGS))
-else
-	$(call TIMED_RUN,test-integration-agent,\
-		$(PYTEST) $(INTEGRATION_AGENT_FILES) -x -q --tb=short -n $(INTEGRATION_AGENT_PARALLEL) --dist=loadgroup $(PYTEST_TIMINGS))
-endif
+# The live-agent assurance lane (#194). NOT part of validate-pr-raw: its
+# subjects drive real provider CLIs, so whether they execute at all depends on
+# an external model's choices, and that must not decide whether an unrelated
+# candidate publishes. It reduces the run to one of exactly three outcomes —
+# PASS / SECURITY_FAIL / INCONCLUSIVE — and files it against the exact artifact
+# it ran on, which is what `trusted-runtime-promote` then requires.
+#
+# Selected by marker, never by filename, and serial: the probes share
+# authenticated local CLIs and provider account state, and the lane plugin
+# classifies exceptions in the process that raised them.
+#
+# The `--live-assurance-*` options are what make the record exact-artifact
+# evidence. `git rev-parse HEAD` is resolved here rather than inside the plugin,
+# so the artifact identity is the checkout's and is visible in the command.
+#
+# There is deliberately no `-x` and no `-n`. `-x` would stop at the first
+# probe and hide a breach a later one would have proven; `-n` would classify
+# exceptions in worker processes the lane's session hook never sees, and the
+# probes share authenticated CLIs besides. Neither is a knob worth offering.
+LIVE_ASSURANCE_ROOT ?= .
+test-live-assurance: sync-deps
+	$(call TIMED_RUN,test-live-assurance,\
+		$(PYTEST) tests/integration -q --tb=short -m "$(LIVE_AGENT_MARKER)" \
+			-p tests.live_assurance_lane \
+			--live-assurance-root=$(LIVE_ASSURANCE_ROOT) \
+			--live-assurance-head-sha=$$(git rev-parse HEAD) \
+			$(PYTEST_TIMINGS))
 
 # Full integration tests including infrastructure-dependent ones (run in CI)
 test-integration-full: sync-deps
@@ -662,7 +686,7 @@ VALIDATE_AGENT_JOBS ?= 1
 VALIDATE_E2E_JOBS ?= 1
 
 define VALIDATE_CONFIG
-	@echo "[validate-timing] CONFIG validate_jobs=$(VALIDATE_JOBS) unit_parallel=$(UNIT_PARALLEL) simulated_parallel=$(SIMULATED_PARALLEL) integration_parallel=$(INTEGRATION_PARALLEL) integration_agent_parallel=$(INTEGRATION_AGENT_PARALLEL) static_jobs=$(VALIDATE_STATIC_JOBS) test_jobs=$(VALIDATE_TEST_JOBS) web_jobs=$(VALIDATE_WEB_JOBS) live_web_jobs=$(VALIDATE_LIVE_WEB_JOBS) agent_jobs=$(VALIDATE_AGENT_JOBS) e2e_jobs=$(VALIDATE_E2E_JOBS)"
+	@echo "[validate-timing] CONFIG validate_jobs=$(VALIDATE_JOBS) unit_parallel=$(UNIT_PARALLEL) simulated_parallel=$(SIMULATED_PARALLEL) integration_parallel=$(INTEGRATION_PARALLEL) static_jobs=$(VALIDATE_STATIC_JOBS) test_jobs=$(VALIDATE_TEST_JOBS) web_jobs=$(VALIDATE_WEB_JOBS) live_web_jobs=$(VALIDATE_LIVE_WEB_JOBS) agent_jobs=$(VALIDATE_AGENT_JOBS) e2e_jobs=$(VALIDATE_E2E_JOBS)"
 endef
 
 validate-raw:
@@ -705,7 +729,11 @@ _validate-pr-impl:
 	$(call TIMED_RUN,validate-agent-phase,\
 		$(GMAKE) -j$(VALIDATE_AGENT_JOBS) --output-sync=target _validate-agent-impl)
 
-_validate-agent-impl: test-simulated-agent test-integration-agent
+# #194: the live-agent integration lane is gone from here. Its subjects run
+# real provider CLIs, so a model declining to issue a tool call decided whether
+# an unrelated candidate could publish. They are collected by
+# `test-live-assurance` now, which is not part of any blocking gate.
+_validate-agent-impl: test-simulated-agent
 
 # Full validation including e2e tests
 validate-full:

@@ -11,6 +11,12 @@ from collections.abc import Mapping
 pytestmark = [
     pytest.mark.integration,
     pytest.mark.live,
+    # Spawns a real Claude CLI, so what it observes depends on an external
+    # model's choices. `live_agent` is the one semantic that keeps such a test
+    # out of blocking candidate validation and inside the assurance lane
+    # (#194); before it, a three-filename Makefile list decided that instead,
+    # and a marked file could still gate publication.
+    pytest.mark.live_agent,
     # Run PTY tests sequentially in one worker to avoid Python 3.14 forkpty warning
     # (forkpty() in multi-threaded processes can deadlock)
     pytest.mark.xdist_group("pty"),

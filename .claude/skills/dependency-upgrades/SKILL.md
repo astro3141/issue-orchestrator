@@ -81,14 +81,21 @@ real merge result before it lands.
 #### Agent-lane-only dependencies
 
 Their behavior is exercised *solely* by `test-simulated-agent` /
-`test-integration-agent`, which skip on GitHub:
+`test-live-assurance`, which skip on GitHub:
 
 - `pexpect` — drives agent PTY spawning (`execution/agent_runner.py`); its PTY
   tests (`tests/integration/test_live_agent_chain.py`) skip on GitHub.
 
 A grouped PR that includes one of these needs local verification as a whole —
-`make deps-batch` upgrades the group together and runs the lane, so that pass
-covers the group.
+`make deps-batch` upgrades the group together and runs `test-simulated-agent`,
+so that pass covers the group.
+
+**`make deps-batch` no longer runs the live-agent lane.** Since #194 those tests
+live in `make test-live-assurance`, which is in no blocking gate: its result is
+`PASS` / `SECURITY_FAIL` / `INCONCLUSIVE` about an artifact, not a pass or fail
+of a change. A dependency whose only coverage is that lane — `pexpect` today —
+needs `make test-live-assurance` run explicitly, and its recorded outcome read,
+before the upgrade is trusted.
 
 ### Verify locally with `make deps-batch` — for the rest
 

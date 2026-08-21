@@ -59,6 +59,65 @@ while stamping `suite=publish_gate` onto the record, and the completion
 processor's publish-gate seam was never wired in composition — so
 `validation.publish.cmd` ran nowhere in the orchestrator path.
 
+### Live-agent assurance is not publication validation
+
+There is a **third** lane, and it is deliberately not in the table above.
+
+Some tests drive a real provider CLI: the OS-sandbox boundary proof in
+`tests/integration/test_sandbox_os_boundary.py` launches `claude` and `codex`
+with the generated sandbox argv and asserts on what the operating system did.
+Whether such a test executes at all depends on an external model choosing to
+issue a tool call. While it sat inside the pinned publish command, a model that
+declined to issue one was recorded as **the candidate failing**, three times
+([#109]) — most recently against a candidate whose changes had nothing to do
+with sandbox behaviour.
+
+Segregation is by **marker**, not by filename. A module declaring
+`pytest.mark.live_agent` is deselected from every blocking target
+(`-m "... and not live_agent"`, the way `live_codex` already worked) and
+collected by `make test-live-assurance`. There is no second list: adding a
+fourth live-agent module requires no other edit, and
+`tests/unit/test_makefile_validation_phases.py` fails if the publish gate ever
+names one by path again.
+
+The lane's result is one of exactly three, and the middle one is the point:
+
+| Outcome | Meaning |
+|---------|---------|
+| `PASS` | The required operation was actually issued and the allow/deny boundary was proven. |
+| `SECURITY_FAIL` | The boundary was really exercised and a security assertion failed. |
+| `INCONCLUSIVE` | The provider was unavailable, the run timed out, the model never issued the required operation, or nothing was selected. |
+
+`INCONCLUSIVE` is neither a candidate failure nor a security pass; the failed
+observation is preserved in the record's `detail` rather than reinterpreted.
+Precedence is `SECURITY_FAIL` > `INCONCLUSIVE` > `PASS`, so a proven breach
+never hides behind an unrelated provider hiccup and an empty selection never
+reads as a vacuous pass. Re-running the *lane* after an `INCONCLUSIVE` is
+availability handling for assurance evidence; it is not a retry of any
+candidate's validation, and nothing re-runs a gate on a candidate's behalf.
+
+Records live at `.issue-orchestrator/live-assurance/<HEAD_SHA>.json` —
+a separate directory from `.issue-orchestrator/validation/`, keyed by the
+**artifact commit alone**. What the lane proves is a property of a build, not
+of somebody's candidate for an issue.
+
+**No evidence crossover, in both directions.** The record carries its own suite
+label, `live_assurance`, and `LiveAssuranceRecord` refuses any suite
+`ValidationGateKind` defines — so a `publish_gate` payload dropped into the
+lane's directory raises rather than admitting anything. Symmetrically, a
+`ValidationVerdictReceipt` carrying `live_assurance` certifies nothing, because
+`ValidationGateKind.PUBLISH.produced` does not recognise the label. This is the
+same discipline that stops an `agent_gate` pass reading as a publication pass
+([#25]), extended to a third lane.
+
+**What the assurance record authorizes.** `control/trusted_runtime_promotion.py`
+admits a trusted-runtime promotion only for an artifact with a `PASS` record
+naming that exact commit. Before this the rule was prose — "ship the runtime
+you verified" — with nothing that could refuse. `trusted-runtime-promote
+--head-sha <sha>` is the command form: exit `0` admitted, `1` refused with the
+reason, `2` malformed request. It moves no pin; the pin and the promotion
+procedure stay in issue #18.
+
 ### The verdict outlives the run directory
 
 Every path named above lives inside the coder worktree, so all of it is gone
@@ -1120,3 +1179,17 @@ Record fields:
 - `stdout`/`stderr` paths (optional but recommended)
 - `profile` — the named validation profile the run executed (see below);
   records written before profiles existed read back as `default`
+
+### Live-assurance record format
+
+Location: `.issue-orchestrator/live-assurance/<HEAD_SHA>.json` — a different
+directory, because it is a different kind of evidence.
+
+Record fields:
+- `schema_version`
+- `suite` — always `live_assurance`. Any suite `ValidationGateKind` defines is
+  refused on both write and read, so this file can never be a publication
+  receipt and a publication receipt can never be read as one of these.
+- `head_sha` — the exact artifact the lane ran against
+- `outcome` — `pass`, `security_fail` or `inconclusive`
+- `detail` — why, preserved verbatim; never empty
