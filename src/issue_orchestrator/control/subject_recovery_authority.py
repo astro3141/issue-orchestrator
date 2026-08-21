@@ -7,24 +7,37 @@ on. #136 gave ``planning_investigation`` a capability row that omits every
 recovery kind, so the role may not propose a recovery action on its subject —
 and therefore must not achieve one by malfunctioning either.
 
-Four completion paths would each answer that question for themselves, which is
+Six completion paths would each answer that question for themselves, which is
 how the boundary ended up half-enforced the first time (#136 review A1/A2):
 
 1. the crash path — the session died;
 2. the rejection path — the session completed with a refused decision;
 3. ``invalid_record_actions`` — the record could not be accepted;
-4. the BLOCKED completion path — the agent reported it cannot proceed.
+4. the BLOCKED completion path — the agent reported it cannot proceed;
+5. the publish-failure path — the run COMPLETED and the push or PR creation
+   failed, leaving ``publish-failed`` and eventually ``needs-human``;
+6. the review-exchange-halt path — the exchange around that publish stopped
+   without an outcome, leaving ``blocked-failed``.
 
 Paths 1 and 2 are planned by :mod:`.tech_lead_terminal_effects`, which knows
-the run's flavor. Paths 3 and 4 are GENERIC session machinery that never learns
-whose session it is, so #182 threads the answer to them as a value instead —
-:class:`SubjectRecoveryAuthority`, resolved once by the tech_lead owner and
-passed in. What travels is the ANSWER, never the flavor: a generic path that
-received a flavor would be one flavor comparison away from owning this rule
-too.
+the run's flavor. Paths 3 through 6 are GENERIC session machinery that never
+learns whose session it is, so #182 threads the answer to them as a value
+instead — :class:`SubjectRecoveryAuthority`, resolved once by the tech_lead
+owner and passed in. What travels is the ANSWER, never the flavor: a generic
+path that received a flavor would be one flavor comparison away from owning
+this rule too.
+
+Paths 5 and 6 are the ones a run reaches by SUCCEEDING at its own job: a
+focused tech_lead run publishes onto its disposable branch
+(``shape_requested_actions_for_tech_lead`` deliberately keeps ``PUSH_BRANCH``
+and ``CREATE_PR``), and a push that fails there lands a blocking label on
+``issue-{N}`` — which for a focused flavor IS the subject (#182 review F1).
+Ruled OUT deliberately: the interrupted-retry path, whose guard label bounds a
+RELAUNCH rather than retiring the issue, and the provider-blocked path, where a
+dead credential is an outage record rather than a verdict on the issue.
 
 The answer is read from the capability table rather than matched by flavor, so
-a future bounded role inherits every one of these four suppressions the moment
+a future bounded role inherits every one of these six suppressions the moment
 it declares its row, and a role that later GAINS a recovery kind loses them in
 the same edit.
 """
@@ -91,11 +104,21 @@ class SubjectRecoveryAuthority:
     ) -> SubjectRecoveryOutcome:
         """Does *add_label* survive, and what does the operator get told?
 
-        The whole decision the two generic paths need, made once here rather
-        than branched at each of them (#182). They differ only in which label
-        they would have added and how they phrase its presence, so both hand
-        those in and splice the result — neither re-asks the question, and
-        neither can produce a comment that disagrees with its own action list.
+        The whole decision for a path whose entire effect on its subject is ONE
+        label, made once here rather than branched at each of them (#182): the
+        rejection path, the rejected-record path, the blocked path, and the
+        review-exchange halt. They differ only in which label they would have
+        added and how they phrase its presence, so each hands those in and
+        splices the result — none re-asks the question, and none can produce a
+        comment that disagrees with its own action list.
+
+        A path whose effect is a SET rather than one label — the publish-failure
+        path adds a blocking label, clears ``needs-rework`` and rolls a failure
+        counter, and past a threshold escalates to a DIFFERENT label — cannot be
+        expressed as "keep or drop one action", because the threshold itself is
+        part of what a bounded role may not reach. Those read
+        :attr:`may_leave_recovery_label` and build their substitute, ending its
+        comment with :meth:`suppression_note` so the voice stays one voice.
         """
         if self.may_leave_recovery_label:
             return SubjectRecoveryOutcome((add_label,), note_when_added)
@@ -104,10 +127,11 @@ class SubjectRecoveryAuthority:
     def suppression_note(self, *suppressed: str) -> str:
         """Why the subject carries no blocking label, in ONE voice for all paths.
 
-        Each path suppresses a different label set — the crash path two, the
-        rejection, rejected-record, and blocked paths one each — so the names are
-        passed in. An operator reading any of those issues gets the same
-        explanation, because it is the same rule that produced all of them.
+        Each path suppresses a different label set — the crash and
+        publish-failure paths two each, the rejection, rejected-record, blocked,
+        and exchange-halt paths one each — so the names are passed in. An
+        operator reading any of those issues gets the same explanation, because
+        it is the same rule that produced all of them.
         """
         if self.may_leave_recovery_label:
             raise ValueError(

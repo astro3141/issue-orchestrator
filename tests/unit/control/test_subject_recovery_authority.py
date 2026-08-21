@@ -1,6 +1,6 @@
 """The single owner of "may this run change its subject's recovery state?".
 
-Four completion paths ask it (#136 A1/A2, #182). These tests pin the answer
+Six completion paths ask it (#136 A1/A2, #182). These tests pin the answer
 itself and the one voice that explains a suppression; the per-path tests in
 ``tests/unit/test_completion_action_planner.py`` pin what each path does with
 the answer.

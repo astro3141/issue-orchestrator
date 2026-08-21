@@ -23,7 +23,7 @@ proposing the very action the capability gate refused.
 :class:`~.subject_recovery_authority.SubjectRecoveryAuthority` owns the answer
 for every path that asks; this module is where a tech_lead session's run is
 resolved into one (:func:`resolve_subject_recovery_authority`), for its own two
-paths and for the generic ones that cannot resolve it themselves (#182).
+paths and for the four generic ones that cannot resolve it themselves (#182).
 
 Everything else a failure produces is untouched: the rejection surface, the
 operator comment, the manifest labels, the anchor close, and the released
@@ -252,11 +252,12 @@ def resolve_subject_recovery_authority(
 ) -> SubjectRecoveryAuthority:
     """The threaded answer for a session the GENERIC paths must plan for (#182).
 
-    ``invalid_record_actions`` and the BLOCKED completion path are session
-    machinery with no notion of tech_lead roles, and they never receive a
+    ``invalid_record_actions``, the BLOCKED completion path, the publish-failure
+    path, and the review-exchange halt are session machinery with no notion of
+    tech_lead roles, and none of them receives a
     :class:`TechLeadLaunchAuthority`. This is the one place their answer is
     resolved — same store, same session-shaped read, and the same predicate the
-    crash and rejection paths ask — so closing those two doors adds no second
+    crash and rejection paths ask — so closing those four doors adds no second
     copy of the rule.
 
     Unbounded, so the generic recovery label stands, for a non-tech_lead

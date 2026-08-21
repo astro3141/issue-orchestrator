@@ -147,11 +147,12 @@ class TechLeadActionCapabilityPolicy:
         The recovery kinds are what "may change a work item's recovery state"
         means for this table, so the question "does this role hold recovery
         authority?" is answered HERE rather than by re-listing the kinds — or,
-        worse, by naming the one flavor that lacks them — at each caller. The
-        terminal-effects owner (``control.tech_lead_completion``) asks it to
-        decide whether a dead session may stamp a blocking label on its own
-        focused subject: a role the contract forbids from proposing a recovery
-        action must not achieve one by dying.
+        worse, by naming the one flavor that lacks them — at each caller. Its
+        one consumer is ``control.subject_recovery_authority``, which reads it
+        on behalf of every completion path that would stamp a blocking label on
+        a run's own focused subject (#182): a role the contract forbids from
+        proposing a recovery action must not achieve one by dying, by
+        malfunctioning, or by failing to publish.
         """
         return bool(self.allowed_kinds(flavor) & _RECOVERY_KINDS)
 
