@@ -157,6 +157,14 @@ def _stage_one_source(
     this adds no fetch surface of its own. The subject is re-read here rather
     than described from the in-hand snapshot so every source's ``updated_at``
     is its revision at THIS launch, on one uniform path.
+
+    ``get_issue_comments`` answers with ONE page, so a long conversation is
+    staged partially (#185). The descriptor records the tracker's reported
+    total beside what was staged — the count rides the SAME ``get_issue``
+    payload already in hand, so reading it costs no extra call — and a reader
+    tells a short conversation from a clipped one off the two numbers.
+    Fetching the remaining pages is a separate concern and deliberately not
+    done here.
     """
     fetched_at = _now()
     try:
@@ -181,6 +189,7 @@ def _stage_one_source(
                 updated_at=issue.updated_at or "",
                 body_sha256=body_sha256,
                 comments=comments,
+                comment_count=issue.comment_count,
             ),
             body=body,
         )
@@ -296,4 +305,18 @@ def stage_canonical_context(
         sum(1 for source in snapshot.sources if not source.staged),
         path,
     )
+    clipped = [source for source in snapshot.sources if source.comments_truncated]
+    if clipped:
+        # Not a failure: the descriptor says so itself, per source. Worth
+        # saying out loud because a run reasoning from a clipped governing
+        # source is a quieter problem than one missing it outright.
+        logger.warning(
+            "[tech_lead] Canonical context for planning subject #%s staged only"
+            " part of some conversations: %s",
+            subject_issue.number,
+            ", ".join(
+                f"#{source.issue_number} {len(source.comments)}/{source.comment_count}"
+                for source in clipped
+            ),
+        )
     return snapshot

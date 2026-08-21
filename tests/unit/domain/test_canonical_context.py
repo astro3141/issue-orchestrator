@@ -7,6 +7,7 @@ domain, so they are proven here without touching a repository host.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 from pathlib import Path
 
@@ -55,6 +56,14 @@ def _governing(number: int, **overrides: object) -> CanonicalSource:
     }
     fields.update(overrides)
     return CanonicalSource(**fields)  # type: ignore[arg-type]
+
+
+def _comment(comment_id: int) -> StagedComment:
+    return StagedComment(
+        comment_id=comment_id,
+        updated_at="2026-08-18T09:00:00Z",
+        sha256=content_digest(f"comment {comment_id}"),
+    )
 
 
 class TestParseGoverningSources:
@@ -134,7 +143,22 @@ class TestCanonicalSourceStates:
                 absent_reason="boom",
             )
 
-    def test_an_absent_source_may_not_claim_content_it_never_staged(self) -> None:
+    @pytest.mark.parametrize(
+        "content_fact",
+        [
+            {"title": "Looks staged"},
+            {"state": "open"},
+            {"updated_at": "2026-08-19T10:00:00Z"},
+            {"body_sha256": content_digest("body")},
+            {"comments": (_comment(1),)},
+            # #185: the conversation TOTAL is a content fact too. A source
+            # that staged nothing knows nothing about its conversation.
+            {"comment_count": 5},
+        ],
+    )
+    def test_an_absent_source_may_not_claim_content_it_never_staged(
+        self, content_fact: dict[str, object]
+    ) -> None:
         with pytest.raises(ValueError, match="content facts"):
             CanonicalSource(
                 kind=CanonicalSourceKind.GOVERNING,
@@ -143,8 +167,22 @@ class TestCanonicalSourceStates:
                 fetched_at=FETCHED_AT,
                 staged=False,
                 absent_reason="unreachable",
-                title="Looks staged",
+                **content_fact,  # type: ignore[arg-type]
             )
+
+    def test_an_absent_source_is_absent_rather_than_clipped(self) -> None:
+        absent = CanonicalSource(
+            kind=CanonicalSourceKind.GOVERNING,
+            issue_number=23,
+            required=False,
+            fetched_at=FETCHED_AT,
+            staged=False,
+            absent_reason="unreachable",
+        )
+
+        assert absent.comment_count == 0
+        assert absent.comments == ()
+        assert absent.comments_truncated is False
 
     def test_an_absent_source_must_say_why(self) -> None:
         with pytest.raises(ValueError, match="must record why"):
@@ -163,6 +201,99 @@ class TestCanonicalSourceStates:
     def test_fetch_time_is_always_recorded(self) -> None:
         with pytest.raises(ValueError, match="when it was"):
             _governing(21, fetched_at="")
+
+
+class TestConversationCompleteness:
+    """#185: a complete comment set and a clipped first page read differently.
+
+    ``get_issue_comments`` answers with one page, so a staged conversation may
+    be a prefix of the real one. The descriptor records the tracker's total
+    beside what it staged, and "was it clipped" is READ OFF the pair rather
+    than stored beside it.
+    """
+
+    def test_a_clipped_conversation_says_how_much_is_missing(self) -> None:
+        clipped = _governing(
+            21, comments=tuple(_comment(i) for i in range(100)), comment_count=137
+        )
+
+        assert clipped.comments_truncated is True
+        assert len(clipped.comments) == 100
+        assert clipped.comment_count == 137
+        # Not merely "something is missing" - exactly 37 comments are.
+        assert clipped.comment_count - len(clipped.comments) == 37
+
+    def test_a_complete_conversation_reads_as_complete(self) -> None:
+        complete = _governing(
+            21, comments=(_comment(1), _comment(2)), comment_count=2
+        )
+
+        assert complete.comments_truncated is False
+        assert complete.comment_count == len(complete.comments)
+
+    def test_a_silent_source_is_not_mistaken_for_a_clipped_one(self) -> None:
+        # Zero staged comments is the honest answer for an issue nobody
+        # commented on, and must not read as "the page was clipped at zero".
+        silent = _governing(21, comments=(), comment_count=0)
+
+        assert silent.comments_truncated is False
+
+    def test_no_stored_flag_can_disagree_with_the_counts(self) -> None:
+        # The failure CompletedReviewExchange was reshaped to remove: two
+        # stored values for one fact, free to drift apart. There is exactly
+        # one representation here, and it is the pair.
+        field_names = {field.name for field in dataclasses.fields(CanonicalSource)}
+        assert not any("truncat" in name for name in field_names)
+        assert "comment_count" in field_names
+        with pytest.raises(TypeError):
+            CanonicalSource(  # type: ignore[call-arg]
+                kind=CanonicalSourceKind.GOVERNING,
+                issue_number=21,
+                required=True,
+                fetched_at=FETCHED_AT,
+                staged=True,
+                updated_at="2026-08-19T10:00:00Z",
+                body_sha256=content_digest("body"),
+                truncated=True,
+            )
+        serialized = _governing(21, comments=(_comment(1),), comment_count=9).to_dict()
+        assert not any("truncat" in key for key in serialized)
+        assert serialized["comment_count"] == 9
+        assert len(serialized["comments"]) == 1
+
+    def test_a_source_may_not_claim_fewer_comments_than_it_staged(self) -> None:
+        with pytest.raises(ValueError, match="fewer comments than it handed over"):
+            _governing(21, comments=(_comment(1), _comment(2)), comment_count=1)
+
+    def test_the_pair_survives_the_serialized_form(self, tmp_path: Path) -> None:
+        snapshot = CanonicalContextSnapshot(
+            subject_issue_number=183,
+            sources=(
+                _subject(comments=(_comment(1),), comment_count=1),
+                _governing(21, comments=(_comment(2),), comment_count=42),
+            ),
+        )
+        path = tmp_path / "canonical-context.json"
+
+        snapshot.write(path)
+        replayed = CanonicalContextSnapshot.read(path)
+
+        assert replayed == snapshot
+        assert replayed.sources[0].comments_truncated is False
+        assert replayed.sources[1].comments_truncated is True
+        payload = json.loads(path.read_text())
+        assert payload["sources"][1]["comment_count"] == 42
+        # The reader guidance explains the pair, so an agent handed only this
+        # file knows a short conversation from a clipped one.
+        assert "comment_count" in payload["guidance"]
+
+    @pytest.mark.parametrize("raw", ["7", 7.0, True, None])
+    def test_a_malformed_stored_total_is_loud(self, raw: object) -> None:
+        payload = _governing(21).to_dict()
+        payload["comment_count"] = raw
+
+        with pytest.raises(ValueError, match="comment_count must be an int"):
+            CanonicalSource.from_dict(payload)
 
 
 class TestCanonicalContextSnapshot:
@@ -222,6 +353,7 @@ class TestCanonicalContextSnapshot:
                             sha256=content_digest("a comment"),
                         ),
                     ),
+                    comment_count=1,
                 ),
             ),
         )
