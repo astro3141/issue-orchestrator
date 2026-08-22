@@ -19,6 +19,7 @@ class ReviewExchangeReason(StrEnum):
     """Terminal reason values persisted in ``review-exchange/summary.json``."""
 
     REVIEWER_OK = "reviewer_ok"
+    REVIEWER_REQUESTED_CHANGES = "reviewer_requested_changes"
     REVIEWER_REPORTS_NO_PROGRESS = "reviewer_reports_no_progress"
     MAX_ROUNDS_EXCEEDED = "max_rounds_exceeded"
     REVIEWER_NO_COMPLETION = "reviewer_no_completion"
@@ -32,6 +33,10 @@ VALID_REVIEW_EXCHANGE_TERMINALS: frozenset[
 ] = frozenset(
     {
         (ReviewExchangeStatus.OK, ReviewExchangeReason.REVIEWER_OK),
+        (
+            ReviewExchangeStatus.STOPPED,
+            ReviewExchangeReason.REVIEWER_REQUESTED_CHANGES,
+        ),
         (
             ReviewExchangeStatus.STOPPED,
             ReviewExchangeReason.REVIEWER_REPORTS_NO_PROGRESS,

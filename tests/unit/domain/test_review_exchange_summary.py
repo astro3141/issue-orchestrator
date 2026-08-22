@@ -60,6 +60,21 @@ class TestReviewExchangeTerminalState:
         assert terminal.status is ReviewExchangeStatus.ERROR
         assert terminal.reason is ReviewExchangeReason.REVIEWER_DECISION_INVALID
 
+    def test_the_changes_requested_handoff_is_a_stopped_terminal(self) -> None:
+        """#180's terminal, spelled as its own reason rather than borrowed.
+
+        ``reviewer_reports_no_progress`` and ``max_rounds_exceeded`` are both
+        claims about coder rounds this exchange never ran, so reusing either
+        would record something untrue about why it stopped.
+        """
+        terminal = ReviewExchangeTerminalState(
+            status=ReviewExchangeStatus.STOPPED,
+            reason=ReviewExchangeReason.REVIEWER_REQUESTED_CHANGES,
+        )
+
+        assert terminal.status is ReviewExchangeStatus.STOPPED
+        assert terminal.reason is ReviewExchangeReason.REVIEWER_REQUESTED_CHANGES
+
     def test_rejects_crossed_status_reason_pairs(self) -> None:
         with pytest.raises(ValueError, match="invalid review-exchange terminal state"):
             ReviewExchangeTerminalState(

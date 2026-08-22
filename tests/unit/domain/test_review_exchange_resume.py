@@ -24,6 +24,7 @@ from issue_orchestrator.domain.review_exchange_resume import (
     REASON_REVIEWER_NO_COMPLETION,
     REASON_REVIEWER_OK,
     REASON_REVIEWER_REPORTS_NO_PROGRESS,
+    REASON_REVIEWER_REQUESTED_CHANGES,
     ResumeDecision,
     ResumeFacts,
     decide,
@@ -127,6 +128,7 @@ class TestReuseHalt:
         [
             REASON_REVIEWER_REPORTS_NO_PROGRESS,
             REASON_MAX_ROUNDS_EXCEEDED,
+            REASON_REVIEWER_REQUESTED_CHANGES,
         ],
     )
     def test_stopped_outcomes_reuse_halt(self, reason: str) -> None:
@@ -355,6 +357,7 @@ class TestNoCompletionClassifier:
         [
             REASON_REVIEWER_OK,
             REASON_REVIEWER_REPORTS_NO_PROGRESS,
+            REASON_REVIEWER_REQUESTED_CHANGES,
             REASON_MAX_ROUNDS_EXCEEDED,
             REASON_CODER_PROTOCOL_ERROR,
             REASON_REVIEWER_DECISION_INVALID,
@@ -381,6 +384,7 @@ class TestNoCompletionClassifier:
 # refactor author to think through the new cell.
 _MATRIX_AT_CURRENT_HEAD: list[tuple[str, str, ResumeDecision]] = [
     ("ok", REASON_REVIEWER_OK, ResumeDecision.REUSE_APPROVAL),
+    ("stopped", REASON_REVIEWER_REQUESTED_CHANGES, ResumeDecision.REUSE_HALT),
     ("stopped", REASON_REVIEWER_REPORTS_NO_PROGRESS, ResumeDecision.REUSE_HALT),
     ("stopped", REASON_MAX_ROUNDS_EXCEEDED, ResumeDecision.REUSE_HALT),
     (

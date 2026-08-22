@@ -14,6 +14,10 @@ from issue_orchestrator.domain.continuation_settlement import (
     ContinuationSettlementKind,
 )
 from issue_orchestrator.domain.issue_key import FakeIssueKey, GitHubIssueKey
+from issue_orchestrator.domain.review_verdict_binding import (
+    BoundReviewVerdict,
+    ReviewVerdictOutcome,
+)
 from issue_orchestrator.domain.validation_verdict_receipt import (
     ValidationVerdict,
     ValidationVerdictReceipt,
@@ -196,6 +200,46 @@ def test_an_attempt_refuses_a_history_entry_naming_another_commit() -> None:
             key=AttemptKey(GitHubIssueKey("owner/repo", "139"), SHA),
             completed_evaluations=(_publish_receipt(), other),
         )
+
+
+def test_an_attempt_refuses_a_review_verdict_naming_another_commit() -> None:
+    """#178's fail-closed rule, at the record that stores the verdict (#180).
+
+    The handoff #180 adds produces a ``CHANGES_REQUESTED`` binding for exactly
+    ``A``. Nothing about it relaxes the other direction: a binding that covers
+    ``A'`` — the shape #193 actually produced, and the one ``10cee0c0``
+    proposed settling ``A`` from — is refused here rather than filed and
+    reinterpreted later.
+    """
+    covers_another_commit = BoundReviewVerdict(
+        verdict=ReviewVerdictOutcome.APPROVED,
+        reviewed_sha="b" * 40,
+        decided_at="2026-08-23T00:00:00+00:00",
+        completed_rounds=2,
+    )
+
+    with pytest.raises(ValueError, match="must name the attempt's own commit"):
+        Attempt(
+            key=AttemptKey(GitHubIssueKey("owner/repo", "180"), SHA),
+            continuation_review_verdict=covers_another_commit,
+        )
+
+
+def test_an_attempt_accepts_a_changes_requested_verdict_for_its_own_commit() -> None:
+    """The producer #180 adds writes exactly this, and the record keeps it."""
+    rejected = BoundReviewVerdict(
+        verdict=ReviewVerdictOutcome.CHANGES_REQUESTED,
+        reviewed_sha=SHA,
+        decided_at="2026-08-23T00:00:00+00:00",
+        completed_rounds=1,
+    )
+
+    attempt = Attempt(
+        key=AttemptKey(GitHubIssueKey("owner/repo", "180"), SHA)
+    ).with_continuation_review_verdict(rejected)
+
+    assert attempt.continuation_review_verdict == rejected
+    assert Attempt.from_dict(attempt.to_dict()).continuation_review_verdict == rejected
 
 
 def test_a_later_quick_evaluation_does_not_answer_the_publication_question() -> None:

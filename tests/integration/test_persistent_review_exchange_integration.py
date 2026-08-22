@@ -57,6 +57,7 @@ from issue_orchestrator.infra.config import Config
 from issue_orchestrator.domain.models import AgentConfig
 from issue_orchestrator.ports import TraceEvent
 from issue_orchestrator.ports.turn_mailbox import TurnMailbox
+from issue_orchestrator.domain.review_exchange_rework import ReviewExchangeRework
 
 
 _INTERACTIVE_REVIEW_AGENT = (
@@ -216,6 +217,7 @@ def _run_review_exchange_for_test(
     agent_label: str,
     events: object,
     event_context: object,
+    rework: ReviewExchangeRework = ReviewExchangeRework.IN_EXCHANGE,
 ):
     exchange_run = session_output.start_review_exchange_run(
         worktree,
@@ -231,6 +233,7 @@ def _run_review_exchange_for_test(
         issue_title=issue_title,
         session_name=session_name,
         agent_label=agent_label,
+        rework=rework,
         events=events,
         event_context=event_context,
     )

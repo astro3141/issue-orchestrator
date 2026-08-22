@@ -69,7 +69,38 @@ flowchart LR
   REV -->|approved| DONE["Create PR + mark code-reviewed"]
 ```
 
-Stops when: reviewer approves, `max_rounds` reached, or `max_no_progress` consecutive rounds without improvement.
+Stops when: reviewer approves, `max_rounds` reached, `max_no_progress` consecutive rounds without improvement, or — for a caller that owns no coder — the first round that asks for changes.
+
+### Who reworks when the reviewer asks for changes
+
+The exchange runs for two kinds of caller, and they mean different things by a
+changes-requested round, so the caller states which it is
+(`ReviewExchangeRework`, passed to the review-exchange runner):
+
+| Caller | Policy | A changes-requested round |
+|--------|--------|---------------------------|
+| Any completion with a live session behind it — ordinary sessions, publish retry, tech lead | `IN_EXCHANGE` (the default) | goes back to the exchange's own coder for another bounded round |
+| The control continuation (#149) | `HAND_OFF` | ends the exchange at `stopped` / `reviewer_requested_changes`, binding `changes_requested` to the commit that was presented |
+
+The continuation owns no coder: it replays a recorded intent for one exact
+candidate `A` whose session is gone, while a control operation still holds the
+issue against ordinary work. A coder round there would move the branch to `A'`
+inside that hold — the ordering #149 settled, run backwards. The handoff exists
+so the rejection becomes durable evidence about exactly `A` and the candidate
+goes back to ordinary rework instead.
+
+`max_rounds` is not a substitute: a bound of 1 still runs round 1's coder turn,
+which is precisely the turn that must not happen.
+
+The hand-off only pays off if the rejection is read back, and that reading has
+one seam. The exchange allocates a run of its own — a *sibling* of the session
+run, not a directory beneath it — and writes `review-verdict.json` there. So
+the completion pipeline reports which run it allocated
+(`ProcessingResult.review_exchange_run`), and the continuation asks
+`ReviewVerdictBindings.for_exchange_run` about that run. Deriving the location
+from anything else reads an empty directory and drops every verdict, approvals
+included; the continuation then settles nothing and pays a second full reviewer
+exchange over the same rejected commit before its run allowance runs out.
 
 ## Review Artifacts
 
@@ -121,11 +152,13 @@ Four things make it authority rather than convenience:
 - **Validity is re-derived, never remembered.** `BoundReviewVerdict.approves(head_sha)`
   answers False once HEAD moves; the binding is then detectably stale.
 
-Only two terminals produce a binding: the `reviewer_ok` completion, which binds
-`approved`, and the no-progress stop, which binds `changes_requested`. Neither
-picks that value itself — both write the verdict the single derivation above
-produced, which is why a reviewer whose transport field disagrees with its own
-decision never reaches the approving terminal at all. Every other way an exchange can end
+Only the terminals a *reviewer round* decides produce a binding: the
+`reviewer_ok` completion, which binds `approved`; the no-progress stop, which
+binds `changes_requested`; and the `reviewer_requested_changes` handoff, which
+also binds `changes_requested`. None of them picks that value itself — all
+write the verdict the single derivation above produced, which is why a reviewer
+whose transport field disagrees with its own decision never reaches the
+approving terminal at all. Every other way an exchange can end
 — max rounds exceeded, a protocol failure, a timeout — writes no
 `review-verdict.json`, because no reviewer verdict describes the commit the
 exchange left behind: max rounds is reached after a coder turn that was asked to
