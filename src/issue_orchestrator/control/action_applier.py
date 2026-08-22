@@ -87,6 +87,7 @@ from .actions import (
     ActionResult,
     ActionType,
     AddLabelAction,
+    ReleaseAbandonedIssueAction,
     RemoveLabelAction,
     SyncLabelsAction,
     ShedRecoveredWorkflowLabelsAction,
@@ -113,6 +114,7 @@ from .provider_impact import ApplyProviderImpactAction, apply_provider_impact
 from .session_manager import SessionManager, SessionRef, SessionType, SessionContext
 from .tech_lead_applier_handlers import tech_lead_action_handlers
 from .tech_lead_issue_creation import apply_create_tech_lead_issue
+from .abandoned_release_applying import apply_release_abandoned_issue
 from .history_reconciliation import apply_history_reconciliation
 from .tech_lead_proposals import execute_approved_tech_lead_op
 from .tech_lead_reset_retry import apply_surface_tech_lead_proposal
@@ -260,6 +262,7 @@ class ActionApplier:
         handlers: dict[ActionType, Callable[[Action], ActionResult]] = {
             ActionType.ADD_LABEL: self._apply_add_label,
             ActionType.REMOVE_LABEL: self._apply_remove_label,
+            ActionType.RELEASE_ABANDONED_ISSUE: self._apply_release_abandoned_issue,
             ActionType.SYNC_LABELS: self._apply_sync_labels,
             ActionType.APPLY_PROVIDER_IMPACT: self._apply_provider_impact,
             # SHED_RECOVERED_WORKFLOW_LABELS is intentionally NOT dispatchable:
@@ -532,6 +535,23 @@ class ActionApplier:
                 detail=str(e),
             )
             return ActionResult.fail(action, str(e))
+
+    def _apply_release_abandoned_issue(self, action: Action) -> ActionResult:
+        """Give an abandoned candidate back to scheduling (#195).
+
+        The ordered command lives in :mod:`.abandoned_release_applying`; this
+        supplies the applier's ordinary write paths for it to sequence, so
+        reconciliation gating, claim verification, needs-human cause
+        bookkeeping, label-store write-through and mutation stats stay here.
+        """
+        assert isinstance(action, ReleaseAbandonedIssueAction)
+        return apply_release_abandoned_issue(
+            action,
+            history_owner=self.history_owner,
+            add_label=self._apply_add_label,
+            remove_label=self._apply_remove_label,
+            add_comment=self._apply_add_comment,
+        )
 
     def _apply_provider_impact(self, action: Action) -> ActionResult:
         """Move an issue across the provider-availability boundary (#5980)."""

@@ -106,6 +106,104 @@ class RemoveLabelAction(Action):
 
 
 @dataclass(frozen=True)
+class ReleaseAbandonedIssueAction(Action):
+    """Release an issue whose last session left it to nobody (#195).
+
+    Two steps that must not drift apart, so they travel as one command:
+
+    1. shed the stale ``in-progress`` label — the same removal
+       ``_plan_stale_cleanup`` has always planned for a stale label; and
+    2. release this run's duplicate-launch CLAIM on the issue, so the planner
+       will consider it again on a later tick.
+
+    Step 2 is what a process restart used to be needed for: ``session_history``
+    is per-process, so restarting an engine dropped every claim at once and the
+    next tick reached the next attempt. This command does the same for exactly
+    ONE issue that has provably lost its owner, and only for the claim: the
+    history entry stays as the operator's record of the session that failed,
+    and every durable record — labels, attempt receipts, rework and
+    publish-failure counters — is untouched.
+
+    ``escalation_label`` is set when this run has spent its release budget for
+    the issue (``retry.max_abandoned_releases``, see
+    :mod:`.stale_cleanup_planning`). The release still happens — withholding it
+    would strand the issue behind a stale label with nothing said about why —
+    but it arrives carrying a blocking label, so what the issue is handed back
+    to is a human rather than the scheduler. Without it the release would be
+    the ONLY bound on relaunch that this command retires, with nothing left in
+    the system counting fresh coding launches.
+
+    ``escalation_comment`` is the operator-facing explanation of that ceiling,
+    and it travels here for the mirror-image reason the label does. Planned as
+    a sibling action it would be applied whether or not the release succeeded —
+    ``_apply_single_action`` does not halt the plan — so a release that failed
+    on the label add would still post a comment ASSERTING the label was
+    applied, and re-post it every tick until the add succeeded. Inside the
+    command it can only be posted after the escalation it describes has
+    actually happened, which also makes it one-shot: the same release retires
+    the claim that names the issue abandoned.
+
+    The applier owns the ordering (escalation label, then stale label, then
+    claim, then comment), so the issue is never handed back while a label the
+    shed failed to remove still says a session owns it, nor handed back
+    unblocked when the escalation is the whole point of the release.
+    """
+
+    issue_number: int = 0
+    label: str = ""
+    issue_key: str = ""  # stable_id for SSE events; falls back to str(issue_number) when empty
+    escalation_label: str = ""  # non-empty -> this run's release budget is spent
+    escalation_reason: str = ""
+    escalation_comment: str = ""
+    action_type: ActionType = field(
+        default=ActionType.RELEASE_ABANDONED_ISSUE, init=False
+    )
+
+    def label_removal(self) -> "RemoveLabelAction":
+        """The stale-label half, as the removal the applier already knows."""
+        return RemoveLabelAction(
+            issue_number=self.issue_number,
+            label=self.label,
+            issue_key=self.issue_key,
+            reason=self.reason,
+            expected=self.expected,
+        )
+
+    def escalation(self) -> "AddLabelAction | None":
+        """The budget-exhausted half, as the addition the applier already knows.
+
+        Carries ``SESSION_LIFECYCLE`` as its cause: the assertion being made is
+        that this run's own session lifecycle gave up on the issue, which is the
+        same cause the publish-failure ceiling asserts when it escalates.
+        """
+        if not self.escalation_label:
+            return None
+        return AddLabelAction(
+            issue_number=self.issue_number,
+            label=self.escalation_label,
+            issue_key=self.issue_key,
+            reason=self.escalation_reason,
+            expected=self.expected,
+            needs_human_cause=NeedsHumanCause.SESSION_LIFECYCLE,
+        )
+
+    def escalation_announcement(self) -> "AddCommentAction | None":
+        """The explanation of the ceiling, as the comment the applier knows.
+
+        Only meaningful alongside :meth:`escalation` — a release that is not
+        the exhausting one has nothing to announce.
+        """
+        if not self.escalation_comment:
+            return None
+        return AddCommentAction(
+            number=self.issue_number,
+            comment=self.escalation_comment,
+            reason="Explain why automatic relaunch stopped",
+            expected=self.expected,
+        )
+
+
+@dataclass(frozen=True)
 class SyncLabelsAction(Action):
     """Synchronize labels on an issue to match desired state."""
 

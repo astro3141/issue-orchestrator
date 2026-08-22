@@ -35,7 +35,9 @@ from .cleanup_facts import (
     gather_cleanup_facts,
     gather_terminal_disposal_facts,
 )
+from .abandoned_candidates import AbandonedCandidates
 from .provider_launch_readiness import ProviderLaunchReadiness
+from .session_history import SessionHistoryOwner
 from .health_review_trigger import (
     classify_tech_lead_anchor_issues,
     discover_open_tech_lead_anchor_issues,
@@ -204,6 +206,7 @@ class FactGatherer:
         stale_claim_issues: list["Issue"] | None = None,
         provider_launch: ProviderLaunchReadiness | None = None,
         reconcile_only_issues: list["Issue"] | None = None,
+        abandoned_candidates: "AbandonedCandidates | None" = None,
     ) -> "OrchestratorSnapshot":
         """Create an immutable snapshot for planning.
 
@@ -220,6 +223,10 @@ class FactGatherer:
                 excluded from ``issues`` but that reconciliation must still see
                 (#46). Passed in rather than derived here because queue
                 eligibility is ``QueueCache``'s policy, not this gatherer's.
+            abandoned_candidates: The subset of ``reconcile_only_issues`` whose
+                last session left NO owner behind, each with this run's release
+                verdict for it (#195). Same reason for passing it in: the
+                discrimination and the budget are ``QueueCache``'s policy.
 
         Returns:
             Immutable snapshot of orchestrator state for Planner
@@ -274,8 +281,14 @@ class FactGatherer:
             cleanup_facts=cleanup_facts,
             stale_in_progress_issues=tuple(stale_in_progress_issues or []),
             stale_claim_issues=tuple(stale_claim_issues or []),
+            abandoned_candidates=abandoned_candidates or AbandonedCandidates(),
             failed_this_cycle=frozenset(state.failed_this_cycle),
-            session_history_issue_numbers=frozenset(e.issue_number for e in state.session_history),
+            # Which issues history still CLAIMS, not which it merely mentions:
+            # a released entry is a record of a failed session, not a reason to
+            # keep skipping the issue for the rest of the run (#195).
+            session_history_issue_numbers=SessionHistoryOwner(
+                state.session_history
+            ).claiming_issue_numbers(),
             e2e_occupies_slot=e2e_occupies_slot,
             e2e_due=e2e_due,
             provider_launch=provider_launch or ProviderLaunchReadiness.empty(),

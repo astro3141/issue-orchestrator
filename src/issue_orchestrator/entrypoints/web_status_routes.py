@@ -7,6 +7,7 @@ import os
 from fastapi import APIRouter
 from fastapi.responses import JSONResponse
 
+from ..control.session_history import SessionHistoryOwner
 from ..infra.audit import SkipReason, audit_queue
 from ..infra.e2e_slot_policy import get_e2e_role
 from ..view_models.dashboard import flow_steps_for, issue_url_for
@@ -95,9 +96,13 @@ async def get_excluded_issues(orchestrator: WebOrchestratorDependency) -> JSONRe
         s.issue.number for s in state.active_sessions
     } | {
         i.number for i in state.cached_queue_issues
-    } | {
-        e.issue_number for e in state.session_history
-    }
+    } | (
+        # The still-CLAIMING subset, not every record (#195): a released entry
+        # no longer keeps its issue out of the queue, so counting it as
+        # displayed would hide the issue from /api/excluded-issues in the
+        # window before the next queue refresh puts it back on the board.
+        SessionHistoryOwner(state.session_history).claiming_issue_numbers()
+    )
 
     entries = audit_queue(config, state=state, issue_tracker=orchestrator.repository_host)
     excluded: list[dict[str, object]] = []

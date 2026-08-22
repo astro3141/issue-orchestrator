@@ -6,8 +6,9 @@ existing exclusion in this codebase is derived from something that does not
 exist for such an operation: ``PendingWorkClaim`` means a dequeued queue
 request, ``InFlightWorkLedger`` is keyed on ``session.terminal_id``,
 ``LaunchWorkClaim`` is typed on ``SessionRunAssets``, the ``in-progress`` label
-asserts an issue session exists, and the queue cache excludes from
-``session_history`` ∪ ``active_sessions`` — both session-derived. So a
+asserts an issue session exists, and the queue cache excludes from the still-
+CLAIMING subset of ``session_history`` (#195) ∪ ``active_sessions`` — both
+session-derived. So a
 terminal-less operation is invisible to all of them, and needs its own
 identity.
 

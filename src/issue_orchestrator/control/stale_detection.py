@@ -10,7 +10,7 @@ it — so they live together here rather than among the tick's sequencing.
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Sequence
 
 from ..events import EventContext, EventName
 from ..ports import EventSink, make_trace_event
@@ -99,16 +99,45 @@ def detect_stale_in_progress(
     state: "OrchestratorState",
     events: EventSink,
     event_context: EventContext,
+    abandoned_issues: Sequence["Issue"],
 ) -> list["Issue"]:
     """Detect stale in-progress issues."""
-    return _detect_stale_in_progress(observer, state, events, event_context)
+    return _detect_stale_in_progress(observer, state, events, event_context, abandoned_issues)
 
 
-def _detect_stale_in_progress(observer: object | None, state: "OrchestratorState", events: EventSink, event_context: EventContext) -> list["Issue"]:
-    """Detect stale in-progress issues."""
+def _detect_stale_in_progress(
+    observer: object | None,
+    state: "OrchestratorState",
+    events: EventSink,
+    event_context: EventContext,
+    abandoned_issues: Sequence["Issue"],
+) -> list["Issue"]:
+    """Detect stale in-progress issues over the reconciliation-visible set.
+
+    Staleness is a RECONCILIATION question, not a scheduling one — "does this
+    label still describe reality?" is asked of an issue precisely when nothing
+    is working on it, which is when the duplicate-launch guard has already
+    dropped it from the launchable queue. Asking it of
+    ``cached_queue_issues`` alone therefore never reaches the issues that need
+    it most: a candidate that ended ``validation_failed`` left the queue on the
+    same tick it left ``active_sessions``, so its ``in-progress`` label stayed
+    forever and only a restart (whose ``session_history`` starts empty) could
+    clear it (#195).
+
+    ``abandoned_issues`` is that extra set, named by the queue owner
+    (``QueueCache.abandoned_candidates``) and passed in already computed: it is
+    the queue's policy to decide, and the caller needs the same answer for
+    planning, so it is asked once per tick. It names only issues no other owner
+    is answering for — a running session, a live control operation and the
+    awaiting-merge presentation record all stay out — INCLUDING the ones that
+    have spent this run's release budget, because a stale label has to be shed
+    and an escalation planned for those too. Disjoint from the queue by
+    construction, so the two concatenate without deduplicating.
+    """
     if not (observer and hasattr(observer, 'detect_stale_in_progress')):
         return []
-    stale_issues = observer.detect_stale_in_progress(state.cached_queue_issues, state.active_sessions)
+    visible = [*state.cached_queue_issues, *abandoned_issues]
+    stale_issues = observer.detect_stale_in_progress(visible, state.active_sessions)
     for issue in stale_issues:
         events.publish(make_trace_event(EventName.STALE_IN_PROGRESS_DETECTED, event_context.enrich({"issue_number": issue.number, "labels": list(issue.labels)})))
     return stale_issues

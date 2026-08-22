@@ -25,6 +25,7 @@ from ..domain.models import (
     TechLeadFacts,
 )
 from ..ports.issue import Issue
+from .abandoned_candidates import AbandonedCandidates
 from .actions import Action, ActionType
 from .provider_launch_readiness import ProviderLaunchReadiness
 
@@ -130,6 +131,14 @@ class OrchestratorSnapshot:
     cleanup_facts: Optional[CleanupFacts] = None
     # Issues with stale in-progress labels (label present but no active session)
     stale_in_progress_issues: tuple[Issue, ...] = field(default_factory=tuple)
+    # In-scope issues whose last session ended leaving NO owner behind (#195),
+    # named by ``QueueCache.abandoned_candidates``, each carrying how many
+    # automatic attempts this run has already granted it. A subset of
+    # ``reconcile_only_issues``; the planner intersects it with
+    # ``stale_in_progress_issues`` to decide which stale label removal must
+    # ALSO release this run's duplicate-launch claim — and which has spent its
+    # budget and must escalate instead.
+    abandoned_candidates: AbandonedCandidates = field(default_factory=AbandonedCandidates)
     # Issues with stale claims (io:claimed label but claim is expired)
     stale_claim_issues: tuple[Issue, ...] = field(default_factory=tuple)
     # Issues that failed this cycle - skip until cache refresh (prevents immediate retry)
@@ -213,6 +222,7 @@ class OrchestratorSnapshot:
         cleanup_facts: Optional[CleanupFacts] = None,
         stale_in_progress_issues: Sequence[Issue] = (),
         stale_claim_issues: Sequence[Issue] = (),
+        abandoned_candidates: AbandonedCandidates = AbandonedCandidates(),
     ) -> "OrchestratorSnapshot":
         """Create snapshot from mutable state.
 
@@ -232,6 +242,8 @@ class OrchestratorSnapshot:
             cleanup_facts: Facts about pending cleanups and their review status
             stale_in_progress_issues: Issues with stale in-progress labels
             stale_claim_issues: Issues with stale/expired claims
+            abandoned_candidates: Issues whose last session left no owner,
+                each with this run's release verdict for it (#195)
         """
         return cls(
             issues=tuple(issues),
@@ -267,6 +279,7 @@ class OrchestratorSnapshot:
             cleanup_facts=cleanup_facts,
             stale_in_progress_issues=tuple(stale_in_progress_issues),
             stale_claim_issues=tuple(stale_claim_issues),
+            abandoned_candidates=abandoned_candidates,
             failed_this_cycle=frozenset(state.failed_this_cycle),
         )
 
