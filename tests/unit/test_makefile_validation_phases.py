@@ -10,6 +10,12 @@ from pathlib import Path
 import pytest
 
 from tests.fixtures.live_agent_cli import LIVE_PROVIDER_PROBES
+from tests.live_agent_reach import (
+    PROVIDER_REACH_NAMES,
+    collected_tests,
+    missing_provider_reach,
+    missing_provider_reach_in,
+)
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -545,10 +551,114 @@ class TestTheAssuranceLane:
             )
 
 
-class TestDeterministicSandboxCoverageStaysInBlockingValidation:
-    """Proof 7: the non-model-dependent assertions did not leave with the module."""
+class TestEveryLiveAgentTestReachesAProvider:
+    """Proof 7: the marker takes nothing out of blocking validation for free.
+
+    ``pytest.mark.live_agent`` in a ``pytestmark`` list is module scope, so
+    marking a module removes *every* test in it from every blocking gate — and
+    the assurance lane that collects them files a record rather than failing a
+    candidate, so what leaves blocking validation lands in no gate at all.
+    Whether that is correct depends on each test, one at a time: the marker's
+    own criterion is spawning a real provider CLI.
+
+    Stated as a rule rather than as a list of the cases someone thought of.
+    ``TestDeterministicSandboxCoverageStaysInBlockingValidation`` below is the
+    list, and it is kept — as the witness that the two named extractions are
+    still where they were put — but it could only ever prove that about the
+    modules it names. ``TestShellEscaping`` and the ``agent-done`` cases left
+    blocking validation past it without a word.
+    """
+
+    def test_no_live_agent_module_hides_a_deterministic_case(self):
+        offenders = {
+            path.relative_to(REPO_ROOT).as_posix(): tests
+            for path in _integration_modules_declaring("live_agent")
+            if (tests := missing_provider_reach_in(path))
+        }
+
+        assert offenders == {}, (
+            "these tests are in a live_agent module but show no sign of "
+            "reaching a provider, so the marker has taken them out of every "
+            "blocking gate without putting them in one that can fail: "
+            f"{offenders}. Move them to a non-live_agent module (see "
+            "tests/integration/test_agent_invocation_surface.py), or — if they "
+            "do reach a provider by a route nothing registers — add that route "
+            "to tests/live_agent_reach.py."
+        )
+
+    def test_that_rule_can_actually_fail(self):
+        """Otherwise it is the vacuous check it was written to replace.
+
+        A synthetic module rather than a planted broken file: the rule has to
+        be provably able to report an offender without the tree having to
+        contain one.
+        """
+        deterministic = '''
+import subprocess
+
+class TestQuoting:
+    def test_escaping_round_trips(self):
+        """Claude and Codex invocations are built with this."""
+        wrapped = "bash -c " + "echo hi".replace("'", "'\\\\''")
+        assert subprocess.run(["bash", "-c", wrapped]).returncode == 0
+'''
+        assert missing_provider_reach(deterministic, filename="<synthetic>") == (
+            "TestQuoting::test_escaping_round_trips",
+        )
+
+    def test_a_live_probe_is_recognised_through_a_module_helper(self):
+        """Reach may be one call away; the rule must not demand it be inline."""
+        indirect = '''
+def _spawn(prompt):
+    return run(["claude", "--print", prompt])
+
+def test_the_model_answers():
+    assert "OK" in _spawn("Reply OK").stdout
+'''
+        assert missing_provider_reach(indirect, filename="<synthetic>") == ()
+
+    def test_the_registry_and_the_collector_have_live_subjects(self):
+        """Both halves of the rule must be about something that exists."""
+        assert PROVIDER_REACH_NAMES
+
+        modules = _integration_modules_declaring("live_agent")
+        assert modules, "no live_agent module; the rule has no subject"
+
+        collected = [
+            name
+            for path in modules
+            for name, _node in collected_tests(
+                ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+            )
+        ]
+        assert collected, (
+            "the live_agent modules collect no tests, so the rule above passes "
+            "by having nothing to check"
+        )
+
+
+class TestDeterministicCoverageStaysInBlockingValidation:
+    """Proof 7, continued: the extractions are still where they were put.
+
+    A case list, and kept only as one: it witnesses that these specific
+    deterministic cases survived their split, which the rule above cannot —
+    a case deleted outright reaches no provider and is in no live-agent
+    module, so nothing structural misses it. The rule above is what notices a
+    module nobody named here.
+    """
 
     DETERMINISTIC_CASES = (
+        (
+            "tests/integration/test_agent_invocation_surface.py",
+            (
+                "test_single_quote_escaping",
+                "test_complex_quoting_pattern",
+                "test_nested_quotes_in_prompt",
+                "test_agent_done_wrapper_resolves_correctly",
+                "test_completion_json_written_to_worktree_not_main_repo",
+                "test_completion_json_written_to_wrong_place_without_cd",
+            ),
+        ),
         (
             "tests/unit/test_sandbox_stream_events.py",
             (
@@ -583,10 +693,17 @@ class TestDeterministicSandboxCoverageStaysInBlockingValidation:
             f"{cases} from blocking validation"
         )
 
-    def test_the_unit_lane_that_runs_them_is_in_the_publish_gate(self):
+    def test_the_lanes_that_run_them_are_in_the_publish_gate(self):
+        """Both of them: the extracted cases are split across two suites.
+
+        Naming a module ``tests/unit/...`` or ``tests/integration/...`` does
+        nothing on its own — what puts it in front of publication is a target
+        that collects it, inside the expanded ``_validate-pr-impl`` graph.
+        """
         lines = _dry_run_closure("_validate-pr-impl")
 
         _find_line(lines, 'target="test-unit"')
+        _find_line(lines, 'target="test-integration-core"')
 
 
 def test_live_agent_transport_is_scheduled_by_e2e_not_integration_assurance():

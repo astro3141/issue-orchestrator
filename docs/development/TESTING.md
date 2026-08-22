@@ -28,8 +28,17 @@ The lane does not pass or fail a change. It records `PASS`, `SECURITY_FAIL` or
 without a `PASS`. Adding a `live_agent` module needs no other edit — there is no
 filename list.
 
-Two things to know when you run it:
+Three things to know when you run it or add to it:
 
+- **The marker takes the whole file, so every test in the module must need it.**
+  `pytestmark` is module scope: a deterministic case sitting in a `live_agent`
+  module leaves blocking validation with the probes, and the assurance lane
+  files a record rather than failing a candidate, so it then runs in no gate at
+  all. `tests/live_agent_reach.py` states the rule — every test in a `live_agent`
+  module must reach a provider — and `tests/unit/test_makefile_validation_phases.py`
+  fails on one that does not. Put deterministic cases in a non-`live_agent`
+  module; `tests/integration/test_agent_invocation_surface.py` and
+  `tests/unit/test_sandbox_stream_events.py` are the two existing homes.
 - **Commit first if you mean to promote.** The lane reads the commit *and* the
   working-tree state from the checkout it is pointed at. Run it dirty and it
   still runs, but the record is marked `working_tree_dirty` and assures nothing,

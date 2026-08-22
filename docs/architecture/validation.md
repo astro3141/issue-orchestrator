@@ -80,6 +80,22 @@ fourth live-agent module requires no other edit, and
 `tests/unit/test_makefile_validation_phases.py` fails if the publish gate ever
 names one by path again.
 
+**The marker is module scope, so what it takes out has to be checked test by
+test.** `pytestmark` applies to the whole file: mark a module and every case in
+it leaves every blocking gate, and the lane that collects them files a record
+rather than failing a candidate — so a deterministic assertion carried along by
+the marker ends up in *no* gate at all. That is not hypothetical; it is how
+`TestShellEscaping` and the `agent-done` cases went unrun until they were moved
+to `tests/integration/test_agent_invocation_surface.py`. The rule has an owner
+now: `tests/live_agent_reach.py` states *every test in a `live_agent` module
+must reach a live provider* structurally — the body must name a provider CLI, a
+registered production seam that builds one, a registered live-provider probe, or
+one of the lane's `assert_no_breach` / `require_probe_ran` helpers — and
+`tests/unit/test_makefile_validation_phases.py` fails on any test that does not.
+Reach means *the provider CLI*, not *the model*: `codex --version` needs no
+model but does need the operator's installed CLI, and a CLI upgrade must not be
+able to fail an unrelated candidate.
+
 The lane's result is one of exactly three, and the middle one is the point:
 
 | Outcome | Meaning |

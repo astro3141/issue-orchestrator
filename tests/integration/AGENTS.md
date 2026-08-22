@@ -59,10 +59,39 @@ Inside such a module, say which outcome an assertion means:
 `assert_no_breach(...)` for a security condition, `require_probe_ran(...)` for
 "the required operation was actually issued". A bare `assert` carrying a
 `SANDBOX BREACH` message is classified `INCONCLUSIVE` — a proven breach filed
-as a provider hiccup — and is caught by a guardrail test. Deterministic
-assertions that do **not** depend on a model belong in a non-`live_agent`
-module so they stay in blocking validation (see
-`tests/sandbox_stream_events.py` and `tests/unit/test_sandbox_stream_events.py`).
+as a provider hiccup — and is caught by a guardrail test.
+
+Say which one it is in the message, too. `require_probe_ran` also covers a
+*positive control* that failed — the operation was issued and our own
+allow-list refused it. Both leave the boundary unproven, so both are
+`INCONCLUSIVE`, but only "never issued" is answered by the re-run
+`trusted-runtime-promote` suggests. The message survives verbatim into the
+record's `detail` and is all an operator has once the probes are gone.
+
+## Every test in a `live_agent` module must reach a provider
+
+The marker is module scope, so it takes the whole file. A test that spawns no
+provider and depends on no model leaves blocking validation along with the
+probes it was sitting next to, and the assurance lane files a record rather
+than failing a candidate — so it then runs in **no** gate at all. That is what
+happened to `TestShellEscaping` and the `agent-done` cases; they now live in
+`tests/integration/test_agent_invocation_surface.py`, which carries no marker.
+
+`tests/live_agent_reach.py` states the rule structurally: a test reaches a
+provider when its body names a provider CLI, a registered production seam that
+builds one (`CodexProvider`, `ClaudeCodeAdapter`, …), a registered
+live-provider probe, or `assert_no_breach` / `require_probe_ran`.
+`tests/unit/test_makefile_validation_phases.py` fails on any live-agent test
+that does not. Reach means the provider **CLI**, not the model: `codex
+--version` needs no model but does need the operator's install, and a CLI
+upgrade must not be able to fail an unrelated candidate.
+
+The check fails closed. If a test genuinely reaches a provider by a route
+nothing registers, add the route in `tests/live_agent_reach.py` — do not loosen
+the check. Deterministic assertions that do **not** depend on a provider belong
+in a non-`live_agent` module so they stay in blocking validation (see
+`tests/integration/test_agent_invocation_surface.py`, and
+`tests/sandbox_stream_events.py` + `tests/unit/test_sandbox_stream_events.py`).
 
 ## Difference from Unit Tests
 
