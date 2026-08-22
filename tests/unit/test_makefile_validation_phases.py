@@ -28,9 +28,24 @@ def _gnu_make() -> str:
     return make_bin
 
 
+# These guardrails describe the *tracked* target graph — what this repository's
+# Makefile selects — so the dry run must not inherit a caller's override of a
+# variable the Makefile exposes with `?=`. GNU make exports a command-line
+# override into every recipe's environment, so a gate invoked as
+# `make validate-pr-raw PYTEST='... --deselect <nodeid>'` (which is exactly how
+# #194's STEP A bootstrap pinned live-agent segregation from the engine, before
+# the marker semantic landed here) hands that value to pytest, and pytest hands
+# it on to the `make -n` below. The dry run would then describe the caller's
+# selector rather than the Makefile's, and an assertion about what the publish
+# gate names would be answering the wrong question. Dropping these lets each
+# variable fall back to the Makefile's own default.
+_AMBIENT_MAKE_VARIABLES = ("MAKEFLAGS", "MAKEOVERRIDES", "PYTEST")
+
+
 def _dry_run(target: str, **overrides: str) -> list[str]:
     env = dict(os.environ)
-    env.pop("MAKEFLAGS", None)
+    for name in _AMBIENT_MAKE_VARIABLES:
+        env.pop(name, None)
     env.update(
         {
             "VALIDATE_JOBS": "10",
@@ -271,6 +286,35 @@ def test_core_validation_runs_live_codex_marker_serially():
 # ---------------------------------------------------------------------------
 # #194 — publish validation vs live-agent assurance
 # ---------------------------------------------------------------------------
+
+
+class TestTheGuardrailsReadTheTrackedGraph:
+    """What follows is only a proof if the dry run describes this repository.
+
+    Every assertion below is of the form "the publish gate does/does not name
+    X". The gate is invoked as ``make validate-pr-raw``, and a caller may pass
+    ``PYTEST=...`` on that command line — #194's STEP A bootstrap did exactly
+    that, from the engine, to segregate the live-agent probes before the marker
+    semantic existed here. Make exports such an override into the environment
+    of every recipe, so without isolation these tests would be reading the
+    caller's selector out of their own ambient environment.
+    """
+
+    OVERRIDE = (
+        ".venv/bin/pytest --deselect "
+        "tests/integration/test_sandbox_os_boundary.py::test_a_live_probe"
+    )
+
+    def test_an_ambient_override_does_not_reach_the_dry_run(self, monkeypatch):
+        monkeypatch.setenv("PYTEST", self.OVERRIDE)
+
+        lines = _dry_run_closure("_validate-pr-impl")
+
+        assert all("--deselect" not in line for line in lines)
+        assert any(".venv/bin/pytest" in line for line in lines), (
+            "the Makefile's own default did not take over; the dry run is "
+            "describing something other than the tracked target graph"
+        )
 
 
 class TestMarkerBeatsFilename:
