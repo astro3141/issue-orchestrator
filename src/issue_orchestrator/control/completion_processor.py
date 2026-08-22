@@ -1607,13 +1607,13 @@ class CompletionProcessor:
         # ``_require_matching_review_run``, so this is the allocated run and
         # not a second reading of where one might be (#180).
         exchange_run = exchange_result.run_assets if exchange_result else None
-        if deferred:
-            return ActionExecutionOutcome(
-                branch, pr_url, review_exchange_completed, True, None, exchange_run
-            )
-        if should_halt:
-            return ActionExecutionOutcome(
-                branch, pr_url, review_exchange_completed, False, None, exchange_run
+        if deferred or should_halt:
+            return ActionExecutionOutcome.of(
+                branch=branch,
+                pr_url=pr_url,
+                review_exchange_completed=review_exchange_completed,
+                review_exchange_run=exchange_run,
+                deferred=deferred,
             )
 
         pre_publish_failure = self._run_pre_publish_gate_if_required(
@@ -1629,16 +1629,12 @@ class CompletionProcessor:
             rework=rework,
         )
         if pre_publish_failure is not None:
-            return ActionExecutionOutcome(
-                branch,
-                pr_url,
-                review_exchange_completed,
-                False,
-                pre_publish_failure,
-                # The reroute this failure may have spawned owns a run of its
-                # own, and names it on its own result. Preferred over the
-                # first exchange's, which that reroute has superseded.
-                pre_publish_failure.review_exchange_run or exchange_run,
+            return ActionExecutionOutcome.of(
+                branch=branch,
+                pr_url=pr_url,
+                review_exchange_completed=review_exchange_completed,
+                review_exchange_run=exchange_run,
+                early_result=pre_publish_failure,
             )
 
         (
@@ -1669,8 +1665,12 @@ class CompletionProcessor:
                 worktree, record, issue_number, run_assets, issue_key,
             ),
         )
-        return ActionExecutionOutcome(
-            branch, pr_url, review_exchange_completed, False, action_result, exchange_run
+        return ActionExecutionOutcome.of(
+            branch=branch,
+            pr_url=pr_url,
+            review_exchange_completed=review_exchange_completed,
+            review_exchange_run=exchange_run,
+            early_result=action_result,
         )
 
     def _execute_planned_actions(

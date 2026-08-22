@@ -1,7 +1,7 @@
 """Shared completion-processing result types."""
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from ..domain.review_exchange_run import ReviewExchangeRunAssets
 
@@ -105,6 +105,12 @@ class ActionExecutionOutcome:
     ``deferred`` and ``early_result`` are the two ways this phase can end
     without having finished the record: the exchange is running in the
     background, or an action produced a result the caller must return as-is.
+
+    Build one with :meth:`of`, never by calling this constructor: an
+    ``early_result`` is returned to the caller VERBATIM and never passes the
+    place the outcome's own ``review_exchange_run`` is read, so a result that
+    did not carry the run itself would lose it. That is the same drop the type
+    exists to prevent, one exit further out.
     """
 
     branch: str | None
@@ -113,6 +119,39 @@ class ActionExecutionOutcome:
     deferred: bool
     early_result: "ProcessingResult | None"
     review_exchange_run: ReviewExchangeRunAssets | None
+
+    @classmethod
+    def of(
+        cls,
+        *,
+        branch: str | None,
+        pr_url: str | None,
+        review_exchange_completed: bool,
+        review_exchange_run: ReviewExchangeRunAssets | None,
+        deferred: bool = False,
+        early_result: "ProcessingResult | None" = None,
+    ) -> "ActionExecutionOutcome":
+        """The outcome, with ``early_result`` made to name the same run.
+
+        One derivation of "which run did this pass's exchange use", applied to
+        both places it can be read from — this outcome, and the early result
+        that bypasses it. A result that already names a run keeps it: the
+        post-review validation reroute allocates a SECOND exchange run, and its
+        result is evidence about that one, not about the exchange the reroute
+        superseded.
+        """
+        if early_result is not None and early_result.review_exchange_run is None:
+            early_result = replace(
+                early_result, review_exchange_run=review_exchange_run
+            )
+        return cls(
+            branch=branch,
+            pr_url=pr_url,
+            review_exchange_completed=review_exchange_completed,
+            deferred=deferred,
+            early_result=early_result,
+            review_exchange_run=review_exchange_run,
+        )
 
 
 RepublicationCheck = Callable[[], ProcessingResult | None]

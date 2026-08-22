@@ -2756,6 +2756,8 @@ class TestTechLeadCompletionEffects:
         *,
         review_exchange_runner=None,
         tech_lead_authority=None,
+        pre_publish_gate=None,
+        review_exchange_max_rounds=None,
     ) -> CompletionProcessor:
         prompt = tmp_path / "tech-lead.md"
         prompt.write_text("Tech Lead prompt")
@@ -2776,6 +2778,8 @@ class TestTechLeadCompletionEffects:
             # The exchange refuses an unresolved repo — it scopes the attempt
             # records it files (#34).
             config.repo = "acme/widgets"
+        if review_exchange_max_rounds is not None:
+            config.review_exchange_max_rounds = review_exchange_max_rounds
         mock_git_adapter.default_branch.return_value = "main"
         from issue_orchestrator.infra.tech_lead_authority_store import (
             SqliteTechLeadAuthorityStore,
@@ -2790,6 +2794,7 @@ class TestTechLeadCompletionEffects:
             git_adapter=mock_git_adapter,
             session_output=FileSystemSessionOutput(),
             review_exchange_runner=review_exchange_runner,
+            pre_publish_gate=pre_publish_gate,
             event_bus=event_bus,
             label_config={},
             config=config,
@@ -3211,6 +3216,69 @@ class TestTechLeadCompletionEffects:
         result = self._process(processor, worktree, agent_label="agent:coder")
 
         assert result.review_exchange_run is None
+
+    def test_an_early_result_still_names_the_run_the_exchange_allocated(
+        self,
+        tmp_path,
+        mock_label_adapter,
+        mock_pr_adapter,
+        mock_git_adapter,
+        event_bus,
+        worktree_with_completion,
+    ):
+        """#180 F2: the exit that bypasses the result builder must carry it too.
+
+        A publish-gate refusal returns its own ``ProcessingResult`` straight to
+        the caller, skipping the one place the pipeline's outcome is read. The
+        exchange that ran before it still concluded and still bound a verdict
+        about exactly this commit — so the continuation must be able to read it
+        here as much as on the ordinary exit, or it settles nothing and pays
+        for a second full run over the same candidate.
+
+        ``review_exchange_max_rounds=0`` is only the lever: it puts the reroute
+        budget in the state a permanently-failing validation reaches on its own,
+        so the refusal is the terminal rather than another rework round.
+        """
+        review_runner = _CapturingReviewExchangeRunner()
+        pre_publish_gate = Mock()
+        pre_publish_gate.check.return_value = PrePublishGateResult(
+            allowed=False,
+            reason="Pre-push hook failed",
+            command="/tmp/hooks/pre-push",
+            started_at=datetime.now(timezone.utc).isoformat(),
+            ended_at=datetime.now(timezone.utc).isoformat(),
+            exit_code=1,
+            stdout="",
+            stderr="boom",
+            hook_path="/tmp/hooks/pre-push",
+            head_sha="abc123",
+            ran=True,
+        )
+        processor = self._make_processor(
+            tmp_path,
+            mock_label_adapter,
+            mock_pr_adapter,
+            mock_git_adapter,
+            event_bus,
+            review_exchange_runner=review_runner,
+            pre_publish_gate=pre_publish_gate,
+            review_exchange_max_rounds=0,
+        )
+        worktree = worktree_with_completion(self._completed_record())
+        run_assets = make_session_run_assets(worktree)
+
+        result = self._process(
+            processor,
+            worktree,
+            agent_label="agent:coder",
+            run_assets=run_assets,
+        )
+
+        assert result.success is False
+        assert result.review_exchange_halted is True
+        allocated = review_runner.calls[0]["exchange_run"].assets
+        assert result.review_exchange_run == allocated
+        assert result.review_exchange_run.run_dir != run_assets.run_dir
 
     def test_completed_tech_lead_session_without_pair_records_critical_error(
         self,
@@ -3711,6 +3779,7 @@ class TestPushRetryRepublicationGate:
         pr_adapter,
         attempt_store,
         repo_root,
+        review_exchange_runner=None,
     ):
         from issue_orchestrator.control.publication_gate import (
             build_publication_gate,
@@ -3735,7 +3804,32 @@ class TestPushRetryRepublicationGate:
             git_adapter=git_adapter,
             publication_gate=gate,
             session_output=FileSystemSessionOutput(),
+            review_exchange_runner=review_exchange_runner,
+            config=(
+                self._reviewing_config(repo_root)
+                if review_exchange_runner is not None
+                else None
+            ),
         )
+
+    @staticmethod
+    def _reviewing_config(repo_root) -> Config:
+        """A config whose exchange runs, so the refused push follows one."""
+        prompt = repo_root / "agent.md"
+        prompt.write_text("Agent prompt")
+        config = Config()
+        config.repo = "acme/widgets"
+        config.repo_root = repo_root
+        config.review_enabled = True
+        config.review_exchange_mode = "via-local-loop"
+        config.review_exchange_require_validation = False
+        config.code_review_agent = "agent:reviewer"
+        config.config_path = _write_test_config(repo_root)
+        config.agents = {
+            "agent:coder": AgentConfig(prompt_path=prompt),
+            "agent:reviewer": AgentConfig(prompt_path=prompt),
+        }
+        return config
 
     @staticmethod
     def _certification(attempt_store, issue_key, head_sha):
@@ -3864,6 +3958,63 @@ class TestPushRetryRepublicationGate:
         )
         assert certification.admitted is False
         assert certification.reason == "publication_verdict_not_passed"
+
+    def test_the_refusal_still_names_the_run_the_exchange_allocated(
+        self,
+        rebasing_git_adapter,
+        head,
+        journal,
+        mock_label_adapter,
+        mock_pr_adapter,
+        worktree_with_completion,
+    ):
+        """#180 F2, on the pipeline's other early exit: a planned action's own.
+
+        A refused rebase returns its result from inside the action loop, so it
+        leaves ``_execute_actions`` as an ``early_result`` and never reaches the
+        place the pipeline's outcome is read. The review exchange that approved
+        the pre-rebase commit still bound a verdict, and a continuation on this
+        path must be able to read it — otherwise it settles nothing and its
+        allowance pays for a second run over the same candidate.
+        """
+        from issue_orchestrator.domain.issue_key import FakeIssueKey
+        from tests.unit.publication_evidence_helpers import InMemoryAttemptStore
+
+        review_runner = _CapturingReviewExchangeRunner()
+        worktree = worktree_with_completion(make_record(
+            outcome=CompletionOutcome.COMPLETED,
+            requested_actions=[
+                RequestedAction.PUSH_BRANCH,
+                RequestedAction.CREATE_PR,
+            ],
+        ))
+        processor = self._processor(
+            exit_codes=[0, 1],
+            journal=journal,
+            head=head,
+            git_adapter=rebasing_git_adapter,
+            label_adapter=mock_label_adapter,
+            pr_adapter=mock_pr_adapter,
+            attempt_store=InMemoryAttemptStore(),
+            repo_root=worktree.parent,
+            review_exchange_runner=review_runner,
+        )
+        run_assets = make_session_run_assets(worktree)
+
+        result = processor.process(
+            worktree,
+            run_assets=run_assets,
+            issue_number=123,
+            issue_title="Test",
+            agent_label="agent:coder",
+            issue_key=FakeIssueKey(name="123"),
+        )
+
+        assert result.success is False
+        mock_pr_adapter.create_pr.assert_not_called()
+        allocated = review_runner.calls[0]["exchange_run"].assets
+        assert result.review_exchange_run == allocated
+        assert result.review_exchange_run.run_dir != run_assets.run_dir
 
 
 class TestCompletionProcessorValidation:
