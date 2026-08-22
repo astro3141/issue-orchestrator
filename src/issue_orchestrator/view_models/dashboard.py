@@ -13,6 +13,7 @@ from ..domain.models import BLOCKED_HISTORY_STATUSES, DONE_HISTORY_STATUSES, Ses
 from ..domain.session_key import TaskKind
 from ..history import latest_history_entries_by_issue
 from ..control.label_manager import LabelManager
+from ..control.session_history import SessionHistoryOwner
 from ..infra.audit import get_issue_dependencies
 from ..infra import gh_audit
 from ..ports.provider_resilience import ProviderCircuitStatusReader
@@ -304,6 +305,7 @@ def _queue_wait_reason(
     issue_number: int,
     dep_problem: Any | None,
     queue_position: int,
+    claiming_issue_numbers: frozenset[int],
 ) -> str:
     if state.paused:
         return "Waiting: orchestrator paused"
@@ -319,7 +321,8 @@ def _queue_wait_reason(
     if issue_number in state.failed_this_cycle:
         return "Waiting: previous launch/action failed (manual retry may be needed)"
 
-    if any(entry.issue_number == issue_number for entry in state.session_history):
+    # Only a still-CLAIMING entry holds the issue back; a released one is a retained record, and naming it would report a gate that no longer exists (#195).
+    if issue_number in claiming_issue_numbers:
         return "Waiting: previous run state"
 
     if queue_position <= 1:
@@ -667,6 +670,7 @@ def _build_queue_items(  # noqa: C901, PLR0912 — aggregates queue from multipl
     queue_issues = state.cached_queue_issues
     queue_total = len(queue_issues)
     dependency_info = get_issue_dependencies(queue_issues, config)
+    claiming_issue_numbers = SessionHistoryOwner(state.session_history).claiming_issue_numbers()
 
     queued_position = 0
     for issue in queue_issues:
@@ -726,7 +730,7 @@ def _build_queue_items(  # noqa: C901, PLR0912 — aggregates queue from multipl
             if (
                 not is_dependency_blocked
                 and issue.number not in state.failed_this_cycle
-                and not any(entry.issue_number == issue.number for entry in state.session_history)
+                and issue.number not in claiming_issue_numbers  # released -> genuinely queued (#195)
             ):
                 queued_position += 1
         flow_steps = flow_steps_for(flow_stage)
@@ -738,6 +742,7 @@ def _build_queue_items(  # noqa: C901, PLR0912 — aggregates queue from multipl
                 issue_number=issue.number,
                 dep_problem=dep_problem,
                 queue_position=queued_position,
+                claiming_issue_numbers=claiming_issue_numbers,
             )
             if flow_stage == "queued"
             else None

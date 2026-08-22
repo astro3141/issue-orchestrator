@@ -57,7 +57,6 @@ from .actions import (
     ActionType,
     AddCommentAction,
     AddLabelAction,
-    ReleaseAbandonedIssueAction,
     RemoveLabelAction,
     LaunchSessionAction,
     LaunchValidationRetryAction,
@@ -90,6 +89,7 @@ from .worker_budget import (
 )
 from .reactive_tech_lead_planning import plan_tech_lead_launch_queue
 from .reconciliation import build_expected_for_mutation
+from .stale_cleanup_planning import plan_stale_in_progress_actions
 from .stuck_sweep import build_stuck_sweep_escalation_actions
 from .terminal_disposal import immediate_disposal_actions
 from .planner_types import OrchestratorSnapshot, Plan, PlanContext, SkippedItem
@@ -1063,51 +1063,19 @@ class Planner:
         """Plan cleanup actions for issues with stale in-progress labels.
 
         When an issue has the in-progress label but no active session exists,
-        the label is stale and should be removed. This allows the issue to be
-        retried or processed normally.
-
-        An issue that is ALSO abandoned — its last session ended leaving no
-        owner at all (#195) — needs one thing more before "retried or processed
-        normally" is true of this process: this run's duplicate-launch claim on
-        it. Shedding the label alone leaves it stranded until a restart, so
-        those issues get the release command that owns both steps. Every other
-        stale issue gets exactly the removal it always got.
-
-        Returns:
-            List of stale in-progress label actions
+        the label is stale and should be removed. An issue that is ALSO
+        abandoned — its last session left no owner at all — needs its
+        duplicate-launch claim back too, and one that has spent this run's
+        release budget needs an escalation instead of another attempt (#195).
+        :mod:`.stale_cleanup_planning` owns that three-way decision.
         """
-        actions: list[Action] = []
-
         if not snapshot.stale_in_progress_issues:
-            return actions
-
-        abandoned = {issue.number for issue in snapshot.abandoned_issues}
-        for issue in snapshot.stale_in_progress_issues:
-            if issue.number in abandoned:
-                actions.append(ReleaseAbandonedIssueAction(
-                    issue_number=issue.number,
-                    label=self._lm.in_progress,
-                    reason="abandoned after completion - no owner, no running session",
-                    expected=build_expected_for_mutation(),
-                    issue_key=issue.key.stable_id(),
-                ))
-                logger.info(
-                    "Planner: releasing abandoned issue #%d (stale in-progress label "
-                    "and no owner)",
-                    issue.number,
-                )
-                continue
-            actions.append(RemoveLabelAction(
-                issue_number=issue.number,
-                label=self._lm.in_progress,
-                reason="stale - no running session",
-                expected=build_expected_for_mutation(),
-                issue_key=issue.key.stable_id(),
-            ))
-            logger.info("Planner: removing stale in-progress label from issue #%d",
-                       issue.number)
-
-        return actions
+            return []
+        return plan_stale_in_progress_actions(
+            stale_issues=snapshot.stale_in_progress_issues,
+            abandoned=snapshot.abandoned_candidates,
+            labels=self._lm,
+        )
 
     def _plan_stale_claim_cleanup(self, snapshot: OrchestratorSnapshot) -> list[Action]:
         """Plan cleanup actions for issues with stale/expired claims.

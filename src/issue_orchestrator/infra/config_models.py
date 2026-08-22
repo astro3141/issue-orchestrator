@@ -148,6 +148,14 @@ class RetryConfig:
     """
 
     max_validation_retries: int = 3  # Max times to retry after validation failure
+    # How many times ONE run may hand a single abandoned candidate back to
+    # scheduling (#195). ``max_validation_retries`` above bounds retries INSIDE
+    # a session; this bounds fresh attempts across sessions, which nothing else
+    # counts. The release that reaches this ceiling still happens, but carries
+    # a needs-human escalation instead of another automatic attempt, so a
+    # deterministically-failing validation command stops at
+    # ``max_abandoned_releases + 1`` attempts rather than running forever.
+    max_abandoned_releases: int = 2
     validation_error_file: str = "validation-errors.txt"  # Filename in session output dir
     # Default retry prompt template path (relative to repo root).
     # Agents can override this with their own retry_prompt_template.

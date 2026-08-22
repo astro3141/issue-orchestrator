@@ -28,9 +28,11 @@ from issue_orchestrator.ports.provider_resilience import (
     NO_PROVIDER_CIRCUIT_STATUS,
     ProviderCircuitStatusReader,
 )
+from issue_orchestrator.control.session_history import SessionHistoryOwner
 from issue_orchestrator.view_models.dashboard import (
     _attach_running_timeline_snapshots,
     _normalize_status_reason,
+    _queue_wait_reason,
     build_dashboard_view_model,
 )
 from issue_orchestrator.view_models.dashboard_flow import (
@@ -2396,3 +2398,94 @@ def test_queue_card_embeds_producer_stack_gate_view():
     assert gates["merge"] is False
     assert "merge" in stack["blocked_gates"]
     assert stack["stack_base_branch"] == "feat/base"
+
+
+def _released_history_entry(issue_number: int) -> SessionHistoryEntry:
+    """The record an abandoned-candidate release leaves behind (#195).
+
+    The claim is gone — the issue is genuinely queued and schedulable again —
+    but the entry is retained forever so the failure stays diagnosable.
+    """
+    entry = SessionHistoryEntry(
+        issue_number=issue_number,
+        title="Refused by the validation gate",
+        agent_type="agent:web",
+        status="validation_failed",
+        runtime_minutes=4,
+        status_reason="Validation failed after session completion",
+    )
+    entry.claim_released = True
+    return entry
+
+
+def test_released_issue_does_not_report_a_previous_run_gate():
+    """#195 F2: the released entry is a record, not a reason to be waiting.
+
+    Before the release existed, the entry really did hold the issue out of the
+    queue, so ``Waiting: previous run state`` was true. It is retained by
+    design after the release, so reading the raw history predicate would tell
+    the operator — permanently — that the issue waits on a gate the engine
+    already retired.
+    """
+    state = OrchestratorState(session_history=[_released_history_entry(41)])
+    claiming = SessionHistoryOwner(state.session_history).claiming_issue_numbers()
+
+    reason = _queue_wait_reason(
+        state=state,
+        config=_make_config(),
+        issue_number=41,
+        dep_problem=None,
+        queue_position=1,
+        claiming_issue_numbers=claiming,
+    )
+
+    assert reason == "Waiting: next scheduler tick"
+
+
+def test_a_still_claiming_entry_still_reports_the_previous_run_gate():
+    """The other side of the same rule: an unreleased claim IS a real gate."""
+    entry = _released_history_entry(41)
+    entry.claim_released = False
+    state = OrchestratorState(session_history=[entry])
+    claiming = SessionHistoryOwner(state.session_history).claiming_issue_numbers()
+
+    reason = _queue_wait_reason(
+        state=state,
+        config=_make_config(),
+        issue_number=41,
+        dep_problem=None,
+        queue_position=1,
+        claiming_issue_numbers=claiming,
+    )
+
+    assert reason == "Waiting: previous run state"
+
+
+def test_a_released_issue_occupies_its_queue_position():
+    """#195 F2, second site, at the rendered payload.
+
+    A released issue is genuinely queued, so it holds a position. Suppressing
+    its increment understates every position behind it — the issue that is
+    really second is told it is next.
+    """
+    config = _make_config()
+    state = OrchestratorState(
+        startup_status="complete",
+        cached_queue_issues=[
+            Issue(number=41, title="Released", labels=["agent:web"]),
+            Issue(number=42, title="Behind it", labels=["agent:web"]),
+        ],
+        session_history=[_released_history_entry(41)],
+    )
+
+    view_model = build_dashboard_view_model(
+        _OrchestratorStub(state=state, config=config),
+        provider_circuit=NO_PROVIDER_CIRCUIT_STATUS,
+        queue_page=1,
+        active_tab="kanban",
+        e2e_page=1,
+        e2e_status_provider=lambda _: {"enabled": False, "running": False},
+    )
+
+    behind = next(item for item in view_model.queue_items if item["issue_number"] == 42)
+    assert behind["queue_wait_reason"] == "Waiting: 1 runnable queued ahead"

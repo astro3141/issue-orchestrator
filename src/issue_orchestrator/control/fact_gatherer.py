@@ -35,6 +35,7 @@ from .cleanup_facts import (
     gather_cleanup_facts,
     gather_terminal_disposal_facts,
 )
+from .abandoned_candidates import AbandonedCandidates
 from .provider_launch_readiness import ProviderLaunchReadiness
 from .session_history import SessionHistoryOwner
 from .health_review_trigger import (
@@ -205,7 +206,7 @@ class FactGatherer:
         stale_claim_issues: list["Issue"] | None = None,
         provider_launch: ProviderLaunchReadiness | None = None,
         reconcile_only_issues: list["Issue"] | None = None,
-        abandoned_issues: list["Issue"] | None = None,
+        abandoned_candidates: "AbandonedCandidates | None" = None,
     ) -> "OrchestratorSnapshot":
         """Create an immutable snapshot for planning.
 
@@ -222,9 +223,10 @@ class FactGatherer:
                 excluded from ``issues`` but that reconciliation must still see
                 (#46). Passed in rather than derived here because queue
                 eligibility is ``QueueCache``'s policy, not this gatherer's.
-            abandoned_issues: The subset of ``reconcile_only_issues`` whose last
-                session left NO owner behind (#195). Same reason for passing it
-                in: the discrimination is ``QueueCache``'s policy.
+            abandoned_candidates: The subset of ``reconcile_only_issues`` whose
+                last session left NO owner behind, each with this run's release
+                verdict for it (#195). Same reason for passing it in: the
+                discrimination and the budget are ``QueueCache``'s policy.
 
         Returns:
             Immutable snapshot of orchestrator state for Planner
@@ -279,7 +281,7 @@ class FactGatherer:
             cleanup_facts=cleanup_facts,
             stale_in_progress_issues=tuple(stale_in_progress_issues or []),
             stale_claim_issues=tuple(stale_claim_issues or []),
-            abandoned_issues=tuple(abandoned_issues or []),
+            abandoned_candidates=abandoned_candidates or AbandonedCandidates(),
             failed_this_cycle=frozenset(state.failed_this_cycle),
             # Which issues history still CLAIMS, not which it merely mentions:
             # a released entry is a record of a failed session, not a reason to

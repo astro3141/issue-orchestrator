@@ -89,17 +89,16 @@ class ClaimReleaseResult:
     """What :meth:`SessionHistoryOwner.release_claim` actually released (#195).
 
     Reports the number of entries whose duplicate-launch claim was dropped, so
-    a caller can tell a real release from a no-op, and the statuses they held,
-    so the release can be audited against what the session actually did.
+    a caller can tell a real release from a no-op; the statuses they held, so
+    the release can be audited against what the session actually did; and how
+    many abandoned releases this run has now spent on the issue, which is the
+    number the relaunch budget is measured against.
     """
 
     issue_number: int
     released_entries: int
     statuses: tuple[SessionHistoryStatus, ...]
-
-    @property
-    def released(self) -> bool:
-        return self.released_entries > 0
+    releases_granted: int
 
 
 class SessionHistoryOwner:
@@ -300,6 +299,24 @@ class SessionHistoryOwner:
             if status in ABANDONED_AFTER_COMPLETION_HISTORY_STATUSES
         )
 
+    def abandoned_releases_granted(self, issue_number: int) -> int:
+        """How many times this run has already handed the issue back (#195).
+
+        The relaunch budget's counter, and it needs no state of its own: the
+        release marks the entries it retires, so the entries that carry BOTH a
+        released claim and an abandoned-after-completion status are exactly the
+        automatic attempts this run has already granted. Entries released for
+        any other reason are excluded, so a future release path cannot silently
+        consume this budget.
+        """
+        return sum(
+            1
+            for entry in self.session_history
+            if entry.issue_number == issue_number
+            and entry.claim_released
+            and entry.status in ABANDONED_AFTER_COMPLETION_HISTORY_STATUSES
+        )
+
     def release_claim(self, issue_number: int) -> ClaimReleaseResult:
         """Give an abandoned issue back to scheduling, keeping its record (#195).
 
@@ -314,6 +331,15 @@ class SessionHistoryOwner:
         Nothing durable is touched, so no allowance is created or refunded:
         labels, attempt receipts and failure counters are untouched, and the
         scheduler re-decides from them on the next pass.
+
+        The release is NOT where the relaunch budget is enforced. The budget
+        bounds how many releases carry an automatic next attempt with them, and
+        the exhausting one still has to happen -- it simply arrives with a
+        blocking label, which the caller plants first. Refusing the mutation
+        here would leave the issue stranded behind a stale ``in-progress``
+        label with no escalation, which is the failure #195 exists to remove.
+        What this reports is the counter itself, so the decision is auditable
+        from the outcome (see :class:`ClaimReleaseResult`).
         """
         released = [
             entry
@@ -322,15 +348,19 @@ class SessionHistoryOwner:
         ]
         for entry in released:
             entry.claim_released = True
+        granted = self.abandoned_releases_granted(issue_number)
         logger.info(
-            "release_claim: issue=#%d released=%d entry/entries (record retained)",
+            "release_claim: issue=#%d released=%d entry/entries "
+            "(record retained, abandoned releases granted this run=%d)",
             issue_number,
             len(released),
+            granted,
         )
         return ClaimReleaseResult(
             issue_number=issue_number,
             released_entries=len(released),
             statuses=tuple(entry.status for entry in released),
+            releases_granted=granted,
         )
 
     def _find_latest_matching_entry(

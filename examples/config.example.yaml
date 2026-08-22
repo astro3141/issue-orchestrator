@@ -306,6 +306,10 @@ validation:
 
 retry:
   max_validation_retries: 3
+  # Fresh attempts one run may start after an abandoned (validation_failed)
+  # completion, per issue. Reaching it escalates to needs-human instead of
+  # relaunching again, so a permanently failing gate cannot loop forever.
+  max_abandoned_releases: 2
   validation_error_file: "validation-errors.txt"
   # retry_prompt_template: ".prompts/retry.md"
   interrupted_sessions:

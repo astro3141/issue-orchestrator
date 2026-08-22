@@ -122,18 +122,28 @@ class ReleaseAbandonedIssueAction(Action):
     ONE issue that has provably lost its owner, and only for the claim: the
     history entry stays as the operator's record of the session that failed,
     and every durable record — labels, attempt receipts, rework and
-    publish-failure counters — is untouched. No allowance is created or
-    refunded: whether another attempt is legitimate is still decided entirely
-    by those records, on the very next scheduling pass.
+    publish-failure counters — is untouched.
 
-    The applier owns the ordering (label first, claim second), so the issue is
-    never handed back while a label the shed failed to remove still says a
-    session owns it.
+    ``escalation_label`` is set when this run has spent its release budget for
+    the issue (``retry.max_abandoned_releases``, see
+    :mod:`.stale_cleanup_planning`). The release still happens — withholding it
+    would strand the issue behind a stale label with nothing said about why —
+    but it arrives carrying a blocking label, so what the issue is handed back
+    to is a human rather than the scheduler. Without it the release would be
+    the ONLY bound on relaunch that this command retires, with nothing left in
+    the system counting fresh coding launches.
+
+    The applier owns the ordering (escalation label, then stale label, then
+    claim), so the issue is never handed back while a label the shed failed to
+    remove still says a session owns it, nor handed back unblocked when the
+    escalation is the whole point of the release.
     """
 
     issue_number: int = 0
     label: str = ""
     issue_key: str = ""  # stable_id for SSE events; falls back to str(issue_number) when empty
+    escalation_label: str = ""  # non-empty -> this run's release budget is spent
+    escalation_reason: str = ""
     action_type: ActionType = field(
         default=ActionType.RELEASE_ABANDONED_ISSUE, init=False
     )
@@ -146,6 +156,24 @@ class ReleaseAbandonedIssueAction(Action):
             issue_key=self.issue_key,
             reason=self.reason,
             expected=self.expected,
+        )
+
+    def escalation(self) -> "AddLabelAction | None":
+        """The budget-exhausted half, as the addition the applier already knows.
+
+        Carries ``SESSION_LIFECYCLE`` as its cause: the assertion being made is
+        that this run's own session lifecycle gave up on the issue, which is the
+        same cause the publish-failure ceiling asserts when it escalates.
+        """
+        if not self.escalation_label:
+            return None
+        return AddLabelAction(
+            issue_number=self.issue_number,
+            label=self.escalation_label,
+            issue_key=self.issue_key,
+            reason=self.escalation_reason,
+            expected=self.expected,
+            needs_human_cause=NeedsHumanCause.SESSION_LIFECYCLE,
         )
 
 

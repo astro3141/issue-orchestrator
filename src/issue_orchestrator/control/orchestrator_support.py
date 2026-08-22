@@ -306,7 +306,13 @@ class OrchestratorSupport:
 
         logger.warning("[PLAN] Action %s failed: %s", action.action_type.value, result.error)
 
-        # Mark issue as failed if applicable
+        # Mark issue as failed if applicable.
+        # RELEASE_ABANDONED_ISSUE is deliberately absent even though its label
+        # halves are REMOVE_LABEL/ADD_LABEL writes (#195): the command's own
+        # recovery is that the next tick re-plans it, which `failed_this_cycle`
+        # would suppress until the cache refreshes. A failed release leaves the
+        # issue exactly as it was — still wearing `in-progress`, still claimed —
+        # so re-planning is safe and is the only thing that unsticks it.
         failed_actions_mark_issue = {
             ActionType.ADD_LABEL,
             ActionType.REMOVE_LABEL,
@@ -653,7 +659,10 @@ def run_planning_cycle(
     # candidate has already left the queue by the time its label goes stale
     # (#195).
     queue_cache = QueueCache(config, state, queue_cache_store)
-    stale_issues = _detect_stale_in_progress(observer, state, events, event_context, queue_cache)
+    # Asked ONCE per tick: staleness detection and planning need the same
+    # answer, and each call re-walks reconciliation_only_issues.
+    abandoned_candidates = queue_cache.abandoned_candidates()
+    stale_issues = _detect_stale_in_progress(observer, state, events, event_context, abandoned_candidates.issues)
     stale_claim_issues = _detect_stale_claims(state.cached_queue_issues, state.active_sessions, claim_manager, events, event_context, io_claimed_label=io_claimed_label)
 
     # Sample provider launch eligibility BEFORE planning: it probes a CLI and
@@ -666,7 +675,7 @@ def run_planning_cycle(
     # so reconciliation keeps seeing them (#46) without any of them becoming
     # launchable.
     reconcile_only_issues = queue_cache.reconciliation_only_issues()
-    snapshot = fact_gatherer.create_snapshot(state, state.cached_queue_issues, stale_in_progress_issues=stale_issues, stale_claim_issues=stale_claim_issues, provider_launch=provider_launch, reconcile_only_issues=reconcile_only_issues, abandoned_issues=queue_cache.abandoned_after_completion_issues())
+    snapshot = fact_gatherer.create_snapshot(state, state.cached_queue_issues, stale_in_progress_issues=stale_issues, stale_claim_issues=stale_claim_issues, provider_launch=provider_launch, reconcile_only_issues=reconcile_only_issues, abandoned_candidates=abandoned_candidates)
     _emit_facts_gathered(events, event_context, state, stale_issues)
 
     plan = planner.plan(snapshot)

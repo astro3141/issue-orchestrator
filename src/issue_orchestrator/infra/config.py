@@ -1157,10 +1157,10 @@ class Config(ConfigLaunchIdentity, RuntimeConfigReferenceOwner, TechLeadActivati
 
         # Retry section
         retry_dict: dict = {}
-        if self.retry.max_validation_retries != 3:
-            retry_dict["max_validation_retries"] = self.retry.max_validation_retries
-        if self.retry.validation_error_file != "validation-errors.txt":
-            retry_dict["validation_error_file"] = self.retry.validation_error_file
+        _retry_defaults = RetryConfig()  # one loop against the dataclass's own defaults: a new retry scalar round-trips by being listed
+        for _key in ("max_validation_retries", "max_abandoned_releases", "validation_error_file"):
+            if (_value := getattr(self.retry, _key)) != getattr(_retry_defaults, _key):
+                retry_dict[_key] = _value
         if self.retry.retry_prompt_template:
             retry_dict["retry_prompt_template"] = self.retry.retry_prompt_template
 

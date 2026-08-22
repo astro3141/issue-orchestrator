@@ -13,6 +13,7 @@ import time
 import traceback
 from typing import TYPE_CHECKING
 
+from .abandoned_candidates import AbandonedCandidate, AbandonedCandidates
 from .issue_scope import evaluate_issue_scope, issue_scope_skip_detail, outside_single_issue_scope
 from .session_history import SessionHistoryOwner
 
@@ -268,7 +269,7 @@ class QueueCache:
             and not self.is_outside_engine_scope(issue)
         ]
 
-    def abandoned_after_completion_issues(self) -> list["Issue"]:
+    def abandoned_candidates(self) -> AbandonedCandidates:
         """Reconciliation-visible issues NOTHING is holding any more (#195).
 
         The discrimination inside ``REJECTED_EXCLUDED`` that
@@ -294,18 +295,31 @@ class QueueCache:
         A strict subset of :meth:`reconciliation_only_issues`, so it is
         disjoint from the queue for the same reason and callers may concatenate
         the two without deduplicating.
+
+        Each named issue carries its RELEASE VERDICT: how many automatic
+        attempts this run has already granted it, against the configured
+        ceiling. The verdict rides along rather than filtering the set, because
+        an issue past its ceiling still needs to be seen — its stale
+        ``in-progress`` label must be shed and its escalation planned, and both
+        happen on this set. See :mod:`.abandoned_candidates`.
         """
-        abandoned = self._history_owner().abandoned_after_completion_issue_numbers()
+        history = self._history_owner()
+        abandoned = history.abandoned_after_completion_issue_numbers()
         if not abandoned:
-            return []
+            return AbandonedCandidates()
         running = {session.issue.number for session in self._state.active_sessions}
-        return [
-            issue
+        max_releases = self._config.retry.max_abandoned_releases
+        return AbandonedCandidates(tuple(
+            AbandonedCandidate(
+                issue=issue,
+                releases_granted=history.abandoned_releases_granted(issue.number),
+                max_releases=max_releases,
+            )
             for issue in self.reconciliation_only_issues()
             if issue.number in abandoned
             and issue.number not in running
             and not self._state.control_operation_exclusions.excludes_issue(issue.key)
-        ]
+        ))
 
     def prune_refresh_timestamps(self) -> None:
         """Prune refresh timestamp map to currently tracked issue IDs."""

@@ -118,8 +118,8 @@ def test_stale_in_progress_events_payload_shape():
         def detect_stale_in_progress(self, cached_queue_issues, active_sessions):
             return cached_queue_issues
 
-    queue_cache = QueueCache(Config(repo="acme/widgets"), state)
-    stale = detect_stale_in_progress(_Observer(), state, events, context, queue_cache)
+    abandoned = QueueCache(Config(repo="acme/widgets"), state).abandoned_candidates()
+    stale = detect_stale_in_progress(_Observer(), state, events, context, abandoned.issues)
     assert stale
     detected = events.get_events_by_name(EventName.STALE_IN_PROGRESS_DETECTED)
     assert len(detected) == 1

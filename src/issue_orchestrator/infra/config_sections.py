@@ -778,6 +778,7 @@ def load_retry_section(config: "Config", retry_data: dict) -> None:
         interrupted_data = retry_data.get("interrupted_sessions", {}) or {}
         config.retry = RetryConfig(
             max_validation_retries=retry_data.get("max_validation_retries", 3),
+            max_abandoned_releases=retry_data.get("max_abandoned_releases", 2),
             validation_error_file=retry_data.get("validation_error_file", "validation-errors.txt"),
             retry_prompt_template=retry_data.get("retry_prompt_template"),
             interrupted_sessions=InterruptedSessionRetryConfig(

@@ -175,3 +175,41 @@ def test_a_blocked_completion_is_still_left_alone(scenario_repo: Path) -> None:
         label == "blocked" or label.startswith(("blocked-", "blocked:"))
         for label in repo_host.issues[0].labels
     ), repo_host.issues[0].labels
+
+
+def test_the_relaunch_loop_stops_at_the_configured_budget(
+    scenario_repo: Path,
+) -> None:
+    """The bound on the recovery this leaf grants.
+
+    The release retires the one thing that was holding a ``validation_failed``
+    candidate out of the launch filter, and nothing else in the system counts
+    fresh coding launches. With a validation command that always refuses, an
+    unbounded release would relaunch this issue every few ticks for the life of
+    the process. ``retry.max_abandoned_releases`` is the ceiling, and reaching
+    it must be VISIBLE — a blocking label an operator can see and clear, not an
+    issue that quietly stops being retried.
+
+    Written to fail in both directions: it fails if the loop runs past the
+    ceiling, and it fails if the engine goes quiet without escalating.
+    """
+    config = _config(scenario_repo, validation_cmd=script("validate_fail.sh"))
+    config.retry.max_abandoned_releases = 1
+    orch, repo_host, events, _timeline = build_orchestrator(
+        scenario_repo, [_issue()], config
+    )
+
+    run_until(orch, lambda: "needs-human" in repo_host.issues[0].labels, max_ticks=20)
+
+    attempts_at_escalation = _sessions_started(events)
+    assert attempts_at_escalation == 2, (
+        "one automatic relaunch is allowed by the budget, then the escalation"
+    )
+
+    # Long after the ceiling, the engine must still refuse to start another.
+    for _ in range(8):
+        orch.tick()
+
+    assert _sessions_started(events) == attempts_at_escalation
+    assert "needs-human" in repo_host.issues[0].labels
+    assert IN_PROGRESS not in repo_host.issues[0].labels

@@ -47,6 +47,7 @@ from issue_orchestrator.control.control_operation_ownership import (
 )
 from issue_orchestrator.control.fact_gatherer import FactGatherer
 from issue_orchestrator.control.label_manager import LabelManager
+from issue_orchestrator.control.needs_human_block import NeedsHumanCause
 from issue_orchestrator.control.planner import Planner
 from issue_orchestrator.control.queue_cache import QueueCache, QueueMutationStatus
 from issue_orchestrator.control.scheduler import Scheduler
@@ -141,7 +142,7 @@ class TestTheQueueOwnerNamesOnlyTheOwnerlessIssues:
         cache = _cache(config, state, _issue(ABANDONED, labels=[IN_PROGRESS]))
 
         assert state.cached_queue_issues == []
-        assert [i.number for i in cache.abandoned_after_completion_issues()] == [
+        assert [i.number for i in cache.abandoned_candidates().issues] == [
             ABANDONED
         ]
 
@@ -159,7 +160,7 @@ class TestTheQueueOwnerNamesOnlyTheOwnerlessIssues:
         cache = _cache(config, state, issue)
 
         assert [i.number for i in cache.reconciliation_only_issues()] == [ABANDONED]
-        assert cache.abandoned_after_completion_issues() == []
+        assert cache.abandoned_candidates().issues == ()
 
     def test_the_awaiting_merge_presentation_record_is_never_named(
         self, tmp_path: Path
@@ -170,7 +171,7 @@ class TestTheQueueOwnerNamesOnlyTheOwnerlessIssues:
         cache = _cache(config, state, _issue(ABANDONED, labels=["pr-pending"]))
 
         assert [i.number for i in cache.reconciliation_only_issues()] == [ABANDONED]
-        assert cache.abandoned_after_completion_issues() == []
+        assert cache.abandoned_candidates().issues == ()
 
     def test_a_later_completion_retires_an_earlier_refusal(
         self, tmp_path: Path
@@ -182,7 +183,7 @@ class TestTheQueueOwnerNamesOnlyTheOwnerlessIssues:
         state.session_history.append(_awaiting_merge_record(ABANDONED))
         cache = _cache(config, state, _issue(ABANDONED, labels=["pr-pending"]))
 
-        assert cache.abandoned_after_completion_issues() == []
+        assert cache.abandoned_candidates().issues == ()
 
     def test_a_live_control_operation_is_never_named(self, tmp_path: Path) -> None:
         """#146's terminal-less owner still owns the issue."""
@@ -202,7 +203,7 @@ class TestTheQueueOwnerNamesOnlyTheOwnerlessIssues:
         cache = _cache(config, state, issue)
 
         assert [i.number for i in cache.reconciliation_only_issues()] == [ABANDONED]
-        assert cache.abandoned_after_completion_issues() == []
+        assert cache.abandoned_candidates().issues == ()
 
     @pytest.mark.parametrize(
         "status", ["blocked", "needs_human", "failed", "timed_out", "completed"]
@@ -216,7 +217,7 @@ class TestTheQueueOwnerNamesOnlyTheOwnerlessIssues:
         state.session_history.append(_history(ABANDONED, status))
         cache = _cache(config, state, _issue(ABANDONED, labels=[IN_PROGRESS]))
 
-        assert cache.abandoned_after_completion_issues() == []
+        assert cache.abandoned_candidates().issues == ()
 
     def test_a_queued_issue_is_never_named(self, tmp_path: Path) -> None:
         """A subset of ``reconciliation_only_issues``, so still queue-disjoint."""
@@ -225,7 +226,7 @@ class TestTheQueueOwnerNamesOnlyTheOwnerlessIssues:
         cache = _cache(config, state, _issue(OPEN_WORK))
 
         assert [i.number for i in state.cached_queue_issues] == [OPEN_WORK]
-        assert cache.abandoned_after_completion_issues() == []
+        assert cache.abandoned_candidates().issues == ()
 
     def test_an_operator_narrowed_run_keeps_its_narrow_blast_radius(
         self, tmp_path: Path
@@ -238,7 +239,7 @@ class TestTheQueueOwnerNamesOnlyTheOwnerlessIssues:
             config, state, _issue(ABANDONED, labels=[IN_PROGRESS]), _issue(OPEN_WORK)
         )
 
-        assert cache.abandoned_after_completion_issues() == []
+        assert cache.abandoned_candidates().issues == ()
 
     def test_the_history_owner_answers_from_the_latest_entry_only(self) -> None:
         history = [
@@ -282,7 +283,7 @@ class TestTheLiveTickSeesTheStrandedIssue:
             state,
             MockEventSink(),
             EventContext(tick_id=1),
-            cache,
+            cache.abandoned_candidates().issues,
         )
 
         assert [i.number for i in stale] == [ABANDONED]
@@ -299,7 +300,7 @@ class TestTheLiveTickSeesTheStrandedIssue:
             state,
             MockEventSink(),
             EventContext(tick_id=1),
-            cache,
+            cache.abandoned_candidates().issues,
         )
 
         assert [i.number for i in stale] == [OPEN_WORK]
@@ -320,7 +321,7 @@ class TestTheLiveTickSeesTheStrandedIssue:
             state,
             MockEventSink(),
             EventContext(tick_id=1),
-            cache,
+            cache.abandoned_candidates().issues,
         )
 
         assert stale == []
@@ -339,7 +340,11 @@ class TestTheLiveTickSeesTheStrandedIssue:
         events = MockEventSink()
 
         stale = detect_stale_in_progress(
-            self._observer(config), state, events, EventContext(tick_id=1), cache
+            self._observer(config),
+            state,
+            events,
+            EventContext(tick_id=1),
+            cache.abandoned_candidates().issues,
         )
 
         assert sorted(i.number for i in stale) == sorted([ABANDONED, OPEN_WORK])
@@ -363,10 +368,10 @@ class TestThePlannerSeparatesTheTwoStaleKinds:
             state.cached_queue_issues,
             stale_in_progress_issues=[
                 *state.cached_queue_issues,
-                *cache.abandoned_after_completion_issues(),
+                *cache.abandoned_candidates().issues,
             ],
             reconcile_only_issues=cache.reconciliation_only_issues(),
-            abandoned_issues=cache.abandoned_after_completion_issues(),
+            abandoned_candidates=cache.abandoned_candidates(),
         )
 
     def _stale_actions(
@@ -557,7 +562,7 @@ class TestTheReleaseTouchesNothingDurable:
 
         SessionHistoryOwner(state.session_history).release_claim(ABANDONED)
 
-        assert cache.abandoned_after_completion_issues() == []
+        assert cache.abandoned_candidates().issues == ()
 
     def test_the_planner_stops_skipping_a_released_issue(
         self, tmp_path: Path
@@ -625,3 +630,279 @@ class TestTheReleaseTouchesNothingDurable:
             ((ABANDONED, IN_PROGRESS), {})
         ]
         labels.add_label.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# The bound on relaunch, and the escalation that makes it terminal
+# ---------------------------------------------------------------------------
+
+
+def _released(entry: SessionHistoryEntry) -> SessionHistoryEntry:
+    entry.claim_released = True
+    return entry
+
+
+class TestTheReleaseBudgetBoundsRelaunch:
+    """The release retires the only gate on relaunch, so it needs its own.
+
+    ``session_history_issue_numbers`` is the sole member of the planner's launch
+    filter that can hold a ``validation_failed`` issue with no PR and no queued
+    review, and every other budget in the system is per-session or reached from
+    a different completion path. Without a ceiling here, a deterministically
+    failing validation command relaunches for the life of the process.
+    """
+
+    def _cache_with(
+        self, tmp_path: Path, *, granted: int, max_releases: int
+    ) -> tuple[QueueCache, OrchestratorState]:
+        config = _config(tmp_path)
+        config.retry.max_abandoned_releases = max_releases
+        state = OrchestratorState()
+        for _ in range(granted):
+            state.session_history.append(
+                _released(_history(ABANDONED, "validation_failed"))
+            )
+        state.session_history.append(_history(ABANDONED, "validation_failed"))
+        return _cache(config, state, _issue(ABANDONED, labels=[IN_PROGRESS])), state
+
+    def test_a_first_attempt_is_within_budget(self, tmp_path: Path) -> None:
+        cache, _state = self._cache_with(tmp_path, granted=0, max_releases=2)
+
+        verdict = cache.abandoned_candidates().verdict(ABANDONED)
+
+        assert verdict is not None
+        assert verdict.releases_granted == 0
+        assert verdict.max_releases == 2
+        assert not verdict.exhausted
+
+    def test_the_ceiling_is_reached_after_the_configured_releases(
+        self, tmp_path: Path
+    ) -> None:
+        cache, _state = self._cache_with(tmp_path, granted=2, max_releases=2)
+
+        verdict = cache.abandoned_candidates().verdict(ABANDONED)
+
+        assert verdict is not None
+        assert verdict.releases_granted == 2
+        assert verdict.exhausted
+
+    def test_the_ceiling_comes_from_config(self, tmp_path: Path) -> None:
+        """An operator who wants more automatic attempts gets them."""
+        cache, _state = self._cache_with(tmp_path, granted=2, max_releases=5)
+
+        verdict = cache.abandoned_candidates().verdict(ABANDONED)
+
+        assert verdict is not None
+        assert not verdict.exhausted
+
+    def test_an_exhausted_candidate_is_still_named(self, tmp_path: Path) -> None:
+        """It has to be: its stale label is shed and its escalation planned here.
+
+        Filtering it out of the abandoned set would leave the issue wearing an
+        ``in-progress`` label nothing ever removes and say nothing to the
+        operator about why the attempts stopped — the exact silent stranding
+        #195 exists to remove.
+        """
+        cache, _state = self._cache_with(tmp_path, granted=9, max_releases=2)
+
+        assert [i.number for i in cache.abandoned_candidates().issues] == [ABANDONED]
+
+    def test_a_release_for_another_reason_does_not_spend_the_budget(self) -> None:
+        """Only released ABANDONED entries count, so a future release path
+        cannot silently consume this ceiling."""
+        state = OrchestratorState()
+        state.session_history.append(_released(_history(ABANDONED, "completed")))
+        state.session_history.append(_history(ABANDONED, "validation_failed"))
+
+        owner = SessionHistoryOwner(state.session_history)
+
+        assert owner.abandoned_releases_granted(ABANDONED) == 0
+
+    def test_the_release_reports_the_counter_it_advanced(self) -> None:
+        state = OrchestratorState()
+        state.session_history.append(
+            _released(_history(ABANDONED, "validation_failed"))
+        )
+        state.session_history.append(_history(ABANDONED, "validation_failed"))
+
+        result = SessionHistoryOwner(state.session_history).release_claim(ABANDONED)
+
+        assert result.released_entries == 1
+        assert result.releases_granted == 2
+
+
+class TestTheExhaustedCandidateEscalatesInsteadOfRelaunching:
+    def _planner(self, config: Config) -> Planner:
+        return Planner(config=config, scheduler=Scheduler(config=config))
+
+    def _plan(self, tmp_path: Path, *, granted: int, max_releases: int = 2) -> list:
+        config = _config(tmp_path)
+        config.retry.max_abandoned_releases = max_releases
+        state = OrchestratorState()
+        for _ in range(granted):
+            state.session_history.append(
+                _released(_history(ABANDONED, "validation_failed"))
+            )
+        state.session_history.append(_history(ABANDONED, "validation_failed"))
+        cache = _cache(config, state, _issue(ABANDONED, labels=[IN_PROGRESS]))
+        snapshot = FactGatherer(
+            config=config, repository_host=MockGitHubAdapter()
+        ).create_snapshot(
+            state,
+            state.cached_queue_issues,
+            stale_in_progress_issues=list(cache.abandoned_candidates().issues),
+            reconcile_only_issues=cache.reconciliation_only_issues(),
+            abandoned_candidates=cache.abandoned_candidates(),
+        )
+        return list(self._planner(config).plan(snapshot).actions)
+
+    def test_within_budget_the_release_carries_no_escalation(
+        self, tmp_path: Path
+    ) -> None:
+        releases = [
+            a
+            for a in self._plan(tmp_path, granted=1)
+            if a.action_type is ActionType.RELEASE_ABANDONED_ISSUE
+        ]
+
+        assert len(releases) == 1
+        assert releases[0].escalation_label == ""
+        assert releases[0].escalation() is None
+
+    def test_the_exhausting_release_plants_the_blocking_label(
+        self, tmp_path: Path
+    ) -> None:
+        """The bound is enforced by a label the scheduler already refuses —
+        the same shape ``max_consecutive_publish_failures`` escalates with."""
+        config = _config(tmp_path)
+        actions = self._plan(tmp_path, granted=2)
+        releases = [
+            a for a in actions if a.action_type is ActionType.RELEASE_ABANDONED_ISSUE
+        ]
+
+        assert len(releases) == 1
+        escalation = releases[0].escalation()
+        assert escalation is not None
+        assert escalation.label == LabelManager(config).needs_human
+        assert escalation.needs_human_cause is NeedsHumanCause.SESSION_LIFECYCLE
+
+    def test_the_escalation_explains_itself_to_the_operator(
+        self, tmp_path: Path
+    ) -> None:
+        comments = [
+            a
+            for a in self._plan(tmp_path, granted=2)
+            if a.action_type is ActionType.ADD_COMMENT
+        ]
+
+        assert len(comments) == 1
+        assert comments[0].number == ABANDONED
+        assert "max_abandoned_releases" in comments[0].comment
+        assert "2" in comments[0].comment
+
+    def test_no_comment_is_posted_while_the_budget_holds(
+        self, tmp_path: Path
+    ) -> None:
+        """The escalation is a one-off, not a per-tick announcement."""
+        assert [
+            a
+            for a in self._plan(tmp_path, granted=0)
+            if a.action_type is ActionType.ADD_COMMENT
+        ] == []
+
+    def test_the_escalated_issue_is_refused_by_the_scheduler(
+        self, tmp_path: Path
+    ) -> None:
+        """The loop terminates because the label the escalation plants blocks.
+
+        Without it the released issue is available on the very next pass: no
+        active session, no ``in-progress``, and ``validation-failed`` is a
+        LIFECYCLE label the scheduler does not refuse.
+        """
+        config = _config(tmp_path)
+        scheduler = Scheduler(config=config)
+        needs_human = LabelManager(config).needs_human
+
+        assert scheduler.evaluate_issues([_issue(ABANDONED)])[0].available
+        assert not scheduler.evaluate_issues(
+            [_issue(ABANDONED, labels=[needs_human])]
+        )[0].available
+
+
+class TestTheApplierOrdersTheEscalatedRelease:
+    def _applier(self, state: OrchestratorState) -> tuple[ActionApplier, MagicMock]:
+        labels = MagicMock()
+        labels.get_labels.return_value = [AGENT, IN_PROGRESS]
+        labels.has_label.return_value = False
+        return (
+            ActionApplier(
+                labels=labels,
+                sessions=MagicMock(),
+                events=MockEventSink(),
+                history_owner=SessionHistoryOwner(lambda: state.session_history),
+            ),
+            labels,
+        )
+
+    def _escalated(self) -> ReleaseAbandonedIssueAction:
+        return ReleaseAbandonedIssueAction(
+            issue_number=ABANDONED,
+            label=IN_PROGRESS,
+            reason="abandoned",
+            escalation_label="needs-human",
+            escalation_reason="budget spent",
+        )
+
+    def _state(self) -> OrchestratorState:
+        state = OrchestratorState()
+        state.session_history.append(
+            _released(_history(ABANDONED, "validation_failed"))
+        )
+        state.session_history.append(
+            _released(_history(ABANDONED, "validation_failed"))
+        )
+        state.session_history.append(_history(ABANDONED, "validation_failed"))
+        return state
+
+    def test_the_block_lands_before_the_issue_is_handed_back(self) -> None:
+        state = self._state()
+        applier, labels = self._applier(state)
+        order: list[str] = []
+        labels.add_label.side_effect = lambda *_a, **_k: order.append("add")
+        labels.remove_label.side_effect = lambda *_a, **_k: order.append("remove")
+
+        result = applier.apply(self._escalated())
+
+        assert result.success
+        assert order == ["add", "remove"]
+        labels.add_label.assert_called_once_with(ABANDONED, "needs-human")
+        assert state.session_history[-1].claim_released is True
+
+    def test_a_failed_escalation_hands_nothing_back(self) -> None:
+        """No unbounded attempt slips through a failed block: the shed does not
+        happen either, so the next tick sees the same stale label and re-plans."""
+        state = self._state()
+        applier, labels = self._applier(state)
+        labels.add_label.side_effect = RuntimeError("GitHub said no")
+
+        result = applier.apply(self._escalated())
+
+        assert not result.success
+        labels.remove_label.assert_not_called()
+        assert state.session_history[-1].claim_released is False
+
+    def test_the_unexhausted_release_still_writes_only_the_removal(self) -> None:
+        """Direction 8 is unchanged for every release inside the budget."""
+        state = OrchestratorState()
+        state.session_history.append(_history(ABANDONED, "validation_failed"))
+        applier, labels = self._applier(state)
+
+        result = applier.apply(
+            ReleaseAbandonedIssueAction(
+                issue_number=ABANDONED, label=IN_PROGRESS, reason="abandoned"
+            )
+        )
+
+        assert result.success
+        labels.add_label.assert_not_called()
+        labels.remove_label.assert_called_once_with(ABANDONED, IN_PROGRESS)

@@ -538,22 +538,39 @@ class ActionApplier:
     def _apply_release_abandoned_issue(self, action: Action) -> ActionResult:
         """Give an abandoned candidate back to scheduling (#195).
 
-        Two steps in one command, ordered like ``RECOVER_TERMINAL_ISSUE``: shed
-        the stale ``in-progress`` label first, and only then release this run's
-        duplicate-launch claim on the issue. Releasing first would hand the
-        issue back while a label the shed failed to remove still says a session
-        owns it; failing the whole command instead leaves the issue exactly as
-        it was, and the next tick plans the release again.
+        Up to three steps in one command, ordered like ``RECOVER_TERMINAL_ISSUE``
+        and each gated on the one before:
 
-        The label half delegates to the ordinary removal path rather than
-        reimplementing it, so reconciliation gating, claim verification,
-        label-store write-through and mutation stats stay in one place. The
-        claim half goes through the history owner, which keeps the operator's
-        record of the failed session intact — a record is not a claim.
+        1. plant the escalation label, when this run has spent its release
+           budget for the issue. First, because it is what the issue is being
+           handed back TO — a release that landed without it would leave the
+           issue considerable with nothing in the system refusing it;
+        2. shed the stale ``in-progress`` label;
+        3. release this run's duplicate-launch claim.
+
+        Releasing before either label would hand the issue back while a label
+        the write failed to change still says a session owns it. Failing the
+        whole command instead leaves the issue exactly as it was, still wearing
+        ``in-progress``, so the next tick sees the same stale label and plans
+        the same command again.
+
+        Both label halves delegate to the ordinary add/remove paths rather than
+        reimplementing them, so reconciliation gating, claim verification,
+        needs-human cause bookkeeping, label-store write-through and mutation
+        stats stay in one place. The claim half goes through the history owner,
+        which keeps the operator's record of the failed session intact — a
+        record is not a claim.
         """
         assert isinstance(action, ReleaseAbandonedIssueAction)
         if self.history_owner is None:
             return ActionResult.fail(action, "Session history owner is not configured")
+        if (escalation := action.escalation()) is not None:
+            escalated = self._apply_add_label(escalation)
+            if not escalated.success:
+                return ActionResult.fail(
+                    action,
+                    escalated.error or "release-budget escalation label add failed",
+                )
         removal = self._apply_remove_label(action.label_removal())
         if not removal.success:
             return ActionResult.fail(
@@ -566,6 +583,8 @@ class ActionApplier:
             issue_number=action.issue_number,
             label=action.label,
             released_entries=release.released_entries,
+            releases_granted=release.releases_granted,
+            escalation_label=action.escalation_label,
         )
 
     def _apply_provider_impact(self, action: Action) -> ActionResult:
