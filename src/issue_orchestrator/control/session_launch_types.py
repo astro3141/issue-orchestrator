@@ -11,11 +11,11 @@ class LaunchDisposition(Enum):
     """What a launch attempt means for the pending item that requested it.
 
     A failed launch is not one thing. "The terminal is already up", "I could
-    not read the file I needed", "the provider refused" and "give up" call for
-    four different queue reactions, and encoding them as ad-hoc booleans meant
-    an unrecognised failure silently fell through to the most destructive one —
-    dropping the work (#6999 F10/A1). Every launch path returns exactly one of
-    these, and one owner maps it to a queue action.
+    not read the file I needed", "the environment is not ready yet" and "give
+    up" call for four different queue reactions, and encoding them as ad-hoc
+    booleans meant an unrecognised failure silently fell through to the most
+    destructive one — dropping the work (#6999 F10/A1). Every launch path
+    returns exactly one of these, and one owner maps it to a queue action.
     """
 
     #: A session started. The pending item is done.
@@ -23,17 +23,26 @@ class LaunchDisposition(Enum):
     #: A terminal for this work is already running. The queue keeps the item
     #: and tries to restore that terminal; a successful restore consumes it.
     EXISTING_TERMINAL = "existing_terminal"
-    #: The provider refused before anything was attempted — an expired login,
-    #: or a CLI that is not installed. Nothing about the work failed and
-    #: nothing was consumed, so the item stays queued exactly as it was, for a
-    #: tick when the provider is ready. Deliberately distinct from a retry
-    #: budget: there is no failure here to count against the work.
-    PROVIDER_DEFERRED = "provider_deferred"
+    #: A precondition of launching refused before anything was attempted: the
+    #: provider (an expired login, a CLI that is not installed) or the
+    #: process's own environment (an agent callback endpoint that has not
+    #: answered yet). Nothing about the work failed and nothing was consumed,
+    #: so the item stays queued exactly as it was, for a tick when the
+    #: precondition holds. Deliberately distinct from a retry budget: there is
+    #: no failure here to count against the work.
+    #:
+    #: Named for the launch rather than for the provider (#193): the callback
+    #: endpoint's pre-attempt refusal is the same decision for the queue as an
+    #: expired login, and routing it through ``RETRYABLE_FAILURE`` instead —
+    #: the nearest member whose contract does NOT fit — made every deferral
+    #: take the ledger-fault branch and report a store anomaly on a healthy
+    #: path.
+    LAUNCH_DEFERRED = "launch_deferred"
     #: The launch attempt itself failed and may work next time: required input
     #: could not be prepared (a transient DB/log/filesystem read), or the
     #: terminal never came up. The item is retained, but on a bounded retry
-    #: budget owned by the queue — unlike a provider refusal, this attempt DID
-    #: fail, and an input or a terminal that never recovers must not relaunch
+    #: budget owned by the queue — unlike a deferral, this attempt DID fail,
+    #: and an input or a terminal that never recovers must not relaunch
     #: forever. Named for the retry rather than for one of its causes (#6999
     #: F5): a failed ``create_session`` is the same decision for the queue as a
     #: failed input read, and calling it an input failure would have made
@@ -48,7 +57,7 @@ class LaunchDisposition(Enum):
     #: rewrite silently matched zero rows, so the budget was spent in memory
     #: against nothing, and a process death then lost the request outright.
     #: Nothing failed about the WORK here; the ledger did. The item is retained
-    #: with its budget untouched, exactly as a provider refusal leaves it.
+    #: with its budget untouched, exactly as a deferral leaves it.
     CLAIM_UNRECORDED = "claim_unrecorded"
     #: The launcher gave up. The queue drops the item.
     PERMANENT_FAILURE = "permanent_failure"
@@ -105,9 +114,9 @@ class LaunchResult:
         )
 
     @property
-    def defers_to_provider(self) -> bool:
-        """Whether the provider refused and the work must stay untouched."""
-        return self.disposition is LaunchDisposition.PROVIDER_DEFERRED
+    def defers_launch(self) -> bool:
+        """Whether a precondition refused and the work must stay untouched."""
+        return self.disposition is LaunchDisposition.LAUNCH_DEFERRED
 
 
 @dataclass

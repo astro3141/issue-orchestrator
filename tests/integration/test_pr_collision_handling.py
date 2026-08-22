@@ -518,7 +518,7 @@ class TestLaunchDispositionRetainsPendingWork:
         result = LaunchResult(session=None, success=False, reason="Some error")
 
         assert result.disposition is LaunchDisposition.PERMANENT_FAILURE
-        assert not result.defers_to_provider
+        assert not result.defers_launch
 
     def test_a_successful_launch_is_always_launched(self):
         """Success has exactly one disposition; it cannot contradict itself."""
@@ -539,7 +539,7 @@ class TestLaunchDispositionRetainsPendingWork:
         "disposition,retained",
         [
             ("EXISTING_TERMINAL", True),
-            ("PROVIDER_DEFERRED", True),
+            ("LAUNCH_DEFERRED", True),
             ("RETRYABLE_FAILURE", True),
             ("PERMANENT_FAILURE", False),
         ],

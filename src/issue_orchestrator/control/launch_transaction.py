@@ -62,8 +62,9 @@ class WorkDisposal(Enum):
     DROPPED = "dropped"
     #: There is no durable row for this request at all, and none should be
     #: written (#6999 F1 round 2). A launch can end before the claim is ever
-    #: held - the provider refuses, or the ledger write itself fails - and the
-    #: item then sits on its queue exactly as it arrived. Naming that state
+    #: held - a launch precondition refuses, or the ledger write itself fails -
+    #: and the item then sits on its queue exactly as it arrived. Naming that
+    #: state
     #: instead of settling it as RETAINED is what stops a settlement believing
     #: it committed something: the RETAINED write is an UPDATE of the deferred
     #: row, which matches zero rows here and reports nothing.
@@ -456,13 +457,23 @@ class LaunchSettlement:
         splitting them is how a dropped item kept a recoverable row.
         """
         claim = self.work.claim
-        if result.disposition is LaunchDisposition.PROVIDER_DEFERRED:
-            # The provider refused before the work was touched. Keep the item
-            # exactly as it is: no restoration attempt (there is no terminal to
-            # restore) and no budget spent (nothing about this request failed).
-            # For a failure investigation the queue is the only record that
-            # exists, so dropping it here would lose it permanently.
-            logger.info("[PROVIDER] Launch deferred, work retained: %s", result.reason)
+        if result.disposition is LaunchDisposition.LAUNCH_DEFERRED:
+            # A precondition refused before the work was touched - the provider,
+            # or the process's own callback endpoint. Keep the item exactly as
+            # it is: no restoration attempt (there is no terminal to restore)
+            # and no budget spent (nothing about this request failed). For a
+            # failure investigation the queue is the only record that exists, so
+            # dropping it here would lose it permanently.
+            #
+            # INFO, and the result's own reason rather than a per-cause prefix:
+            # this is the expected, healthy state of a window that has not
+            # closed yet, and the reason already names which precondition
+            # refused (#193).
+            logger.info(
+                "[WORK] %s launch deferred, work retained untouched: %s",
+                claim.kind.value,
+                result.reason,
+            )
             return SettlementDecision(WorkDisposal.RETAINED, claim, _no_projection)
         if result.disposition is LaunchDisposition.CLAIM_UNRECORDED:
             # The ledger refused the claim, so this request has no durable row

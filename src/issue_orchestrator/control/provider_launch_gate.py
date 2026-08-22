@@ -19,9 +19,11 @@ circuit. This module owns only the launch consequence — park or proceed — so
 the five launch paths (issue, validation retry, review, retrospective review,
 rework) cannot drift apart on it.
 
-A refusal here is a ``PROVIDER_DEFERRED`` disposition, never a plain failure:
+A refusal here is a ``LAUNCH_DEFERRED`` disposition, never a plain failure:
 nothing about the work went wrong, so the queue that asked for the launch must
-keep its item intact for a tick when the provider is ready (#6999 F10).
+keep its item intact for a tick when the provider is ready (#6999 F10). That
+disposition is shared with every other pre-attempt refusal — the settlement owes
+them all the same answer, and the reason string is what names which one fired.
 """
 
 from __future__ import annotations
@@ -85,7 +87,7 @@ class ProviderLaunchGate:
             None,
             False,
             f"Provider not ready: {provider} ({readiness.state.value})",
-            disposition=LaunchDisposition.PROVIDER_DEFERRED,
+            disposition=LaunchDisposition.LAUNCH_DEFERRED,
         )
 
     def _park_for_open_circuit(
@@ -105,7 +107,7 @@ class ProviderLaunchGate:
             None,
             False,
             f"Provider unavailable: {provider}",
-            disposition=LaunchDisposition.PROVIDER_DEFERRED,
+            disposition=LaunchDisposition.LAUNCH_DEFERRED,
         )
 
 

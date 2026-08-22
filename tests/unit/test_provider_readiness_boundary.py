@@ -3276,7 +3276,7 @@ class TestAProviderRefusalNeverConsumesPendingWork:
     def test_the_refusal_attempts_no_terminal_restoration(
         self, queue, refusal, tmp_path: Path
     ) -> None:
-        """PROVIDER_DEFERRED is not EXISTING_TERMINAL — there is nothing to adopt.
+        """LAUNCH_DEFERRED is not EXISTING_TERMINAL — there is nothing to adopt.
 
         Adoption starts by asking the runner what is running, so a single
         discovery call is enough to prove the settlement wandered into the
@@ -3401,7 +3401,7 @@ def test_a_provider_deferral_touches_neither_restoration_nor_the_retry_budget(
             session=None,
             success=False,
             reason="claude not on PATH",
-            disposition=LaunchDisposition.PROVIDER_DEFERRED,
+            disposition=LaunchDisposition.LAUNCH_DEFERRED,
         ),
         OrchestratorState(),
     )
@@ -3431,8 +3431,8 @@ def test_the_launch_gate_reports_a_provider_deferral(tmp_path: Path) -> None:
 
     assert result is not None
     assert not result.success
-    assert result.disposition is LaunchDisposition.PROVIDER_DEFERRED
-    assert result.defers_to_provider
+    assert result.disposition is LaunchDisposition.LAUNCH_DEFERRED
+    assert result.defers_launch
 
 
 def test_an_unhandled_launch_disposition_never_silently_drops_the_work(

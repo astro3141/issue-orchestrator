@@ -340,8 +340,8 @@ class PendingWorkClaimStore(Protocol):
         investigation whose retries are already exhausted.
 
         Returns whether a deferred row was actually rewritten (#6999 F1 round
-        2). A launch that never held the claim — the provider refused before the
-        hold, or the hold itself failed — has no row here, and the write then
+        2). A launch that never held the claim — a precondition refused before
+        the hold, or the hold itself failed — has no row here, and the write then
         matches nothing. That is a legitimate outcome, but it is NOT a commit,
         and a caller that treats it as one spends a retry budget nothing
         durable will remember. Unlike :meth:`retire_deferred_claim`, whose

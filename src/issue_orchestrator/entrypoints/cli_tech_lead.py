@@ -42,12 +42,6 @@ if TYPE_CHECKING:
 
 console = Console()
 
-#: The Control API port a one-shot tech-lead command requests: none. Neither
-#: command exposes ``--api-port`` and neither binds a server, so this is the
-#: value that makes the shared ``declare_no_control_api`` owner declare the
-#: endpoint unavailable rather than leave it unresolved (#193).
-_ONE_SHOT_CONTROL_API_PORT: int | None = None
-
 
 def cmd_tech_lead(args: argparse.Namespace) -> int:
     """Dispatch the tech lead at one or more specific issues, on demand.
@@ -316,7 +310,10 @@ def _build_one_shot_orchestrator(config: "Config") -> "Orchestrator":
     from .cli_run_modes import declare_no_control_api
 
     orchestrator = _build_orchestrator(config)
-    declare_no_control_api(orchestrator, _ONE_SHOT_CONTROL_API_PORT)
+    # The Control API port these commands request: none. That is the value the
+    # shared owner reads to declare the endpoint unavailable rather than leave
+    # it unresolved (#193).
+    declare_no_control_api(orchestrator, None)
     return orchestrator
 
 

@@ -226,10 +226,11 @@ def orchestrator_launch_tech_lead_session(
     It is retained in exactly three cases:
 
     - ``EXISTING_TERMINAL`` — a terminal that could not be restored yet;
-    - ``PROVIDER_DEFERRED`` — the provider refused before anything was
-      attempted. Nothing about the investigation failed, so it keeps its full
-      retry budget and simply waits for a tick when the provider is ready
-      (#6999 F10);
+    - ``LAUNCH_DEFERRED`` — a launch precondition refused before anything was
+      attempted: the provider, or the agent callback endpoint the spawned
+      agent would have to reach (#193). Nothing about the investigation
+      failed, so it keeps its full retry budget and simply waits for a tick
+      when the precondition holds (#6999 F10);
     - ``RETRYABLE_FAILURE`` — the launch attempt failed transiently BEFORE the
       session started: required-input prep, or a terminal that never came up.
       For failure investigations the queued item is the only record of the

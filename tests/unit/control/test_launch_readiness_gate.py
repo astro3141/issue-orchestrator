@@ -180,7 +180,7 @@ def test_flavor_proceeds_past_the_gate_once_resolved(
 
 
 class TestTheDeferralRetainsTheQueuedWork:
-    """The queue owner must treat this refusal as retryable, not as a drop.
+    """The queue owner must treat this refusal as a deferral, not a drop.
 
     Driven through the production routing function that owns the pending
     tech-lead queue, so the assertion is about what the SETTLEMENT did —
@@ -244,12 +244,14 @@ class TestTheDeferralRetainsTheQueuedWork:
     def test_the_retained_item_keeps_its_full_retry_budget(
         self, unresolved_endpoint: RuntimeAgentCallbackEndpoint, tmp_path: Path
     ) -> None:
-        """The gate refuses before the durable claim is ever held.
+        """The gate refuses before anything is attempted.
 
-        So the queue owner's bounded budget has no deferred row to spend
-        against, and the settlement declines to spend one in memory
-        (#6999 F1 round 2). The item waits with its budget intact — the
-        endpoint resolving on a later tick must not cost it an attempt.
+        Nothing failed, so there is nothing to count against the work: the
+        item waits with its budget intact and the endpoint resolving on a
+        later tick does not cost it an attempt. This is also why the
+        refusal cannot honestly be a bounded retry — the gate fires before
+        the durable claim is ever held, so no spend could ever reach the
+        ledger to bound anything (#6999 F1 round 2, #193).
         """
         state, _ = self._route(unresolved_endpoint, tmp_path)
 
@@ -266,10 +268,36 @@ class TestTheDeferralRetainsTheQueuedWork:
         The pilot run showed queue bookkeeping and no reason at all, so
         the refusal's own string had to be read out of the source (#193).
         """
-        with caplog.at_level(logging.WARNING):
+        with caplog.at_level(logging.INFO):
             self._route(unresolved_endpoint, tmp_path)
 
         assert DEFER_REASON in caplog.text, caplog.text
+
+    def test_the_deferral_reports_no_ledger_anomaly(
+        self,
+        unresolved_endpoint: RuntimeAgentCallbackEndpoint,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A window that has not closed yet is not a store fault.
+
+        Settling this as a bounded retry sent it through the branch that
+        spends the budget, which found no deferred row — by construction,
+        since the gate refuses before the claim is held — and announced a
+        LEDGER anomaly at ERROR on every deferral, on every queue, every
+        tick. That points an operator at SQLite when the thing to look at
+        is the Control API, so nothing above INFO may come out of a
+        healthy deferral (#193).
+        """
+        with caplog.at_level(logging.INFO):
+            self._route(unresolved_endpoint, tmp_path)
+
+        assert "holds no deferred row" not in caplog.text, caplog.text
+        assert [
+            record.getMessage()
+            for record in caplog.records
+            if record.levelno > logging.INFO
+        ] == []
 
     def test_a_resolved_endpoint_lets_the_issue_path_past_the_gate(
         self, unresolved_endpoint: RuntimeAgentCallbackEndpoint

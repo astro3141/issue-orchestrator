@@ -30,23 +30,31 @@ def callback_endpoint_not_ready(
     previously lived inside one launcher's precondition helper, which
     review, retrospective-review and rework never reach (#6924 F7-R3).
 
-    Retryable, and said so EXPLICITLY: the next tick launches once the
+    A deferral, and said so EXPLICITLY: the next tick launches once the
     server has published, or a run mode has declared that it serves no
     Control API. ``LaunchResult`` defaults to ``PERMANENT_FAILURE`` — "the
     launcher gave up" — so a deferral that took the default was settled by
     :class:`~.launch_transaction.LaunchSettlement` as a drop: the queued
     item removed and its durable claim retired, over a window that had not
     yet had a chance to close and a request nothing had failed about
-    (#193). ``RETRYABLE_FAILURE`` retains it on the queue owner's bounded
-    budget instead, which is the honest reading — this attempt did fail,
-    and an endpoint that never resolves must not relaunch forever.
+    (#193).
+
+    ``LAUNCH_DEFERRED`` is the member whose contract this refusal actually
+    meets: it fires BEFORE anything is attempted, so no attempt failed and
+    nothing was consumed, and the item waits with its budget intact.
+    ``RETRYABLE_FAILURE`` — the nearest-looking alternative — would promise
+    a bound this path cannot deliver: the guard refuses before the durable
+    claim is ever held, so the ledger has no deferred row to spend against
+    and the settlement declines to spend one in memory. The budget would
+    never move, the "bound" would be fiction, and every deferral would take
+    the branch that exists to announce a store fault.
     """
     if endpoint.is_ready():
         return None
     return LaunchResult(
         None, False,
         "Agent callback endpoint not published yet; deferring launch",
-        disposition=LaunchDisposition.RETRYABLE_FAILURE,
+        disposition=LaunchDisposition.LAUNCH_DEFERRED,
     )
 
 
