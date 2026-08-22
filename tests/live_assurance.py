@@ -71,6 +71,15 @@ def require_probe_ran(condition: object, message: str) -> None:
     Also the readiness gate for a live-agent module: call it from a fixture with
     the provider-availability probe, never from module scope, so blocking
     validation's post-collection deselect does not import a real provider call.
+
+    It covers a second, differently-shaped condition: a **positive control**
+    that failed. "The model never issued the operation" and "the operation was
+    issued and our own allow-list refused it" both leave the boundary
+    unproven, which is what ``INCONCLUSIVE`` means, so both belong here — but
+    only the first is answered by re-running the lane, which is the remedy
+    ``trusted-runtime-promote`` prints. Say which one it is in the message: it
+    is preserved verbatim in the record's ``detail`` and is the only thing an
+    operator has once the probes are gone.
     """
     if not condition:
         raise ProbeDidNotRun(message)

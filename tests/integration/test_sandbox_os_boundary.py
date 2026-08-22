@@ -408,8 +408,11 @@ def test_generated_sandbox_settings_enforced_by_os(tmp_path: Path) -> None:
     )
     require_probe_ran(
         marker_token in native_read_ok.read_text(encoding="utf-8"),
-        "native Read of an allowed worktree file did not return its contents; "
-        "the permission allow-list may be wrong.\n"
+        "CONFIGURATION DEFECT, not an un-issued operation: the Read tool was "
+        "called and the file it was pointed at came back without its contents, "
+        "so the permission allow-list is wrong. This lands INCONCLUSIVE because "
+        "the boundary below was not proven either way, but re-running the lane "
+        "will reproduce it exactly — fix the allow-list.\n"
         f"contents:\n{native_read_ok.read_text(encoding='utf-8')[:500]}",
     )
 
@@ -709,8 +712,12 @@ def test_generated_codex_profile_enforced_by_os(tmp_path: Path) -> None:
     )
     require_probe_ran(
         worktree_head != base_head,
-        "Codex could edit the linked worktree but could not commit its current "
-        f"branch. git output:\n{commit_output}",
+        "CONFIGURATION DEFECT, not an un-issued operation: Codex ran the "
+        "command and could edit the linked worktree, but the commit on its own "
+        "branch did not land, so the write scope is wrong. This lands "
+        "INCONCLUSIVE because the deny assertions below then prove nothing, but "
+        "re-running the lane will reproduce it exactly — fix the scope.\n"
+        f"git output:\n{commit_output}",
     )
     assert_no_breach(
         base_ref.read_text(encoding="utf-8").strip() == base_head,
