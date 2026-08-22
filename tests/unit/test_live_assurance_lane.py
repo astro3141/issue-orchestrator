@@ -82,6 +82,24 @@ def test_provider_unavailable() -> None:
     pytest.skip("claude CLI not installed")
 '''
 
+_UNREADY_PROVIDER_PROBE = '''
+@pytest.fixture(autouse=True)
+def _require_authenticated_provider() -> None:
+    require_probe_ran(False, "the provider CLI is not authenticated on this host")
+
+
+def test_the_chain_runs() -> None:
+    assert_no_breach(True, "SANDBOX BREACH: nothing escaped")
+'''
+"""The readiness-gate shape a live-agent module actually lands.
+
+``tests/integration/test_live_agent_chain.py`` reports an unusable provider
+from an autouse fixture, because the probe is a real ``claude -p`` round trip
+and must not run while blocking validation imports the module. That puts the
+failure in the **setup** phase, which is a different path through the collector
+than the call-phase failures every other probe here exercises.
+"""
+
 
 def _subprocess_env() -> dict[str, str]:
     """Environment in which this checkout's source is the one that runs.
@@ -233,6 +251,22 @@ class TestTheLaneRecordsWhatItObserved:
 
         assert record is not None
         assert record.outcome is LiveAssuranceOutcome.INCONCLUSIVE
+
+    def test_a_readiness_gate_refused_in_setup_is_inconclusive(
+        self, tmp_path: Path
+    ) -> None:
+        """The live-agent modules' own shape: the gate is an autouse fixture.
+
+        Its ``require_probe_ran`` fails during **setup**, so the call phase this
+        collector counts executions in never happens. A lane that only watched
+        call-phase reports would see a run with nothing wrong in it and file a
+        ``PASS`` for a boundary no provider was available to exercise.
+        """
+        record = _run_lane(tmp_path, _UNREADY_PROVIDER_PROBE)
+
+        assert record is not None
+        assert record.outcome is LiveAssuranceOutcome.INCONCLUSIVE
+        assert "not authenticated" in record.detail
 
     def test_a_breach_beside_a_probe_that_never_ran_is_security_fail(
         self, tmp_path: Path

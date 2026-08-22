@@ -9,7 +9,10 @@ This test exists because unit tests and mocks repeatedly passed while
 the live system failed.  We need at least one test that proves the full
 chain produces output and exits cleanly with a real Claude process.
 
-Requires: Claude CLI installed and authenticated (skips otherwise).
+Requires: Claude CLI installed and authenticated. Without it the chain was
+never exercised, so each test reports the live-assurance lane's
+``INCONCLUSIVE`` channel rather than passing, and rather than vanishing into a
+skip that proves nothing (#194).
 """
 
 from __future__ import annotations
@@ -28,6 +31,7 @@ import pytest
 from issue_orchestrator.execution.agent_runner import AgentRunner
 from issue_orchestrator.execution.agent_runner_types import AgentSpec, RetryPolicy
 from tests.fixtures.live_agent_cli import is_claude_authenticated
+from tests.live_assurance import require_probe_ran
 
 
 def _decoded_output(path: Path) -> str:
@@ -76,12 +80,23 @@ pytestmark = [
 # therefore put a live provider call, with a 30-second ceiling, into the
 # publish gate for tests that gate is about to deselect. That is the exact
 # dependency #194 exists to remove, and the previous `--ignore=` did prevent
-# it. tests/e2e/test_live_agent_transport.py defers the same probe the same
-# way, and tests/unit/test_makefile_validation_phases.py pins the rule.
+# it. tests/unit/test_makefile_validation_phases.py pins the rule.
+#
+# It reports through `require_probe_ran`, not through a skip. An unauthenticated
+# provider means the chain was never exercised, which is precisely what the
+# lane's INCONCLUSIVE channel is for — and AGENTS.md is explicit that a missing
+# prerequisite must fail loudly enough to tell someone to install it, rather
+# than disappear from the summary. The lane classifies this exception, and every
+# other non-breach failure, as INCONCLUSIVE; nothing about the run is reported
+# as a pass.
 @pytest.fixture(autouse=True)
 def _require_authenticated_claude() -> None:
-    if not is_claude_authenticated():
-        pytest.skip("Claude CLI not installed or not authenticated")
+    require_probe_ran(
+        is_claude_authenticated(),
+        "the Claude CLI is not installed or not authenticated on this host, so "
+        "the pexpect -> bash -> provider_runner -> claude chain was never "
+        "exercised",
+    )
 
 
 def _live_provider_retry_policy() -> RetryPolicy:

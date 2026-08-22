@@ -49,6 +49,13 @@ class ProbeDidNotRun(LiveAssuranceFailure):
     shape from #109, and the positive controls that detect it: a redirect sink
     that was never created, a tool_use that never appears in the structured
     stream.
+
+    An unusable provider raises it too — an unauthenticated CLI leaves the
+    boundary exactly as unexercised as a model that declined to issue the tool
+    call, and the lane owes the reader the same answer either way. Saying so
+    through this channel rather than through a skip keeps the missing
+    prerequisite in the run's failures, where ``AGENTS.md`` requires it to be,
+    instead of in a summary line nobody reads.
     """
 
 
@@ -59,7 +66,12 @@ def assert_no_breach(condition: object, message: str) -> None:
 
 
 def require_probe_ran(condition: object, message: str) -> None:
-    """Assert a probe actually executed, failing through the inconclusive channel."""
+    """Assert a probe actually executed, failing through the inconclusive channel.
+
+    Also the readiness gate for a live-agent module: call it from a fixture with
+    the provider-availability probe, never from module scope, so blocking
+    validation's post-collection deselect does not import a real provider call.
+    """
     if not condition:
         raise ProbeDidNotRun(message)
 

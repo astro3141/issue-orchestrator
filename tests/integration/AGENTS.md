@@ -39,11 +39,21 @@ lane, and `tests/unit/test_makefile_validation_phases.py` fails on it.
 **The marker deselects; it does not prevent collection.** Blocking validation
 still *imports* every module in this directory, once per xdist worker. So a
 readiness probe that contacts a provider — `is_claude_authenticated()`, which
-runs a real `claude -p` — must happen at call time, in a fixture or a
-`pytest.skip` inside the test, never at module scope. At module scope it becomes
-a live provider call inside the publish gate, for tests that gate is about to
-throw away. `test_live_agent_chain.py` shows the shape, the probe registry lives
+runs a real `claude -p` — must happen at call time, in an autouse fixture,
+never at module scope. At module scope it becomes a live provider call inside
+the publish gate, for tests that gate is about to throw away — and a
+`skipif` condition is module scope, because a decorator expression is evaluated
+on import. `test_live_agent_chain.py` shows the shape, the probe registry lives
 in `tests/fixtures/live_agent_cli.py`, and a guardrail proves the rule by AST.
+
+That fixture reports an unusable provider with `require_probe_ran(...)`, not by
+skipping. An unauthenticated CLI leaves the boundary exactly as unexercised as
+a model that declined to issue the tool call, so the lane should reach
+`INCONCLUSIVE` by the same route; and the root `AGENTS.md` is explicit that a
+missing prerequisite must fail loudly enough to tell someone to install it.
+The orchestrator's own branch-diff guard refuses newly added skip constructs in
+test paths, so this is the shape that lands, not merely the one that reads
+better.
 
 Inside such a module, say which outcome an assertion means:
 `assert_no_breach(...)` for a security condition, `require_probe_ran(...)` for
