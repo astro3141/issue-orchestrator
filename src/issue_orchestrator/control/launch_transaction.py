@@ -480,14 +480,18 @@ class LaunchSettlement:
             )
             return SettlementDecision(WorkDisposal.UNRECORDED, claim, _no_projection)
         if result.disposition is LaunchDisposition.RETRYABLE_FAILURE:
-            # Say WHY before spending, like the two branches above. Without it
-            # a retained-then-retried launch is silent per attempt and the
-            # reason survives only as far as an eventual exhaustion escalation,
-            # so an operator watching a launch that never happens sees the
-            # queue bookkeeping and never the refusal that caused it (#193).
+            # Say WHY, like the two branches above. Without it a
+            # retained-then-retried launch is silent per attempt and the reason
+            # survives only as far as an eventual exhaustion escalation, so an
+            # operator watching a launch that never happens sees the queue
+            # bookkeeping and never the refusal that caused it (#193).
+            #
+            # The reason only - NOT what the settlement will do about it. That
+            # is _spend_retry_budget's answer, and it is allowed to be "no
+            # spend at all" when the ledger holds no row for this work, so
+            # announcing a spend here would contradict the very next line.
             logger.warning(
-                "[WORK] %s launch failed and may succeed next tick; spending "
-                "one unit of its retry budget: %s",
+                "[WORK] %s launch failed and may succeed on a later tick: %s",
                 claim.kind.value,
                 result.reason,
             )

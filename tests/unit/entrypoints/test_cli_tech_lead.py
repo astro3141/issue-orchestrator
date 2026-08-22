@@ -13,6 +13,7 @@ import contextlib
 from pathlib import Path
 from unittest.mock import Mock, patch
 
+from issue_orchestrator.control.launch_guards import callback_endpoint_not_ready
 from issue_orchestrator.control.tech_lead_trigger import (
     HealthReviewResult,
     TechLeadOutcomeStatus,
@@ -198,20 +199,28 @@ class TestTheOneShotAnswersTheCallbackEndpointQuestion:
         run.assert_called_once()
         return orchestrator
 
+    @staticmethod
+    def _gate_verdict(orchestrator) -> "object | None":
+        """What the PRODUCTION gate says about this run's endpoint.
+
+        The real :func:`callback_endpoint_not_ready`, not a restatement of
+        its rule: this test's whole claim is that the gate which refused
+        every attempt now lets one through, so the gate itself has to be
+        the thing asked.
+        """
+        return callback_endpoint_not_ready(orchestrator.deps.agent_callback_endpoint)
+
     def test_targeted_dispatch_finds_the_endpoint_resolved(self) -> None:
         """The live-proof path: a targeted ``tech_lead`` run (#193)."""
-        seen: list[bool] = []
+        seen: list[object | None] = []
 
         self._dispatch(
             cli_tech_lead.cmd_tech_lead,
             _args(issues=[23], flavor="planning_investigation"),
-            on_dispatch=lambda orch: seen.append(
-                orch.deps.agent_callback_endpoint.is_ready()
-            )
-            or [],
+            on_dispatch=lambda orch: seen.append(self._gate_verdict(orch)) or [],
         )
 
-        assert seen == [True], "the launch gate would refuse every attempt"
+        assert seen == [None], f"the launch gate would refuse every attempt: {seen}"
 
     def test_health_review_shares_the_same_answer(self) -> None:
         """Same owner, so the whole-board command cannot drift from it.
@@ -219,20 +228,18 @@ class TestTheOneShotAnswersTheCallbackEndpointQuestion:
         This pins the shared wiring only; it is not a claim that the
         one-shot ``health-review`` path is proven end to end.
         """
-        seen: list[bool] = []
+        seen: list[object | None] = []
 
         self._dispatch(
             cli_tech_lead.cmd_health_review,
             _args(),
-            on_dispatch=lambda orch: seen.append(
-                orch.deps.agent_callback_endpoint.is_ready()
-            )
+            on_dispatch=lambda orch: seen.append(self._gate_verdict(orch))
             or HealthReviewResult(
                 200, status=TechLeadOutcomeStatus.COMPLETED, detail="done"
             ),
         )
 
-        assert seen == [True]
+        assert seen == [None], seen
 
     def test_agents_are_told_there_is_no_endpoint_rather_than_a_dead_one(
         self,
