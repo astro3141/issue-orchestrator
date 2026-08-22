@@ -1,6 +1,7 @@
 """Tests for Makefile validation phase orchestration."""
 
 import ast
+import functools
 import os
 import re
 import shutil
@@ -21,7 +22,15 @@ from tests.live_agent_reach import (
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
+@functools.cache
 def _gnu_make() -> str:
+    """The binary the Makefile's ``GMAKE :=`` would resolve to, here.
+
+    Deliberately the same search the Makefile runs
+    (``command -v gmake || command -v make``): a Homebrew macOS box answers
+    ``gmake`` and a Linux CI runner answers ``make``, and every recipe below
+    is printed with whichever one that is substituted in.
+    """
     make_bin = shutil.which("gmake") or shutil.which("make")
     if make_bin is None:
         pytest.fail("GNU make is required to validate Makefile targets")
@@ -140,16 +149,35 @@ def _has_marker(path: Path, marker: str) -> bool:
     )
 
 
-_SUBMAKE = re.compile(r"gmake\s+((?:(?:-\S+|--\S+)\s+)*)([\w.\-]+(?:\s+[\w.\-]+)*)\s*;")
+@functools.cache
+def _submake() -> re.Pattern[str]:
+    """Nested sub-make invocations, named the way *this machine* prints them.
+
+    The Makefile substitutes ``$(GMAKE)`` — the resolved binary, as an absolute
+    path — into every phase recipe, so the dry run says ``.../gmake`` where one
+    is installed and ``.../make`` where one is not. Matching the literal
+    ``gmake`` therefore expanded nothing on a Linux CI runner while expanding
+    everything on a Homebrew macOS box: the same assertions read a different
+    graph on each. Anchor the pattern to the binary `_gnu_make` resolved, which
+    is the same search ``GMAKE :=`` runs, and both describe the same graph.
+    """
+    return re.compile(
+        re.escape(_gnu_make())
+        + r"\s+((?:(?:-\S+|--\S+)\s+)*)([\w.\-]+(?:\s+[\w.\-]+)*)\s*;"
+    )
 
 
 def _dry_run_closure(target: str, **overrides: str) -> list[str]:
     """Every command the phased target graph would run, phases expanded.
 
-    ``make -n`` on a phase target prints the nested ``gmake`` invocations
+    ``make -n`` on a phase target prints the nested sub-make invocations
     without expanding them, so asserting an absence against that output is
     vacuous — which is exactly how a live-agent lane could creep back into the
     publish gate unnoticed. This follows each sub-make and returns the union.
+
+    Expanding nothing is the same vacuum by another route, so it is refused
+    here rather than left to surface as whichever assertion happened to be
+    reading the un-expanded output.
     """
     seen: set[str] = set()
     collected: list[str] = []
@@ -161,11 +189,16 @@ def _dry_run_closure(target: str, **overrides: str) -> list[str]:
         lines = _dry_run(name, **overrides)
         collected.extend(lines)
         for line in lines:
-            for _flags, names in _SUBMAKE.findall(line):
+            for _flags, names in _submake().findall(line):
                 for nested in names.split():
                     walk(nested)
 
     walk(target)
+    assert len(seen) > 1, (
+        f"{target} expanded to no sub-make: the closure is just its own dry "
+        f"run, and every absence asserted against it would be vacuous "
+        f"(looked for {_gnu_make()!r} invocations)"
+    )
     return collected
 
 
@@ -382,6 +415,40 @@ class TestTheGuardrailsReadTheTrackedGraph:
             "the Makefile's own default did not take over; the dry run is "
             "describing something other than the tracked target graph"
         )
+
+    def test_the_same_graph_is_read_where_there_is_no_gmake(self, tmp_path, monkeypatch):
+        """A Linux CI runner has no ``gmake``, and must read the same graph.
+
+        ``GMAKE := $(shell command -v gmake || command -v make)`` falls back to
+        ``make`` there, and every phase recipe is then printed under that name
+        instead. A sub-make pattern written against the Homebrew name expands
+        the whole graph on the machine the tests were written on and nothing at
+        all on the runner, so the closure silently degrades to a single dry run
+        and each absence asserted against it stops proving anything.
+
+        This stands the fallback up for real: GNU make, reachable only as
+        ``make``, with every PATH entry that carries a ``gmake`` removed.
+        """
+        as_make = tmp_path / "make"
+        as_make.symlink_to(_gnu_make())
+        without_gmake = [
+            entry
+            for entry in os.environ["PATH"].split(os.pathsep)
+            if entry and not (Path(entry) / "gmake").exists()
+        ]
+        monkeypatch.setenv("PATH", os.pathsep.join([str(tmp_path), *without_gmake]))
+        _gnu_make.cache_clear()
+        _submake.cache_clear()
+        try:
+            assert shutil.which("gmake") is None
+            assert _gnu_make() == str(as_make)
+
+            lines = _dry_run_closure("_validate-pr-impl")
+
+            _find_line(lines, 'target="test-unit"')
+        finally:
+            _gnu_make.cache_clear()
+            _submake.cache_clear()
 
 
 class TestMarkerBeatsFilename:
