@@ -50,15 +50,13 @@ from ..domain.models import (
 )
 from ..domain.events import EventBus, SessionEvent
 from ..domain.review_artifacts import review_artifacts_from_exchange_result
+from ..domain.review_exchange_rework import ReviewExchangeRework
 from ..domain.review_exchange_run import ReviewExchangeRun, ReviewExchangeRunAssets
 from ..domain.runtime_identity import RuntimeIdentity
 from ..domain.session_run import SessionRunAssets
 from ..events import EventContext, EventName
 from ..ports import EventSink
-from ..ports.review_artifact_reader import (
-    ReviewArtifactReadCommand,
-    ReviewArtifactReader,
-)
+from ..ports.review_artifact_reader import ReviewArtifactReader
 from .background_job_supervisor import BackgroundJobSupervisor
 from ..ports.event_sink import RunScopedEventPayload, make_run_scoped_event, make_trace_event
 from ..infra.runtime_artifacts import (
@@ -104,7 +102,13 @@ from .completion_result_artifacts import (
 )
 from .completion_review_exchange import CompletionReviewExchange
 from .completion_validation_evidence import CompletionValidationEvidence
-from .completion_ports import GitAdapter, LabelAdapter, PRAdapter
+from .completion_ports import (
+    GitAdapter,
+    LabelAdapter,
+    MissingReviewArtifactReader,
+    MissingTechLeadAuthorityStore,
+    PRAdapter,
+)
 from .completion_pr_labels import apply_pr_labels, reserved_pr_label_error
 from .completion_types import (
     ERROR_PREFIX_CREATE_PR,
@@ -139,38 +143,6 @@ if TYPE_CHECKING:
     from ..ports.tech_lead_authority import TechLeadAuthorityStore
     from .stack_base import StackBaseDecision
     from .stack_publish_gate import StackBaseGate
-
-
-class _MissingReviewArtifactReader:
-    def read_review_artifact(self, command: ReviewArtifactReadCommand) -> Any:
-        raise RuntimeError(
-            "CompletionProcessor requires review_artifact_reader to read "
-            f"review artifacts for issue #{command.issue_number}"
-        )
-
-
-class _MissingTechLeadAuthorityStore:
-    """Fail-fast default: tech_lead completions require the wired port.
-
-    Production always injects the SQLite-backed store from bootstrap; a test
-    that exercises a tech_lead completion without wiring the port surfaces the
-    misconfiguration immediately instead of silently fail-safing.
-    """
-
-    def _fail(self) -> Any:
-        raise RuntimeError(
-            "CompletionProcessor requires tech_lead_authority to process a "
-            "tech_lead session completion (wired in entrypoints/bootstrap.py)"
-        )
-
-    def record(self, *, run_id: str, session_name: str, authority: Any) -> None:
-        self._fail()
-
-    def load(self, *, run_id: str, session_name: str) -> Any:
-        self._fail()
-
-    def discard(self, *, run_id: str, session_name: str) -> None:
-        self._fail()
 
 
 # Containment for agent-supplied validation record paths lives in its own
@@ -323,9 +295,9 @@ class CompletionProcessor:
             config=config,
             git_adapter=git_adapter,
         )
-        self._review_artifact_reader = review_artifact_reader or _MissingReviewArtifactReader()
+        self._review_artifact_reader = review_artifact_reader or MissingReviewArtifactReader()
         self._tech_lead_authority: "TechLeadAuthorityStore" = (
-            tech_lead_authority or _MissingTechLeadAuthorityStore()
+            tech_lead_authority or MissingTechLeadAuthorityStore()
         )
         self._runtime_identity = runtime_identity
         # Optional stack publish-gate owner (ADR-0029 / #6596). When attached, a
@@ -697,6 +669,7 @@ class CompletionProcessor:
         completion_path: str | None = None,
         agent_label: str | None = None,
         issue_key: "IssueKey | None",
+        rework: ReviewExchangeRework = ReviewExchangeRework.IN_EXCHANGE,
     ) -> ProcessingResult:
         """Process a completion record and execute actions.
 
@@ -718,6 +691,10 @@ class CompletionProcessor:
                 case: it holds only an issue *number*, and deriving a key from
                 a work-item number is the drift #40 removed rather than a
                 fallback worth reinstating.
+            rework: Whether this completion's review exchange owns a coder to
+                hand a changes-requested round to (#180). Defaulted because
+                every caller with a live session behind it does; the control
+                continuation is the one caller that does not.
 
         Returns:
             ProcessingResult with success status and details.
@@ -830,6 +807,7 @@ class CompletionProcessor:
             error_details=error_details,
             run_assets=run_assets,
             issue_key=issue_key,
+            rework=rework,
         )
         if early_result is not None:
             return early_result
@@ -1359,6 +1337,7 @@ class CompletionProcessor:
         actions_taken: list[str],
         errors: list[str],
         run_assets: SessionRunAssets,
+        rework: ReviewExchangeRework,
     ) -> ProcessingResult | None:
         if self.pre_publish_gate is None:
             return None
@@ -1384,6 +1363,7 @@ class CompletionProcessor:
             agent_label=agent_label,
             record=record,
             run_assets=run_assets,
+            rework=rework,
         )
         if rerouted is not None:
             return rerouted
@@ -1413,6 +1393,7 @@ class CompletionProcessor:
         agent_label: str | None,
         record: CompletionRecord,
         run_assets: SessionRunAssets,
+        rework: ReviewExchangeRework,
     ) -> ProcessingResult | None:
         if session_name is None or agent_label is None:
             return None
@@ -1463,7 +1444,12 @@ class CompletionProcessor:
             ),
             errors=reroute_errors,
             actions_taken=reroute_actions,
-            run_review_exchange_loop=self._run_review_exchange_loop,
+            # The same policy the completion's first exchange ran under: a
+            # caller that owns no coder does not acquire one by way of a
+            # post-review validation failure (#180).
+            run_review_exchange_loop=partial(
+                self._run_review_exchange_loop, rework=rework
+            ),
         )
 
         # The review-exchange helper enforces the configured max_rounds and
@@ -1616,6 +1602,7 @@ class CompletionProcessor:
         error_details: list[dict[str, Any]],
         run_assets: SessionRunAssets,
         issue_key: "IssueKey | None",
+        rework: ReviewExchangeRework,
     ) -> tuple[str | None, str | None, bool, bool, ProcessingResult | None]:
         """Execute all requested actions from completion record.
 
@@ -1653,7 +1640,13 @@ class CompletionProcessor:
             ),
             errors=errors,
             actions_taken=actions_taken,
-            run_review_exchange_loop=self._run_review_exchange_loop,
+            # Bound rather than threaded, in the shape
+            # ``recertify_rewritten_head`` below uses: the cache/mode/dispatch
+            # owner has no use for the caller's rework policy, so it is handed
+            # a callable that already carries it (#180).
+            run_review_exchange_loop=partial(
+                self._run_review_exchange_loop, rework=rework
+            ),
             approval_gate=self._review_exchange_approval_gate(
                 agent_label=agent_label,
                 run_assets=run_assets,
@@ -1674,6 +1667,7 @@ class CompletionProcessor:
             actions_taken=actions_taken,
             errors=errors,
             run_assets=run_assets,
+            rework=rework,
         )
         if pre_publish_failure is not None:
             return branch, pr_url, review_exchange_completed, False, pre_publish_failure
@@ -2603,6 +2597,7 @@ class CompletionProcessor:
         agent_label: str | None,
         initial_validation_record_path: Path | None = None,
         approval_gate: "ReviewExchangeApprovalGate | None" = None,
+        rework: ReviewExchangeRework = ReviewExchangeRework.IN_EXCHANGE,
     ) -> Any:
         return self._review_exchange.run_review_exchange_loop(
             exchange_run=exchange_run,
@@ -2613,6 +2608,7 @@ class CompletionProcessor:
             agent_label=agent_label,
             initial_validation_record_path=initial_validation_record_path,
             approval_gate=approval_gate,
+            rework=rework,
             events=self._trace_events,
             event_context=self._event_context,
         )

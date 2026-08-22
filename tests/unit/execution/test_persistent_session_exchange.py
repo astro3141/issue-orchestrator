@@ -26,6 +26,7 @@ import pytest
 from issue_orchestrator.domain.models import AgentConfig
 from issue_orchestrator.domain.review_artifacts import ReviewDecision
 from issue_orchestrator.domain.review_exchange import ReviewExchangeResponse
+from issue_orchestrator.domain.review_exchange_rework import ReviewExchangeRework
 from issue_orchestrator.domain.review_exchange_run import ReviewExchangeRun
 from issue_orchestrator.domain.review_exchange_summary import ReviewExchangeSummaryV1
 from issue_orchestrator.domain.review_verdict_binding import (
@@ -7534,6 +7535,8 @@ def _run_binding_exchange(
     require_validation: bool = False,
     initial_validation_record_path: Path | None = None,
     execution_identities: CandidateExecutionIdentityRecorder | None = None,
+    rework: ReviewExchangeRework = ReviewExchangeRework.IN_EXCHANGE,
+    state_out: dict[str, Any] | None = None,
 ) -> Any:
     """Run one exchange over a real coder branch and reviewer worktree.
 
@@ -7543,6 +7546,9 @@ def _run_binding_exchange(
 
     ``unobservable_head`` drops the git-backed worktrees for bare directories,
     modelling an exchange whose presented commit cannot be established at all.
+
+    ``state_out``, when given, is updated with the patched runner's journal so
+    a caller can assert on which role turns actually ran.
     """
     prompt_path = tmp_path / "p.md"
     prompt_path.write_text("Prompt", encoding="utf-8")
@@ -7555,6 +7561,8 @@ def _run_binding_exchange(
         coder_branch = repo.branch
     session_output = FileSystemSessionOutput()
     state = _patch_persistent_runner(monkeypatch, response_script=response_script)
+    if state_out is not None:
+        state_out.update(state)
     return pse.run_persistent_session_exchange(
         exchange_run=_start_exchange_run(
             session_output=session_output,
@@ -7578,6 +7586,7 @@ def _run_binding_exchange(
         max_rounds=max_rounds,
         max_no_progress=max_no_progress,
         require_validation=require_validation,
+        rework=rework,
         initial_validation_record_path=initial_validation_record_path,
         before_reviewer_round=before_reviewer_round,
         execution_identities=execution_identities or _identity_recorder(tmp_path),
@@ -7926,6 +7935,237 @@ class TestExactShaVerdictBinding:
 
         assert (outcome.status, outcome.reason) == ("ok", "reviewer_ok")
         assert load_review_verdict(outcome.run_assets.exchange_dir) is None
+
+
+class TestHandOffRework:
+    """#180: an exchange whose caller owns no coder must not run one.
+
+    The control continuation (#149) reviews one exact candidate ``A`` while
+    still holding the issue against ordinary work. Its exchange running a coder
+    round moves the branch to ``A'`` inside that hold — the ordering #149
+    settled, run backwards, and exactly what was observed in #193: an approval
+    bound to ``A'`` and no review authority for ``A`` at all.
+
+    So these are about one decision point: the reviewer has concluded changes
+    are needed, and the next thing that happens is either a coder turn or a
+    terminal. Which one is the caller's to say.
+    """
+
+    _CHANGES_REQUESTED = {
+        "response_type": "changes_requested",
+        "response_text": "See review report.",
+        "getting_closer": True,
+        "decision": {
+            "verdict": "changes_requested",
+            "risk": "medium",
+            "blocking_findings": [{"id": "F1"}],
+            "nits": [],
+            "abstraction_review": {"status": "no_issues", "findings": []},
+            "nit_policy": "surface",
+        },
+        "_authored_report_text": "# Review\n\n## F1\n\nRework this.\n",
+    }
+
+    def test_changes_requested_stops_before_any_coder_turn(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Failure direction 1, the one the whole leaf exists for.
+
+        The reviewer rejects at round 1. Under hand-off there is no coder turn
+        and no round 2: the only role turn that ever ran is the reviewer's, and
+        the exchange terminates naming what the reviewer decided.
+
+        ``max_rounds`` is deliberately generous — a bound of 1 would still let
+        round 1's coder turn run, so a test that pinned the bound would pass
+        against the very sequence this forbids.
+        """
+        journal: dict[str, Any] = {}
+
+        outcome = _run_binding_exchange(
+            tmp_path=tmp_path,
+            monkeypatch=monkeypatch,
+            response_script={
+                "reviewer": [dict(self._CHANGES_REQUESTED)],
+                # Empty on purpose: the patched runner raises if a coder turn
+                # is attempted, so an in-exchange rework cannot pass silently.
+                "coder": [],
+            },
+            max_rounds=3,
+            rework=ReviewExchangeRework.HAND_OFF,
+            state_out=journal,
+        )
+
+        assert [role for role, _ in journal["rounds_seen"]] == ["reviewer"]
+        assert (outcome.status, outcome.reason, outcome.rounds) == (
+            "stopped",
+            "reviewer_requested_changes",
+            1,
+        )
+
+    def test_the_rejection_is_bound_to_the_commit_that_was_presented(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Failure direction 2: a durable exact-``A`` changes-requested verdict.
+
+        Through the existing binding producer, so the record is the same kind
+        of authority artifact an approval leaves — bound to the commit the
+        ORCHESTRATOR checked out for the reviewer, never to current HEAD.
+        """
+        repo = _BindingRepo(tmp_path)
+        presented = repo.coder_head()
+
+        outcome = _run_binding_exchange(
+            tmp_path=tmp_path,
+            monkeypatch=monkeypatch,
+            repo=repo,
+            response_script={
+                "reviewer": [dict(self._CHANGES_REQUESTED)],
+                "coder": [],
+            },
+            max_rounds=3,
+            rework=ReviewExchangeRework.HAND_OFF,
+        )
+
+        binding = load_review_verdict(outcome.run_assets.exchange_dir)
+        assert binding is not None
+        assert binding.verdict is ReviewVerdictOutcome.CHANGES_REQUESTED
+        assert binding.reviewed_sha == presented
+        assert binding.reviewed_sha == repo.reviewer_head()
+        assert binding.approves(presented) is False
+
+    def test_an_approval_still_completes_at_the_presented_commit(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Failure direction 6: the approval path is untouched.
+
+        Hand-off says what happens when changes are requested and nothing else.
+        A reviewer that approves still reaches the ordinary ``ok`` terminal at
+        exactly the commit it was shown, which is what the continuation's
+        pull request is created from.
+        """
+        repo = _BindingRepo(tmp_path)
+        presented = repo.coder_head()
+
+        outcome = _run_binding_exchange(
+            tmp_path=tmp_path,
+            monkeypatch=monkeypatch,
+            repo=repo,
+            response_script={
+                "reviewer": [
+                    {
+                        "response_type": "ok",
+                        "response_text": "Looks good",
+                        "getting_closer": True,
+                    }
+                ],
+                "coder": [],
+            },
+            max_rounds=3,
+            rework=ReviewExchangeRework.HAND_OFF,
+        )
+
+        assert (outcome.status, outcome.reason, outcome.rounds) == (
+            "ok",
+            "reviewer_ok",
+            1,
+        )
+        binding = load_review_verdict(outcome.run_assets.exchange_dir)
+        assert binding is not None
+        assert binding.verdict is ReviewVerdictOutcome.APPROVED
+        assert binding.approves(presented) is True
+
+    def test_an_in_exchange_caller_still_reworks_and_reaches_round_two(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Failure direction 7: ordinary review/rework behaviour is unchanged.
+
+        The same round-1 rejection, from a caller that owns its coder, still
+        runs the coder turn and still lets round 2 approve — and the verdict
+        that binds is round 2's, about the commit round 2 was shown.
+        """
+        journal: dict[str, Any] = {}
+
+        outcome = _run_binding_exchange(
+            tmp_path=tmp_path,
+            monkeypatch=monkeypatch,
+            response_script={
+                "reviewer": [
+                    dict(self._CHANGES_REQUESTED),
+                    {
+                        "response_type": "ok",
+                        "response_text": "All good",
+                        "getting_closer": True,
+                    },
+                ],
+                "coder": [
+                    {
+                        "response_type": "ok",
+                        "response_text": "Reworked",
+                        "getting_closer": None,
+                    }
+                ],
+            },
+            max_rounds=3,
+            rework=ReviewExchangeRework.IN_EXCHANGE,
+            state_out=journal,
+        )
+
+        assert [role for role, _ in journal["rounds_seen"]] == [
+            "reviewer",
+            "coder",
+            "reviewer",
+        ]
+        assert (outcome.status, outcome.reason, outcome.rounds) == (
+            "ok",
+            "reviewer_ok",
+            2,
+        )
+
+    def test_in_exchange_is_what_a_caller_that_says_nothing_gets(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The default is the ordinary policy, so no existing caller changes.
+
+        Same script as above with the parameter omitted entirely: the coder
+        turn runs, which is the observable difference between the two policies.
+        """
+        journal: dict[str, Any] = {}
+
+        _run_binding_exchange(
+            tmp_path=tmp_path,
+            monkeypatch=monkeypatch,
+            response_script={
+                "reviewer": [
+                    dict(self._CHANGES_REQUESTED),
+                    {
+                        "response_type": "ok",
+                        "response_text": "All good",
+                        "getting_closer": True,
+                    },
+                ],
+                "coder": [
+                    {
+                        "response_type": "ok",
+                        "response_text": "Reworked",
+                        "getting_closer": None,
+                    }
+                ],
+            },
+            max_rounds=3,
+            state_out=journal,
+        )
+
+        assert "coder" in [role for role, _ in journal["rounds_seen"]]
 
 
 class TestCandidateExecutionIdentityBinding:

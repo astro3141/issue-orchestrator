@@ -26,6 +26,7 @@ from issue_orchestrator.domain.models import (
     AgentConfig,
 )
 from issue_orchestrator.domain.review_exchange import ReviewExchangeOutcome
+from issue_orchestrator.domain.review_exchange_rework import ReviewExchangeRework
 from issue_orchestrator.domain.review_exchange_run import (
     ReviewExchangeRun,
     ReviewExchangeRunAssets,
@@ -2808,7 +2809,15 @@ class TestTechLeadCompletionEffects:
             comment_body="## Implementation\n\nAudited 3 PRs.",
         )
 
-    def _process(self, processor, worktree, *, agent_label: str, run_assets=None):
+    def _process(
+        self,
+        processor,
+        worktree,
+        *,
+        agent_label: str,
+        run_assets=None,
+        **policy,
+    ):
         return processor.process(
             worktree,
             run_assets=run_assets or make_session_run_assets(worktree),
@@ -2816,6 +2825,7 @@ class TestTechLeadCompletionEffects:
             issue_title="Batch Review",
             agent_label=agent_label,
             issue_key=None,
+            **policy,
         )
 
     def _armed_run_assets(self, authority_store, worktree):
@@ -3054,6 +3064,77 @@ class TestTechLeadCompletionEffects:
         assert result.success is True
         assert len(review_runner.calls) == 1
         assert review_runner.calls[0]["approval_gate"] is None
+
+    def test_a_hand_off_completion_tells_the_exchange_it_owns_no_coder(
+        self,
+        tmp_path,
+        mock_label_adapter,
+        mock_pr_adapter,
+        mock_git_adapter,
+        event_bus,
+        worktree_with_completion,
+    ):
+        """#180: the caller's rework policy reaches the exchange it runs.
+
+        The control continuation is the caller that says this, and it says it
+        per completion — so what has to hold here is that the completion owner
+        carries the answer all the way to the review-exchange port rather than
+        deriving one of its own from config or from the agent label.
+        """
+        review_runner = _CapturingReviewExchangeRunner()
+        processor = self._make_processor(
+            tmp_path,
+            mock_label_adapter,
+            mock_pr_adapter,
+            mock_git_adapter,
+            event_bus,
+            review_exchange_runner=review_runner,
+        )
+        worktree = worktree_with_completion(self._completed_record())
+
+        result = self._process(
+            processor,
+            worktree,
+            agent_label="agent:coder",
+            rework=ReviewExchangeRework.HAND_OFF,
+        )
+
+        assert result.success is True
+        assert len(review_runner.calls) == 1
+        assert review_runner.calls[0]["rework"] is ReviewExchangeRework.HAND_OFF
+
+    def test_an_ordinary_completion_leaves_the_exchange_reworking_in_place(
+        self,
+        tmp_path,
+        mock_label_adapter,
+        mock_pr_adapter,
+        mock_git_adapter,
+        event_bus,
+        worktree_with_completion,
+    ):
+        """Every caller with a live session behind it owns its coder.
+
+        Stated as a default rather than asked of each caller, because the
+        record on disk was written by an agent still standing in the worktree
+        the exchange would rework — and a caller that forgot to answer must get
+        the behaviour that has always been there, not the handoff.
+        """
+        review_runner = _CapturingReviewExchangeRunner()
+        processor = self._make_processor(
+            tmp_path,
+            mock_label_adapter,
+            mock_pr_adapter,
+            mock_git_adapter,
+            event_bus,
+            review_exchange_runner=review_runner,
+        )
+        worktree = worktree_with_completion(self._completed_record())
+
+        result = self._process(processor, worktree, agent_label="agent:coder")
+
+        assert result.success is True
+        assert len(review_runner.calls) == 1
+        assert review_runner.calls[0]["rework"] is ReviewExchangeRework.IN_EXCHANGE
 
     def test_completed_tech_lead_session_without_pair_records_critical_error(
         self,
@@ -5425,9 +5506,67 @@ class TestCompletionProcessorPublishGate:
             agent_label="agent:coder",
             record=record,
             run_assets=make_session_run_assets(tmp_path),
+            rework=ReviewExchangeRework.IN_EXCHANGE,
         )
 
         assert result is None
+
+    def test_reroute_does_not_hand_a_coderless_caller_a_coder(
+        self,
+        tmp_path,
+        mock_label_adapter,
+        mock_pr_adapter,
+        mock_git_adapter,
+        mock_publish_gate,
+    ):
+        """#180: the reroute is the completion's second door to a coder round.
+
+        A post-review validation failure is normally handed straight back to
+        the exchange's coder. A caller that owns none does not acquire one that
+        way, so the policy it stated for the completion has to reach the
+        exchange this path spawns as well as the first one.
+        """
+        config = Config()
+        processor = CompletionProcessor(
+            agent_callback_endpoint=ready_callback_endpoint(),
+            label_adapter=mock_label_adapter,
+            pr_adapter=mock_pr_adapter,
+            git_adapter=mock_git_adapter,
+            publication_gate=mock_publish_gate,
+            session_output=FileSystemSessionOutput(),
+            config=config,
+        )
+        worktree = tmp_path / "worktree"
+        worktree.mkdir()
+        run = processor.session_output.start_run(worktree, "issue-1", issue_number=1)
+        (run.run_dir / "validation-record.json").write_text(
+            json.dumps({"passed": False, "head_sha": "deadbeef" * 5})
+        )
+        record = make_record(
+            outcome=CompletionOutcome.COMPLETED,
+            requested_actions=[RequestedAction.PUSH_BRANCH, RequestedAction.CREATE_PR],
+        )
+        loop = MagicMock(return_value=None)
+        processor._run_review_exchange_loop = loop  # noqa: SLF001
+
+        def _spawn(**kwargs):
+            kwargs["run_review_exchange_loop"]()
+            return ("via-local-loop", None, False, True)
+
+        processor._review_exchange.run_review_exchange_if_needed = _spawn  # noqa: SLF001
+
+        processor._reroute_pre_publish_validation_failure_if_possible(  # noqa: SLF001
+            worktree=worktree,
+            issue_number=1,
+            issue_title="Test",
+            session_name=run.session_name,
+            agent_label="agent:coder",
+            record=record,
+            run_assets=run,
+            rework=ReviewExchangeRework.HAND_OFF,
+        )
+
+        loop.assert_called_once_with(rework=ReviewExchangeRework.HAND_OFF)
 
     def test_validation_reroute_budget_halts_after_max_attempts_on_same_sha(
         self,
@@ -5490,6 +5629,7 @@ class TestCompletionProcessorPublishGate:
                 agent_label="agent:coder",
                 record=record,
                 run_assets=run,
+                rework=ReviewExchangeRework.IN_EXCHANGE,
             )
             assert result is not None
             assert result.success is True
@@ -5504,6 +5644,7 @@ class TestCompletionProcessorPublishGate:
             agent_label="agent:coder",
             record=record,
             run_assets=run,
+            rework=ReviewExchangeRework.IN_EXCHANGE,
         )
         assert result is not None
         assert result.success is False
@@ -5577,6 +5718,7 @@ class TestCompletionProcessorPublishGate:
                 agent_label="agent:coder",
                 record=record,
                 run_assets=run,
+                rework=ReviewExchangeRework.IN_EXCHANGE,
             )
             assert result is not None
             assert result.success is True
@@ -5627,6 +5769,7 @@ class TestCompletionProcessorPublishGate:
                 agent_label="agent:coder",
                 record=record,
                 run_assets=run,
+                rework=ReviewExchangeRework.IN_EXCHANGE,
             )
             assert result is not None and result.success is True
 
@@ -5641,6 +5784,7 @@ class TestCompletionProcessorPublishGate:
                 agent_label="agent:coder",
                 record=record,
                 run_assets=run,
+                rework=ReviewExchangeRework.IN_EXCHANGE,
             )
             assert result is not None and result.success is True
 
@@ -5653,6 +5797,7 @@ class TestCompletionProcessorPublishGate:
             agent_label="agent:coder",
             record=record,
             run_assets=run,
+            rework=ReviewExchangeRework.IN_EXCHANGE,
         )
         assert result is not None
         assert result.success is False

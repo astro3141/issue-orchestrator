@@ -74,6 +74,7 @@ from issue_orchestrator.domain.models import (
     OrchestratorState,
     RequestedAction,
 )
+from issue_orchestrator.domain.review_exchange_rework import ReviewExchangeRework
 from issue_orchestrator.domain.review_verdict_binding import (
     BoundReviewVerdict,
     ReviewVerdictOutcome,
@@ -978,6 +979,61 @@ class TestRecordedIntentIsReplayedNotInvented:
         )
 
         assert harness.completion.calls[0]["issue_key"] == _issue().key
+
+
+class TestTheExchangeMayNotReworkTheCandidate:
+    """#180: the continuation hands its rejection back, it does not rework it.
+
+    The producer half of the boundary. What the exchange DOES with the answer
+    is pinned where the round loop is
+    (``tests/unit/execution/test_persistent_session_exchange.py``); what is
+    under test here is that this route states it at all, and that it is the one
+    route that does.
+    """
+
+    def test_the_continuation_tells_the_pipeline_it_owns_no_coder(
+        self, harness: Harness
+    ) -> None:
+        """A coder round here would move the branch to ``A'`` mid-hold.
+
+        The candidate's session is gone and the control operation still
+        excludes ordinary work from the issue, so the exchange has no coder to
+        spend — the rejection has to become durable evidence about exactly
+        ``A`` and go back through #149's ordering instead.
+        """
+        harness.runner.advance(
+            _owned(
+                _operation(
+                    _attempt(RequestedAction.CREATE_PR),
+                    ContinuationPhase.PASS_PENDING_REVIEW,
+                )
+            )
+        )
+
+        assert harness.completion.calls[0]["rework"] is ReviewExchangeRework.HAND_OFF
+
+    def test_a_resumed_pass_says_the_same_thing(self, harness: Harness) -> None:
+        """The policy belongs to the route, not to the pass that first ran it.
+
+        A deferred exchange re-enters the pipeline on later passes, and one of
+        them silently reverting to in-exchange rework would reinstate exactly
+        the coder round the first pass refused.
+        """
+        operation = _operation(
+            _attempt(RequestedAction.CREATE_PR),
+            ContinuationPhase.PASS_PENDING_REVIEW,
+        )
+        harness.completion.outcome = ProcessingOutcome(
+            success=True, message="deferred", review_exchange_deferred=True
+        )
+
+        harness.runner.advance(_owned(operation))
+        harness.runner.advance(_owned(operation))
+
+        assert [call["rework"] for call in harness.completion.calls] == [
+            ReviewExchangeRework.HAND_OFF,
+            ReviewExchangeRework.HAND_OFF,
+        ]
 
 
 class TestDurableReviewVerdict:

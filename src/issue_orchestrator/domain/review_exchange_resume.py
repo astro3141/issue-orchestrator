@@ -61,8 +61,8 @@ class ResumeDecision(Enum):
     REUSE_HALT = "reuse_halt"
     """Cached deterministic terminal outcome the caller should not
     retry. Today: ``status=stopped`` (max_rounds_exceeded,
-    reviewer_reports_no_progress) and ``status=error
-    reason=coder_protocol_error``.
+    reviewer_reports_no_progress, reviewer_requested_changes) and
+    ``status=error reason=coder_protocol_error``.
 
     The exchange tried hard and gave up for a reason that won't
     spontaneously change on the same head. The caller surfaces a
@@ -190,6 +190,12 @@ STATUS_REVIEWER_ERROR = ReviewExchangeStatus.ERROR
 REASON_REVIEWER_OK = ReviewExchangeReason.REVIEWER_OK
 """Status=ok terminal: the reviewer approved."""
 
+REASON_REVIEWER_REQUESTED_CHANGES = ReviewExchangeReason.REVIEWER_REQUESTED_CHANGES
+"""Status=stopped terminal: the reviewer asked for changes and the exchange
+had no coder of its own to hand them to (#180). Deterministic on the same
+head — the commit that was reviewed is exactly the commit that was rejected —
+so it reuses as a halt rather than spawning a second exchange over it."""
+
 REASON_REVIEWER_REPORTS_NO_PROGRESS = ReviewExchangeReason.REVIEWER_REPORTS_NO_PROGRESS
 """Status=stopped terminal: max_no_progress threshold reached."""
 
@@ -220,6 +226,7 @@ _NO_COMPLETION_REASONS: frozenset[ReviewExchangeReason] = frozenset(
 
 _TERMINAL_HALT_REASONS: frozenset[ReviewExchangeReason] = frozenset(
     {
+        REASON_REVIEWER_REQUESTED_CHANGES,
         REASON_REVIEWER_REPORTS_NO_PROGRESS,
         REASON_MAX_ROUNDS_EXCEEDED,
         REASON_CODER_PROTOCOL_ERROR,
@@ -313,6 +320,7 @@ _KNOWN_STATUS_REASON_PAIRS: frozenset[
 ] = frozenset(
     {
         (STATUS_REVIEWER_OK, REASON_REVIEWER_OK),
+        (STATUS_REVIEWER_STOPPED, REASON_REVIEWER_REQUESTED_CHANGES),
         (STATUS_REVIEWER_STOPPED, REASON_REVIEWER_REPORTS_NO_PROGRESS),
         (STATUS_REVIEWER_STOPPED, REASON_MAX_ROUNDS_EXCEEDED),
         (STATUS_REVIEWER_ERROR, REASON_REVIEWER_NO_COMPLETION),

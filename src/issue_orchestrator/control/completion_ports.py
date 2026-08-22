@@ -1,9 +1,17 @@
-"""Adapter protocols used by completion processing."""
+"""Adapter protocols used by completion processing, and their refusals.
+
+The null objects at the end are the defaults for the two ports a completion
+processor may be constructed without. They live beside the protocols they
+stand in for, and they refuse rather than no-op: a deployment that forgot to
+wire one should say so at the first call, not quietly process a completion
+whose evidence nothing read.
+"""
 
 from pathlib import Path
-from typing import Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 from ..ports.pull_request_tracker import PRInfo
+from ..ports.review_artifact_reader import ReviewArtifactReadCommand
 from ..ports.working_copy import (
     BranchPathsResult,
     BranchTextFilesResult,
@@ -62,3 +70,37 @@ class GitAdapter(Protocol):
         self, worktree: Path, base_ref: str
     ) -> BranchPathsResult: ...
     def default_branch(self, repo_root: Path, remote: str = "origin") -> str: ...
+
+
+class MissingReviewArtifactReader:
+    """Fail-fast default for an unwired review-artifact reader."""
+
+    def read_review_artifact(self, command: ReviewArtifactReadCommand) -> Any:
+        raise RuntimeError(
+            "CompletionProcessor requires review_artifact_reader to read "
+            f"review artifacts for issue #{command.issue_number}"
+        )
+
+
+class MissingTechLeadAuthorityStore:
+    """Fail-fast default: tech_lead completions require the wired port.
+
+    Production always injects the SQLite-backed store from bootstrap; a test
+    that exercises a tech_lead completion without wiring the port surfaces the
+    misconfiguration immediately instead of silently fail-safing.
+    """
+
+    def _fail(self) -> Any:
+        raise RuntimeError(
+            "CompletionProcessor requires tech_lead_authority to process a "
+            "tech_lead session completion (wired in entrypoints/bootstrap.py)"
+        )
+
+    def record(self, *, run_id: str, session_name: str, authority: Any) -> None:
+        self._fail()
+
+    def load(self, *, run_id: str, session_name: str) -> Any:
+        self._fail()
+
+    def discard(self, *, run_id: str, session_name: str) -> None:
+        self._fail()

@@ -14,7 +14,7 @@ ownership and exclusion                 :class:`~.control_operation_ownership.Co
 
 What is left here is the decision of *which* owned operation to advance now,
 and the re-entry of a run that already exists into the completion pipeline.
-Six rules keep that from becoming a second lifecycle.
+Seven rules keep that from becoming a second lifecycle.
 
 **It never decides admission.** A ``RETRY_PENDING`` operation is handed whole
 to #139, which re-checks the contract, the allowance and the reserve-before-
@@ -31,6 +31,16 @@ The one field the descriptor cannot supply — ``validation_record_path``, which
 the ordinary path's coder turn fills in — is not invented either: it names a
 record the configured quick gate has just written into this run's own
 directory, and a run whose gate produced no such record never opens (#173).
+
+**It never reworks the candidate it is reviewing.** The exchange it re-enters
+is reviewer-first and owns a coder, and on the ordinary path a
+changes-requested round hands the feedback straight to that coder. Here that
+round would move the branch to ``A'`` while the operation still held the issue
+for exactly ``A`` — the ordering #149 settled, run backwards, and the shape
+#193 was observed in. So this route tells the exchange it may not rework in
+place (#180): a changes-requested round terminates it with a durable
+``CHANGES_REQUESTED(A)``, which is the transfer fact ``EXIT_TO_REWORK`` reads,
+and ordinary rework produces ``A'`` after the release rather than before it.
 
 **It never races ordinary work.** Ownership already excludes the issue from the
 queue, but an issue whose session is still running was never the continuation's
@@ -84,6 +94,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Protocol
 
 from ..domain.continuation_phase import ContinuationPhase
+from ..domain.review_exchange_rework import ReviewExchangeRework
 from .continuation_live_truth import LiveContinuation
 from .continuation_run_open import ContinuationRunOpener
 from .continuation_runs import ContinuationRun
@@ -142,6 +153,7 @@ class ContinuationCompletionOwner(Protocol):
         completion_path: str | None = ...,
         agent_label: str | None = ...,
         issue_key: "IssueKey | None",
+        rework: ReviewExchangeRework = ...,
     ) -> "ProcessingResult": ...
 
 
@@ -398,6 +410,23 @@ class ControlContinuationRunner:
     def _process(self, operation: LiveContinuation, run: ContinuationRun) -> bool:
         """Re-enter the completion pipeline for ``run``, and say whether it ended.
 
+        The one thing this route says about the exchange itself is that it may
+        not rework in place (#180). Everything else about the exchange — its
+        rounds, its reviewer pairing, its gate — is the completion owner's, and
+        the continuation second-guesses none of it. But the coder that exchange
+        would rework with is not the continuation's to spend: this candidate's
+        session is gone, the operation still holds the issue against ordinary
+        work, and a coder round here would move the branch to ``A'`` while
+        exactly ``A`` was still the thing under review. So a changes-requested
+        round terminates the exchange with a durable ``CHANGES_REQUESTED(A)``,
+        which :meth:`_record_review_verdict` is meant to promote onto the
+        attempt so the phase derives ``EXIT_TO_REWORK`` — #149's ordering, in
+        which ownership is released BEFORE ordinary rework is evaluated, and
+        only ordinary rework ever produces ``A'``.
+
+        That promotion does not reach the attempt today, and this route is not
+        where the break is: see :meth:`_record_review_verdict`.
+
         Returns:
             Whether the pipeline reached a TERMINAL result. ``False`` means the
             review exchange is running in the background, or a post-review
@@ -413,6 +442,7 @@ class ControlContinuationRunner:
             completion_path=run.completion_path,
             agent_label=run.agent_label,
             issue_key=operation.issue.key,
+            rework=ReviewExchangeRework.HAND_OFF,
         )
         logger.info(
             "[CONTINUATION] %s completion processing success=%s: %s",
@@ -452,6 +482,17 @@ class ControlContinuationRunner:
 
         A verdict bound to another commit is dropped rather than filed: the
         attempt would refuse it anyway, and refusing here says why.
+
+        **Known break:** ``run_dir`` is this continuation's own SESSION run
+        directory, and the binding is not in it. The review exchange allocates
+        a run of its own — a sibling under the same worktree's ``sessions/`` —
+        and writes ``review-verdict.json`` into that run's exchange directory.
+        So the lookup below has always returned ``None``, for approvals as well
+        as rejections, and ``EXIT_TO_REWORK`` has never been reachable in
+        production. Fixing it means carrying the exchange run's identity out of
+        the completion pipeline, which is its own change; #180 deliberately did
+        not fold it in, and left this note rather than a docstring that
+        describes a promotion that does not happen.
         """
         binding = self._review_verdicts.for_run(run_dir)
         if binding is None:

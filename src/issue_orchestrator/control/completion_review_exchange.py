@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any, Literal
 from ..domain.models import CompletionRecord, RequestedAction
 from ..domain.completion_finalization import ReviewExchangeRunningQuery
 from ..domain.issue_key import github_issue_key
+from ..domain.review_exchange_rework import ReviewExchangeRework
 from ..domain.review_exchange_run import ReviewExchangeRun, ReviewExchangeRunAssets
 from ..domain.review_exchange_resume import ResumeDecision
 from ..domain.review_artifacts import review_artifacts_from_exchange_result
@@ -1297,6 +1298,7 @@ class CompletionReviewExchange:
         agent_label: str | None,
         initial_validation_record_path: Path | None = None,
         approval_gate: "ReviewExchangeApprovalGate | None" = None,
+        rework: ReviewExchangeRework = ReviewExchangeRework.IN_EXCHANGE,
         events: Any | None = None,
         event_context: Any | None = None,
     ) -> Any:
@@ -1350,6 +1352,10 @@ class CompletionReviewExchange:
             max_rounds=self._config.review_exchange_max_rounds,
             max_no_progress=self._config.review_exchange_max_no_progress,
             require_validation=self._config.review_exchange_require_validation,
+            # Not read off config: it is a property of the CALLER, not of the
+            # deployment. The completion owner that has no coder to rework with
+            # says so per exchange (#180); every other caller reworks in place.
+            rework=rework,
             nit_policy=nit_policy,
             initial_validation_record_path=initial_validation_record_path,
             approval_gate=approval_gate,
