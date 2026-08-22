@@ -96,10 +96,16 @@ jobs:
           uv sync --frozen --all-extras
           make semgrep-venv
 
+      # `make test-integration-agent` was here too. It became
+      # `make test-live-assurance` in #194, a lane that files a
+      # PASS/SECURITY_FAIL/INCONCLUSIVE record against an exact artifact rather
+      # than passing or failing a candidate — its INCONCLUSIVE result must not
+      # decide whether a PR is green. CI has never had the authenticated
+      # provider CLIs to run it meaningfully anyway (ADR-0032); it is run
+      # deliberately, against a build being promoted.
       - name: Run agent-backed validate
         run: |
           make test-simulated-agent
-          make test-integration-agent
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 

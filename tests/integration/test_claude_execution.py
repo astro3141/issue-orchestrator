@@ -11,6 +11,12 @@ from collections.abc import Mapping
 pytestmark = [
     pytest.mark.integration,
     pytest.mark.live,
+    # Spawns a real Claude CLI, so what it observes depends on an external
+    # model's choices. `live_agent` is the one semantic that keeps such a test
+    # out of blocking candidate validation and inside the assurance lane
+    # (#194); before it, a three-filename Makefile list decided that instead,
+    # and a marked file could still gate publication.
+    pytest.mark.live_agent,
     # Run PTY tests sequentially in one worker to avoid Python 3.14 forkpty warning
     # (forkpty() in multi-threaded processes can deadlock)
     pytest.mark.xdist_group("pty"),
@@ -298,72 +304,13 @@ class TestClaudeWithEnvironmentIsolation:
         ), f"Expected auth failure with isolated HOME, but got: {combined_output}"
 
 
-class TestShellEscaping:
-    """Test POSIX single-quote escaping used by terminal adapters.
-
-    The escaping pattern replace("'", "'\\''") is POSIX standard and works
-    identically in bash and zsh. Production uses 'zsh -l -c' for login shell
-    PATH setup, but the escaping itself is shell-agnostic.
-    """
-
-    def test_single_quote_escaping(self):
-        """Verify the POSIX single-quote escaping pattern works.
-
-        This tests the escaping used by terminal adapters: replace("'", "'\\''")
-        The pattern: end quote, escaped literal quote, start quote.
-        """
-        # This is the pattern: replace ' with '\''
-        original = "echo 'hello world'"
-        escaped = original.replace("'", "'\\''")
-        wrapped = f"bash -c '{escaped}'"
-
-        result = subprocess.run(
-            ["bash", "-c", wrapped],
-            capture_output=True,
-            text=True,
-            timeout=xdist_timeout(5),
-        )
-
-        assert result.returncode == 0, f"Command failed: {result.stderr}"
-        assert "hello world" in result.stdout
-
-    def test_complex_quoting_pattern(self):
-        """Test the quoting pattern with multiple quoted arguments."""
-        command = "echo --flag 'value with spaces' 'another value'"
-        escaped = command.replace("'", "'\\''")
-        wrapped = f"bash -c 'cd /tmp && {escaped}'"
-
-        result = subprocess.run(
-            ["bash", "-c", wrapped],
-            capture_output=True,
-            text=True,
-            timeout=xdist_timeout(5),
-        )
-
-        assert result.returncode == 0
-        assert "value with spaces" in result.stdout
-        assert "another value" in result.stdout
-
-    def test_nested_quotes_in_prompt(self):
-        """Test quoting when the prompt itself contains quotes."""
-        # Prompts may contain quotes like: "Fix the 'broken' feature"
-        prompt = "This has 'single' and \"double\" quotes"
-        # For shell safety, we escape single quotes
-        escaped_prompt = prompt.replace("'", "'\\''")
-        command = f"echo '{escaped_prompt}'"
-        escaped = command.replace("'", "'\\''")
-        wrapped = f"bash -c '{escaped}'"
-
-        result = subprocess.run(
-            ["bash", "-c", wrapped],
-            capture_output=True,
-            text=True,
-            timeout=xdist_timeout(5),
-        )
-
-        assert result.returncode == 0
-        # The output should contain the original text (with quotes resolved)
-        assert "single" in result.stdout or "double" in result.stdout
+# The POSIX single-quote escaping cases that used to sit here — and the
+# `agent-done` cases below — spawn no provider and depend on no model, so
+# `pytest.mark.live_agent` in this file's `pytestmark` was taking them out of
+# every blocking gate along with the live probes. They now live in
+# `tests/integration/test_agent_invocation_surface.py`, which carries no such
+# marker. `tests/live_agent_reach.py` is what keeps the next one from drifting
+# back in.
 
 
 @pytest.mark.skipif(not is_claude_available(), reason="Claude CLI not installed")
@@ -655,174 +602,6 @@ class TestAgentDoneInvocation:
         completion_data = json.loads(completion_path.read_text())
         assert completion_data.get("outcome") == "completed", (
             f"Unexpected outcome: {completion_data}"
-        )
-
-    def test_agent_done_wrapper_resolves_correctly(self):
-        """Verify the agent-done wrapper script finds the real completion command.
-
-        This tests the wrapper at scripts/agent-done can locate
-        and execute the venv-installed coding-done/reviewer-done.
-        """
-        import os
-        from pathlib import Path
-
-        repo_root = Path(__file__).parent.parent.parent
-        wrapper = repo_root / "src" / "issue_orchestrator" / "scripts" / "agent-done"
-        venv_agent_done = repo_root / ".venv" / "bin" / "agent-done"
-
-        # Wrapper should exist and be executable
-        assert wrapper.exists(), f"Wrapper not found at {wrapper}"
-        assert os.access(wrapper, os.X_OK), f"Wrapper not executable: {wrapper}"
-
-        # Venv completion commands should exist (if venv is set up)
-        if venv_agent_done.exists():
-            # Run wrapper with --help to verify it forwards correctly
-            env = dict(os.environ)
-            env["PATH"] = f"{wrapper.parent}:{env.get('PATH', '')}"
-
-            result = subprocess.run(
-                ["agent-done", "--help"],
-                capture_output=True,
-                text=True,
-                timeout=xdist_timeout(10),
-                env=env,
-            )
-
-            assert result.returncode == 0, f"agent-done --help failed: {result.stderr}"
-            assert "completed" in result.stdout.lower(), (
-                f"Unexpected help output: {result.stdout}"
-            )
-
-    def test_completion_json_written_to_worktree_not_main_repo(self, tmp_path):
-        """CRITICAL: Verify completion.json is written to worktree, not main repo.
-
-        This is the exact bug that caused sessions to silently fail:
-        - Claude ran in the main repo instead of the worktree
-        - completion.json was written to main repo's .issue-orchestrator/
-        - Orchestrator never detected completion (looking in worktree)
-        - Reviews never ran, PRs never created
-
-        The fix is that _setup_and_run must cd to working_dir FIRST.
-        This test verifies that behavior end-to-end.
-
-        KEY: coding-done uses Path.cwd() to determine where to write.
-        Without cd to worktree, cwd is main repo, so completion goes there.
-        With cd to worktree, cwd is worktree, so completion goes there.
-        """
-        import json
-
-        # Simulate the bug scenario: main repo vs worktree
-        main_repo = tmp_path / "main-repo"
-        main_repo.mkdir()
-        (main_repo / ".git").touch()  # Mark as git root
-        (main_repo / ".issue-orchestrator").mkdir()
-
-        worktree = tmp_path / "worktree-issue-123"
-        worktree.mkdir()
-        (worktree / ".git").touch()  # Worktrees have .git file
-        worktree_io_dir = worktree / ".issue-orchestrator"
-        worktree_io_dir.mkdir()
-
-        # Get scripts directory
-        from pathlib import Path
-        repo_root = Path(__file__).parent.parent.parent
-        scripts_dir = repo_root / "src" / "issue_orchestrator" / "scripts"
-
-        # Build environment like orchestrator does
-        # NOTE: We do NOT set ISSUE_ORCHESTRATOR_COMPLETION_PATH - coding-done uses cwd!
-        import os
-        env = dict(os.environ)
-        env["PATH"] = f"{scripts_dir}:{env.get('PATH', '')}"
-        # Clear any existing path to test cwd behavior
-        env.pop(f"{ENV_PREFIX}COMPLETION_PATH", None)
-
-        # The key test: we cd to worktree, then run the completion command
-        # This simulates what _setup_and_run does with the cd fix
-        cmd = f'cd "{worktree}" && agent-done completed --implementation "test" --problems "none"'
-
-        result = subprocess.run(
-            ["bash", "-c", cmd],
-            capture_output=True,
-            text=True,
-            timeout=xdist_timeout(10),
-            env=env,
-            # Start in main_repo to simulate the bug scenario
-            cwd=str(main_repo),
-        )
-
-        # Log for debugging
-        print(f"stdout: {result.stdout}")
-        print(f"stderr: {result.stderr}")
-        print(f"return code: {result.returncode}")
-
-        # Check completion.json is in WORKTREE (not main repo)
-        worktree_completion = worktree_io_dir / "completion.json"
-        main_completion = main_repo / ".issue-orchestrator" / "completion.json"
-
-        assert worktree_completion.exists(), (
-            f"completion.json NOT in worktree! "
-            f"Worktree dir: {list(worktree_io_dir.iterdir())}, "
-            f"Main repo dir: {list((main_repo / '.issue-orchestrator').iterdir())}"
-        )
-        assert not main_completion.exists(), (
-            f"completion.json incorrectly written to main repo instead of worktree!"
-        )
-
-        # Verify content
-        completion = json.loads(worktree_completion.read_text())
-        assert completion["outcome"] == "completed"
-
-    def test_completion_json_written_to_wrong_place_without_cd(self, tmp_path):
-        """Verify the BUG: without cd, completion.json goes to wrong place.
-
-        This documents the bug behavior to ensure we don't regress.
-        Without the `cd` fix, coding-done would use cwd (main repo).
-        """
-        import json
-
-        # Same setup as above
-        main_repo = tmp_path / "main-repo"
-        main_repo.mkdir()
-        (main_repo / ".git").touch()
-        (main_repo / ".issue-orchestrator").mkdir()
-
-        worktree = tmp_path / "worktree-issue-123"
-        worktree.mkdir()
-        (worktree / ".git").touch()
-        (worktree / ".issue-orchestrator").mkdir()
-
-        from pathlib import Path
-        repo_root = Path(__file__).parent.parent.parent
-        scripts_dir = repo_root / "src" / "issue_orchestrator" / "scripts"
-
-        import os
-        env = dict(os.environ)
-        env["PATH"] = f"{scripts_dir}:{env.get('PATH', '')}"
-        env.pop(f"{ENV_PREFIX}COMPLETION_PATH", None)
-
-        # NO cd - simulates the bug
-        cmd = 'agent-done completed --implementation "test" --problems "none"'
-
-        result = subprocess.run(
-            ["bash", "-c", cmd],
-            capture_output=True,
-            text=True,
-            timeout=xdist_timeout(10),
-            env=env,
-            # cwd is main_repo - this is where the completion command will write
-            cwd=str(main_repo),
-        )
-
-        # Without cd, completion goes to main_repo (the bug!)
-        main_completion = main_repo / ".issue-orchestrator" / "completion.json"
-        worktree_completion = worktree / ".issue-orchestrator" / "completion.json"
-
-        # Document the bug: without cd, it goes to wrong place
-        assert main_completion.exists(), (
-            "BUG TEST: Expected completion.json in main_repo when no cd"
-        )
-        assert not worktree_completion.exists(), (
-            "BUG TEST: Should NOT be in worktree when no cd"
         )
 
 

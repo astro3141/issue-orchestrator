@@ -181,14 +181,25 @@ validation:
     # The upstream project's own gate, reproduced rather than invented:
     # main.yaml sets publish to `make validate-pr-raw`, which already runs
     # typecheck, lint-arch, lint-complexity, test-unit, test-simulated-core,
-    # test-integration-core-local, test-simulated-agent, test-integration-agent
-    # and test-vscode. Adding typecheck or lint-arch here would duplicate them.
+    # test-integration-core-local, test-simulated-agent and test-vscode. Adding
+    # typecheck or lint-arch here would duplicate them.
     #
     # tests/e2e is intentionally absent: it is a separate live contract needing
     # gh auth and E2E_TEST_REPO, and with that variable unset the fixtures fall
     # back to the current git repo (tests/e2e/fixtures/github_utils.py:140) and
     # write issues into this fork. Upstream CI does not run it either. Run live
     # E2E separately against a throwaway E2E_TEST_REPO.
+    #
+    # LIVE-AGENT SEGREGATION IS NOW IN THE SELECTOR, NOT IN AN OVERRIDE (#194).
+    # Between the Human-A decision and this landing, the engine pinned a
+    # temporary `PYTEST='... --deselect <nodeid> --deselect <nodeid>'` override
+    # here, from the primary checkout, so a migration candidate could not define
+    # and then pass its own gate. That bootstrap is spent: `validate-pr-raw` no
+    # longer reaches a single live-agent test. Blocking targets deselect the
+    # `live_agent` MARKER, the way they already deselected `live_codex`, and
+    # `test-live-assurance` — which is in no blocking phase — owns those tests.
+    # Removing the override changes nothing about what runs; it stops two places
+    # stating the same rule.
     cmd: "make validate-pr-raw"
     timeout_seconds: 5400
 

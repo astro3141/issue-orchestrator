@@ -19,6 +19,10 @@ import pytest
 pytestmark = [
     pytest.mark.integration,
     pytest.mark.live,
+    # Spawns a real Codex CLI — live-agent by the same rule as the Claude
+    # execution suite (#194); the marker, not a filename list, is what keeps it
+    # out of blocking candidate validation.
+    pytest.mark.live_agent,
     pytest.mark.xdist_group("codex"),
     pytest.mark.usefixtures("isolated_codex_home"),
 ]

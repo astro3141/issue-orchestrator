@@ -61,3 +61,28 @@ agent-lane-only list in the `dependency-upgrades` skill current.
 - **Drop `validate-agent` as a required check.** Rejected: it still provides real
   coverage for the non-live tests, and requiring it keeps the merge queue honest
   for those.
+
+## Amendment — 2026-08-22 (#194)
+
+The decision above stands: the live-agent lane is still not run in CI. What
+changed is that it is no longer run in the **local blocking gate** either.
+
+"How the gap is contained" said human PRs run the lane through the pre-push
+hook, because `_validate-pr-impl` included `_validate-agent-impl` and that
+phase included `test-integration-agent`. That containment turned out to have a
+cost the ADR had not weighed: the lane's result depended on an external model
+choosing to issue a tool call, so a candidate could be recorded as *failed* for
+a reason that was not about the candidate. #109 recorded three such
+occurrences.
+
+`test-integration-agent` is therefore now `test-live-assurance`, selected by
+the `live_agent` marker and outside every blocking gate. It does not pass or
+fail a candidate; it files a `PASS` / `SECURITY_FAIL` / `INCONCLUSIVE` record
+against the exact artifact it ran on, and `trusted-runtime-promote` refuses a
+promotion without a `PASS`. See
+[validation.md](../validation.md#live-agent-assurance-is-not-publication-validation).
+
+The residual risk this ADR names is unchanged in kind and larger in degree: an
+agent-lane-only dependency now reaches `main` without the lane having run at
+all unless someone runs it. `make deps-batch` says so where it verifies, and
+the `dependency-upgrades` skill's agent-lane-only list is still the mitigation.

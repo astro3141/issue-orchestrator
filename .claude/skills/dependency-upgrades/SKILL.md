@@ -81,21 +81,33 @@ real merge result before it lands.
 #### Agent-lane-only dependencies
 
 Their behavior is exercised *solely* by `test-simulated-agent` /
-`test-integration-agent`, which skip on GitHub:
+`test-live-assurance`, and CI runs neither meaningfully — since #194 the
+assurance lane is not in the workflow at all, and on a host without the
+provider CLIs it does not skip: the readiness gate raises `ProbeDidNotRun`, so
+the run ends `INCONCLUSIVE` with errors in it.
 
 - `pexpect` — drives agent PTY spawning (`execution/agent_runner.py`); its PTY
-  tests (`tests/integration/test_live_agent_chain.py`) skip on GitHub.
+  tests (`tests/integration/test_live_agent_chain.py`) are in that lane.
 
 A grouped PR that includes one of these needs local verification as a whole —
-`make deps-batch` upgrades the group together and runs the lane, so that pass
-covers the group.
+`make deps-batch` upgrades the group together and runs `test-simulated-agent`,
+so that pass covers the group.
+
+**`make deps-batch` no longer runs the live-agent lane.** Since #194 those tests
+live in `make test-live-assurance`, which is in no blocking gate: its result is
+`PASS` / `SECURITY_FAIL` / `INCONCLUSIVE` about an artifact, not a pass or fail
+of a change. A dependency whose only coverage is that lane — `pexpect` today —
+needs `make test-live-assurance` run explicitly, and its recorded outcome read,
+before the upgrade is trusted.
 
 ### Verify locally with `make deps-batch` — for the rest
 
 `make deps-batch` is a **human maintainer** task, run at a terminal — not an
-orchestrated coding-agent flow. It runs `validate-pr-raw`, a strict superset of
-CI: the VS Code harness and the live-agent lane, neither of which CI can. This is
-the only place npm and the agent-lane deps get real coverage.
+orchestrated coding-agent flow. It runs `validate-pr-raw`, which covers the VS
+Code harness that CI cannot. It does **not** cover the live-agent lane — since
+#194 that lane is in no blocking gate, `validate-pr-raw` included — so a
+dependency whose only coverage is that lane needs `make test-live-assurance`
+run separately, as the section above says.
 
 **Driving it end-to-end.** Two entry points wrap the steps below:
 - `/deps-batch` (`.claude/commands/deps-batch.md`) — interactive Claude runs the

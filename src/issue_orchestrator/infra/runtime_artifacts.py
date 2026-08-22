@@ -108,6 +108,7 @@ CLEANUP_SAFE_UNTRACKED_ROOTS: tuple[str, ...] = (
     ".issue-orchestrator/backups",
     ".issue-orchestrator/diagnostics",
     ".issue-orchestrator/e2e-results",
+    ".issue-orchestrator/live-assurance",
     ".issue-orchestrator/persistent-pairs",
     ".issue-orchestrator/review-feedback",
     ".issue-orchestrator/sessions",

@@ -11,6 +11,52 @@ pytest tests/integration/       # Integration tests (requires Claude CLI)
 pytest tests/e2e/ -v            # Live e2e tests (requires gh auth)
 ```
 
+### The live-agent assurance lane
+
+Tests marked `live_agent` drive a real provider CLI, so whether they execute at
+all depends on an external model choosing to issue a tool call. They are
+deselected from every blocking gate by that marker and run on their own:
+
+```bash
+make test-live-assurance        # requires authenticated claude/codex CLIs
+```
+
+The lane does not pass or fail a change. It records `PASS`, `SECURITY_FAIL` or
+`INCONCLUSIVE` against the exact commit it ran on, in
+`.issue-orchestrator/live-assurance/<sha>.json`, and
+`trusted-runtime-promote --head-sha <sha>` refuses a trusted-runtime promotion
+without a `PASS`. Adding a `live_agent` module needs no other edit — there is no
+filename list.
+
+Three things to know when you run it or add to it:
+
+- **The marker takes the whole file, so every test in the module must need it.**
+  `pytestmark` is module scope: a deterministic case sitting in a `live_agent`
+  module leaves blocking validation with the probes, and the assurance lane
+  files a record rather than failing a candidate, so it then runs in no gate at
+  all. `tests/live_agent_reach.py` states the rule — every test in a `live_agent`
+  module must reach a provider — and `tests/unit/test_makefile_validation_phases.py`
+  fails on one that does not. Put deterministic cases in a non-`live_agent`
+  module; `tests/integration/test_agent_invocation_surface.py` and
+  `tests/unit/test_sandbox_stream_events.py` are the two existing homes.
+- **Commit first if you mean to promote.** The lane reads the commit *and* the
+  working-tree state from the checkout it is pointed at. Run it dirty and it
+  still runs, but the record is marked `working_tree_dirty` and assures nothing,
+  because the probes exercised a tree that commit does not name.
+- **A readiness probe in a `live_agent` module must run at call time.** Blocking
+  validation deselects the marker but still imports the module, so a
+  module-scope `is_claude_authenticated()` would put a real provider call inside
+  the publish gate. Use an autouse fixture, as
+  `tests/integration/test_live_agent_chain.py` does — a `skipif` condition is
+  module scope, because a decorator expression is evaluated on import. Report an
+  unusable provider from that fixture with `require_probe_ran(...)`, not by
+  skipping: an unauthenticated CLI leaves the boundary as unexercised as a model
+  that declined to issue the tool call, so the lane should reach `INCONCLUSIVE`
+  the same way. Expect errors, not skips, on a host without the CLIs.
+
+See
+[validation.md](../architecture/validation.md#live-agent-assurance-is-not-publication-validation).
+
 ## Test Structure
 
 ```

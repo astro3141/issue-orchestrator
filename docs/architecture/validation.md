@@ -59,6 +59,114 @@ while stamping `suite=publish_gate` onto the record, and the completion
 processor's publish-gate seam was never wired in composition — so
 `validation.publish.cmd` ran nowhere in the orchestrator path.
 
+### Live-agent assurance is not publication validation
+
+There is a **third** lane, and it is deliberately not in the table above.
+
+Some tests drive a real provider CLI: the OS-sandbox boundary proof in
+`tests/integration/test_sandbox_os_boundary.py` launches `claude` and `codex`
+with the generated sandbox argv and asserts on what the operating system did.
+Whether such a test executes at all depends on an external model choosing to
+issue a tool call. While it sat inside the pinned publish command, a model that
+declined to issue one was recorded as **the candidate failing**, three times
+([#109]) — most recently against a candidate whose changes had nothing to do
+with sandbox behaviour.
+
+Segregation is by **marker**, not by filename. A module declaring
+`pytest.mark.live_agent` is deselected from every blocking target
+(`-m "... and not live_agent"`, the way `live_codex` already worked) and
+collected by `make test-live-assurance`. There is no second list: adding a
+fourth live-agent module requires no other edit, and
+`tests/unit/test_makefile_validation_phases.py` fails if the publish gate ever
+names one by path again.
+
+**The marker is module scope, so what it takes out has to be checked test by
+test.** `pytestmark` applies to the whole file: mark a module and every case in
+it leaves every blocking gate, and the lane that collects them files a record
+rather than failing a candidate — so a deterministic assertion carried along by
+the marker ends up in *no* gate at all. That is not hypothetical; it is how
+`TestShellEscaping` and the `agent-done` cases went unrun until they were moved
+to `tests/integration/test_agent_invocation_surface.py`. The rule has an owner
+now: `tests/live_agent_reach.py` states *every test in a `live_agent` module
+must reach a live provider* structurally — the body must name a provider CLI, a
+registered production seam that builds one, a registered live-provider probe, or
+one of the lane's `assert_no_breach` / `require_probe_ran` helpers — and
+`tests/unit/test_makefile_validation_phases.py` fails on any test that does not.
+Reach means *the provider CLI*, not *the model*: `codex --version` needs no
+model but does need the operator's installed CLI, and a CLI upgrade must not be
+able to fail an unrelated candidate.
+
+The lane's result is one of exactly three, and the middle one is the point:
+
+| Outcome | Meaning |
+|---------|---------|
+| `PASS` | The required operation was actually issued and the allow/deny boundary was proven. |
+| `SECURITY_FAIL` | The boundary was really exercised and a security assertion failed. |
+| `INCONCLUSIVE` | The provider was unavailable, the run timed out, the model never issued the required operation, or nothing was selected. |
+
+`INCONCLUSIVE` is neither a candidate failure nor a security pass; the failed
+observation is preserved in the record's `detail` rather than reinterpreted.
+Precedence is `SECURITY_FAIL` > `INCONCLUSIVE` > `PASS`, so a proven breach
+never hides behind an unrelated provider hiccup and an empty selection never
+reads as a vacuous pass. Re-running the *lane* after an `INCONCLUSIVE` is
+availability handling for assurance evidence; it is not a retry of any
+candidate's validation, and nothing re-runs a gate on a candidate's behalf.
+
+Records live at `.issue-orchestrator/live-assurance/<HEAD_SHA>.json` —
+a separate directory from `.issue-orchestrator/validation/`, keyed by the
+**artifact commit alone**. What the lane proves is a property of a build, not
+of somebody's candidate for an issue.
+
+**The artifact is the checkout, not a SHA passed beside it.** The lane is given
+one root (`--live-assurance-root`, `LIVE_ASSURANCE_ROOT`) and resolves the
+commit *and* the working-tree state from it, through
+`execution/assured_artifact.py`. Computing the SHA in the Makefile recipe
+instead would take it from `make`'s cwd while the record was written under a
+separately overridable root, so the two were free to name different checkouts
+with nothing downstream able to notice. A root that is at no commit is a usage
+error, before any probe runs.
+
+**A dirty tree assures nothing.** Running the lane mid-change is normal — it is
+when sandbox work happens — but the probes then exercise a tree the commit does
+not name. The record carries `working_tree_dirty` and `assures()` refuses it, so
+the lane stays usable during development while a promotion cannot be admitted on
+evidence gathered from uncommitted edits. This is the same SHA↔tree discipline
+`validate-pr-raw` follows when `deps-batch` avoids seeding the SHA-keyed
+pre-push cache from an uncommitted tree.
+
+**Blocking validation still *imports* live-agent modules.** `-m "... and not
+live_agent"` deselects after collection, unlike the `--ignore=` it replaced, so
+every module under `tests/integration` is imported on every publish — once per
+xdist worker. A module-scope provider probe would therefore put a real `claude`
+call inside the publish gate for tests that gate is about to deselect. Readiness
+probes belong in an autouse fixture — a `skipif` condition is module scope, since
+a decorator expression is evaluated on import — and
+`tests/unit/test_makefile_validation_phases.py` proves by AST that no
+integration module calls one at import time.
+
+That fixture reports an unusable provider through `require_probe_ran(...)`, so
+the answer arrives as `INCONCLUSIVE` by the same route as a model that declined
+to issue the tool call. Both leave the boundary equally unexercised, and a
+missing prerequisite that fails is one somebody notices — which is also what
+the orchestrator's own newly-added-test-skip guard requires of any diff.
+
+**No evidence crossover, in both directions.** The record carries its own suite
+label, `live_assurance`, and `LiveAssuranceRecord` refuses any suite
+`ValidationGateKind` defines — so a `publish_gate` payload dropped into the
+lane's directory raises rather than admitting anything. Symmetrically, a
+`ValidationVerdictReceipt` carrying `live_assurance` certifies nothing, because
+`ValidationGateKind.PUBLISH.produced` does not recognise the label. This is the
+same discipline that stops an `agent_gate` pass reading as a publication pass
+([#25]), extended to a third lane.
+
+**What the assurance record authorizes.** `control/trusted_runtime_promotion.py`
+admits a trusted-runtime promotion only for an artifact with a `PASS` record
+naming that exact commit. Before this the rule was prose — "ship the runtime
+you verified" — with nothing that could refuse. `trusted-runtime-promote
+--head-sha <sha>` is the command form: exit `0` admitted, `1` refused with the
+reason, `2` malformed request. It moves no pin; the pin and the promotion
+procedure stay in issue #18.
+
 ### The verdict outlives the run directory
 
 Every path named above lives inside the coder worktree, so all of it is gone
@@ -1120,3 +1228,30 @@ Record fields:
 - `stdout`/`stderr` paths (optional but recommended)
 - `profile` — the named validation profile the run executed (see below);
   records written before profiles existed read back as `default`
+
+### Live-assurance record format
+
+Location: `.issue-orchestrator/live-assurance/<HEAD_SHA>.json` — a different
+directory, because it is a different kind of evidence.
+
+Record fields:
+- `schema_version`
+- `suite` — always `live_assurance`. Any suite `ValidationGateKind` defines is
+  refused on both write and read, so this file can never be a publication
+  receipt and a publication receipt can never be read as one of these.
+- `head_sha` — the exact artifact the lane ran against, resolved from
+  `--live-assurance-root` itself so it cannot describe another checkout
+- `outcome` — `pass`, `security_fail` or `inconclusive`
+- `detail` — why, preserved verbatim; never empty. An `inconclusive` reason is
+  reduced to its first line; a `security_fail` keeps its full multi-line
+  evidence, because that record is what an operator reads after the probes are
+  gone
+- `working_tree_dirty` — whether the checkout had uncommitted changes when the
+  lane ran. Required, never defaulted, and `true` makes the record assure
+  nothing: the probes exercised a tree the SHA does not name
+- `probes_executed` — how many live-agent probes completed a call phase.
+  Required, an `int` and never a `bool`, and a `pass` naming `0` is refused on
+  both write and read. A narrowed selection (`make test-live-assurance
+  PYTEST='… -k codex'`) files an honest record, and this is the field that lets
+  a reader tell it from a full run; deciding what "the full probe set" is for an
+  artifact is a separate question this record deliberately does not answer

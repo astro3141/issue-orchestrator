@@ -8,6 +8,22 @@ import subprocess
 from functools import cache
 
 
+LIVE_PROVIDER_PROBES = ("is_claude_authenticated",)
+"""Helpers here that make a **real** provider round trip when called.
+
+Blocking validation deselects `live_agent` after collection, so it imports
+every module under ``tests/integration`` regardless. Calling one of these while
+a module is being imported therefore puts a live provider call — in every xdist
+worker — inside the publish gate.
+``tests/unit/test_makefile_validation_phases.py`` states that as a guardrail,
+and reads this tuple rather than hard-coding names, so a new probe helper is
+covered by adding it here.
+
+``is_claude_available`` is deliberately absent: it is a ``shutil.which`` lookup
+and contacts nothing.
+"""
+
+
 def is_claude_available() -> bool:
     """Return whether the Claude CLI is available in PATH."""
     return shutil.which("claude") is not None
