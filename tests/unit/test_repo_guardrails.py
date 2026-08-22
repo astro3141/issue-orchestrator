@@ -9,6 +9,7 @@ import sys
 from pathlib import Path
 
 import pytest
+import yaml
 
 from issue_orchestrator.domain.models import AgentConfig
 from issue_orchestrator.infra.config import Config
@@ -310,7 +311,7 @@ def test_checked_in_verify_pr_matches_portable_generated_output() -> None:
     )
 
 
-def test_selfhost_config_provisions_the_worktrees_its_gates_run_in() -> None:
+def test_selfhost_config_provisions_the_worktrees_its_gates_run_in(tmp_path: Path) -> None:
     """The config this fork runs must declare worktree provisioning (#48).
 
     The publish gate's last target is `test-vscode` and its quick gate runs
@@ -319,11 +320,34 @@ def test_selfhost_config_provisions_the_worktrees_its_gates_run_in() -> None:
     orchestrator provisioned nothing, worktrees reached validation missing
     prerequisites, and the resulting failure was recorded against the
     candidate commit rather than against the environment.
+
+    Loaded through a copy that redirects `worktrees.base`, and only that key.
+    `Config.load` validates the base by creating it, so loading the tracked
+    file verbatim requires the machine it names -- an operator's macOS home.
+    Everywhere else, including a Linux CI runner, the load raised
+    ``worktrees.base ... cannot be created`` and this assertion never ran. The
+    tracked value is the one field the claim under test does not depend on;
+    every other line is still the tracked document, still read through the
+    real loader.
     """
-    repo_root = Path(__file__).resolve().parents[2]
-    config = Config.load(
-        repo_root / ".issue-orchestrator" / "config" / "modes" / "default" / "selfhost.yaml"
+    tracked = (
+        Path(__file__).resolve().parents[2]
+        / ".issue-orchestrator"
+        / "config"
+        / "modes"
+        / "default"
+        / "selfhost.yaml"
     )
+    document = yaml.safe_load(tracked.read_text(encoding="utf-8"))
+    assert document["worktrees"].get("base"), (
+        "selfhost.yaml no longer declares worktrees.base; the redirect below "
+        "would be inventing a key rather than replacing one"
+    )
+    document["worktrees"]["base"] = str(tmp_path / "worktrees")
+    portable = tmp_path / "selfhost.yaml"
+    portable.write_text(yaml.safe_dump(document, sort_keys=False), encoding="utf-8")
+
+    config = Config.load(portable)
 
     assert config.setup_worktree, (
         "selfhost.yaml must declare worktrees.setup; without it no launch path "
