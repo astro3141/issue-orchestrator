@@ -101,6 +101,32 @@ a separate directory from `.issue-orchestrator/validation/`, keyed by the
 **artifact commit alone**. What the lane proves is a property of a build, not
 of somebody's candidate for an issue.
 
+**The artifact is the checkout, not a SHA passed beside it.** The lane is given
+one root (`--live-assurance-root`, `LIVE_ASSURANCE_ROOT`) and resolves the
+commit *and* the working-tree state from it, through
+`execution/assured_artifact.py`. Computing the SHA in the Makefile recipe
+instead would take it from `make`'s cwd while the record was written under a
+separately overridable root, so the two were free to name different checkouts
+with nothing downstream able to notice. A root that is at no commit is a usage
+error, before any probe runs.
+
+**A dirty tree assures nothing.** Running the lane mid-change is normal — it is
+when sandbox work happens — but the probes then exercise a tree the commit does
+not name. The record carries `working_tree_dirty` and `assures()` refuses it, so
+the lane stays usable during development while a promotion cannot be admitted on
+evidence gathered from uncommitted edits. This is the same SHA↔tree discipline
+`validate-pr-raw` follows when `deps-batch` avoids seeding the SHA-keyed
+pre-push cache from an uncommitted tree.
+
+**Blocking validation still *imports* live-agent modules.** `-m "... and not
+live_agent"` deselects after collection, unlike the `--ignore=` it replaced, so
+every module under `tests/integration` is imported on every publish — once per
+xdist worker. A module-scope provider probe would therefore put a real `claude`
+call inside the publish gate for tests that gate is about to deselect. Readiness
+probes belong in a fixture or a call-time condition;
+`tests/unit/test_makefile_validation_phases.py` proves by AST that no
+integration module calls one at import time.
+
 **No evidence crossover, in both directions.** The record carries its own suite
 label, `live_assurance`, and `LiveAssuranceRecord` refuses any suite
 `ValidationGateKind` defines — so a `publish_gate` payload dropped into the
@@ -1190,6 +1216,13 @@ Record fields:
 - `suite` — always `live_assurance`. Any suite `ValidationGateKind` defines is
   refused on both write and read, so this file can never be a publication
   receipt and a publication receipt can never be read as one of these.
-- `head_sha` — the exact artifact the lane ran against
+- `head_sha` — the exact artifact the lane ran against, resolved from
+  `--live-assurance-root` itself so it cannot describe another checkout
 - `outcome` — `pass`, `security_fail` or `inconclusive`
-- `detail` — why, preserved verbatim; never empty
+- `detail` — why, preserved verbatim; never empty. An `inconclusive` reason is
+  reduced to its first line; a `security_fail` keeps its full multi-line
+  evidence, because that record is what an operator reads after the probes are
+  gone
+- `working_tree_dirty` — whether the checkout had uncommitted changes when the
+  lane ran. Required, never defaulted, and `true` makes the record assure
+  nothing: the probes exercised a tree the SHA does not name

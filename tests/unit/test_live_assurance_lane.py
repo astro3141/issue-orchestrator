@@ -32,7 +32,6 @@ from issue_orchestrator.domain.live_assurance import (
 from tests.live_assurance_lane import LiveAssuranceLane
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-ARTIFACT = "e" * 40
 
 _UNMARKED_MODULE = '''
 def test_not_a_live_agent_test() -> None:
@@ -57,6 +56,17 @@ _BREACHING_PROBE = '''
 def test_deny_rule_was_reverted() -> None:
     require_probe_ran(True, "probe ran")
     assert_no_breach(False, "SANDBOX BREACH: a denied secret was read by Bash.")
+'''
+
+_MULTILINE_BREACHING_PROBE = '''
+def test_a_denied_secret_was_read() -> None:
+    require_probe_ran(True, "probe ran")
+    assert_no_breach(
+        False,
+        "SANDBOX BREACH: a denied secret was read by Bash.\\n"
+        "denied path: /etc/secret-token\\n"
+        "captured provider output: SECRET_VALUE=hunter2",
+    )
 '''
 
 _NEVER_RAN_PROBE = '''
@@ -91,8 +101,43 @@ def _subprocess_env() -> dict[str, str]:
     return env
 
 
-def _run_lane(tmp_path: Path, *probe_sources: str) -> LiveAssuranceRecord | None:
-    """Run the lane over generated probes and return the record it filed."""
+def _git(checkout: Path, *args: str) -> str:
+    result = subprocess.run(
+        ["git", *args],
+        cwd=checkout,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return result.stdout.strip()
+
+
+def _make_checkout(tmp_path: Path) -> tuple[Path, str]:
+    """A real one-commit checkout, and the SHA the lane must resolve from it.
+
+    The lane reads its artifact identity out of ``--live-assurance-root``
+    rather than being handed a SHA, so the harness has to supply a genuine
+    checkout. A synthetic constant here would be testing an option that no
+    longer exists.
+    """
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    _git(checkout, "init", "--quiet", "--initial-branch=main")
+    _git(checkout, "config", "user.email", "lane@example.invalid")
+    _git(checkout, "config", "user.name", "Lane Harness")
+    _git(checkout, "commit", "--quiet", "--allow-empty", "-m", "artifact")
+    return checkout, _git(checkout, "rev-parse", "HEAD")
+
+
+def _run_lane_in(
+    checkout: Path, tmp_path: Path, *probe_sources: str
+) -> subprocess.CompletedProcess[str]:
+    """Run the lane over generated probes, filing evidence about ``checkout``.
+
+    The probes live outside the checkout so that generating them does not make
+    the tree dirty — that state is a subject of these tests, not a side effect
+    of the harness.
+    """
     probes = tmp_path / "probes"
     probes.mkdir()
     (probes / "test_not_live_agent.py").write_text(_UNMARKED_MODULE, encoding="utf-8")
@@ -101,7 +146,7 @@ def _run_lane(tmp_path: Path, *probe_sources: str) -> LiveAssuranceRecord | None
             _PROBE_HEADER + source, encoding="utf-8"
         )
 
-    subprocess.run(
+    return subprocess.run(
         [
             sys.executable,
             "-m",
@@ -114,8 +159,7 @@ def _run_lane(tmp_path: Path, *probe_sources: str) -> LiveAssuranceRecord | None
             "tests.live_assurance_lane",
             "-m",
             "live_agent",
-            f"--live-assurance-root={tmp_path}",
-            f"--live-assurance-head-sha={ARTIFACT}",
+            f"--live-assurance-root={checkout}",
         ],
         cwd=REPO_ROOT,
         env=_subprocess_env(),
@@ -124,12 +168,21 @@ def _run_lane(tmp_path: Path, *probe_sources: str) -> LiveAssuranceRecord | None
         check=False,
     )
 
-    record_path = tmp_path / LIVE_ASSURANCE_DIR / f"{ARTIFACT}.json"
+
+def _filed_record(checkout: Path, head_sha: str) -> LiveAssuranceRecord | None:
+    record_path = checkout / LIVE_ASSURANCE_DIR / f"{head_sha}.json"
     if not record_path.exists():
         return None
     return LiveAssuranceRecord.from_payload(
         json.loads(record_path.read_text(encoding="utf-8"))
     )
+
+
+def _run_lane(tmp_path: Path, *probe_sources: str) -> LiveAssuranceRecord | None:
+    """Run the lane over generated probes and return the record it filed."""
+    checkout, head_sha = _make_checkout(tmp_path)
+    _run_lane_in(checkout, tmp_path, *probe_sources)
+    return _filed_record(checkout, head_sha)
 
 
 class TestTheLaneRecordsWhatItObserved:
@@ -138,7 +191,6 @@ class TestTheLaneRecordsWhatItObserved:
 
         assert record is not None
         assert record.outcome is LiveAssuranceOutcome.PASS
-        assert record.head_sha == ARTIFACT
 
     def test_a_reverted_deny_rule_is_security_fail_not_inconclusive(
         self, tmp_path: Path
@@ -149,6 +201,22 @@ class TestTheLaneRecordsWhatItObserved:
         assert record is not None
         assert record.outcome is LiveAssuranceOutcome.SECURITY_FAIL
         assert "SANDBOX BREACH" in record.detail
+
+    def test_a_breachs_evidence_survives_into_the_record(
+        self, tmp_path: Path
+    ) -> None:
+        """The refused promotion is read long after the probe output is gone.
+
+        A breach assertion embeds the denied path and the provider output it
+        captured, across several lines. Reducing that to a first line would
+        leave an operator with the headline and none of the proof.
+        """
+        record = _run_lane(tmp_path, _MULTILINE_BREACHING_PROBE)
+
+        assert record is not None
+        assert record.outcome is LiveAssuranceOutcome.SECURITY_FAIL
+        assert "/etc/secret-token" in record.detail
+        assert "SECRET_VALUE=hunter2" in record.detail
 
     def test_an_operation_the_model_never_issued_is_inconclusive(
         self, tmp_path: Path
@@ -272,8 +340,42 @@ class TestTheProbeModuleUsesTheClassificationChannels:
         assert source.count("require_probe_ran(") >= 5
 
 
-class TestTheLaneRefusesAnAnonymousRecord:
-    def test_a_root_without_an_artifact_sha_is_a_usage_error(
+class TestTheRecordIsAboutTheCheckoutItIsFiledUnder:
+    """The writer half of exact-artifact: one root decides both.
+
+    The lane used to be handed ``--live-assurance-head-sha`` beside a
+    separately overridable root, so the SHA and the tree the record described
+    could be two different checkouts with nothing able to notice. Identity now
+    comes from the root itself.
+    """
+
+    def test_the_record_names_the_checkouts_own_head(self, tmp_path: Path) -> None:
+        checkout, head_sha = _make_checkout(tmp_path)
+
+        _run_lane_in(checkout, tmp_path, _PASSING_PROBE)
+
+        record = _filed_record(checkout, head_sha)
+        assert record is not None
+        assert record.head_sha == head_sha
+        assert record.working_tree_dirty is False
+        assert record.assures(head_sha) is True
+
+    def test_a_run_over_uncommitted_changes_assures_nothing(
+        self, tmp_path: Path
+    ) -> None:
+        """The probes exercised a tree this commit does not name."""
+        checkout, head_sha = _make_checkout(tmp_path)
+        (checkout / "sandbox_edit.py").write_text("# in progress\n", encoding="utf-8")
+
+        _run_lane_in(checkout, tmp_path, _PASSING_PROBE)
+
+        record = _filed_record(checkout, head_sha)
+        assert record is not None
+        assert record.outcome is LiveAssuranceOutcome.PASS
+        assert record.working_tree_dirty is True
+        assert record.assures(head_sha) is False
+
+    def test_a_root_that_is_not_a_checkout_is_a_usage_error(
         self, tmp_path: Path
     ) -> None:
         """A record with no artifact identity would assure an unknown build."""
@@ -298,7 +400,7 @@ class TestTheLaneRefusesAnAnonymousRecord:
         )
 
         assert result.returncode != 0
-        assert "must be given" in (result.stdout + result.stderr)
+        assert "not a checkout at a commit" in (result.stdout + result.stderr)
 
 
 @pytest.mark.parametrize(
@@ -316,4 +418,4 @@ def test_a_non_pass_lane_run_never_files_a_pass(
     record = _run_lane(tmp_path, source)
 
     assert record is not None
-    assert record.assures(ARTIFACT) is False
+    assert record.assures(record.head_sha) is False

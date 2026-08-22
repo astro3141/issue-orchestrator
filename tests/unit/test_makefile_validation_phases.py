@@ -9,6 +9,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.fixtures.live_agent_cli import LIVE_PROVIDER_PROBES
+
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -167,6 +169,65 @@ def _integration_modules_declaring(marker: str) -> list[Path]:
         for path in (REPO_ROOT / "tests" / "integration").rglob("test_*.py")
         if _has_marker(path, marker)
     )
+
+
+def _integration_modules() -> list[Path]:
+    return sorted((REPO_ROOT / "tests" / "integration").rglob("test_*.py"))
+
+
+class _ImportTimeCalls(ast.NodeVisitor):
+    """The functions a module calls while it is being *imported*.
+
+    A function body does not run at import; everything at module and class
+    scope does, and so do decorator expressions and default arguments — which
+    is where a ``@pytest.mark.skipif(not probe(), ...)`` would hide.
+    """
+
+    def __init__(self) -> None:
+        self.names: set[str] = set()
+
+    def visit_Call(self, node: ast.Call) -> None:  # noqa: N802 - pytest/ast API
+        dotted = _dotted_name(node.func)
+        if dotted is not None:
+            self.names.add(dotted.rsplit(".", 1)[-1])
+        self.generic_visit(node)
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:  # noqa: N802
+        self._visit_signature_only(node)
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:  # noqa: N802
+        self._visit_signature_only(node)
+
+    def visit_Lambda(self, node: ast.Lambda) -> None:  # noqa: N802
+        self._visit_defaults(node.args)
+
+    def _visit_signature_only(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
+        for decorator in node.decorator_list:
+            self.visit(decorator)
+        self._visit_defaults(node.args)
+
+    def _visit_defaults(self, args: ast.arguments) -> None:
+        for default in (*args.defaults, *args.kw_defaults):
+            if default is not None:
+                self.visit(default)
+
+
+def _import_time_calls(path: Path) -> set[str]:
+    visitor = _ImportTimeCalls()
+    visitor.visit(ast.parse(path.read_text(encoding="utf-8"), filename=str(path)))
+    return visitor.names
+
+
+def _any_scope_calls(path: Path) -> set[str]:
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    names = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        dotted = _dotted_name(node.func)
+        if dotted is not None:
+            names.add(dotted.rsplit(".", 1)[-1])
+    return names
 
 
 def test_validate_impl_runs_core_phases_with_separate_job_caps():
@@ -386,12 +447,58 @@ class TestPublicationIsNotModelGated:
         _find_line(lines, 'target="test-simulated-agent"')
         assert all("live_assurance" not in line for line in lines)
 
-    def test_the_sandbox_probes_are_not_collected_by_the_publish_gate(self):
+    def test_the_publish_gate_never_names_the_sandbox_probe_module(self):
+        """Named, not collected — deliberately the weaker of the two claims.
+
+        ``-m "... and not live_agent"`` is a *deselect applied after
+        collection*, so the publish gate does import every module under
+        ``tests/integration``, this one included. What this proves is that no
+        blocking recipe reaches for the probe module by path, which is the
+        filename coupling #194 removed. What runs at import time is the
+        separate, stronger claim below.
+        """
         lines = _dry_run_closure("_validate-pr-impl")
 
         assert all(
             "tests/integration/test_sandbox_os_boundary.py" not in line
             for line in lines
+        )
+
+    def test_no_integration_module_calls_a_live_provider_at_import(self):
+        """The cost of the publish gate must not depend on a provider answering.
+
+        Because the marker deselects rather than prevents collection, a
+        module-scope ``is_claude_authenticated()`` runs a real ``claude -p``
+        call — with a 30-second ceiling, once per xdist worker, twice over for
+        the second integration invocation — every time anybody publishes, for
+        tests that are then deselected. `--ignore=` used to prevent that
+        import; the marker does not, so the probe has to be deferred to call
+        time instead.
+        """
+        offenders = {
+            path.relative_to(REPO_ROOT).as_posix(): sorted(called)
+            for path in _integration_modules()
+            if (called := _import_time_calls(path) & set(LIVE_PROVIDER_PROBES))
+        }
+
+        assert offenders == {}, (
+            "these modules make a real provider round trip while being "
+            f"imported, which blocking validation does on every run: {offenders}"
+        )
+
+    def test_that_rule_has_a_live_subject(self):
+        """Otherwise the check above passes by naming something nobody calls."""
+        assert LIVE_PROVIDER_PROBES
+        callers = [
+            path.relative_to(REPO_ROOT).as_posix()
+            for path in _integration_modules()
+            if _any_scope_calls(path) & set(LIVE_PROVIDER_PROBES)
+        ]
+
+        assert callers, (
+            "no integration module calls a registered live-provider probe at "
+            "all; the import-time guardrail is checking for a name that has "
+            "left the tree"
         )
 
 
@@ -404,7 +511,20 @@ class TestTheAssuranceLane:
 
         assert '-m "live_agent"' in pytest_line
         assert "-p tests.live_assurance_lane" in pytest_line
-        assert "--live-assurance-head-sha=$(git rev-parse HEAD)" in pytest_line
+
+    def test_the_artifact_identity_is_not_resolved_in_the_recipe(self):
+        """One root, one artifact — a second source could name another tree.
+
+        A SHA computed by the recipe comes from ``make``'s cwd while the record
+        is written under ``LIVE_ASSURANCE_ROOT``, so the two are free to
+        describe different checkouts and nothing downstream can tell. The lane
+        resolves both from the root instead.
+        """
+        lines = _dry_run("test-live-assurance")
+        pytest_line = lines[_find_line(lines, "--live-assurance-root")]
+
+        assert "--live-assurance-head-sha" not in pytest_line
+        assert "rev-parse" not in pytest_line
 
     def test_it_runs_serially_and_does_not_stop_at_the_first_probe(self):
         """``-x`` would let one breach hide behind an earlier probe's failure."""

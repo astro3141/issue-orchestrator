@@ -69,11 +69,19 @@ pytestmark = [
     pytest.mark.live_agent,
 ]
 
-# Import-time probe is acceptable here: this module is only collected by the
-# dedicated live-agent lanes (test-live-assurance / heavy runs), where a
-# real provider round-trip is proportionate. The whole-suite e2e module
-# (tests/e2e/test_live_agent_transport.py) defers the same probe to runtime.
-_CLAUDE_READY = is_claude_authenticated()
+# The readiness probe is a **real** `claude -p` round trip, so it runs at call
+# time, never at import. `-m "... and not live_agent"` is a deselect applied
+# after collection, so blocking validation still imports every module under
+# tests/integration — once per xdist worker. An import-time probe here would
+# therefore put a live provider call, with a 30-second ceiling, into the
+# publish gate for tests that gate is about to deselect. That is the exact
+# dependency #194 exists to remove, and the previous `--ignore=` did prevent
+# it. tests/e2e/test_live_agent_transport.py defers the same probe the same
+# way, and tests/unit/test_makefile_validation_phases.py pins the rule.
+@pytest.fixture(autouse=True)
+def _require_authenticated_claude() -> None:
+    if not is_claude_authenticated():
+        pytest.skip("Claude CLI not installed or not authenticated")
 
 
 def _live_provider_retry_policy() -> RetryPolicy:
@@ -85,7 +93,6 @@ def _live_provider_retry_policy() -> RetryPolicy:
     )
 
 
-@pytest.mark.skipif(not _CLAUDE_READY, reason="Claude CLI not installed or not authenticated")
 class TestLiveAgentChain:
     """Prove the full pexpect → bash → provider_runner → Claude chain works."""
 

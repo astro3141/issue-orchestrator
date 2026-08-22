@@ -34,11 +34,14 @@ def run_promotion_gate(*, head_sha: str, root: Path) -> int:
     """Ask the gate about ``head_sha`` and render its answer as an exit code."""
     gate = TrustedRuntimePromotion(live_assurance_store_for(root))
     try:
-        gate.admit(head_sha)
+        # The gate hands back the normalised SHA it admitted, so the success
+        # line names the record's own key rather than however the caller
+        # happened to spell it.
+        artifact = gate.admit(head_sha)
     except TrustedRuntimePromotionRefused as refusal:
         print(f"REFUSED: {refusal}", file=sys.stderr)
         return 1
-    print(f"ADMITTED: live-assurance PASS recorded for artifact {head_sha}")
+    print(f"ADMITTED: live-assurance PASS recorded for artifact {artifact}")
     return 0
 
 

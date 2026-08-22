@@ -33,10 +33,16 @@ OTHER_ARTIFACT = "d" * 40
 
 
 def _record(
-    outcome: LiveAssuranceOutcome, *, head_sha: str = ARTIFACT
+    outcome: LiveAssuranceOutcome,
+    *,
+    head_sha: str = ARTIFACT,
+    working_tree_dirty: bool = False,
 ) -> LiveAssuranceRecord:
     return LiveAssuranceRecord(
-        head_sha=head_sha, outcome=outcome, detail=f"lane said {outcome.value}"
+        head_sha=head_sha,
+        outcome=outcome,
+        detail=f"lane said {outcome.value}",
+        working_tree_dirty=working_tree_dirty,
     )
 
 
@@ -78,12 +84,31 @@ class TestPromotionIsBound:
         ):
             TrustedRuntimePromotion(store).admit(ARTIFACT)
 
+    def test_a_pass_recorded_from_a_modified_tree_is_refused(
+        self, store: JsonLiveAssuranceStore
+    ) -> None:
+        """The probes ran on something this commit does not name."""
+        store.record(_record(LiveAssuranceOutcome.PASS, working_tree_dirty=True))
+
+        with pytest.raises(
+            TrustedRuntimePromotionRefused, match="modified working tree"
+        ):
+            TrustedRuntimePromotion(store).admit(ARTIFACT)
+
     def test_a_pass_for_the_exact_artifact_admits(
         self, store: JsonLiveAssuranceStore
     ) -> None:
         store.record(_record(LiveAssuranceOutcome.PASS))
 
-        TrustedRuntimePromotion(store).admit(ARTIFACT)
+        assert TrustedRuntimePromotion(store).admit(ARTIFACT) == ARTIFACT
+
+    def test_the_admitted_artifact_is_the_key_the_record_is_filed_under(
+        self, store: JsonLiveAssuranceStore
+    ) -> None:
+        """So a caller reporting success cannot name a different spelling."""
+        store.record(_record(LiveAssuranceOutcome.PASS))
+
+        assert TrustedRuntimePromotion(store).admit(ARTIFACT.upper()) == ARTIFACT
 
     def test_an_abbreviated_sha_is_refused_before_any_lookup(
         self, store: JsonLiveAssuranceStore
@@ -105,6 +130,7 @@ class TestPromotionIsBound:
                 "head_sha": ARTIFACT,
                 "outcome": "pass",
                 "detail": "publication contract passed",
+                "working_tree_dirty": False,
             }),
             encoding="utf-8",
         )

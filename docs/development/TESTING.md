@@ -26,7 +26,21 @@ The lane does not pass or fail a change. It records `PASS`, `SECURITY_FAIL` or
 `.issue-orchestrator/live-assurance/<sha>.json`, and
 `trusted-runtime-promote --head-sha <sha>` refuses a trusted-runtime promotion
 without a `PASS`. Adding a `live_agent` module needs no other edit — there is no
-filename list. See
+filename list.
+
+Two things to know when you run it:
+
+- **Commit first if you mean to promote.** The lane reads the commit *and* the
+  working-tree state from the checkout it is pointed at. Run it dirty and it
+  still runs, but the record is marked `working_tree_dirty` and assures nothing,
+  because the probes exercised a tree that commit does not name.
+- **A readiness probe in a `live_agent` module must run at call time.** Blocking
+  validation deselects the marker but still imports the module, so a
+  module-scope `is_claude_authenticated()` would put a real provider call inside
+  the publish gate. Use a fixture, as
+  `tests/integration/test_live_agent_chain.py` does.
+
+See
 [validation.md](../architecture/validation.md#live-agent-assurance-is-not-publication-validation).
 
 ## Test Structure

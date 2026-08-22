@@ -30,6 +30,17 @@ There is no fourth member and no ``UNKNOWN``: "the lane never ran" is the
 absence of a record, exactly as :class:`~.validation_verdict_receipt.
 ValidationVerdict` keeps "never gated" outside its own enum.
 
+**Exact artifact means the tree, not just the commit.** A SHA names a tree
+only when the checkout that ran had nothing uncommitted in it, so the record
+carries ``working_tree_dirty`` and :meth:`LiveAssuranceRecord.assures` refuses
+a dirty one. Otherwise a lane run over an operator's in-progress sandbox edits
+— the ordinary state during exactly the work this lane covers — would file a
+``PASS`` under ``HEAD``, and a later promotion would ship a build whose
+boundary was never probed. The reader is not asked to remember to check: the
+record cannot assure anything it did not observe. See
+:func:`~..execution.assured_artifact.artifact_under_assurance`, which is the
+only thing that resolves this pair.
+
 **Evidence identity, not a flag.** ``suite`` is carried and validated, and
 :class:`~.validation_profile.ValidationGateKind` is asked whether it owns the
 label. It must not: a record that could name ``publish_gate`` would be a
@@ -112,6 +123,7 @@ class LiveAssuranceRecord:
     head_sha: str
     outcome: LiveAssuranceOutcome
     detail: str
+    working_tree_dirty: bool
     suite: str = LIVE_ASSURANCE_SUITE
     schema_version: int = LIVE_ASSURANCE_SCHEMA_VERSION
 
@@ -125,6 +137,11 @@ class LiveAssuranceRecord:
         object.__setattr__(
             self, "detail", _required_text(self.detail, field_name="detail")
         )
+        if type(self.working_tree_dirty) is not bool:
+            # No default and no coercion: a truthy string or a forgotten
+            # argument would silently claim the tree was clean, which is the
+            # one thing about this record a promotion relies on.
+            raise TypeError("working_tree_dirty must be bool")
         suite = _required_text(self.suite, field_name="suite")
         if ValidationGateKind.defines(suite):
             # The crossover guard, in the direction a *writer* could breach it.
@@ -155,15 +172,40 @@ class LiveAssuranceRecord:
         """Whether this record is about ``head_sha`` itself."""
         return normalize_commit_sha(head_sha, field_name="head_sha") == self.head_sha
 
-    def assures(self, head_sha: str) -> bool:
-        """Whether the boundary was proven to hold for ``head_sha`` exactly.
+    def why_not_assuring(self, head_sha: str) -> str | None:
+        """Why this record does not assure ``head_sha``, or ``None`` if it does.
 
-        Both halves, never one. Drop the outcome check and an ``INCONCLUSIVE``
-        run — the model never issued the operation — reads as a proof. Drop
-        ``covers`` and a different artifact's proof admits this one, which is
-        the exact-artifact requirement the whole record exists to carry.
+        Three halves, never fewer. Drop the outcome check and an
+        ``INCONCLUSIVE`` run — the model never issued the operation — reads as
+        a proof. Drop ``covers`` and a different artifact's proof admits this
+        one, which is the exact-artifact requirement the whole record exists to
+        carry. Drop the tree check and a lane run over uncommitted edits
+        assures the commit those edits are not in.
+
+        The reason is produced here rather than by the gate so that "does it
+        assure" and "why not" cannot drift apart into two enumerations of the
+        same rule.
         """
-        return self.outcome is LiveAssuranceOutcome.PASS and self.covers(head_sha)
+        if not self.covers(head_sha):
+            return f"the record is about artifact {self.head_sha}"
+        if self.outcome is not LiveAssuranceOutcome.PASS:
+            # Ahead of the tree check deliberately: an operator whose lane
+            # proved a breach needs to hear about the breach, not about
+            # bookkeeping.
+            return (
+                f"the lane recorded {self.outcome.value}, "
+                f"not {LiveAssuranceOutcome.PASS.value}"
+            )
+        if self.working_tree_dirty:
+            return (
+                "the lane ran on a modified working tree, so what it observed "
+                "is not the artifact this SHA names"
+            )
+        return None
+
+    def assures(self, head_sha: str) -> bool:
+        """Whether the boundary was proven to hold for ``head_sha`` exactly."""
+        return self.why_not_assuring(head_sha) is None
 
     @classmethod
     def from_payload(cls, payload: Mapping[str, object]) -> "LiveAssuranceRecord":
@@ -178,13 +220,23 @@ class LiveAssuranceRecord:
         schema_version = payload.get("schema_version")
         if not isinstance(schema_version, int) or isinstance(schema_version, bool):
             raise ValueError("live-assurance record requires int schema_version")
-        for field_name in ("suite", "head_sha", "detail"):
+        for field_name in ("suite", "head_sha", "detail", "working_tree_dirty"):
             if field_name not in payload:
                 raise ValueError(f"live-assurance record requires {field_name}")
+        working_tree_dirty = payload["working_tree_dirty"]
+        if type(working_tree_dirty) is not bool:
+            # Absent-reads-as-clean is the failure this refuses: a record
+            # written by something that did not know to answer must not read
+            # back as a record that answered "clean".
+            raise ValueError(
+                "live-assurance record working_tree_dirty must be bool, got "
+                f"{working_tree_dirty!r}"
+            )
         return cls(
             head_sha=normalize_commit_sha(payload["head_sha"], field_name="head_sha"),
             outcome=outcome,
             detail=_required_text(payload.get("detail"), field_name="detail"),
+            working_tree_dirty=working_tree_dirty,
             suite=_required_text(payload.get("suite"), field_name="suite"),
             schema_version=schema_version,
         )
@@ -197,6 +249,7 @@ class LiveAssuranceRecord:
             "head_sha": self.head_sha,
             "outcome": self.outcome.value,
             "detail": self.detail,
+            "working_tree_dirty": self.working_tree_dirty,
         }
 
 

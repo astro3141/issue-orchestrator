@@ -30,7 +30,6 @@ check" is exactly the failure mode the prose procedure already had.
 from __future__ import annotations
 
 from ..domain.commit_sha import normalize_commit_sha
-from ..domain.live_assurance import LiveAssuranceOutcome
 from ..ports.live_assurance_store import LiveAssuranceStore
 
 
@@ -44,10 +43,10 @@ class TrustedRuntimePromotion:
     def __init__(self, assurance: LiveAssuranceStore) -> None:
         self._assurance = assurance
 
-    def admit(self, head_sha: str) -> None:
+    def admit(self, head_sha: str) -> str:
         """Allow ``head_sha`` to be promoted, or raise naming what is missing.
 
-        Three refusals, kept distinguishable because they call for different
+        Four refusals, kept distinguishable because they call for different
         operator actions:
 
         * **No record** — the lane never ran for this artifact. Run it.
@@ -58,6 +57,16 @@ class TrustedRuntimePromotion:
           a retry of any candidate's validation.
         * **``SECURITY_FAIL``** — the boundary was exercised and it did not
           hold. Nothing to re-run; the artifact must not ship.
+        * **Recorded from a modified working tree** — the probes exercised
+          something this commit does not name. Commit, then run the lane.
+
+        Which of those applies is :class:`~..domain.live_assurance.
+        LiveAssuranceRecord`'s to say, not this gate's: asking the record why
+        keeps one rule with one implementation, where restating it here would
+        be a second enumeration free to drift.
+
+        Returns the normalised artifact SHA it admitted, so a caller reporting
+        success names the same string the record is keyed by.
         """
         artifact = normalize_commit_sha(head_sha, field_name="head_sha")
         record = self._assurance.for_artifact(artifact)
@@ -66,12 +75,13 @@ class TrustedRuntimePromotion:
                 f"no live-assurance record for artifact {artifact}; "
                 "the live-assurance lane has not run against this build"
             )
-        if not record.assures(artifact):
+        reason = record.why_not_assuring(artifact)
+        if reason is not None:
             raise TrustedRuntimePromotionRefused(
-                f"live-assurance for artifact {artifact} is "
-                f"{record.outcome.value}, not {LiveAssuranceOutcome.PASS.value}: "
-                f"{record.detail}"
+                f"live-assurance for artifact {artifact} does not assure it: "
+                f"{reason}: {record.detail}"
             )
+        return artifact
 
 
 __all__ = ["TrustedRuntimePromotion", "TrustedRuntimePromotionRefused"]

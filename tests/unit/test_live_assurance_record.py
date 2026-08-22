@@ -31,9 +31,14 @@ def _record(
     head_sha: str = SHA_A,
     detail: str = "3 live-agent probe(s) passed",
     suite: str = LIVE_ASSURANCE_SUITE,
+    working_tree_dirty: bool = False,
 ) -> LiveAssuranceRecord:
     return LiveAssuranceRecord(
-        head_sha=head_sha, outcome=outcome, detail=detail, suite=suite
+        head_sha=head_sha,
+        outcome=outcome,
+        detail=detail,
+        working_tree_dirty=working_tree_dirty,
+        suite=suite,
     )
 
 
@@ -79,6 +84,44 @@ class TestTheThreeOutcomesAreDistinct:
 
         assert record.assures(SHA_A) is True
         assert record.assures(SHA_B) is False
+
+    def test_a_pass_from_a_modified_tree_assures_nothing(self) -> None:
+        """A SHA names a tree only when nothing uncommitted was in it.
+
+        The lane is run mid-change on purpose — that is when sandbox work
+        happens — so the record has to carry what it observed rather than file
+        a proof of a commit the probes never exercised.
+        """
+        record = _record(LiveAssuranceOutcome.PASS, working_tree_dirty=True)
+
+        assert record.outcome is LiveAssuranceOutcome.PASS
+        assert record.assures(SHA_A) is False
+        assert "modified working tree" in str(record.why_not_assuring(SHA_A))
+
+    def test_a_breach_from_a_modified_tree_still_reports_the_breach(self) -> None:
+        """Bookkeeping must not shadow a security result in the refusal."""
+        record = _record(LiveAssuranceOutcome.SECURITY_FAIL, working_tree_dirty=True)
+
+        assert record.why_not_assuring(SHA_A) == (
+            "the lane recorded security_fail, not pass"
+        )
+
+    def test_a_record_that_assures_gives_no_reason_not_to(self) -> None:
+        assert _record(LiveAssuranceOutcome.PASS).why_not_assuring(SHA_A) is None
+
+    def test_the_dirty_flag_is_neither_optional_nor_coerced(self) -> None:
+        """A forgotten or truthy-string argument must not read as "clean"."""
+        with pytest.raises(TypeError):
+            LiveAssuranceRecord(  # type: ignore[call-arg]
+                head_sha=SHA_A, outcome=LiveAssuranceOutcome.PASS, detail="ran"
+            )
+        with pytest.raises(TypeError, match="working_tree_dirty must be bool"):
+            LiveAssuranceRecord(
+                head_sha=SHA_A,
+                outcome=LiveAssuranceOutcome.PASS,
+                detail="ran",
+                working_tree_dirty="no",  # type: ignore[arg-type]
+            )
 
     def test_there_is_no_fourth_outcome(self) -> None:
         """"Never ran" is the absence of a record, not a member inside one."""
@@ -162,7 +205,9 @@ class TestTheRecordRefusesWhatItCannotReadExactly:
         with pytest.raises(ValueError, match="unknown live-assurance outcome"):
             LiveAssuranceRecord.from_payload(payload)
 
-    @pytest.mark.parametrize("field_name", ["suite", "head_sha", "detail"])
+    @pytest.mark.parametrize(
+        "field_name", ["suite", "head_sha", "detail", "working_tree_dirty"]
+    )
     def test_a_missing_field_names_itself(self, field_name: str) -> None:
         payload = _record().to_payload()
         del payload[field_name]
@@ -170,8 +215,21 @@ class TestTheRecordRefusesWhatItCannotReadExactly:
         with pytest.raises(ValueError, match=f"requires {field_name}"):
             LiveAssuranceRecord.from_payload(payload)
 
-    def test_a_round_trip_preserves_every_meaning(self) -> None:
-        record = _record(LiveAssuranceOutcome.SECURITY_FAIL, detail="breach at probe 2")
+    def test_a_non_bool_dirty_flag_is_refused_rather_than_read_as_clean(self) -> None:
+        payload = _record().to_payload() | {"working_tree_dirty": "false"}
+
+        with pytest.raises(ValueError, match="working_tree_dirty must be bool"):
+            LiveAssuranceRecord.from_payload(payload)
+
+    @pytest.mark.parametrize("working_tree_dirty", [False, True])
+    def test_a_round_trip_preserves_every_meaning(
+        self, working_tree_dirty: bool
+    ) -> None:
+        record = _record(
+            LiveAssuranceOutcome.SECURITY_FAIL,
+            detail="breach at probe 2",
+            working_tree_dirty=working_tree_dirty,
+        )
 
         assert LiveAssuranceRecord.from_payload(record.to_payload()) == record
         assert record.schema_version == LIVE_ASSURANCE_SCHEMA_VERSION

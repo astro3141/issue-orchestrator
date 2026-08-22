@@ -12,13 +12,12 @@ from ..domain.repository_launch_selection import (
     RepositoryConfigurationIdentity,
     RepositoryLaunchSelection,
 )
-from ..execution.git_working_copy import GitWorkingCopy
 from ..execution.orchestrator_http_api import probe_orchestrator_json
 from ..infra.repo_identity import (
     RepoIdentity,
-    build_repo_identity_with_status,
     diff_repo_identity,
 )
+from .repo_identity_resolution import build_repo_identity
 
 LOCK_HEARTBEAT_UNRESPONSIVE_SECONDS = 45
 
@@ -37,24 +36,6 @@ class RepositoryOrchestratorOwnership:
     @property
     def all(self) -> tuple[dict[str, Any], ...]:
         return self.matching + self.conflicting
-
-
-def build_repo_identity(repo_root: Path) -> RepoIdentity:
-    """Build repo identity with execution-layer git status resolution."""
-    git = GitWorkingCopy()
-
-    def _resolve_repo_status(root: Path) -> tuple[str | None, list[str]]:
-        branch: str | None = None
-        try:
-            branch = git.get_current_branch(root)
-        except Exception:
-            branch = None
-        dirty_lines = git.get_status_porcelain_lines(root)
-        return branch, dirty_lines
-
-    return build_repo_identity_with_status(
-        repo_root, status_resolver=_resolve_repo_status
-    )
 
 
 def get_selected_launch_selection(repo_root: Path) -> RepositoryLaunchSelection:

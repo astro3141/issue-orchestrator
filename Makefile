@@ -531,9 +531,11 @@ test-integration-no-infra: test-integration-core
 # authenticated local CLIs and provider account state, and the lane plugin
 # classifies exceptions in the process that raised them.
 #
-# The `--live-assurance-*` options are what make the record exact-artifact
-# evidence. `git rev-parse HEAD` is resolved here rather than inside the plugin,
-# so the artifact identity is the checkout's and is visible in the command.
+# `--live-assurance-root` is the whole artifact identity: the lane reads the
+# commit *and* the working-tree state from that one checkout, so the record can
+# never be about a tree other than the one it is filed under. Resolving the SHA
+# here with `git rev-parse HEAD` would put it back in `make`'s cwd, free to name
+# a different checkout than the root, with nothing able to notice.
 #
 # There is deliberately no `-x` and no `-n`. `-x` would stop at the first
 # probe and hide a breach a later one would have proven; `-n` would classify
@@ -545,7 +547,6 @@ test-live-assurance: sync-deps
 		$(PYTEST) tests/integration -q --tb=short -m "$(LIVE_AGENT_MARKER)" \
 			-p tests.live_assurance_lane \
 			--live-assurance-root=$(LIVE_ASSURANCE_ROOT) \
-			--live-assurance-head-sha=$$(git rev-parse HEAD) \
 			$(PYTEST_TIMINGS))
 
 # Full integration tests including infrastructure-dependent ones (run in CI)
