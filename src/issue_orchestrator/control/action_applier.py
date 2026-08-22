@@ -87,6 +87,7 @@ from .actions import (
     ActionResult,
     ActionType,
     AddLabelAction,
+    ReleaseAbandonedIssueAction,
     RemoveLabelAction,
     SyncLabelsAction,
     ShedRecoveredWorkflowLabelsAction,
@@ -260,6 +261,7 @@ class ActionApplier:
         handlers: dict[ActionType, Callable[[Action], ActionResult]] = {
             ActionType.ADD_LABEL: self._apply_add_label,
             ActionType.REMOVE_LABEL: self._apply_remove_label,
+            ActionType.RELEASE_ABANDONED_ISSUE: self._apply_release_abandoned_issue,
             ActionType.SYNC_LABELS: self._apply_sync_labels,
             ActionType.APPLY_PROVIDER_IMPACT: self._apply_provider_impact,
             # SHED_RECOVERED_WORKFLOW_LABELS is intentionally NOT dispatchable:
@@ -532,6 +534,39 @@ class ActionApplier:
                 detail=str(e),
             )
             return ActionResult.fail(action, str(e))
+
+    def _apply_release_abandoned_issue(self, action: Action) -> ActionResult:
+        """Give an abandoned candidate back to scheduling (#195).
+
+        Two steps in one command, ordered like ``RECOVER_TERMINAL_ISSUE``: shed
+        the stale ``in-progress`` label first, and only then release this run's
+        duplicate-launch claim on the issue. Releasing first would hand the
+        issue back while a label the shed failed to remove still says a session
+        owns it; failing the whole command instead leaves the issue exactly as
+        it was, and the next tick plans the release again.
+
+        The label half delegates to the ordinary removal path rather than
+        reimplementing it, so reconciliation gating, claim verification,
+        label-store write-through and mutation stats stay in one place. The
+        claim half goes through the history owner, which keeps the operator's
+        record of the failed session intact — a record is not a claim.
+        """
+        assert isinstance(action, ReleaseAbandonedIssueAction)
+        if self.history_owner is None:
+            return ActionResult.fail(action, "Session history owner is not configured")
+        removal = self._apply_remove_label(action.label_removal())
+        if not removal.success:
+            return ActionResult.fail(
+                action,
+                removal.error or "stale in-progress label removal failed",
+            )
+        release = self.history_owner.release_claim(action.issue_number)
+        return ActionResult.ok(
+            action,
+            issue_number=action.issue_number,
+            label=action.label,
+            released_entries=release.released_entries,
+        )
 
     def _apply_provider_impact(self, action: Action) -> ActionResult:
         """Move an issue across the provider-availability boundary (#5980)."""

@@ -648,8 +648,12 @@ def run_planning_cycle(
         # propagates to the run loop, which logs the actionable message and
         # shuts down cleanly rather than crashing with a raw traceback.
 
-    # Detect stale issues and claims
-    stale_issues = _detect_stale_in_progress(observer, state, events, event_context)
+    # Detect stale issues and claims. Staleness is asked of the queue owner's
+    # reconciliation-visible set, not the launchable queue: an abandoned
+    # candidate has already left the queue by the time its label goes stale
+    # (#195).
+    queue_cache = QueueCache(config, state, queue_cache_store)
+    stale_issues = _detect_stale_in_progress(observer, state, events, event_context, queue_cache)
     stale_claim_issues = _detect_stale_claims(state.cached_queue_issues, state.active_sessions, claim_manager, events, event_context, io_claimed_label=io_claimed_label)
 
     # Sample provider launch eligibility BEFORE planning: it probes a CLI and
@@ -661,8 +665,8 @@ def run_planning_cycle(
     # owner also names the in-scope issues its duplicate-launch guard excluded,
     # so reconciliation keeps seeing them (#46) without any of them becoming
     # launchable.
-    reconcile_only_issues = QueueCache(config, state, queue_cache_store).reconciliation_only_issues()
-    snapshot = fact_gatherer.create_snapshot(state, state.cached_queue_issues, stale_in_progress_issues=stale_issues, stale_claim_issues=stale_claim_issues, provider_launch=provider_launch, reconcile_only_issues=reconcile_only_issues)
+    reconcile_only_issues = queue_cache.reconciliation_only_issues()
+    snapshot = fact_gatherer.create_snapshot(state, state.cached_queue_issues, stale_in_progress_issues=stale_issues, stale_claim_issues=stale_claim_issues, provider_launch=provider_launch, reconcile_only_issues=reconcile_only_issues, abandoned_issues=queue_cache.abandoned_after_completion_issues())
     _emit_facts_gathered(events, event_context, state, stale_issues)
 
     plan = planner.plan(snapshot)

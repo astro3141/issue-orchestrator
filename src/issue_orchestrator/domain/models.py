@@ -791,6 +791,28 @@ class StatusRollupCapability:
 BLOCKED_HISTORY_STATUSES: frozenset[SessionHistoryStatus] = frozenset(
     {"blocked", "needs_human", "failed", "validation_failed", "timed_out"}
 )
+ABANDONED_AFTER_COMPLETION_HISTORY_STATUSES: frozenset[SessionHistoryStatus] = frozenset(
+    {"validation_failed"}
+)
+"""History statuses whose session ended leaving the issue with NO owner (#195).
+
+The narrow half of :data:`BLOCKED_HISTORY_STATUSES`, and the narrowness is the
+point. Every other terminal completion keeps SOMEONE answering for the issue:
+
+- ``completed`` hands it to the awaiting-merge reconciler (and to the startup
+  presentation record rehydrated under the same status);
+- ``blocked``, ``failed`` and ``timed_out`` plant a BLOCKING label, so the
+  scheduler refuses the issue whether or not any in-memory gate is retired;
+- ``needs_human`` deliberately KEEPS ``in-progress`` to hold the ownership
+  claim while a human looks at it.
+
+``validation_failed`` is the one completion that leaves nothing: the terminal
+is disposed, the worktree removed, nothing is queued, and the marker it does
+leave (``validation-failed``) is LIFECYCLE, not blocking — so the issue is
+genuinely still schedulable and only the process-local "already worked this
+run" bookkeeping strands it until a restart. Widening this set would change a
+completion path that today has an owner.
+"""
 
 
 def session_history_status_from_session_status(status: SessionStatus) -> SessionHistoryStatus:
@@ -1421,6 +1443,13 @@ class SessionHistoryEntry:
     worktree_path: Optional[Path] = None
     completed_at: Optional[datetime] = None  # When the session completed (for sequence visibility)
     issue_labels: tuple[str, ...] = ()  # Snapshot retained for area/seam facts
+    # Whether this run has given the issue back (#195). An entry plays two
+    # roles: it is the operator-facing RECORD of what a session did, and it is
+    # the session-derived half of the duplicate-launch guard's CLAIM on the
+    # issue. Releasing an abandoned candidate retires the claim only — the
+    # record stays, because the failure it describes is exactly what the next
+    # attempt has to be judged against.
+    claim_released: bool = False
 
 
 @dataclass

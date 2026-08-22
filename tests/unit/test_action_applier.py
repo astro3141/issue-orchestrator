@@ -3273,6 +3273,11 @@ class TestClaimGateAudit:
     #   case file, which is never claimed.
     # - CLEANUP_SESSION: post-completion cleanup
     # - RECONCILE_HISTORY_ENTRY: local session history mutation + event only
+    # - RELEASE_ABANDONED_ISSUE: owner command (#195) - its only GitHub write is
+    #   the stale in-progress label removal, delegated to this applier's
+    #   claim-verified RemoveLabel handler (same delegation shape as
+    #   RESET_RETRY_ISSUE / APPLY_PROVIDER_IMPACT); the other half is a local
+    #   session-history claim release, like RECONCILE_HISTORY_ENTRY.
     # - CREATE_PR: not implemented in action_applier
     EXEMPT_ACTIONS = {
         ActionType.APPLY_PROVIDER_IMPACT,
@@ -3300,6 +3305,7 @@ class TestClaimGateAudit:
         ActionType.DISCARD_TERMINAL_TECH_LEAD_PROPOSAL_OPS,
         ActionType.CLEANUP_SESSION,
         ActionType.RECONCILE_HISTORY_ENTRY,
+        ActionType.RELEASE_ABANDONED_ISSUE,
         ActionType.CREATE_PR,
     }
 

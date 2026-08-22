@@ -102,6 +102,11 @@ class ActionType(Enum):
     # Terminal recovery (shed transient labels, then finalize history)
     RECOVER_TERMINAL_ISSUE = "recover_terminal_issue"
 
+    # Abandoned-candidate release (#195): shed the stale in-progress label, then
+    # release this run's duplicate-launch claim, so the engine reaches the next
+    # legitimate attempt without a restart. Keeps the history RECORD.
+    RELEASE_ABANDONED_ISSUE = "release_abandoned_issue"
+
 
 @dataclass(frozen=True)
 class Action:

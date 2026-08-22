@@ -11,8 +11,10 @@ from issue_orchestrator.control.orchestrator_support import (
     emit_queue_changes,
     track_stale_ticks,
 )
+from issue_orchestrator.control.queue_cache import QueueCache
 from issue_orchestrator.control.stale_detection import detect_stale_in_progress
 from issue_orchestrator.control.session_history import SessionHistoryOwner
+from issue_orchestrator.infra.config import Config
 from issue_orchestrator.contracts.public import (
     DependencyBlockedPayload,
     DependencyUnblockedPayload,
@@ -116,7 +118,8 @@ def test_stale_in_progress_events_payload_shape():
         def detect_stale_in_progress(self, cached_queue_issues, active_sessions):
             return cached_queue_issues
 
-    stale = detect_stale_in_progress(_Observer(), state, events, context)
+    queue_cache = QueueCache(Config(repo="acme/widgets"), state)
+    stale = detect_stale_in_progress(_Observer(), state, events, context, queue_cache)
     assert stale
     detected = events.get_events_by_name(EventName.STALE_IN_PROGRESS_DETECTED)
     assert len(detected) == 1

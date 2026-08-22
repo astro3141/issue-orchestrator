@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from typing import Literal, TypeAlias
 
 from ..domain.models import (
+    ABANDONED_AFTER_COMPLETION_HISTORY_STATUSES,
     AwaitingMergeTerminalStatus,
     BLOCKED_HISTORY_STATUSES,
     RECONCILABLE_HISTORY_STATUSES,
@@ -81,6 +82,24 @@ ClosedIssueHistoryResult: TypeAlias = (
 ISSUE_CLOSED_RECONCILABLE_HISTORY_STATUSES: frozenset[SessionHistoryStatus] = (
     BLOCKED_HISTORY_STATUSES | RECONCILABLE_HISTORY_STATUSES
 )
+
+
+@dataclass(frozen=True)
+class ClaimReleaseResult:
+    """What :meth:`SessionHistoryOwner.release_claim` actually released (#195).
+
+    Reports the number of entries whose duplicate-launch claim was dropped, so
+    a caller can tell a real release from a no-op, and the statuses they held,
+    so the release can be audited against what the session actually did.
+    """
+
+    issue_number: int
+    released_entries: int
+    statuses: tuple[SessionHistoryStatus, ...]
+
+    @property
+    def released(self) -> bool:
+        return self.released_entries > 0
 
 
 class SessionHistoryOwner:
@@ -236,6 +255,82 @@ class SessionHistoryOwner:
             previous_status=previous_status,
             status="closed",
             status_reason=status_reason,
+        )
+
+    def claiming_issue_numbers(self) -> frozenset[int]:
+        """Issues this run's history still holds a duplicate-launch claim on.
+
+        The session-derived half of ``QueueCache.evaluate_issue``'s guard, and
+        the planner's "already had a session this run" gate, read THIS rather
+        than every entry (#195). An entry whose claim has been released stays
+        in the history for the operator to read, but stops answering "this run
+        already worked the issue" — that is the whole difference between the
+        record and the claim.
+        """
+        return frozenset(
+            entry.issue_number
+            for entry in self.session_history
+            if not entry.claim_released
+        )
+
+    def abandoned_after_completion_issue_numbers(self) -> frozenset[int]:
+        """Issues whose history says the last session left no owner behind (#195).
+
+        The LATEST still-claiming entry decides, in the same spirit as every
+        other question this owner answers (:meth:`_find_latest_issue_entry`).
+        An issue that failed publication once and later completed with a PR is
+        owned by the awaiting-merge reconciler now, and must not read as
+        abandoned because an older row still says ``validation_failed``. An
+        issue whose claim is ALREADY released is not abandoned either — it has
+        been given back, so naming it again would release it every tick.
+
+        History-only: whether anything ELSE currently owns the issue — a
+        running session, a live control operation — is the queue owner's
+        question, not this one's.
+        """
+        latest_by_issue: dict[int, SessionHistoryStatus] = {}
+        for entry in self.session_history:
+            if entry.claim_released:
+                latest_by_issue.pop(entry.issue_number, None)
+                continue
+            latest_by_issue[entry.issue_number] = entry.status
+        return frozenset(
+            issue_number
+            for issue_number, status in latest_by_issue.items()
+            if status in ABANDONED_AFTER_COMPLETION_HISTORY_STATUSES
+        )
+
+    def release_claim(self, issue_number: int) -> ClaimReleaseResult:
+        """Give an abandoned issue back to scheduling, keeping its record (#195).
+
+        The in-memory counterpart of what a restart used to be needed for:
+        ``session_history`` is per-process, so restarting dropped every claim
+        at once and the next tick could reach the next attempt. This drops the
+        claim for ONE issue that has provably lost its owner, and drops nothing
+        else — the status, the reason, the PR URL and the worktree path all
+        stay, so the dashboard and failure diagnosis still see the session that
+        failed.
+
+        Nothing durable is touched, so no allowance is created or refunded:
+        labels, attempt receipts and failure counters are untouched, and the
+        scheduler re-decides from them on the next pass.
+        """
+        released = [
+            entry
+            for entry in self.session_history
+            if entry.issue_number == issue_number and not entry.claim_released
+        ]
+        for entry in released:
+            entry.claim_released = True
+        logger.info(
+            "release_claim: issue=#%d released=%d entry/entries (record retained)",
+            issue_number,
+            len(released),
+        )
+        return ClaimReleaseResult(
+            issue_number=issue_number,
+            released_entries=len(released),
+            statuses=tuple(entry.status for entry in released),
         )
 
     def _find_latest_matching_entry(

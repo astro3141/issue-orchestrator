@@ -130,6 +130,12 @@ class OrchestratorSnapshot:
     cleanup_facts: Optional[CleanupFacts] = None
     # Issues with stale in-progress labels (label present but no active session)
     stale_in_progress_issues: tuple[Issue, ...] = field(default_factory=tuple)
+    # In-scope issues whose last session ended leaving NO owner behind (#195),
+    # named by ``QueueCache.abandoned_after_completion_issues``. A subset of
+    # ``reconcile_only_issues``; the planner intersects it with
+    # ``stale_in_progress_issues`` to decide which stale label removal must
+    # ALSO release this run's duplicate-launch claim on the issue.
+    abandoned_issues: tuple[Issue, ...] = field(default_factory=tuple)
     # Issues with stale claims (io:claimed label but claim is expired)
     stale_claim_issues: tuple[Issue, ...] = field(default_factory=tuple)
     # Issues that failed this cycle - skip until cache refresh (prevents immediate retry)
@@ -213,6 +219,7 @@ class OrchestratorSnapshot:
         cleanup_facts: Optional[CleanupFacts] = None,
         stale_in_progress_issues: Sequence[Issue] = (),
         stale_claim_issues: Sequence[Issue] = (),
+        abandoned_issues: Sequence[Issue] = (),
     ) -> "OrchestratorSnapshot":
         """Create snapshot from mutable state.
 
@@ -232,6 +239,7 @@ class OrchestratorSnapshot:
             cleanup_facts: Facts about pending cleanups and their review status
             stale_in_progress_issues: Issues with stale in-progress labels
             stale_claim_issues: Issues with stale/expired claims
+            abandoned_issues: Issues whose last session left no owner (#195)
         """
         return cls(
             issues=tuple(issues),
@@ -267,6 +275,7 @@ class OrchestratorSnapshot:
             cleanup_facts=cleanup_facts,
             stale_in_progress_issues=tuple(stale_in_progress_issues),
             stale_claim_issues=tuple(stale_claim_issues),
+            abandoned_issues=tuple(abandoned_issues),
             failed_this_cycle=frozenset(state.failed_this_cycle),
         )
 

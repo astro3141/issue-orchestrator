@@ -18,6 +18,7 @@ from ..ports import EventSink, make_trace_event
 if TYPE_CHECKING:
     from ..domain.models import OrchestratorState, Session
     from ..ports.issue import Issue
+    from .queue_cache import QueueCache
 
 logger = logging.getLogger(__name__)
 
@@ -99,16 +100,44 @@ def detect_stale_in_progress(
     state: "OrchestratorState",
     events: EventSink,
     event_context: EventContext,
+    queue_cache: "QueueCache",
 ) -> list["Issue"]:
     """Detect stale in-progress issues."""
-    return _detect_stale_in_progress(observer, state, events, event_context)
+    return _detect_stale_in_progress(observer, state, events, event_context, queue_cache)
 
 
-def _detect_stale_in_progress(observer: object | None, state: "OrchestratorState", events: EventSink, event_context: EventContext) -> list["Issue"]:
-    """Detect stale in-progress issues."""
+def _detect_stale_in_progress(
+    observer: object | None,
+    state: "OrchestratorState",
+    events: EventSink,
+    event_context: EventContext,
+    queue_cache: "QueueCache",
+) -> list["Issue"]:
+    """Detect stale in-progress issues over the reconciliation-visible set.
+
+    Staleness is a RECONCILIATION question, not a scheduling one — "does this
+    label still describe reality?" is asked of an issue precisely when nothing
+    is working on it, which is when the duplicate-launch guard has already
+    dropped it from the launchable queue. Asking it of
+    ``cached_queue_issues`` alone therefore never reaches the issues that need
+    it most: a candidate that ended ``validation_failed`` left the queue on the
+    same tick it left ``active_sessions``, so its ``in-progress`` label stayed
+    forever and only a restart (whose ``session_history`` starts empty) could
+    clear it (#195).
+
+    The queue owner names the extra issues, and names only the ones no other
+    owner is answering for — a running session, a live control operation and
+    the awaiting-merge presentation record all stay out. Its result is disjoint
+    from the queue by construction, so the two concatenate without
+    deduplicating.
+    """
     if not (observer and hasattr(observer, 'detect_stale_in_progress')):
         return []
-    stale_issues = observer.detect_stale_in_progress(state.cached_queue_issues, state.active_sessions)
+    visible = [
+        *state.cached_queue_issues,
+        *queue_cache.abandoned_after_completion_issues(),
+    ]
+    stale_issues = observer.detect_stale_in_progress(visible, state.active_sessions)
     for issue in stale_issues:
         events.publish(make_trace_event(EventName.STALE_IN_PROGRESS_DETECTED, event_context.enrich({"issue_number": issue.number, "labels": list(issue.labels)})))
     return stale_issues

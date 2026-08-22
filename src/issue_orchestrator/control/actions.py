@@ -106,6 +106,50 @@ class RemoveLabelAction(Action):
 
 
 @dataclass(frozen=True)
+class ReleaseAbandonedIssueAction(Action):
+    """Release an issue whose last session left it to nobody (#195).
+
+    Two steps that must not drift apart, so they travel as one command:
+
+    1. shed the stale ``in-progress`` label — the same removal
+       ``_plan_stale_cleanup`` has always planned for a stale label; and
+    2. release this run's duplicate-launch CLAIM on the issue, so the planner
+       will consider it again on a later tick.
+
+    Step 2 is what a process restart used to be needed for: ``session_history``
+    is per-process, so restarting an engine dropped every claim at once and the
+    next tick reached the next attempt. This command does the same for exactly
+    ONE issue that has provably lost its owner, and only for the claim: the
+    history entry stays as the operator's record of the session that failed,
+    and every durable record — labels, attempt receipts, rework and
+    publish-failure counters — is untouched. No allowance is created or
+    refunded: whether another attempt is legitimate is still decided entirely
+    by those records, on the very next scheduling pass.
+
+    The applier owns the ordering (label first, claim second), so the issue is
+    never handed back while a label the shed failed to remove still says a
+    session owns it.
+    """
+
+    issue_number: int = 0
+    label: str = ""
+    issue_key: str = ""  # stable_id for SSE events; falls back to str(issue_number) when empty
+    action_type: ActionType = field(
+        default=ActionType.RELEASE_ABANDONED_ISSUE, init=False
+    )
+
+    def label_removal(self) -> "RemoveLabelAction":
+        """The stale-label half, as the removal the applier already knows."""
+        return RemoveLabelAction(
+            issue_number=self.issue_number,
+            label=self.label,
+            issue_key=self.issue_key,
+            reason=self.reason,
+            expected=self.expected,
+        )
+
+
+@dataclass(frozen=True)
 class SyncLabelsAction(Action):
     """Synchronize labels on an issue to match desired state."""
 

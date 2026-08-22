@@ -57,6 +57,7 @@ from .actions import (
     ActionType,
     AddCommentAction,
     AddLabelAction,
+    ReleaseAbandonedIssueAction,
     RemoveLabelAction,
     LaunchSessionAction,
     LaunchValidationRetryAction,
@@ -1065,15 +1066,37 @@ class Planner:
         the label is stale and should be removed. This allows the issue to be
         retried or processed normally.
 
+        An issue that is ALSO abandoned — its last session ended leaving no
+        owner at all (#195) — needs one thing more before "retried or processed
+        normally" is true of this process: this run's duplicate-launch claim on
+        it. Shedding the label alone leaves it stranded until a restart, so
+        those issues get the release command that owns both steps. Every other
+        stale issue gets exactly the removal it always got.
+
         Returns:
-            List of RemoveLabelAction for stale in-progress labels
+            List of stale in-progress label actions
         """
         actions: list[Action] = []
 
         if not snapshot.stale_in_progress_issues:
             return actions
 
+        abandoned = {issue.number for issue in snapshot.abandoned_issues}
         for issue in snapshot.stale_in_progress_issues:
+            if issue.number in abandoned:
+                actions.append(ReleaseAbandonedIssueAction(
+                    issue_number=issue.number,
+                    label=self._lm.in_progress,
+                    reason="abandoned after completion - no owner, no running session",
+                    expected=build_expected_for_mutation(),
+                    issue_key=issue.key.stable_id(),
+                ))
+                logger.info(
+                    "Planner: releasing abandoned issue #%d (stale in-progress label "
+                    "and no owner)",
+                    issue.number,
+                )
+                continue
             actions.append(RemoveLabelAction(
                 issue_number=issue.number,
                 label=self._lm.in_progress,

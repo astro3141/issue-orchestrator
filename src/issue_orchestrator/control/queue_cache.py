@@ -14,6 +14,7 @@ import traceback
 from typing import TYPE_CHECKING
 
 from .issue_scope import evaluate_issue_scope, issue_scope_skip_detail, outside_single_issue_scope
+from .session_history import SessionHistoryOwner
 
 if TYPE_CHECKING:
     from ..infra.config import Config
@@ -59,6 +60,16 @@ class QueueCache:
         self._config = config
         self._state = state
         self._store = queue_cache_store
+
+    def _history_owner(self) -> SessionHistoryOwner:
+        """The owner of every question this cache asks of session history.
+
+        Bound to live state rather than to the current list object: recovery,
+        publish-retry finalization and reset paths replace
+        ``state.session_history`` wholesale, and this cache outlives some of
+        those calls.
+        """
+        return SessionHistoryOwner(lambda: self._state.session_history)
 
     def replace_from_refresh(self, issues: list["Issue"]) -> list["Issue"]:
         """Replace queue from fetched issues using canonical eligibility policy."""
@@ -167,11 +178,17 @@ class QueueCache:
         issue for good. Both halves report ``REJECTED_EXCLUDED``, which keeps
         the issue visible to :meth:`reconciliation_only_issues` — an issue held
         by a live control operation still needs its other state reconciled.
+
+        The history half asks the history owner which entries still CLAIM
+        their issue, not merely which issues appear in the list (#195). A
+        session that ended leaving no owner has its claim released once the
+        engine gives the issue back; the entry stays as the operator's record
+        of that failure, and a record is not a claim.
         """
         if not _matches_scope(self._config, issue):
             return QueueMutationStatus.REJECTED_OUT_OF_SCOPE
 
-        excluded_numbers = {entry.issue_number for entry in self._state.session_history}
+        excluded_numbers = set(self._history_owner().claiming_issue_numbers())
         excluded_numbers.update(session.issue.number for session in self._state.active_sessions)
         if issue.number in excluded_numbers:
             return QueueMutationStatus.REJECTED_EXCLUDED
@@ -249,6 +266,45 @@ class QueueCache:
             if issue.number not in queued
             and self.evaluate_issue(issue) is QueueMutationStatus.REJECTED_EXCLUDED
             and not self.is_outside_engine_scope(issue)
+        ]
+
+    def abandoned_after_completion_issues(self) -> list["Issue"]:
+        """Reconciliation-visible issues NOTHING is holding any more (#195).
+
+        The discrimination inside ``REJECTED_EXCLUDED`` that
+        :meth:`reconciliation_only_issues` deliberately does not draw. That set
+        is "in scope, not launchable again this run", which lumps four
+        situations together; three of them have an owner still answering for
+        the issue and must keep answering exactly as they do today:
+
+        - a RUNNING session (``active_sessions``) — the terminal owns it;
+        - a live control operation (``control_operation_exclusions``) — the
+          orchestrator itself owns it, with no terminal at all (#146);
+        - the awaiting-merge presentation record startup rehydrates into
+          ``session_history`` — the awaiting-merge reconciler owns it.
+
+        What is left is the abandoned-after-completion case: a session that
+        ended, was disposed, and left the issue to nobody
+        (``ABANDONED_AFTER_COMPLETION_HISTORY_STATUSES``). "Is this issue's
+        ``in-progress`` label stale?" is a reconciliation question by the very
+        distinction :meth:`reconciliation_only_issues` documents, and this is
+        the subset of it that can be answered honestly without stepping on
+        another owner's issue.
+
+        A strict subset of :meth:`reconciliation_only_issues`, so it is
+        disjoint from the queue for the same reason and callers may concatenate
+        the two without deduplicating.
+        """
+        abandoned = self._history_owner().abandoned_after_completion_issue_numbers()
+        if not abandoned:
+            return []
+        running = {session.issue.number for session in self._state.active_sessions}
+        return [
+            issue
+            for issue in self.reconciliation_only_issues()
+            if issue.number in abandoned
+            and issue.number not in running
+            and not self._state.control_operation_exclusions.excludes_issue(issue.key)
         ]
 
     def prune_refresh_timestamps(self) -> None:

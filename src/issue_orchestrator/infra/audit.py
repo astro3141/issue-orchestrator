@@ -18,6 +18,7 @@ from ..domain.dependencies import parse_dependencies
 from ..ports.issue import Issue
 from ..domain.models import OrchestratorState
 from ..control.scheduler import Scheduler
+from ..control.session_history import SessionHistoryOwner
 
 
 class SkipReason(Enum):
@@ -119,10 +120,16 @@ def get_queue_issues(
         all_issues = fetch_all_issues(config, issue_tracker)
 
     # Get history and active issue numbers
-    history_numbers = set()
-    active_numbers = set()
+    history_numbers: set[int] = set()
+    active_numbers: set[int] = set()
     if state:
-        history_numbers = {e.issue_number for e in state.session_history}
+        # "Already processed this run" is the duplicate-launch claim, not the
+        # mere presence of a record: an entry whose claim the engine released
+        # no longer keeps its issue out of the queue (#195), so reporting it as
+        # IN_HISTORY would explain a skip that is not happening.
+        history_numbers = set(
+            SessionHistoryOwner(state.session_history).claiming_issue_numbers()
+        )
         active_numbers = {s.issue.number for s in state.active_sessions}
 
     # Use scheduler's filtering (same as run_loop uses)
@@ -166,10 +173,16 @@ def audit_queue(
     entries = []
 
     # Get history issue numbers
-    history_numbers = set()
-    active_numbers = set()
+    history_numbers: set[int] = set()
+    active_numbers: set[int] = set()
     if state:
-        history_numbers = {e.issue_number for e in state.session_history}
+        # "Already processed this run" is the duplicate-launch claim, not the
+        # mere presence of a record: an entry whose claim the engine released
+        # no longer keeps its issue out of the queue (#195), so reporting it as
+        # IN_HISTORY would explain a skip that is not happening.
+        history_numbers = set(
+            SessionHistoryOwner(state.session_history).claiming_issue_numbers()
+        )
         active_numbers = {s.issue.number for s in state.active_sessions}
 
     if issue_branches is None:
