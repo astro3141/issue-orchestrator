@@ -275,11 +275,12 @@ class SessionHistoryOwner:
     def pr_backed_claiming_issue_numbers(self) -> frozenset[int]:
         """Issues still holding an unreleased awaiting-merge record (#195).
 
-        ``completed`` + ``pr_url`` is the awaiting-merge shape, defined here
-        exactly as ``AwaitingMergeReconciler._awaiting_merge_entries`` defines
-        it, and :meth:`reconcile_awaiting_merge` is what retires it once the PR
-        reaches ``merged``/``closed``. While it stands, its claim is what keeps
-        a fresh CODING session off an issue whose PR is still open.
+        The awaiting-merge shape is
+        :attr:`SessionHistoryEntry.is_awaiting_merge_record`, the same predicate
+        ``AwaitingMergeReconciler`` selects on, and
+        :meth:`reconcile_awaiting_merge` is what retires it once the PR reaches
+        ``merged``/``closed``. While it stands, its claim is what keeps a fresh
+        CODING session off an issue whose PR is still open.
 
         Reported per-issue rather than per-entry because that is the grain the
         release works at: :meth:`release_claim` retires EVERY unreleased entry
@@ -298,9 +299,7 @@ class SessionHistoryOwner:
         return frozenset(
             entry.issue_number
             for entry in self.session_history
-            if not entry.claim_released
-            and entry.status in RECONCILABLE_HISTORY_STATUSES
-            and entry.pr_url
+            if not entry.claim_released and entry.is_awaiting_merge_record
         )
 
     def abandoned_after_completion_issue_numbers(self) -> frozenset[int]:

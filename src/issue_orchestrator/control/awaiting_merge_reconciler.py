@@ -14,7 +14,6 @@ from ..domain.models import (
     DiscoveredAwaitingMergeReconciliation,
     DiscoveredRework,
     MergedIssueDisposition,
-    RECONCILABLE_HISTORY_STATUSES,
     TERMINAL_AWAITING_MERGE_HISTORY_STATUSES,
 )
 from ..history import latest_history_entries_by_issue
@@ -234,7 +233,7 @@ class AwaitingMergeReconciler:
                 state.session_history,
                 limit=self.history_limit,
             )
-            if entry.status in RECONCILABLE_HISTORY_STATUSES and bool(entry.pr_url)
+            if entry.is_awaiting_merge_record
         ]
 
     def _discover_entry(

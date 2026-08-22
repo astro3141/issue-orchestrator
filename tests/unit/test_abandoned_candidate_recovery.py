@@ -286,6 +286,28 @@ class TestTheQueueOwnerNamesOnlyTheOwnerlessIssues:
 
         assert [i.number for i in cache.abandoned_candidates().issues] == [ABANDONED]
 
+    @pytest.mark.parametrize(
+        ("status", "pr_url", "expected"),
+        [
+            ("completed", "https://example.test/pr/318", True),
+            ("completed", None, False),
+            ("merged", "https://example.test/pr/318", False),
+            ("closed", "https://example.test/pr/318", False),
+            ("validation_failed", "https://example.test/pr/318", False),
+        ],
+    )
+    def test_the_awaiting_merge_shape_has_one_definition(
+        self, status: str, pr_url: str | None, expected: bool
+    ) -> None:
+        """The duplicate-launch guard and the reconciler select on the SAME rule.
+
+        Held on the entry itself so a change to what "awaiting merge" means
+        cannot move one consumer without the other.
+        """
+        entry = _history(ABANDONED, status, pr_url=pr_url)
+
+        assert entry.is_awaiting_merge_record is expected
+
     def test_a_pr_less_completion_does_not_shield(self, tmp_path: Path) -> None:
         """The claim is the awaiting-merge reconciler's, and it needs a PR.
 

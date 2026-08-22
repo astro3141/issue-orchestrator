@@ -1451,6 +1451,18 @@ class SessionHistoryEntry:
     # attempt has to be judged against.
     claim_released: bool = False
 
+    @property
+    def is_awaiting_merge_record(self) -> bool:
+        """Whether this entry says a PR of ours is still out there.
+
+        One owner for a predicate two different questions depend on:
+        ``AwaitingMergeReconciler`` uses it to decide what to reconcile, and
+        the duplicate-launch guard uses it to decide what must never be
+        released as abandoned (#195). Split across the two, a change to what
+        "awaiting merge" means would silently move only one of them.
+        """
+        return self.status in RECONCILABLE_HISTORY_STATUSES and bool(self.pr_url)
+
 
 @dataclass
 class PendingCleanup:
