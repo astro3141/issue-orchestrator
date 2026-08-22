@@ -114,6 +114,7 @@ from .provider_impact import ApplyProviderImpactAction, apply_provider_impact
 from .session_manager import SessionManager, SessionRef, SessionType, SessionContext
 from .tech_lead_applier_handlers import tech_lead_action_handlers
 from .tech_lead_issue_creation import apply_create_tech_lead_issue
+from .abandoned_release_applying import apply_release_abandoned_issue
 from .history_reconciliation import apply_history_reconciliation
 from .tech_lead_proposals import execute_approved_tech_lead_op
 from .tech_lead_reset_retry import apply_surface_tech_lead_proposal
@@ -538,53 +539,18 @@ class ActionApplier:
     def _apply_release_abandoned_issue(self, action: Action) -> ActionResult:
         """Give an abandoned candidate back to scheduling (#195).
 
-        Up to three steps in one command, ordered like ``RECOVER_TERMINAL_ISSUE``
-        and each gated on the one before:
-
-        1. plant the escalation label, when this run has spent its release
-           budget for the issue. First, because it is what the issue is being
-           handed back TO — a release that landed without it would leave the
-           issue considerable with nothing in the system refusing it;
-        2. shed the stale ``in-progress`` label;
-        3. release this run's duplicate-launch claim.
-
-        Releasing before either label would hand the issue back while a label
-        the write failed to change still says a session owns it. Failing the
-        whole command instead leaves the issue exactly as it was, still wearing
-        ``in-progress``, so the next tick sees the same stale label and plans
-        the same command again.
-
-        Both label halves delegate to the ordinary add/remove paths rather than
-        reimplementing them, so reconciliation gating, claim verification,
-        needs-human cause bookkeeping, label-store write-through and mutation
-        stats stay in one place. The claim half goes through the history owner,
-        which keeps the operator's record of the failed session intact — a
-        record is not a claim.
+        The ordered command lives in :mod:`.abandoned_release_applying`; this
+        supplies the applier's ordinary write paths for it to sequence, so
+        reconciliation gating, claim verification, needs-human cause
+        bookkeeping, label-store write-through and mutation stats stay here.
         """
         assert isinstance(action, ReleaseAbandonedIssueAction)
-        if self.history_owner is None:
-            return ActionResult.fail(action, "Session history owner is not configured")
-        if (escalation := action.escalation()) is not None:
-            escalated = self._apply_add_label(escalation)
-            if not escalated.success:
-                return ActionResult.fail(
-                    action,
-                    escalated.error or "release-budget escalation label add failed",
-                )
-        removal = self._apply_remove_label(action.label_removal())
-        if not removal.success:
-            return ActionResult.fail(
-                action,
-                removal.error or "stale in-progress label removal failed",
-            )
-        release = self.history_owner.release_claim(action.issue_number)
-        return ActionResult.ok(
+        return apply_release_abandoned_issue(
             action,
-            issue_number=action.issue_number,
-            label=action.label,
-            released_entries=release.released_entries,
-            releases_granted=release.releases_granted,
-            escalation_label=action.escalation_label,
+            history_owner=self.history_owner,
+            add_label=self._apply_add_label,
+            remove_label=self._apply_remove_label,
+            add_comment=self._apply_add_comment,
         )
 
     def _apply_provider_impact(self, action: Action) -> ActionResult:

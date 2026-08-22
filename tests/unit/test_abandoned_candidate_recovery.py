@@ -52,6 +52,9 @@ from issue_orchestrator.control.planner import Planner
 from issue_orchestrator.control.queue_cache import QueueCache, QueueMutationStatus
 from issue_orchestrator.control.scheduler import Scheduler
 from issue_orchestrator.control.session_history import SessionHistoryOwner
+from issue_orchestrator.control.stale_cleanup_planning import (
+    plan_stale_in_progress_actions,
+)
 from issue_orchestrator.control.stale_detection import detect_stale_in_progress
 from issue_orchestrator.domain.control_operation import (
     ControlOperationKey,
@@ -184,6 +187,118 @@ class TestTheQueueOwnerNamesOnlyTheOwnerlessIssues:
         cache = _cache(config, state, _issue(ABANDONED, labels=["pr-pending"]))
 
         assert cache.abandoned_candidates().issues == ()
+
+    def test_an_awaiting_merge_record_under_a_later_refusal_is_never_named(
+        self, tmp_path: Path
+    ) -> None:
+        """Direction 4, LAYERED: the PR-backed record is not always the latest.
+
+        ``_plan_discovered_reworks`` does not consult the history gate, so a
+        rework session can run for a PR-backed issue and its pre-publish
+        validation gate can end it ``validation_failed``, appending an entry
+        UNDER which the awaiting-merge record still sits unreleased. Naming the
+        issue would release both — ``release_claim`` is whole-issue — and a
+        fresh coding session would launch against a still-open PR.
+
+        The reconciler does not cover this: it reads the latest entry per
+        issue, so the layered record is dormant and its claim is the only
+        thing holding the line.
+        """
+        config = _config(tmp_path)
+        state = OrchestratorState()
+        state.session_history.append(_awaiting_merge_record(ABANDONED))
+        state.session_history.append(_history(ABANDONED, "validation_failed"))
+        issue = _issue(ABANDONED, labels=[IN_PROGRESS])
+        cache = _cache(config, state, issue)
+
+        assert cache.abandoned_candidates().issues == ()
+        # Still reconciliation-visible, exactly as before: not naming it as
+        # abandoned narrows nothing else about the issue.
+        assert [i.number for i in cache.reconciliation_only_issues()] == [ABANDONED]
+
+    def test_no_pr_backed_claim_is_released_under_a_later_refusal(
+        self, tmp_path: Path
+    ) -> None:
+        """The consequence the naming rule exists to prevent, asserted directly.
+
+        Planned with the issue handed in as stale anyway, so this pins the
+        PLANNER's rule rather than relying on detection never reaching it: an
+        issue the queue owner did not name gets the ordinary removal, which
+        touches no claim, and never the release.
+        """
+        config = _config(tmp_path)
+        state = OrchestratorState()
+        state.session_history.append(_awaiting_merge_record(ABANDONED))
+        state.session_history.append(_history(ABANDONED, "validation_failed"))
+        issue = _issue(ABANDONED, labels=[IN_PROGRESS])
+        cache = _cache(config, state, issue)
+
+        actions = plan_stale_in_progress_actions(
+            stale_issues=[issue],
+            abandoned=cache.abandoned_candidates(),
+            labels=LabelManager(config),
+        )
+
+        assert [a.action_type for a in actions] == [ActionType.REMOVE_LABEL]
+        assert all(not entry.claim_released for entry in state.session_history)
+        # And the issue stays out of the queue, so nothing relaunches it.
+        cache.replace_from_refresh([issue])
+        assert state.cached_queue_issues == []
+
+    def test_the_shielded_issue_is_not_stale_visible_this_tick(
+        self, tmp_path: Path
+    ) -> None:
+        """Not naming it also keeps it out of the staleness-visible set.
+
+        So its ``in-progress`` label is not shed while the PR-backed record
+        still claims it — unchanged from before #195 for this shape, and the
+        conservative direction: the alternative is a fresh coding session
+        against a still-open PR. The shield is not permanent; when the PR
+        reaches ``merged``/``closed`` the record stops being reconcilable, the
+        issue becomes an abandoned candidate, and the label is shed then (see
+        ``test_a_pr_backed_record_shields_only_while_it_is_reconcilable``).
+        """
+        config = _config(tmp_path)
+        state = OrchestratorState()
+        state.session_history.append(_awaiting_merge_record(ABANDONED))
+        state.session_history.append(_history(ABANDONED, "validation_failed"))
+        cache = _cache(config, state, _issue(ABANDONED, labels=[IN_PROGRESS]))
+
+        visible = [*state.cached_queue_issues, *cache.abandoned_candidates().issues]
+
+        assert [i.number for i in visible] == []
+
+    def test_a_pr_backed_record_shields_only_while_it_is_reconcilable(
+        self, tmp_path: Path
+    ) -> None:
+        """Once the reconciler retires the record, the shield lifts with it.
+
+        Otherwise a merged/closed PR would strand the issue permanently — the
+        opposite failure, and the one #195 exists to remove.
+        """
+        config = _config(tmp_path)
+        state = OrchestratorState()
+        state.session_history.append(
+            _history(ABANDONED, "merged", pr_url="https://example.test/pr/318")
+        )
+        state.session_history.append(_history(ABANDONED, "validation_failed"))
+        cache = _cache(config, state, _issue(ABANDONED, labels=[IN_PROGRESS]))
+
+        assert [i.number for i in cache.abandoned_candidates().issues] == [ABANDONED]
+
+    def test_a_pr_less_completion_does_not_shield(self, tmp_path: Path) -> None:
+        """The claim is the awaiting-merge reconciler's, and it needs a PR.
+
+        A ``completed`` row with no PR URL has no reconciler watching it, so it
+        is not an owner and must not keep the later refusal from being seen.
+        """
+        config = _config(tmp_path)
+        state = OrchestratorState()
+        state.session_history.append(_history(ABANDONED, "completed"))
+        state.session_history.append(_history(ABANDONED, "validation_failed"))
+        cache = _cache(config, state, _issue(ABANDONED, labels=[IN_PROGRESS]))
+
+        assert [i.number for i in cache.abandoned_candidates().issues] == [ABANDONED]
 
     def test_a_live_control_operation_is_never_named(self, tmp_path: Path) -> None:
         """#146's terminal-less owner still owns the issue."""
@@ -789,26 +904,46 @@ class TestTheExhaustedCandidateEscalatesInsteadOfRelaunching:
     def test_the_escalation_explains_itself_to_the_operator(
         self, tmp_path: Path
     ) -> None:
-        comments = [
+        actions = self._plan(tmp_path, granted=2)
+        releases = [
+            a for a in actions if a.action_type is ActionType.RELEASE_ABANDONED_ISSUE
+        ]
+
+        assert len(releases) == 1
+        announcement = releases[0].escalation_announcement()
+        assert announcement is not None
+        assert announcement.number == ABANDONED
+        assert "max_abandoned_releases" in announcement.comment
+        assert "2" in announcement.comment
+
+    def test_the_announcement_is_not_a_sibling_of_the_release(
+        self, tmp_path: Path
+    ) -> None:
+        """It travels INSIDE the command, so a failed release cannot announce.
+
+        ``_apply_single_action`` does not halt the plan, so a sibling
+        ``AddCommentAction`` would be applied even when the release failed on
+        its label add — asserting an escalation that did not happen, and
+        re-posting it every tick until the add succeeded.
+        """
+        assert [
             a
             for a in self._plan(tmp_path, granted=2)
             if a.action_type is ActionType.ADD_COMMENT
-        ]
-
-        assert len(comments) == 1
-        assert comments[0].number == ABANDONED
-        assert "max_abandoned_releases" in comments[0].comment
-        assert "2" in comments[0].comment
+        ] == []
 
     def test_no_comment_is_posted_while_the_budget_holds(
         self, tmp_path: Path
     ) -> None:
         """The escalation is a one-off, not a per-tick announcement."""
-        assert [
+        releases = [
             a
             for a in self._plan(tmp_path, granted=0)
-            if a.action_type is ActionType.ADD_COMMENT
-        ] == []
+            if a.action_type is ActionType.RELEASE_ABANDONED_ISSUE
+        ]
+
+        assert len(releases) == 1
+        assert releases[0].escalation_announcement() is None
 
     def test_the_escalated_issue_is_refused_by_the_scheduler(
         self, tmp_path: Path
@@ -830,7 +965,9 @@ class TestTheExhaustedCandidateEscalatesInsteadOfRelaunching:
 
 
 class TestTheApplierOrdersTheEscalatedRelease:
-    def _applier(self, state: OrchestratorState) -> tuple[ActionApplier, MagicMock]:
+    def _applier(
+        self, state: OrchestratorState, *, repository_host: MagicMock | None = None
+    ) -> tuple[ActionApplier, MagicMock]:
         labels = MagicMock()
         labels.get_labels.return_value = [AGENT, IN_PROGRESS]
         labels.has_label.return_value = False
@@ -839,18 +976,20 @@ class TestTheApplierOrdersTheEscalatedRelease:
                 labels=labels,
                 sessions=MagicMock(),
                 events=MockEventSink(),
+                repository_host=repository_host,
                 history_owner=SessionHistoryOwner(lambda: state.session_history),
             ),
             labels,
         )
 
-    def _escalated(self) -> ReleaseAbandonedIssueAction:
+    def _escalated(self, *, comment: str = "") -> ReleaseAbandonedIssueAction:
         return ReleaseAbandonedIssueAction(
             issue_number=ABANDONED,
             label=IN_PROGRESS,
             reason="abandoned",
             escalation_label="needs-human",
             escalation_reason="budget spent",
+            escalation_comment=comment,
         )
 
     def _state(self) -> OrchestratorState:
@@ -906,3 +1045,65 @@ class TestTheApplierOrdersTheEscalatedRelease:
         assert result.success
         labels.add_label.assert_not_called()
         labels.remove_label.assert_called_once_with(ABANDONED, IN_PROGRESS)
+
+    def test_the_announcement_lands_last_and_only_after_the_release(self) -> None:
+        """The comment asserts the block WAS applied, so it must follow it."""
+        state = self._state()
+        host = MagicMock()
+        applier, labels = self._applier(state, repository_host=host)
+        order: list[str] = []
+        labels.add_label.side_effect = lambda *_a, **_k: order.append("add")
+        labels.remove_label.side_effect = lambda *_a, **_k: order.append("remove")
+        host.add_comment.side_effect = lambda *_a, **_k: order.append("comment")
+
+        result = applier.apply(self._escalated(comment="budget spent, escalated"))
+
+        assert result.success
+        assert order == ["add", "remove", "comment"]
+        assert result.details["escalation_announced"] is True
+        assert state.session_history[-1].claim_released is True
+
+    def test_a_failed_escalation_announces_nothing(self) -> None:
+        """The defect this fold closes: a sibling comment would still post here,
+        asserting a block that never landed, and re-post it every tick."""
+        state = self._state()
+        host = MagicMock()
+        applier, labels = self._applier(state, repository_host=host)
+        labels.add_label.side_effect = RuntimeError("GitHub said no")
+
+        result = applier.apply(self._escalated(comment="budget spent, escalated"))
+
+        assert not result.success
+        host.add_comment.assert_not_called()
+        assert state.session_history[-1].claim_released is False
+
+    def test_a_failed_announcement_does_not_take_the_release_back(self) -> None:
+        """By the time it posts, the block and the release have both happened —
+        reporting failure would read as 'still relaunchable', which is untrue."""
+        state = self._state()
+        host = MagicMock()
+        host.add_comment.side_effect = RuntimeError("comment API down")
+        applier, labels = self._applier(state, repository_host=host)
+
+        result = applier.apply(self._escalated(comment="budget spent, escalated"))
+
+        assert result.success
+        assert result.details["escalation_announced"] is False
+        labels.add_label.assert_called_once_with(ABANDONED, "needs-human")
+        assert state.session_history[-1].claim_released is True
+
+    def test_a_release_inside_the_budget_announces_nothing(self) -> None:
+        state = OrchestratorState()
+        state.session_history.append(_history(ABANDONED, "validation_failed"))
+        host = MagicMock()
+        applier, _labels = self._applier(state, repository_host=host)
+
+        result = applier.apply(
+            ReleaseAbandonedIssueAction(
+                issue_number=ABANDONED, label=IN_PROGRESS, reason="abandoned"
+            )
+        )
+
+        assert result.success
+        assert result.details["escalation_announced"] is False
+        host.add_comment.assert_not_called()

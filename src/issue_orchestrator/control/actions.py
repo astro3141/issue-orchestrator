@@ -133,10 +133,20 @@ class ReleaseAbandonedIssueAction(Action):
     the ONLY bound on relaunch that this command retires, with nothing left in
     the system counting fresh coding launches.
 
+    ``escalation_comment`` is the operator-facing explanation of that ceiling,
+    and it travels here for the mirror-image reason the label does. Planned as
+    a sibling action it would be applied whether or not the release succeeded —
+    ``_apply_single_action`` does not halt the plan — so a release that failed
+    on the label add would still post a comment ASSERTING the label was
+    applied, and re-post it every tick until the add succeeded. Inside the
+    command it can only be posted after the escalation it describes has
+    actually happened, which also makes it one-shot: the same release retires
+    the claim that names the issue abandoned.
+
     The applier owns the ordering (escalation label, then stale label, then
-    claim), so the issue is never handed back while a label the shed failed to
-    remove still says a session owns it, nor handed back unblocked when the
-    escalation is the whole point of the release.
+    claim, then comment), so the issue is never handed back while a label the
+    shed failed to remove still says a session owns it, nor handed back
+    unblocked when the escalation is the whole point of the release.
     """
 
     issue_number: int = 0
@@ -144,6 +154,7 @@ class ReleaseAbandonedIssueAction(Action):
     issue_key: str = ""  # stable_id for SSE events; falls back to str(issue_number) when empty
     escalation_label: str = ""  # non-empty -> this run's release budget is spent
     escalation_reason: str = ""
+    escalation_comment: str = ""
     action_type: ActionType = field(
         default=ActionType.RELEASE_ABANDONED_ISSUE, init=False
     )
@@ -174,6 +185,21 @@ class ReleaseAbandonedIssueAction(Action):
             reason=self.escalation_reason,
             expected=self.expected,
             needs_human_cause=NeedsHumanCause.SESSION_LIFECYCLE,
+        )
+
+    def escalation_announcement(self) -> "AddCommentAction | None":
+        """The explanation of the ceiling, as the comment the applier knows.
+
+        Only meaningful alongside :meth:`escalation` — a release that is not
+        the exhausting one has nothing to announce.
+        """
+        if not self.escalation_comment:
+            return None
+        return AddCommentAction(
+            number=self.issue_number,
+            comment=self.escalation_comment,
+            reason="Explain why automatic relaunch stopped",
+            expected=self.expected,
         )
 
 

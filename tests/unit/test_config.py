@@ -2468,6 +2468,44 @@ retry:
         )
 
 
+class TestAbandonedReleaseBudgetConfig:
+    """``retry.max_abandoned_releases`` — the relaunch ceiling (#195)."""
+
+    def test_defaults(self):
+        assert Config().retry.max_abandoned_releases == 2
+
+    def test_parsing(self, tmp_path):
+        prompt = tmp_path / "prompt.md"
+        prompt.write_text("Prompt")
+        config_file = tmp_path / ".issue-orchestrator.yaml"
+        config_file.write_text(f"""
+agents:
+  agent:backend:
+    prompt: {prompt}
+retry:
+  max_abandoned_releases: 5
+""")
+
+        config = Config.load(config_file)
+
+        assert config.retry.max_abandoned_releases == 5
+        # A retry section that names only this key must not disturb its siblings.
+        assert config.retry.max_validation_retries == 3
+
+    def test_round_trip(self, tmp_path):
+        """``to_dict`` serializes it, so a saved config reloads to the same value."""
+        prompt = tmp_path / "prompt.md"
+        prompt.write_text("Prompt")
+        config = Config()
+        config.retry.max_abandoned_releases = 7
+
+        assert config.to_dict()["retry"]["max_abandoned_releases"] == 7
+
+    def test_the_default_is_not_serialized(self, tmp_path):
+        """Same rule its siblings follow: only non-defaults are written back."""
+        assert "max_abandoned_releases" not in Config().to_dict().get("retry", {})
+
+
 class TestCleanupConfig:
     """Tests for cleanup configuration."""
 

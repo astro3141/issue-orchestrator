@@ -272,6 +272,37 @@ class SessionHistoryOwner:
             if not entry.claim_released
         )
 
+    def pr_backed_claiming_issue_numbers(self) -> frozenset[int]:
+        """Issues still holding an unreleased awaiting-merge record (#195).
+
+        ``completed`` + ``pr_url`` is the awaiting-merge shape, defined here
+        exactly as ``AwaitingMergeReconciler._awaiting_merge_entries`` defines
+        it, and :meth:`reconcile_awaiting_merge` is what retires it once the PR
+        reaches ``merged``/``closed``. While it stands, its claim is what keeps
+        a fresh CODING session off an issue whose PR is still open.
+
+        Reported per-issue rather than per-entry because that is the grain the
+        release works at: :meth:`release_claim` retires EVERY unreleased entry
+        for the issue, so an issue holding this record anywhere in its history
+        cannot be released without dropping this claim too. The queue owner
+        uses it to keep such an issue out of the abandoned set entirely
+        (:meth:`QueueCache.abandoned_candidates`), which is where the other
+        "something else still holds this" judgements already live.
+
+        A pure history FACT, and deliberately not "is the reconciler currently
+        watching this issue?" — the reconciler reads only the LATEST entry per
+        issue, so a record sitting under a later one is dormant rather than
+        gone. Dormant is still not abandoned: the PR it names can be open, and
+        the claim is the only thing standing between it and a new session.
+        """
+        return frozenset(
+            entry.issue_number
+            for entry in self.session_history
+            if not entry.claim_released
+            and entry.status in RECONCILABLE_HISTORY_STATUSES
+            and entry.pr_url
+        )
+
     def abandoned_after_completion_issue_numbers(self) -> frozenset[int]:
         """Issues whose history says the last session left no owner behind (#195).
 
@@ -327,6 +358,15 @@ class SessionHistoryOwner:
         else — the status, the reason, the PR URL and the worktree path all
         stay, so the dashboard and failure diagnosis still see the session that
         failed.
+
+        Whole-issue by design, and that is a PRECONDITION on the caller. A
+        restart dropped every claim the issue held, so releasing only the
+        latest entry would leave an older one still answering "this run already
+        worked the issue" and re-strand it. The caller must therefore have
+        established that NO entry for the issue is still an owner's claim —
+        :meth:`QueueCache.abandoned_candidates` is the one place that judgement
+        is made, and :meth:`pr_backed_claiming_issue_numbers` is the fact it
+        reads to keep an awaiting-merge record out of this method's reach.
 
         Nothing durable is touched, so no allowance is created or refunded:
         labels, attempt receipts and failure counters are untouched, and the

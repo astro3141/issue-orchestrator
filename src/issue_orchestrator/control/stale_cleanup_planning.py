@@ -8,7 +8,7 @@ by path:
   command, which sheds the label and hands the duplicate-launch claim back so
   the next legitimate attempt can start (#195);
 - an abandoned candidate whose budget is spent -> the same release, carrying a
-  ``needs-human`` escalation with it.
+  ``needs-human`` escalation and its explanation with it.
 
 The third arm is what keeps the second from being an unbounded relaunch loop.
 The release retires ``session_history_issue_numbers``, which is the only member
@@ -25,7 +25,7 @@ import logging
 from typing import TYPE_CHECKING, Sequence
 
 from .abandoned_candidates import AbandonedCandidate, AbandonedCandidates
-from .actions import Action, AddCommentAction, ReleaseAbandonedIssueAction, RemoveLabelAction
+from .actions import Action, ReleaseAbandonedIssueAction, RemoveLabelAction
 from .reconciliation import build_expected_for_mutation
 
 if TYPE_CHECKING:
@@ -95,29 +95,26 @@ def _release_actions(
         candidate.max_releases,
         labels.needs_human,
     )
-    expected = build_expected_for_mutation()
     return [
-        # The escalation label travels INSIDE the release command so the applier
-        # can order it: blocking label first, stale label second, claim last. A
-        # separate action could be applied after a successful release, leaving a
-        # window where the issue is considerable and nothing refuses it.
+        # The escalation label AND its explanation travel INSIDE the release
+        # command so the applier can order them: blocking label first, stale
+        # label second, claim third, announcement last. Planned as siblings
+        # instead, either could be applied after a release that failed — the
+        # label leaving a window where the issue is considerable and nothing
+        # refuses it, the comment announcing an escalation that did not happen
+        # and re-posting it every tick until it did.
         ReleaseAbandonedIssueAction(
             issue_number=issue.number,
             label=labels.in_progress,
             reason=_RELEASE_REASON,
-            expected=expected,
+            expected=build_expected_for_mutation(),
             issue_key=issue.key.stable_id(),
             escalation_label=labels.needs_human,
             escalation_reason=(
                 f"{candidate.releases_granted} abandoned attempt(s) already relaunched "
                 f"this run (max: {candidate.max_releases}) - escalating to human"
             ),
-        ),
-        AddCommentAction(
-            number=issue.number,
-            comment=_escalation_comment(candidate, labels=labels),
-            reason="Explain why automatic relaunch stopped",
-            expected=expected,
+            escalation_comment=_escalation_comment(candidate, labels=labels),
         ),
     ]
 

@@ -275,14 +275,28 @@ class QueueCache:
         The discrimination inside ``REJECTED_EXCLUDED`` that
         :meth:`reconciliation_only_issues` deliberately does not draw. That set
         is "in scope, not launchable again this run", which lumps four
-        situations together; three of them have an owner still answering for
-        the issue and must keep answering exactly as they do today:
+        situations together; in three of them something still holds the issue,
+        and each must keep answering exactly as it does today:
 
         - a RUNNING session (``active_sessions``) — the terminal owns it;
         - a live control operation (``control_operation_exclusions``) — the
           orchestrator itself owns it, with no terminal at all (#146);
-        - the awaiting-merge presentation record startup rehydrates into
-          ``session_history`` — the awaiting-merge reconciler owns it.
+        - an unreleased PR-backed record (``completed`` + ``pr_url``, the shape
+          startup rehydrates and ``AwaitingMergeReconciler`` reconciles) — its
+          claim is what keeps a fresh coding session off an issue whose PR is
+          still open.
+
+          Asked as "does the issue hold one ANYWHERE in its history?", not "is
+          the latest entry one?". A rework session runs for a PR-backed issue
+          without consulting the history gate (``_plan_discovered_reworks``),
+          and its pre-publish validation gate can append a later
+          ``validation_failed`` entry — so the record can sit layered UNDER an
+          abandoned-looking one. Naming that issue would release the PR-backed
+          claim along with it (the release is whole-issue by necessity, see
+          :meth:`SessionHistoryOwner.release_claim`) and launch a fresh coding
+          session against the open PR. Layered is also precisely where the
+          reconciler does NOT cover for us — it reads the latest entry per
+          issue — so the claim is the only thing holding that line.
 
         What is left is the abandoned-after-completion case: a session that
         ended, was disposed, and left the issue to nobody
@@ -308,6 +322,7 @@ class QueueCache:
         if not abandoned:
             return AbandonedCandidates()
         running = {session.issue.number for session in self._state.active_sessions}
+        awaiting_merge = history.pr_backed_claiming_issue_numbers()
         max_releases = self._config.retry.max_abandoned_releases
         return AbandonedCandidates(tuple(
             AbandonedCandidate(
@@ -318,6 +333,7 @@ class QueueCache:
             for issue in self.reconciliation_only_issues()
             if issue.number in abandoned
             and issue.number not in running
+            and issue.number not in awaiting_merge
             and not self._state.control_operation_exclusions.excludes_issue(issue.key)
         ))
 

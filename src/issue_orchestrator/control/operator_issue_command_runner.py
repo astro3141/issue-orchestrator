@@ -167,8 +167,8 @@ class OperatorIssueCommandRunner:
         """Clear the retry gates, then reconcile the cached copy behind them.
 
         Removing the GitHub label is not enough: ``QueueCache.evaluate_issue``
-        rejects any issue whose number is in ``session_history`` (or
-        ``failed_this_cycle``), so the planner keeps skipping it on every
+        rejects any issue whose number is still CLAIMED by ``session_history``
+        (or is in ``failed_this_cycle``), so the planner keeps skipping it on every
         refresh until the orchestrator restarts. And clearing those gates is not
         enough either, because ``Scheduler`` re-reads the cached issue's LABELS
         and refuses anything still wearing a blocking one.
