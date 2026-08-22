@@ -75,11 +75,16 @@ from issue_orchestrator.domain.models import (
     RequestedAction,
 )
 from issue_orchestrator.domain.review_exchange_rework import ReviewExchangeRework
+from issue_orchestrator.domain.review_exchange_run import ReviewExchangeRunAssets
 from issue_orchestrator.domain.review_verdict_binding import (
     BoundReviewVerdict,
     ReviewVerdictOutcome,
 )
 from issue_orchestrator.domain.session_run import SessionRunAssets
+from issue_orchestrator.execution.review_exchange_records import bind_review_verdict
+from issue_orchestrator.execution.run_review_verdict_bindings import (
+    RunReviewVerdictBindings,
+)
 from issue_orchestrator.domain.validation_profile import ValidationGateKind
 from issue_orchestrator.domain.validation_verdict_receipt import (
     ValidationVerdict,
@@ -351,6 +356,7 @@ class ProcessingOutcome:
     pr_url: str | None = None
     review_exchange_deferred: bool = False
     validation_failed_rerouted: bool = False
+    review_exchange_run: ReviewExchangeRunAssets | None = None
 
     @property
     def is_non_terminal(self) -> bool:
@@ -359,13 +365,31 @@ class ProcessingOutcome:
 
 @dataclass
 class FakeCompletionOwner:
-    """Records the completion re-entry, and what intent it was handed."""
+    """Records the completion re-entry, and what intent it was handed.
+
+    It also stands in for the one thing about the pipeline this leaf depends
+    on: the review exchange allocates a run of its OWN, a sibling of the
+    session run rather than a directory beneath it, and names it on the result
+    (#180). ``binds`` seeds the verdict that exchange will bind, and this fake
+    writes it where a real exchange would — through the production writer, so
+    the layout the runner reads back cannot drift from the layout that wrote
+    it.
+    """
 
     journal: list[str] = field(default_factory=list)
     calls: list[dict[str, object]] = field(default_factory=list)
     records: list[dict[str, object]] = field(default_factory=list)
     outcome: ProcessingOutcome = field(default_factory=ProcessingOutcome)
     during_process: Callable[[], None] | None = None
+    #: (verdict, reviewed sha) the exchange concludes with, or ``None`` for a
+    #: completion whose exchange bound nothing.
+    verdict: tuple[ReviewVerdictOutcome, str] | None = None
+    #: True to run an exchange that allocates a run but binds no verdict.
+    runs_exchange: bool = True
+    exchange_runs: list[ReviewExchangeRunAssets] = field(default_factory=list)
+
+    def binds(self, verdict: ReviewVerdictOutcome, reviewed_sha: str) -> None:
+        self.verdict = (verdict, reviewed_sha)
 
     def process(
         self,
@@ -389,7 +413,30 @@ class FakeCompletionOwner:
         )
         if self.during_process is not None:
             self.during_process()
-        return self.outcome
+        return replace(self.outcome, review_exchange_run=self._run_exchange(worktree))
+
+    def _run_exchange(self, worktree: Path) -> ReviewExchangeRunAssets | None:
+        """Allocate the exchange's own run and bind its verdict into it."""
+        if not self.runs_exchange:
+            return None
+        run_dir = (
+            worktree
+            / ".issue-orchestrator"
+            / "sessions"
+            / f"review-exchange-{len(self.exchange_runs) + 1}"
+        )
+        assets = ReviewExchangeRunAssets.from_run_dir(run_dir)
+        assets.exchange_dir.mkdir(parents=True, exist_ok=True)
+        self.exchange_runs.append(assets)
+        if self.verdict is not None:
+            verdict, reviewed_sha = self.verdict
+            bind_review_verdict(
+                exchange_dir=assets.exchange_dir,
+                verdict=verdict,
+                presented_head_sha=reviewed_sha,
+                completed_rounds=1,
+            )
+        return assets
 
 
 @dataclass
@@ -408,14 +455,6 @@ class FakeActionApplier:
     def apply(self, action: AddLabelAction) -> LabelResult:
         self.applied.append(action)
         return self.result
-
-
-@dataclass
-class FakeVerdicts:
-    binding: BoundReviewVerdict | None = None
-
-    def for_run(self, run_dir: Path) -> BoundReviewVerdict | None:
-        return self.binding
 
 
 @dataclass
@@ -542,7 +581,7 @@ class Harness:
     commands: WorktreeCommands
     session_output: FakeSessionOutput
     completion: FakeCompletionOwner
-    verdicts: FakeVerdicts
+    verdicts: RunReviewVerdictBindings
     jobs: InlineJobs
     attempts: SidecarAttemptStore
     labels: FakeActionApplier
@@ -620,7 +659,11 @@ def harness(tmp_path: Path) -> Harness:
     commands = WorktreeCommands(journal=journal)
     session_output = FakeSessionOutput(journal=journal)
     completion = FakeCompletionOwner(journal=journal)
-    verdicts = FakeVerdicts()
+    # The REAL reader, over the real writer the completion fake uses: what
+    # #180 has to hold is that the runner asks about the exchange's own run
+    # directory, and a double that answered for any path could not tell that
+    # apart from asking about the session's.
+    verdicts = RunReviewVerdictBindings()
     jobs = InlineJobs()
     attempts = SidecarAttemptStore(tmp_path / "primary")
     labels = FakeActionApplier()
@@ -638,7 +681,7 @@ def harness(tmp_path: Path) -> Harness:
         ),
         session_output=session_output,  # type: ignore[arg-type]
         completion_processor=completion,  # type: ignore[arg-type]
-        review_verdicts=verdicts,  # type: ignore[arg-type]
+        review_verdicts=verdicts,
         finalizer=ContinuationFinalizer(
             attempts=attempts,
             action_applier=labels,  # type: ignore[arg-type]
@@ -807,7 +850,7 @@ class TestActiveSessionRefusal:
             ),
             session_output=harness.session_output,  # type: ignore[arg-type]
             completion_processor=harness.completion,  # type: ignore[arg-type]
-            review_verdicts=harness.verdicts,  # type: ignore[arg-type]
+            review_verdicts=harness.verdicts,
             finalizer=ContinuationFinalizer(
                 attempts=harness.attempts,
                 action_applier=harness.labels,  # type: ignore[arg-type]
@@ -1042,12 +1085,7 @@ class TestDurableReviewVerdict:
     ) -> None:
         attempt = _attempt(RequestedAction.CREATE_PR)
         harness.attempts.update(attempt.key, lambda _current: attempt)
-        harness.verdicts.binding = BoundReviewVerdict(
-            verdict=ReviewVerdictOutcome.CHANGES_REQUESTED,
-            reviewed_sha=SHA_A,
-            decided_at="2026-08-19T01:00:00Z",
-            completed_rounds=1,
-        )
+        harness.completion.binds(ReviewVerdictOutcome.CHANGES_REQUESTED, SHA_A)
 
         harness.runner.advance(
             _owned(_operation(attempt, ContinuationPhase.PASS_PENDING_REVIEW))
@@ -1066,12 +1104,7 @@ class TestDurableReviewVerdict:
     ) -> None:
         attempt = _attempt(RequestedAction.CREATE_PR)
         harness.attempts.update(attempt.key, lambda _current: attempt)
-        harness.verdicts.binding = BoundReviewVerdict(
-            verdict=ReviewVerdictOutcome.APPROVED,
-            reviewed_sha=SHA_A_PRIME,
-            decided_at="2026-08-19T01:00:00Z",
-            completed_rounds=1,
-        )
+        harness.completion.binds(ReviewVerdictOutcome.APPROVED, SHA_A_PRIME)
 
         harness.runner.advance(
             _owned(_operation(attempt, ContinuationPhase.PASS_PENDING_REVIEW))
@@ -1094,6 +1127,94 @@ class TestDurableReviewVerdict:
         stored = harness.attempts.for_key(attempt.key)
         assert stored is not None
         assert stored.continuation_review_verdict is None
+
+    def test_a_completion_that_ran_no_exchange_records_none(
+        self, harness: Harness
+    ) -> None:
+        """No exchange run named on the result means nothing to read back.
+
+        The distinguishing case from the one above: there, an exchange ran and
+        bound nothing; here, none ran at all. Both record no verdict, and
+        neither may go looking for one in a directory of its own choosing.
+        """
+        attempt = _attempt(RequestedAction.CREATE_PR)
+        harness.attempts.update(attempt.key, lambda _current: attempt)
+        harness.completion.runs_exchange = False
+
+        harness.runner.advance(
+            _owned(_operation(attempt, ContinuationPhase.PASS_PENDING_REVIEW))
+        )
+
+        stored = harness.attempts.for_key(attempt.key)
+        assert stored is not None
+        assert stored.continuation_review_verdict is None
+
+    def test_the_verdict_is_read_from_the_exchange_run_not_the_session_run(
+        self, harness: Harness
+    ) -> None:
+        """#180 F1: the exchange's run is a SIBLING, not a child (#193's cost).
+
+        The version that derived the directory from this route's own session
+        run read an empty one for every verdict ever bound. Nothing here plants
+        a binding under the session run, so a reader that went back to deriving
+        it would find nothing — and the run the pipeline actually named holds
+        the only copy.
+        """
+        attempt = _attempt(RequestedAction.CREATE_PR)
+        harness.attempts.update(attempt.key, lambda _current: attempt)
+        harness.completion.binds(ReviewVerdictOutcome.CHANGES_REQUESTED, SHA_A)
+
+        harness.runner.advance(
+            _owned(_operation(attempt, ContinuationPhase.PASS_PENDING_REVIEW))
+        )
+
+        exchange_run = harness.completion.exchange_runs[0]
+        session_run_dir = harness.session_output.runs[0].run_dir
+        assert exchange_run.run_dir.parent == session_run_dir.parent
+        assert session_run_dir not in exchange_run.run_dir.parents
+        assert (
+            RunReviewVerdictBindings().for_exchange_run(
+                ReviewExchangeRunAssets.from_run_dir(session_run_dir)
+            )
+            is None
+        )
+        stored = harness.attempts.for_key(attempt.key)
+        assert stored is not None
+        assert stored.continuation_review_verdict is not None
+
+    def test_a_handed_off_rejection_is_durable_after_one_run(
+        self, harness: Harness
+    ) -> None:
+        """#180 F1: the whole point of binding ``CHANGES_REQUESTED(A)``.
+
+        The hand-off settles nothing and creates no pull request, so the ONLY
+        fact that ends the lane is the promoted verdict. Without it the next
+        derivation is ``PASS_PENDING_REVIEW`` again and the allowance pays for
+        a second full reviewer exchange over the identical rejected commit
+        before ``RUNS_EXHAUSTED`` releases it. What the restart matrix in
+        ``test_control_continuation.py`` then reads off this attempt is
+        ``EXIT_TO_REWORK``, which is not live.
+        """
+        attempt = _attempt(RequestedAction.CREATE_PR)
+        harness.attempts.update(attempt.key, lambda _current: attempt)
+        harness.completion.outcome = ProcessingOutcome(
+            success=False, message="review exchange halted"
+        )
+        harness.completion.binds(ReviewVerdictOutcome.CHANGES_REQUESTED, SHA_A)
+
+        harness.runner.advance(
+            _owned(_operation(attempt, ContinuationPhase.PASS_PENDING_REVIEW))
+        )
+
+        stored = harness.attempts.for_key(attempt.key)
+        assert stored is not None
+        assert stored.continuation_review_verdict is not None
+        assert stored.continuation_review_verdict.verdict is (
+            ReviewVerdictOutcome.CHANGES_REQUESTED
+        )
+        assert stored.continuation_settlement is None
+        assert stored.continuation_runs_used == 1
+        assert len(harness.completion.calls) == 1
 
 
 class TestFailureLeavesTruthUnchanged:
@@ -1685,7 +1806,7 @@ class TestTheCoderWorktreeIsMadeRunnable:
             ),
             session_output=harness.session_output,  # type: ignore[arg-type]
             completion_processor=harness.completion,  # type: ignore[arg-type]
-            review_verdicts=harness.verdicts,  # type: ignore[arg-type]
+            review_verdicts=harness.verdicts,
             finalizer=ContinuationFinalizer(
                 attempts=harness.attempts,
                 action_applier=harness.labels,  # type: ignore[arg-type]
@@ -1818,12 +1939,7 @@ class TestAnUnrunnableWorktreeOpensNoRun:
 
     def test_no_verdict_or_settlement_is_fabricated(self, harness: Harness) -> None:
         harness.commands.failing = True
-        harness.verdicts.binding = BoundReviewVerdict(
-            verdict=ReviewVerdictOutcome.APPROVED,
-            reviewed_sha=SHA_A,
-            decided_at="2026-08-19T01:00:00Z",
-            completed_rounds=1,
-        )
+        harness.completion.binds(ReviewVerdictOutcome.APPROVED, SHA_A)
 
         stored = self._unrunnable(harness)
 
@@ -2060,7 +2176,7 @@ class TestTheFirstReviewersEvidenceIsGenuinelyProduced:
             ),
             session_output=harness.session_output,  # type: ignore[arg-type]
             completion_processor=harness.completion,  # type: ignore[arg-type]
-            review_verdicts=harness.verdicts,  # type: ignore[arg-type]
+            review_verdicts=harness.verdicts,
             finalizer=ContinuationFinalizer(
                 attempts=harness.attempts,
                 action_applier=harness.labels,  # type: ignore[arg-type]
@@ -2091,12 +2207,7 @@ class TestTheFirstReviewersEvidenceIsGenuinelyProduced:
         reaches on that basis is promoted onto the candidate exactly as
         before, and no pull request is created.
         """
-        harness.verdicts.binding = BoundReviewVerdict(
-            verdict=ReviewVerdictOutcome.CHANGES_REQUESTED,
-            reviewed_sha=SHA_A,
-            decided_at="2026-08-19T01:00:00Z",
-            completed_rounds=2,
-        )
+        harness.completion.binds(ReviewVerdictOutcome.CHANGES_REQUESTED, SHA_A)
 
         stored = self._open(harness)
 

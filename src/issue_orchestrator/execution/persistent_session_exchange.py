@@ -96,6 +96,7 @@ from .review_exchange_records import write_exchange_summary
 from .review_exchange_terminals import (
     ReviewerRoundTerminals,
     complete_with_reviewer_decision,
+    emit_built_event,
 )
 from .reviewer_worktree import ReviewerCandidatePresentation
 from ..domain.runtime_config import RuntimeConfigReference
@@ -107,7 +108,6 @@ from ..infra.repo_identity import get_repo_head_sha
 from ..infra.terminal_recording import TERMINAL_RECORDING_FILENAME
 from ..ports import (
     EventSink,
-    TraceEvent,
     make_review_exchange_completed_event,
     make_review_exchange_round_completed_event,
     make_trace_event,
@@ -413,6 +413,11 @@ def run_persistent_session_exchange(  # noqa: PLR0913
     max_rounds: int,
     max_no_progress: int,
     require_validation: bool,
+    # The one place the #180 policy still carries a default. Its sole
+    # production caller is ``PersistentReviewExchangeRunner.run``, where the
+    # port makes it required, so no production path can reach this value; what
+    # it serves is the several dozen direct test call sites that never enter
+    # the handoff at all.
     rework: ReviewExchangeRework = ReviewExchangeRework.IN_EXCHANGE,
     nit_policy: str = "surface",
     initial_validation_record_path: Path | None = None,
@@ -1562,13 +1567,6 @@ class _ReviewerDecisionResult:
     policy_rework_feedback: str | None = None
 
 
-def _emit_built_event(
-    emit: Callable[[EventName, dict[str, Any]], None],
-    event: TraceEvent,
-) -> None:
-    emit(event.event_type, event.data)
-
-
 def _finalize_reviewer_decision(
     *,
     exchange_dir: Path,
@@ -2176,7 +2174,7 @@ def _drive_rounds(command: _DriveRoundsCommand) -> ReviewExchangeOutcome:
             return protocol_outcome
 
         decision = artifact_pair.decision
-        _emit_built_event(
+        emit_built_event(
             emit,
             make_review_exchange_round_completed_event(
                 {
@@ -2203,7 +2201,7 @@ def _drive_rounds(command: _DriveRoundsCommand) -> ReviewExchangeOutcome:
         reviewer_response=None,
         validation_record_path=validation_record_path,
     )
-    _emit_built_event(emit, make_review_exchange_completed_event({
+    emit_built_event(emit, make_review_exchange_completed_event({
         "issue_number": issue_number,
         "session_name": session_name,
         "rounds": max_rounds,
@@ -2822,7 +2820,7 @@ def _build_outcome_for_reviewer_decision_error(
         validation_record_path=validation_record_path,
         detail=detail,
     )
-    _emit_built_event(emit, make_review_exchange_round_completed_event({
+    emit_built_event(emit, make_review_exchange_round_completed_event({
         "issue_number": issue_number,
         "session_name": session_name,
         "round_index": round_index,
@@ -2831,7 +2829,7 @@ def _build_outcome_for_reviewer_decision_error(
         "coder_response_type": None,
         "detail": detail,
     }))
-    _emit_built_event(emit, make_review_exchange_completed_event({
+    emit_built_event(emit, make_review_exchange_completed_event({
         "issue_number": issue_number,
         "session_name": session_name,
         "rounds": round_index,
@@ -2870,7 +2868,7 @@ def _build_outcome_for_role_timeout(
         reviewer_response=last_reviewer,
         validation_record_path=validation_record_path,
     )
-    _emit_built_event(emit, make_review_exchange_completed_event({
+    emit_built_event(emit, make_review_exchange_completed_event({
         "issue_number": issue_number,
         "session_name": session_name,
         "rounds": round_index,
@@ -2921,7 +2919,7 @@ def _build_outcome_for_protocol_error(
         reviewer_response=last_reviewer,
         validation_record_path=validation_record_path,
     )
-    _emit_built_event(emit, make_review_exchange_round_completed_event({
+    emit_built_event(emit, make_review_exchange_round_completed_event({
         "issue_number": issue_number,
         "session_name": session_name,
         "round_index": round_index,
@@ -2931,7 +2929,7 @@ def _build_outcome_for_protocol_error(
         "coder_response_text": last_coder.response_text if last_coder else None,
         "detail": protocol_error,
     }))
-    _emit_built_event(emit, make_review_exchange_completed_event({
+    emit_built_event(emit, make_review_exchange_completed_event({
         "issue_number": issue_number,
         "session_name": session_name,
         "rounds": round_index,

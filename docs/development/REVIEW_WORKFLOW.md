@@ -92,6 +92,16 @@ goes back to ordinary rework instead.
 `max_rounds` is not a substitute: a bound of 1 still runs round 1's coder turn,
 which is precisely the turn that must not happen.
 
+The hand-off only pays off if the rejection is read back, and that reading has
+one seam. The exchange allocates a run of its own — a *sibling* of the session
+run, not a directory beneath it — and writes `review-verdict.json` there. So
+the completion pipeline reports which run it allocated
+(`ProcessingResult.review_exchange_run`), and the continuation asks
+`ReviewVerdictBindings.for_exchange_run` about that run. Deriving the location
+from anything else reads an empty directory and drops every verdict, approvals
+included; the continuation then settles nothing and pays a second full reviewer
+exchange over the same rejected commit before its run allowance runs out.
+
 ## Review Artifacts
 
 Before PR creation, each review exchange produces a paired artifact set:

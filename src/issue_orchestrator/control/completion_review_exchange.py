@@ -1298,7 +1298,11 @@ class CompletionReviewExchange:
         agent_label: str | None,
         initial_validation_record_path: Path | None = None,
         approval_gate: "ReviewExchangeApprovalGate | None" = None,
-        rework: ReviewExchangeRework = ReviewExchangeRework.IN_EXCHANGE,
+        # No default: below ``CompletionProcessor.process`` this has exactly one
+        # caller per hop, and the hop above is bound through an untyped
+        # ``RunReviewExchangeLoop`` callable where a dropped keyword is
+        # invisible to pyright. Required here, it raises instead (#180).
+        rework: ReviewExchangeRework,
         events: Any | None = None,
         event_context: Any | None = None,
     ) -> Any:

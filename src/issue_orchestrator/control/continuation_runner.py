@@ -419,13 +419,10 @@ class ControlContinuationRunner:
         work, and a coder round here would move the branch to ``A'`` while
         exactly ``A`` was still the thing under review. So a changes-requested
         round terminates the exchange with a durable ``CHANGES_REQUESTED(A)``,
-        which :meth:`_record_review_verdict` is meant to promote onto the
-        attempt so the phase derives ``EXIT_TO_REWORK`` — #149's ordering, in
-        which ownership is released BEFORE ordinary rework is evaluated, and
-        only ordinary rework ever produces ``A'``.
-
-        That promotion does not reach the attempt today, and this route is not
-        where the break is: see :meth:`_record_review_verdict`.
+        which :meth:`_record_review_verdict` promotes onto the attempt so the
+        phase derives ``EXIT_TO_REWORK`` — #149's ordering, in which ownership
+        is released BEFORE ordinary rework is evaluated, and only ordinary
+        rework ever produces ``A'``.
 
         Returns:
             Whether the pipeline reached a TERMINAL result. ``False`` means the
@@ -458,7 +455,7 @@ class ControlContinuationRunner:
                 run.assets.run_id,
             )
             return False
-        self._record_review_verdict(operation, run.assets.run_dir)
+        self._record_review_verdict(operation, result)
         # The verdict first, then the settlement: both are facts this run
         # produced, and the ordering is the crash window. Settled-without-a-
         # verdict loses only evidence about a PR that demonstrably exists;
@@ -469,7 +466,7 @@ class ControlContinuationRunner:
         return True
 
     def _record_review_verdict(
-        self, operation: LiveContinuation, run_dir: Path
+        self, operation: LiveContinuation, result: "ProcessingResult"
     ) -> None:
         """Promote this run's exact-``A`` verdict binding into durable truth.
 
@@ -480,21 +477,27 @@ class ControlContinuationRunner:
         and ``APPROVED_PENDING_PR`` reconstructible after a restart, which is
         the whole of §8's review half.
 
+        WHICH run is read off the pipeline's own result and not off this
+        route's run (#180). The exchange allocates a run of its own — a sibling
+        under the same worktree's ``sessions/``, not a directory beneath this
+        one — so the continuation cannot derive it, and the version that
+        derived it anyway read an empty directory for every verdict ever bound:
+        approvals as well as rejections, which is why ``EXIT_TO_REWORK`` was
+        unreachable and a rejected candidate spent a second full continuation
+        run before ``RUNS_EXHAUSTED`` released it. The pipeline now names the
+        run it allocated, so there is nothing left to derive.
+
         A verdict bound to another commit is dropped rather than filed: the
         attempt would refuse it anyway, and refusing here says why.
-
-        **Known break:** ``run_dir`` is this continuation's own SESSION run
-        directory, and the binding is not in it. The review exchange allocates
-        a run of its own — a sibling under the same worktree's ``sessions/`` —
-        and writes ``review-verdict.json`` into that run's exchange directory.
-        So the lookup below has always returned ``None``, for approvals as well
-        as rejections, and ``EXIT_TO_REWORK`` has never been reachable in
-        production. Fixing it means carrying the exchange run's identity out of
-        the completion pipeline, which is its own change; #180 deliberately did
-        not fold it in, and left this note rather than a docstring that
-        describes a promotion that does not happen.
         """
-        binding = self._review_verdicts.for_run(run_dir)
+        exchange_run = result.review_exchange_run
+        if exchange_run is None:
+            logger.info(
+                "[CONTINUATION] %s ran no review exchange this run",
+                operation.key,
+            )
+            return
+        binding = self._review_verdicts.for_exchange_run(exchange_run)
         if binding is None:
             logger.info(
                 "[CONTINUATION] %s recorded no review verdict this run",

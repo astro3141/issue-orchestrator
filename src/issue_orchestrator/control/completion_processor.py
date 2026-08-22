@@ -111,6 +111,7 @@ from .completion_ports import (
 )
 from .completion_pr_labels import apply_pr_labels, reserved_pr_label_error
 from .completion_types import (
+    ActionExecutionOutcome,
     ERROR_PREFIX_CREATE_PR,
     ERROR_PREFIX_PUBLISH_BLOCKED,
     ERROR_PREFIX_PUSH,
@@ -119,6 +120,7 @@ from .completion_types import (
     REVIEW_EXCHANGE_ERROR_PREFIX,
 )
 from .pre_publish_gate import PrePublishGate, PrePublishGateResult
+from .validation_reroute_budget import DEFAULT_MAX_ATTEMPTS, ValidationRerouteBudget
 from .review_exchange_contracts import ReviewExchangeCanceller
 from .review_cache_boundary import review_cache_boundary_started_at
 from .review_exchange_pr_comment import (
@@ -285,12 +287,13 @@ class CompletionProcessor:
             review_exchange_canceller=review_exchange_canceller,
             agent_callback_endpoint=agent_callback_endpoint,
         )
-        # Per-(session, head_sha) consecutive validation-failed reroute count.
-        # The reroute path can re-enter every tick when downstream rework
-        # fails to advance the SHA. Without a budget, a permanently-failing
-        # validation forms an infinite loop. Reusing review_exchange_max_rounds
-        # so the catch-all ceiling matches the in-loop bound.
-        self._validation_reroute_counts: dict[tuple[str, str], int] = {}
+        self._reroute_budget = ValidationRerouteBudget(
+            max_attempts=(
+                config.review_exchange_max_rounds
+                if config is not None
+                else DEFAULT_MAX_ATTEMPTS
+            )
+        )
         self._record_validator = CompletionRecordValidator(
             config=config,
             git_adapter=git_adapter,
@@ -705,7 +708,6 @@ class CompletionProcessor:
         actions_taken: list[str] = []
         errors: list[str] = []
         error_details: list[dict[str, Any]] = []  # Full diagnostic info per error
-        pr_url: str | None = None
 
         # Read and validate completion record
         record, session_name, error_result = self._read_and_validate_record(
@@ -787,13 +789,7 @@ class CompletionProcessor:
         )
 
         # Execute requested actions in order
-        (
-            branch,
-            pr_url,
-            review_exchange_completed,
-            deferred,
-            early_result,
-        ) = self._execute_actions(
+        executed = self._execute_actions(
             worktree=worktree,
             record=record,
             issue_number=issue_number,
@@ -809,10 +805,10 @@ class CompletionProcessor:
             issue_key=issue_key,
             rework=rework,
         )
-        if early_result is not None:
-            return early_result
+        if executed.early_result is not None:
+            return executed.early_result
 
-        if deferred:
+        if executed.deferred:
             # Review exchange is running in the background. Leave the completion
             # record on disk so the next observation re-enters this pipeline,
             # and skip result artifacts / cleanup that would imply completion.
@@ -841,9 +837,10 @@ class CompletionProcessor:
             session_name=session_name,
             issue_number=issue_number,
             issue_title=issue_title,
-            branch=branch,
-            pr_url=pr_url,
-            review_exchange_completed=review_exchange_completed,
+            branch=executed.branch,
+            pr_url=executed.pr_url,
+            review_exchange_completed=executed.review_exchange_completed,
+            review_exchange_run=executed.review_exchange_run,
             actions_taken=actions_taken,
             errors=errors,
             error_details=error_details,
@@ -1416,7 +1413,7 @@ class CompletionProcessor:
             session_name=session_name,
             run_id=run_assets.run_id,
         ):
-            budget_exhausted_result = self._consume_validation_reroute_budget(
+            budget_exhausted_result = self._reroute_budget.consume(
                 session_name=session_name,
                 validation_record_path=validation_record_path,
             )
@@ -1465,6 +1462,12 @@ class CompletionProcessor:
                 errors=reroute_errors,
                 actions_taken=reroute_actions,
                 review_exchange_halted=True,
+                # Terminal, so a caller may need to read what this exchange
+                # concluded — and it is a different run from the one the
+                # approval came out of (#180).
+                review_exchange_run=(
+                    exchange_result.run_assets if exchange_result else None
+                ),
             )
 
         if deferred or (exchange_mode in {"via-mcp", "via-local-loop"} and exchange_result):
@@ -1482,65 +1485,12 @@ class CompletionProcessor:
                 errors=reroute_errors,
                 review_exchange_deferred=True,
                 validation_failed_rerouted=True,
-            )
-
-        return None
-
-    def _consume_validation_reroute_budget(
-        self,
-        *,
-        session_name: str,
-        validation_record_path: Path,
-    ) -> ProcessingResult | None:
-        """Increment the per-(session, head_sha) reroute count and halt if exhausted.
-
-        Returns a halting :class:`ProcessingResult` when the budget is spent,
-        otherwise ``None`` to let the caller proceed.
-        """
-        head_sha = self._read_validation_head_sha(validation_record_path)
-        if not head_sha:
-            # No SHA on the failing record — can't key the counter, can't
-            # safely bound the loop. Don't escalate from here; the in-loop
-            # bounds (max_rounds / max_no_progress) still apply.
-            return None
-        max_attempts = (
-            self._config.review_exchange_max_rounds if self._config is not None else 10
-        )
-        key = (session_name, head_sha)
-        attempt = self._validation_reroute_counts.get(key, 0) + 1
-        self._validation_reroute_counts[key] = attempt
-        if attempt > max_attempts:
-            logger.error(
-                "[VALIDATION_REROUTE] budget exhausted: session=%s head_sha=%s "
-                "attempts=%d max=%d — halting reroute",
-                session_name,
-                head_sha[:8],
-                attempt,
-                max_attempts,
-            )
-            return ProcessingResult(
-                success=False,
-                message=(
-                    "Validation failed after review approval and the reroute "
-                    f"budget is exhausted (attempts={attempt} max={max_attempts}); "
-                    "halting to surface the failure"
+                review_exchange_run=(
+                    exchange_result.run_assets if exchange_result else None
                 ),
-                errors=[
-                    f"validation_reroute: exhausted budget on {head_sha[:8]} "
-                    f"(attempts={attempt}, max={max_attempts})"
-                ],
-                review_exchange_halted=True,
             )
-        return None
 
-    @staticmethod
-    def _read_validation_head_sha(record_path: Path) -> str | None:
-        try:
-            data = json.loads(record_path.read_text())
-        except (OSError, json.JSONDecodeError):
-            return None
-        head_sha = data.get("head_sha")
-        return head_sha if isinstance(head_sha, str) and head_sha else None
+        return None
 
     def _persist_pre_publish_failure_artifacts(
         self,
@@ -1603,12 +1553,12 @@ class CompletionProcessor:
         run_assets: SessionRunAssets,
         issue_key: "IssueKey | None",
         rework: ReviewExchangeRework,
-    ) -> tuple[str | None, str | None, bool, bool, ProcessingResult | None]:
+    ) -> ActionExecutionOutcome:
         """Execute all requested actions from completion record.
 
         Returns:
-            Tuple of (final_branch, pr_url, review_exchange_completed, deferred, early_result).
-            When ``deferred`` is True the review exchange is running in the
+            What the actions produced, including where the review exchange put
+            its artifacts. ``deferred`` means the exchange is running in the
             background — callers must NOT treat the completion as finished.
         """
         pr_url: str | None = None
@@ -1652,10 +1602,19 @@ class CompletionProcessor:
                 run_assets=run_assets,
             ),
         )
+        # The exchange's own run, taken from the outcome that names it: the
+        # allocation and the outcome are checked against each other in
+        # ``_require_matching_review_run``, so this is the allocated run and
+        # not a second reading of where one might be (#180).
+        exchange_run = exchange_result.run_assets if exchange_result else None
         if deferred:
-            return branch, pr_url, review_exchange_completed, True, None
+            return ActionExecutionOutcome(
+                branch, pr_url, review_exchange_completed, True, None, exchange_run
+            )
         if should_halt:
-            return branch, pr_url, review_exchange_completed, False, None
+            return ActionExecutionOutcome(
+                branch, pr_url, review_exchange_completed, False, None, exchange_run
+            )
 
         pre_publish_failure = self._run_pre_publish_gate_if_required(
             plan=plan,
@@ -1670,7 +1629,17 @@ class CompletionProcessor:
             rework=rework,
         )
         if pre_publish_failure is not None:
-            return branch, pr_url, review_exchange_completed, False, pre_publish_failure
+            return ActionExecutionOutcome(
+                branch,
+                pr_url,
+                review_exchange_completed,
+                False,
+                pre_publish_failure,
+                # The reroute this failure may have spawned owns a run of its
+                # own, and names it on its own result. Preferred over the
+                # first exchange's, which that reroute has superseded.
+                pre_publish_failure.review_exchange_run or exchange_run,
+            )
 
         (
             branch,
@@ -1700,7 +1669,9 @@ class CompletionProcessor:
                 worktree, record, issue_number, run_assets, issue_key,
             ),
         )
-        return branch, pr_url, review_exchange_completed, False, action_result
+        return ActionExecutionOutcome(
+            branch, pr_url, review_exchange_completed, False, action_result, exchange_run
+        )
 
     def _execute_planned_actions(
         self,
@@ -2597,7 +2568,10 @@ class CompletionProcessor:
         agent_label: str | None,
         initial_validation_record_path: Path | None = None,
         approval_gate: "ReviewExchangeApprovalGate | None" = None,
-        rework: ReviewExchangeRework = ReviewExchangeRework.IN_EXCHANGE,
+        # Always supplied by the ``partial`` the exchange owner is handed, and
+        # required so that a binding that went missing raises here rather than
+        # silently reinstating in-place rework (#180).
+        rework: ReviewExchangeRework,
     ) -> Any:
         return self._review_exchange.run_review_exchange_loop(
             exchange_run=exchange_run,

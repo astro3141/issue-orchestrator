@@ -56,6 +56,16 @@ ReviewerTerminal = tuple[ReviewExchangeStatus, ReviewExchangeReason]
 EmitEvent = Callable[[EventName, dict[str, Any]], None]
 
 
+def emit_built_event(emit: EmitEvent, event: TraceEvent) -> None:
+    """Publish a built :class:`TraceEvent` through a raw ``(name, data)`` sink.
+
+    Lives here rather than in each module that closes a round: the exchange
+    emits through a callable that predates the event builders, and one adapter
+    between the two is one place for that mismatch to be fixed.
+    """
+    emit(event.event_type, event.data)
+
+
 class ReviewerRoundTerminals:
     """Decides whether a reviewer round ends the exchange, and how.
 
@@ -140,7 +150,7 @@ def complete_with_reviewer_decision(
     # §4's other half, bound to the same observation and therefore to the same
     # commit: who executed this candidate, as the orchestrator launched them.
     execution_identities.record(presented_head_sha)
-    _emit(emit, make_review_exchange_round_completed_event({
+    emit_built_event(emit, make_review_exchange_round_completed_event({
         "issue_number": issue_number,
         "session_name": session_name,
         "round_index": round_index,
@@ -152,7 +162,7 @@ def complete_with_reviewer_decision(
         "artifacts": review_artifacts,
         "coder_response_type": None,
     }))
-    _emit(emit, make_review_exchange_completed_event({
+    emit_built_event(emit, make_review_exchange_completed_event({
         "issue_number": issue_number,
         "session_name": session_name,
         "rounds": round_index,
@@ -173,12 +183,9 @@ def complete_with_reviewer_decision(
     )
 
 
-def _emit(emit: EmitEvent, event: TraceEvent) -> None:
-    emit(event.event_type, event.data)
-
-
 __all__ = [
     "ReviewerRoundTerminals",
     "ReviewerTerminal",
     "complete_with_reviewer_decision",
+    "emit_built_event",
 ]

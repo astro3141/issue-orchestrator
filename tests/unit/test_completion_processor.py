@@ -2368,6 +2368,7 @@ class TestReviewExchangeExecution:
             issue_title="Test",
             session_name="session-1",
             agent_label="agent:coder",
+            rework=ReviewExchangeRework.IN_EXCHANGE,
         )
 
         assert captured["coder_label"] == "agent:coder"
@@ -3135,6 +3136,81 @@ class TestTechLeadCompletionEffects:
         assert result.success is True
         assert len(review_runner.calls) == 1
         assert review_runner.calls[0]["rework"] is ReviewExchangeRework.IN_EXCHANGE
+
+    def test_the_result_names_the_run_the_exchange_allocated(
+        self,
+        tmp_path,
+        mock_label_adapter,
+        mock_pr_adapter,
+        mock_git_adapter,
+        event_bus,
+        worktree_with_completion,
+    ):
+        """#180: the pipeline reports WHERE its exchange put its artifacts.
+
+        The exchange's verdict binding is the transfer fact the control
+        continuation promotes onto its attempt, and it lives in a run this
+        pipeline allocated — a sibling of the session run, not a directory
+        under it. A caller that had to derive the location instead of being
+        told it derived the session's and read nothing, for approvals as well
+        as rejections.
+        """
+        review_runner = _CapturingReviewExchangeRunner()
+        processor = self._make_processor(
+            tmp_path,
+            mock_label_adapter,
+            mock_pr_adapter,
+            mock_git_adapter,
+            event_bus,
+            review_exchange_runner=review_runner,
+        )
+        worktree = worktree_with_completion(self._completed_record())
+        run_assets = make_session_run_assets(worktree)
+
+        result = self._process(
+            processor,
+            worktree,
+            agent_label="agent:coder",
+            run_assets=run_assets,
+        )
+
+        allocated = review_runner.calls[0]["exchange_run"].assets
+        assert result.review_exchange_run == allocated
+        assert result.review_exchange_run.run_dir != run_assets.run_dir
+        assert run_assets.run_dir not in result.review_exchange_run.run_dir.parents
+
+    def test_a_completion_that_runs_no_exchange_names_no_run(
+        self,
+        tmp_path,
+        mock_label_adapter,
+        mock_pr_adapter,
+        mock_git_adapter,
+        event_bus,
+        worktree_with_completion,
+    ):
+        """Absent rather than invented: nothing ran, so there is nothing to read.
+
+        A caller must be able to tell "the exchange concluded and its evidence
+        is here" from "no exchange ran", because the second is not a reason to
+        go looking anywhere.
+        """
+        processor = self._make_processor(
+            tmp_path,
+            mock_label_adapter,
+            mock_pr_adapter,
+            mock_git_adapter,
+            event_bus,
+        )
+        worktree = worktree_with_completion(
+            make_record(
+                outcome=CompletionOutcome.COMPLETED,
+                requested_actions=[RequestedAction.PUSH_BRANCH],
+            )
+        )
+
+        result = self._process(processor, worktree, agent_label="agent:coder")
+
+        assert result.review_exchange_run is None
 
     def test_completed_tech_lead_session_without_pair_records_critical_error(
         self,

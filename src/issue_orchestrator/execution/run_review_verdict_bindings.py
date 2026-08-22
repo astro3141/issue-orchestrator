@@ -7,20 +7,21 @@ disagree about where the binding lives or how it parses.
 
 from __future__ import annotations
 
-from pathlib import Path
-
 from ..domain.review_exchange_run import ReviewExchangeRunAssets
 from ..domain.review_verdict_binding import BoundReviewVerdict
 from .review_exchange_records import load_review_verdict
 
 
 class RunReviewVerdictBindings:
-    """Reads a run directory's exact-SHA verdict binding."""
+    """Reads an exchange run's exact-SHA verdict binding."""
 
-    def for_run(self, run_dir: Path) -> BoundReviewVerdict | None:
-        # The canonical exchange directory for a run, derived by the domain
-        # value object rather than re-spelled here: one owner of the layout.
-        exchange_dir = ReviewExchangeRunAssets.from_run_dir(run_dir).exchange_dir
+    def for_exchange_run(
+        self, exchange_run: ReviewExchangeRunAssets
+    ) -> BoundReviewVerdict | None:
+        # The assets carry the canonical exchange directory already — the same
+        # value object the writer allocated — so nothing is re-derived from a
+        # path here, and there is no directory to guess at.
+        exchange_dir = exchange_run.exchange_dir
         if not exchange_dir.exists():
             return None
         return load_review_verdict(exchange_dir)

@@ -44,6 +44,7 @@ from issue_orchestrator.execution.attempt_execution_identity_store import (
     AttemptExecutionIdentityStore,
 )
 from issue_orchestrator.domain.review_exchange import ReviewExchangeOutcome
+from issue_orchestrator.domain.review_exchange_rework import ReviewExchangeRework
 from issue_orchestrator.domain.review_exchange_run import (
     ReviewExchangeRun,
     ReviewExchangeRunAssets,
@@ -161,6 +162,7 @@ def _run(
     *,
     coder_agent: AgentConfig | None = None,
     reviewer_agent: AgentConfig | None = None,
+    rework: ReviewExchangeRework = ReviewExchangeRework.IN_EXCHANGE,
 ):
     exchange_run = _make_exchange_run(tmp_path)
     return runner.run(
@@ -177,6 +179,7 @@ def _run(
         max_rounds=3,
         max_no_progress=3,
         require_validation=False,
+        rework=rework,
     )
 
 

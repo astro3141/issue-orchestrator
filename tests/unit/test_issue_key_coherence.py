@@ -58,6 +58,7 @@ from issue_orchestrator.execution.pending_work_claim_store import (
 from issue_orchestrator.infra.config import Config
 from issue_orchestrator.observation.observation import SessionObservationResult
 from issue_orchestrator.ports.issue import Issue as IssueProtocol
+from issue_orchestrator.domain.review_exchange_rework import ReviewExchangeRework
 from tests.unit.session_run_helpers import make_session_run_assets
 from tests.unit.test_completion_review_exchange_async import (
     _build as build_review_exchange,
@@ -151,6 +152,7 @@ def _review_evidence_key(title: str, tmp_path: Path) -> IssueKey:
         issue_title=title,
         session_name="coding-1",
         agent_label="agent:backend",
+        rework=ReviewExchangeRework.IN_EXCHANGE,
     )
 
     assert len(captured) == 1

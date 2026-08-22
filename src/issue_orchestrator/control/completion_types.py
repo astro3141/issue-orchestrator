@@ -3,6 +3,8 @@
 from collections.abc import Callable
 from dataclasses import dataclass
 
+from ..domain.review_exchange_run import ReviewExchangeRunAssets
+
 ERROR_PREFIX_PUSH = "push_branch"
 ERROR_PREFIX_CREATE_PR = "create_pr"
 ERROR_PREFIX_PUBLISH_BLOCKED = "publish_blocked"
@@ -49,6 +51,20 @@ class ProcessingResult:
     # back into coder rework via the review-exchange path. Callers should keep
     # the session running but still surface validation-failure evidence.
     validation_failed_rerouted: bool = False
+    # WHERE this completion's review exchange put its artifacts, when one ran
+    # and reached an outcome (#180). Every other review-exchange field here
+    # reports *that* something happened; this one is the only fact that says
+    # where the evidence for it landed, and it cannot be derived from anything
+    # else a caller holds: the exchange allocates a run of its own, a sibling
+    # of the session run rather than a directory beneath it. Without it the one
+    # caller that must read an exchange's verdict back — the control
+    # continuation, promoting ``CHANGES_REQUESTED(A)`` onto its attempt — has
+    # to guess a directory, and guessed the session's.
+    #
+    # ``None`` means no exchange outcome was reached on this pass: none was
+    # required, one is still running in the background, or the exchange halted
+    # before a run existed.
+    review_exchange_run: ReviewExchangeRunAssets | None = None
 
     @classmethod
     def for_review_exchange_deferred(cls) -> "ProcessingResult":
@@ -74,6 +90,29 @@ class ProcessingResult:
         state before publish actually completes.
         """
         return self.review_exchange_deferred or self.validation_failed_rerouted
+
+
+@dataclass(frozen=True)
+class ActionExecutionOutcome:
+    """What executing one completion record's requested actions produced.
+
+    Named rather than returned as a tuple because ``review_exchange_run`` is a
+    fact no other field implies and no caller can re-derive: the phase that
+    runs the exchange is the only one that ever holds the run it allocated, so
+    a positional slot for it would be the easiest thing in the pipeline to drop
+    silently on the way out (#180).
+
+    ``deferred`` and ``early_result`` are the two ways this phase can end
+    without having finished the record: the exchange is running in the
+    background, or an action produced a result the caller must return as-is.
+    """
+
+    branch: str | None
+    pr_url: str | None
+    review_exchange_completed: bool
+    deferred: bool
+    early_result: "ProcessingResult | None"
+    review_exchange_run: ReviewExchangeRunAssets | None
 
 
 RepublicationCheck = Callable[[], ProcessingResult | None]

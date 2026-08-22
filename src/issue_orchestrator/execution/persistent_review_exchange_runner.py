@@ -207,7 +207,9 @@ class PersistentReviewExchangeRunner:
         max_rounds: int,
         max_no_progress: int,
         require_validation: bool,
-        rework: ReviewExchangeRework = ReviewExchangeRework.IN_EXCHANGE,
+        # Required, as the port requires it: this implementation is the last
+        # place the caller's answer could be replaced by an inference (#180).
+        rework: ReviewExchangeRework,
         nit_policy: str = "surface",
         initial_validation_record_path: Path | None = None,
         approval_gate: ReviewExchangeApprovalGate | None = None,

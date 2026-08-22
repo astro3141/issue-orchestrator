@@ -17,13 +17,9 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Protocol, TYPE_CHECKING
 
-# Imported at runtime, unlike the rest: it supplies the default value of the
-# ``rework`` parameter below, and a default is evaluated when this module is
-# read rather than when an implementation is type-checked.
-from ..domain.review_exchange_rework import ReviewExchangeRework
-
 if TYPE_CHECKING:
     from ..domain.issue_key import IssueKey
+    from ..domain.review_exchange_rework import ReviewExchangeRework
     from ..domain.models import AgentConfig
     from ..domain.review_exchange import ReviewExchangeOutcome
     from ..domain.review_exchange_run import ReviewExchangeRun
@@ -51,6 +47,8 @@ class ReviewExchangeRunner(Protocol):
     knows whether it owns the coder this exchange would hand feedback to; a
     runner cannot infer it, and inferring it wrongly is how a control
     continuation's exchange reworked a candidate its owner was still holding.
+    It therefore carries no default here: a port that supplied the inference it
+    says cannot be made would answer for a caller that forgot to.
     """
 
     def run(
@@ -69,7 +67,7 @@ class ReviewExchangeRunner(Protocol):
         max_rounds: int,
         max_no_progress: int,
         require_validation: bool,
-        rework: ReviewExchangeRework = ReviewExchangeRework.IN_EXCHANGE,
+        rework: "ReviewExchangeRework",
         nit_policy: str = "surface",
         initial_validation_record_path: Path | None = None,
         approval_gate: "ReviewExchangeApprovalGate | None" = None,
