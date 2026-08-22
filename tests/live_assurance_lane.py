@@ -86,6 +86,11 @@ class LiveAssuranceLane:
         )
 
     @property
+    def probes_executed(self) -> int:
+        """How many probes completed a call phase, for the record's own field."""
+        return self._executed
+
+    @property
     def detail(self) -> str:
         """A short, ordered account of why, preserved rather than discarded.
 
@@ -128,6 +133,7 @@ class LiveAssuranceLane:
             outcome=self.outcome,
             detail=self.detail,
             working_tree_dirty=artifact.working_tree_dirty,
+            probes_executed=self._executed,
         )
         store.record(record)
         return record
@@ -222,6 +228,7 @@ class _LaneCollector:
         writer.line(
             f"[live-assurance] outcome={record.outcome.value} "
             f"artifact={record.head_sha} "
+            f"probes_executed={record.probes_executed} "
             f"working_tree_dirty={str(record.working_tree_dirty).lower()} "
             f"detail={record.detail}"
         )

@@ -1249,3 +1249,9 @@ Record fields:
 - `working_tree_dirty` — whether the checkout had uncommitted changes when the
   lane ran. Required, never defaulted, and `true` makes the record assure
   nothing: the probes exercised a tree the SHA does not name
+- `probes_executed` — how many live-agent probes completed a call phase.
+  Required, an `int` and never a `bool`, and a `pass` naming `0` is refused on
+  both write and read. A narrowed selection (`make test-live-assurance
+  PYTEST='… -k codex'`) files an honest record, and this is the field that lets
+  a reader tell it from a full run; deciding what "the full probe set" is for an
+  artifact is a separate question this record deliberately does not answer

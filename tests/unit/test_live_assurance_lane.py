@@ -284,6 +284,23 @@ class TestTheLaneRecordsWhatItObserved:
         assert record is not None
         assert record.outcome is LiveAssuranceOutcome.INCONCLUSIVE
         assert "no live-agent probe was selected" in record.detail
+        assert record.probes_executed == 0
+
+    def test_how_many_probes_ran_is_carried_as_a_number_not_as_prose(
+        self, tmp_path: Path
+    ) -> None:
+        """A narrowed selection files a PASS; the record has to say how narrow.
+
+        ``make test-live-assurance PYTEST='... -k codex'`` is a legitimate
+        invocation and its record is honest, but only if a reader can tell a
+        two-probe run from the whole set. ``detail`` is prose; this is the
+        field a later completeness gate could actually read.
+        """
+        record = _run_lane(tmp_path, _PASSING_PROBE, _PASSING_PROBE)
+
+        assert record is not None
+        assert record.outcome is LiveAssuranceOutcome.PASS
+        assert record.probes_executed == 2
 
 
 class TestTheLaneAccumulator:
@@ -311,6 +328,15 @@ class TestTheLaneAccumulator:
         lane.record_breach("probe::a", "SANDBOX BREACH")
 
         assert lane.outcome is LiveAssuranceOutcome.SECURITY_FAIL
+
+    def test_the_accumulator_counts_only_executed_probes(self) -> None:
+        lane = LiveAssuranceLane()
+        lane.record_executed()
+        lane.record_executed()
+        lane.record_incomplete("probe::c", "did not run")
+        lane.record_breach("probe::d", "SANDBOX BREACH")
+
+        assert lane.probes_executed == 2
 
     def test_every_observation_is_preserved_in_the_detail(self) -> None:
         """An INCONCLUSIVE whose reason was dropped reinterprets the failure."""

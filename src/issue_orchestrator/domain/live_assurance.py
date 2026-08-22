@@ -41,6 +41,14 @@ record cannot assure anything it did not observe. See
 :func:`~..execution.assured_artifact.artifact_under_assurance`, which is the
 only thing that resolves this pair.
 
+**What was proven is a number, not a sentence.** ``probes_executed`` is a
+typed field beside the outcome, because "how much did this run actually
+observe" is a question a later gate may need to answer and ``detail`` is prose.
+A ``PASS`` naming zero probes is refused outright — the vacuous pass, closed at
+the record as well as inside the lane. Deciding whether a given count is the
+*whole* probe set for an artifact is a separate, harder question and is
+deliberately not answered here.
+
 **Evidence identity, not a flag.** ``suite`` is carried and validated, and
 :class:`~.validation_profile.ValidationGateKind` is asked whether it owns the
 label. It must not: a record that could name ``publish_gate`` would be a
@@ -124,6 +132,20 @@ class LiveAssuranceRecord:
     outcome: LiveAssuranceOutcome
     detail: str
     working_tree_dirty: bool
+    probes_executed: int
+    """How many live-agent probes actually completed a call phase.
+
+    A typed field rather than a sentence inside ``detail``: "how much was
+    proven" is a question a later gate may want to ask, and prose is not
+    answerable. It also closes the vacuous pass at the record — a ``PASS``
+    naming zero probes is refused below, so a hand-written record cannot claim
+    what an empty lane run is already forbidden from filing.
+
+    It is deliberately *not* a completeness policy. Defining "the full probe
+    set" for an artifact is a separate problem; this is the count, which is the
+    half that costs nothing and is impossible to reconstruct later.
+    """
+
     suite: str = LIVE_ASSURANCE_SUITE
     schema_version: int = LIVE_ASSURANCE_SCHEMA_VERSION
 
@@ -142,6 +164,17 @@ class LiveAssuranceRecord:
             # argument would silently claim the tree was clean, which is the
             # one thing about this record a promotion relies on.
             raise TypeError("working_tree_dirty must be bool")
+        if type(self.probes_executed) is not int:
+            # ``bool`` is an ``int`` subclass, so an accidental ``True`` would
+            # otherwise read back as "one probe ran".
+            raise TypeError("probes_executed must be int")
+        if self.probes_executed < 0:
+            raise ValueError("probes_executed must not be negative")
+        if self.outcome is LiveAssuranceOutcome.PASS and self.probes_executed == 0:
+            # The vacuous pass, refused at the record as well as at the lane. A
+            # run that executed nothing proved nothing, whatever it was about
+            # to be filed as.
+            raise ValueError("a pass must have executed at least one probe")
         suite = _required_text(self.suite, field_name="suite")
         if ValidationGateKind.defines(suite):
             # The crossover guard, in the direction a *writer* could breach it.
@@ -220,9 +253,24 @@ class LiveAssuranceRecord:
         schema_version = payload.get("schema_version")
         if not isinstance(schema_version, int) or isinstance(schema_version, bool):
             raise ValueError("live-assurance record requires int schema_version")
-        for field_name in ("suite", "head_sha", "detail", "working_tree_dirty"):
+        for field_name in (
+            "suite",
+            "head_sha",
+            "detail",
+            "working_tree_dirty",
+            "probes_executed",
+        ):
             if field_name not in payload:
                 raise ValueError(f"live-assurance record requires {field_name}")
+        probes_executed = payload["probes_executed"]
+        if type(probes_executed) is not int:
+            # Same fail-closed reading as the dirty flag: a record written by
+            # something that did not know to answer must not read back as one
+            # that answered.
+            raise ValueError(
+                f"live-assurance record probes_executed must be int, got "
+                f"{probes_executed!r}"
+            )
         working_tree_dirty = payload["working_tree_dirty"]
         if type(working_tree_dirty) is not bool:
             # Absent-reads-as-clean is the failure this refuses: a record
@@ -237,6 +285,7 @@ class LiveAssuranceRecord:
             outcome=outcome,
             detail=_required_text(payload.get("detail"), field_name="detail"),
             working_tree_dirty=working_tree_dirty,
+            probes_executed=probes_executed,
             suite=_required_text(payload.get("suite"), field_name="suite"),
             schema_version=schema_version,
         )
@@ -250,6 +299,7 @@ class LiveAssuranceRecord:
             "outcome": self.outcome.value,
             "detail": self.detail,
             "working_tree_dirty": self.working_tree_dirty,
+            "probes_executed": self.probes_executed,
         }
 
 

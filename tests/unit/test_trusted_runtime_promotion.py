@@ -37,12 +37,14 @@ def _record(
     *,
     head_sha: str = ARTIFACT,
     working_tree_dirty: bool = False,
+    probes_executed: int = 3,
 ) -> LiveAssuranceRecord:
     return LiveAssuranceRecord(
         head_sha=head_sha,
         outcome=outcome,
         detail=f"lane said {outcome.value}",
         working_tree_dirty=working_tree_dirty,
+        probes_executed=probes_executed,
     )
 
 
@@ -131,6 +133,7 @@ class TestPromotionIsBound:
                 "outcome": "pass",
                 "detail": "publication contract passed",
                 "working_tree_dirty": False,
+                "probes_executed": 3,
             }),
             encoding="utf-8",
         )

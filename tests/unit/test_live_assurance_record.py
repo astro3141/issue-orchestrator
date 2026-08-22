@@ -32,12 +32,14 @@ def _record(
     detail: str = "3 live-agent probe(s) passed",
     suite: str = LIVE_ASSURANCE_SUITE,
     working_tree_dirty: bool = False,
+    probes_executed: int = 3,
 ) -> LiveAssuranceRecord:
     return LiveAssuranceRecord(
         head_sha=head_sha,
         outcome=outcome,
         detail=detail,
         working_tree_dirty=working_tree_dirty,
+        probes_executed=probes_executed,
         suite=suite,
     )
 
@@ -121,7 +123,34 @@ class TestTheThreeOutcomesAreDistinct:
                 outcome=LiveAssuranceOutcome.PASS,
                 detail="ran",
                 working_tree_dirty="no",  # type: ignore[arg-type]
+                probes_executed=1,
             )
+
+    def test_a_pass_that_executed_nothing_is_refused(self) -> None:
+        """The vacuous pass, closed at the record and not only at the lane.
+
+        The lane already reduces an empty selection to ``INCONCLUSIVE``, but a
+        record is also written and read as a file. A ``PASS`` naming zero
+        probes proves nothing whatever produced it.
+        """
+        with pytest.raises(ValueError, match="must have executed at least one probe"):
+            _record(LiveAssuranceOutcome.PASS, probes_executed=0)
+
+    @pytest.mark.parametrize(
+        "outcome",
+        [LiveAssuranceOutcome.INCONCLUSIVE, LiveAssuranceOutcome.SECURITY_FAIL],
+    )
+    def test_a_non_pass_may_legitimately_have_executed_nothing(
+        self, outcome: LiveAssuranceOutcome
+    ) -> None:
+        """An empty selection and an unavailable provider are exactly that."""
+        assert _record(outcome, probes_executed=0).probes_executed == 0
+
+    def test_the_executed_count_is_neither_a_bool_nor_negative(self) -> None:
+        with pytest.raises(TypeError, match="probes_executed must be int"):
+            _record(probes_executed=True)  # type: ignore[arg-type]
+        with pytest.raises(ValueError, match="probes_executed must not be negative"):
+            _record(probes_executed=-1)
 
     def test_there_is_no_fourth_outcome(self) -> None:
         """"Never ran" is the absence of a record, not a member inside one."""
@@ -206,7 +235,8 @@ class TestTheRecordRefusesWhatItCannotReadExactly:
             LiveAssuranceRecord.from_payload(payload)
 
     @pytest.mark.parametrize(
-        "field_name", ["suite", "head_sha", "detail", "working_tree_dirty"]
+        "field_name",
+        ["suite", "head_sha", "detail", "working_tree_dirty", "probes_executed"],
     )
     def test_a_missing_field_names_itself(self, field_name: str) -> None:
         payload = _record().to_payload()
@@ -221,6 +251,14 @@ class TestTheRecordRefusesWhatItCannotReadExactly:
         with pytest.raises(ValueError, match="working_tree_dirty must be bool"):
             LiveAssuranceRecord.from_payload(payload)
 
+    def test_a_stored_executed_count_that_is_not_an_int_is_refused(self) -> None:
+        """Including ``true``, which would otherwise read back as one probe."""
+        for stored in ("3", True, 2.0, None):
+            payload = _record().to_payload() | {"probes_executed": stored}
+
+            with pytest.raises(ValueError, match="probes_executed must be int"):
+                LiveAssuranceRecord.from_payload(payload)
+
     @pytest.mark.parametrize("working_tree_dirty", [False, True])
     def test_a_round_trip_preserves_every_meaning(
         self, working_tree_dirty: bool
@@ -229,7 +267,9 @@ class TestTheRecordRefusesWhatItCannotReadExactly:
             LiveAssuranceOutcome.SECURITY_FAIL,
             detail="breach at probe 2",
             working_tree_dirty=working_tree_dirty,
+            probes_executed=7,
         )
 
         assert LiveAssuranceRecord.from_payload(record.to_payload()) == record
         assert record.schema_version == LIVE_ASSURANCE_SCHEMA_VERSION
+        assert LiveAssuranceRecord.from_payload(record.to_payload()).probes_executed == 7
