@@ -60,7 +60,7 @@ def _decoded_output(path: Path) -> str:
     return "".join(chunks)
 
 # ---------------------------------------------------------------------------
-# Markers / skip conditions
+# Markers / readiness
 # ---------------------------------------------------------------------------
 
 # `live_agent` is what routes this module: blocking candidate validation
