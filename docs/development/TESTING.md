@@ -37,8 +37,13 @@ Two things to know when you run it:
 - **A readiness probe in a `live_agent` module must run at call time.** Blocking
   validation deselects the marker but still imports the module, so a
   module-scope `is_claude_authenticated()` would put a real provider call inside
-  the publish gate. Use a fixture, as
-  `tests/integration/test_live_agent_chain.py` does.
+  the publish gate. Use an autouse fixture, as
+  `tests/integration/test_live_agent_chain.py` does — a `skipif` condition is
+  module scope, because a decorator expression is evaluated on import. Report an
+  unusable provider from that fixture with `require_probe_ran(...)`, not by
+  skipping: an unauthenticated CLI leaves the boundary as unexercised as a model
+  that declined to issue the tool call, so the lane should reach `INCONCLUSIVE`
+  the same way. Expect errors, not skips, on a host without the CLIs.
 
 See
 [validation.md](../architecture/validation.md#live-agent-assurance-is-not-publication-validation).

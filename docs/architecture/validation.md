@@ -123,9 +123,16 @@ live_agent"` deselects after collection, unlike the `--ignore=` it replaced, so
 every module under `tests/integration` is imported on every publish — once per
 xdist worker. A module-scope provider probe would therefore put a real `claude`
 call inside the publish gate for tests that gate is about to deselect. Readiness
-probes belong in a fixture or a call-time condition;
+probes belong in an autouse fixture — a `skipif` condition is module scope, since
+a decorator expression is evaluated on import — and
 `tests/unit/test_makefile_validation_phases.py` proves by AST that no
 integration module calls one at import time.
+
+That fixture reports an unusable provider through `require_probe_ran(...)`, so
+the answer arrives as `INCONCLUSIVE` by the same route as a model that declined
+to issue the tool call. Both leave the boundary equally unexercised, and a
+missing prerequisite that fails is one somebody notices — which is also what
+the orchestrator's own newly-added-test-skip guard requires of any diff.
 
 **No evidence crossover, in both directions.** The record carries its own suite
 label, `live_assurance`, and `LiveAssuranceRecord` refuses any suite
