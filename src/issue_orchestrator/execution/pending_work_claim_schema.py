@@ -130,6 +130,9 @@ CLAIM_ADDED_COLUMNS: tuple[tuple[str, str], ...] = (
     ("parked", "INTEGER NOT NULL DEFAULT 0"),
 )
 
+#: Where the ledger lives. Owned here, with the shape it describes, and
+#: re-exported by the store so existing importers keep their spelling: two
+#: definitions of one filename are two databases waiting to happen.
 STORE_FILENAME = "pending_work_claims.sqlite"
 
 
@@ -145,6 +148,7 @@ def schema_statements() -> tuple[str, ...]:
         if statement.strip()
     )
 
+
 class PendingWorkClaimMigrationError(RuntimeError):
     """An older ledger holds a row that cannot be carried forward (#6999 F13).
 
@@ -154,6 +158,7 @@ class PendingWorkClaimMigrationError(RuntimeError):
     is precisely how a live terminal gets admitted as carrying no work.
     """
 
+
 def _issue_number_of(claim: PendingWorkClaim) -> int:
     """Trusted issue number for a claim being migrated forward."""
     request = claim.request
@@ -161,6 +166,7 @@ def _issue_number_of(claim: PendingWorkClaim) -> int:
     if resolver is not None:
         return int(resolver() or 0)
     return int(getattr(request, "issue_number", 0))
+
 
 def add_missing_columns(
     conn: sqlite3.Connection,
@@ -178,6 +184,7 @@ def add_missing_columns(
     for column, declaration in added:
         if column not in existing:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {declaration}")
+
 
 def migrate_legacy_claim_table(conn: sqlite3.Connection) -> None:
     """Carry an older table forward WITHOUT losing a single claim.
@@ -296,6 +303,7 @@ def initialize_schema(conn: sqlite3.Connection) -> None:
 
 
 __all__ = [
+    "STORE_FILENAME",
     "PendingWorkClaimMigrationError",
     "initialize_schema",
 ]

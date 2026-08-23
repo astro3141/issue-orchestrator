@@ -72,6 +72,7 @@ from ..ports.pending_work_claim_store import (
     quarantine_key_for_run,
 )
 from .pending_work_claim_schema import (
+    STORE_FILENAME,
     PendingWorkClaimMigrationError,
     initialize_schema,
 )
@@ -81,8 +82,6 @@ from .pending_work_codec import (
     decode_claim_text,
     encode_claim_text,
 )
-
-STORE_FILENAME = "pending_work_claims.sqlite"
 
 logger = logging.getLogger(__name__)
 
@@ -229,13 +228,6 @@ class SqlitePendingWorkClaimStore:
     def list_unresolved_claims(self) -> tuple[UnresolvedClaim, ...]:
         unresolved: list[UnresolvedClaim] = []
         for row in self._all_rows():
-            if row["parked"]:
-                # Settled by a quarantine, so it is evidence rather than work
-                # (#210). A build that has since learned to decode the payload
-                # must NOT quietly re-admit it: an operator was told to work out
-                # what that run was doing and re-queue it by hand, and the
-                # issue is still blocked pending that answer.
-                continue
             try:
                 claim = decode_claim_text(row["payload"], source=row["run_key"])
             except PendingWorkClaimDecodeError:
@@ -248,6 +240,11 @@ class SqlitePendingWorkClaimStore:
                     started_at=str(row["started_at"]),
                     issue_number=int(row["issue_number"]),
                     claim=claim,
+                    # Reported, not applied (#210). Whether a settled row may go
+                    # back to a queue is the re-admitting caller's question, and
+                    # the sweep that escalates live trouble asks the opposite one
+                    # of the same rows.
+                    parked=bool(row["parked"]),
                 )
             )
         return tuple(unresolved)
@@ -268,6 +265,11 @@ class SqlitePendingWorkClaimStore:
                         # The decoder's verdict, carried rather than re-derived
                         # from the message text - that guess IS #209.
                         readability=exc.readability,
+                        # Reported, not applied (#210): the escalation sweeps
+                        # keep these rows whatever their disposition, and this
+                        # is where a settlement on a row nothing can decode is
+                        # observable at all.
+                        parked=bool(row["parked"]),
                     )
                 )
         return tuple(unreadable)
@@ -479,8 +481,18 @@ class SqlitePendingWorkClaimStore:
                     work_kind.value if work_kind is not None else None,
                 ),
             )
-            if settlement is ClaimSettlement.PARK:
-                self._set_claim_parked(conn, run_key, quarantine_key, parked=True)
+            # Both arms write. LEAVE is the INVERSE of PARK, not a no-op (#210):
+            # a re-observation that now reads the payload cleanly quarantines
+            # the same run for being unrestorable alone, and that escalation
+            # promises an operator the next sweep re-queues the work once the
+            # terminal stops - which a row still parked by the earlier verdict
+            # would make false.
+            self._set_claim_parked(
+                conn,
+                run_key,
+                quarantine_key,
+                parked=settlement is ClaimSettlement.PARK,
+            )
 
     def read_quarantine(self, quarantine_key: str) -> QuarantineRecord | None:
         row = self._get_connection().execute(

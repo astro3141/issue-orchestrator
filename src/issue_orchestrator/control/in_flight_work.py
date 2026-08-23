@@ -411,6 +411,16 @@ class InFlightWorkLedger:
 
         The keys are returned so the release reconciliation that follows does
         not immediately undo the quarantines this pass just raised.
+
+        Rows an earlier quarantine PARKED are deliberately included (#210).
+        Parking is a scheduling fact - nothing may re-admit this row - and this
+        loop is not scheduling anything; it is deciding whether a live terminal
+        nobody can track stays blocked. A payload that no build could read
+        becomes readable the moment a pinned runtime is promoted, and skipping
+        the parked row then made a still-live, still-unrestorable run look
+        resolved: the reconciliation below released its quarantine and dropped
+        the ``needs-human`` block for a whole tick, only for the next sweep to
+        re-apply the label and post a fresh comment.
         """
         from .claim_quarantine import QuarantineSubject
 
@@ -455,7 +465,10 @@ class InFlightWorkLedger:
         what to do with it, so handing it back to a queue underneath them would
         be the manual-plus-automatic double launch the escalation warns against.
         Releasing that quarantine un-parks the row and ordinary recovery here
-        resumes, which is how a repaired claim gets its work back.
+        resumes, which is how a repaired claim gets its work back. The rule is
+        applied HERE, where the re-admission decision actually is, rather than
+        by the enumeration - the escalation sweep reads the same rows and needs
+        the opposite answer about them.
 
         ``live_run_keys`` carries every run this pass observed alive whatever
         verdict it reached - including quarantined ones, which are deliberately
@@ -470,7 +483,7 @@ class InFlightWorkLedger:
         }
         readmitted = 0
         for unresolved in self.claims.list_unresolved_claims():
-            if unresolved.run_key in live:
+            if unresolved.run_key in live or not unresolved.re_admissible:
                 continue
             self._restore(unresolved.session_name, unresolved.claim)
             # The row STAYS, moved to deferred. An in-memory queue is not a

@@ -49,6 +49,7 @@ from issue_orchestrator.ports.pending_work_claim_store import (
     ClaimSettlement,
     ClaimState,
     QuarantineLabelState,
+    UnreadableClaimError,
 )
 from issue_orchestrator.events import EventName
 from issue_orchestrator.execution.agent_runner_errors import (
@@ -5444,8 +5445,6 @@ def test_repeated_scans_never_admit_a_mismatched_identity_terminal(
     conn.commit()
     conn.close()
 
-    from issue_orchestrator.ports.pending_work_claim_store import UnreadableClaimError
-
     for _ in range(3):
         restarted, added, _ = _restore_pair(None, [session], harness)
         assert added == []  # never admitted, on any scan
@@ -5455,7 +5454,8 @@ def test_repeated_scans_never_admit_a_mismatched_identity_terminal(
         # terminal that is still running it (#6999 F11, #210).
         with pytest.raises(UnreadableClaimError):
             harness.claims.look_up_pending_work_claim(session.run_assets)
-        assert harness.claims.list_unresolved_claims() == ()
+        (settled,) = harness.claims.list_unresolved_claims()
+        assert not settled.re_admissible
         assert restarted.pending_tech_lead_reviews == []
 
 

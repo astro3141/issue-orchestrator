@@ -172,6 +172,27 @@ class UnresolvedClaim:
     # its PR, and the payload is exactly what may have become unreadable.
     issue_number: int
     claim: PendingWorkClaim
+    #: Whether a quarantine has SETTLED this row where it lies (#210). Carried
+    #: rather than filtered out of the enumeration, because the two sweeps that
+    #: read it want opposite answers: re-admission must skip a parked row, and
+    #: escalation must keep seeing it, since it is the evidence the operator's
+    #: block points at.
+    parked: bool = False
+
+    @property
+    def re_admissible(self) -> bool:
+        """Whether recovery may hand this row's work back to a queue (#210).
+
+        The ONE place the re-admission rule is spelled, so a caller cannot
+        inherit it by accident or lose it by asking a different question. A
+        parked row has reached its durable disposition and an operator has been
+        asked what to do with it; re-admitting it underneath them would launch
+        that work behind a live ``needs-human`` block, which is the manual-plus-
+        automatic double execution this boundary exists to prevent. The
+        exclusion lasts exactly as long as the quarantine does — releasing one
+        un-parks the row it settled, and ordinary recovery resumes.
+        """
+        return not self.parked
 
     @property
     def quarantine_key(self) -> str:
@@ -292,6 +313,15 @@ class ClaimSettlement(Enum):
       an operator that stopping the terminal lets the next sweep re-queue the
       work automatically, so parking it would break that promise and strand the
       work behind a block instead.
+
+    The two are INVERSES, not "do something" and "do nothing". A quarantine is
+    re-recorded on every sweep and its verdict can change under it: a payload
+    that no build could read becomes readable the moment a pinned runtime is
+    promoted, and the same run is then quarantined for being unrestorable
+    alone. Leaving that row parked would leave the earlier disposition standing
+    under an escalation that now promises the opposite, so ``LEAVE`` actively
+    un-parks the row this quarantine settled — on its own generation, exactly
+    as ``PARK`` parks it.
     """
 
     PARK = "park"
@@ -458,6 +488,17 @@ class UnreadableClaim:
     #: which kind of unreadable is exactly the untyped state that told an
     #: operator an intact artifact could not be recovered.
     readability: ClaimReadability
+    #: Whether a quarantine has SETTLED this row where it lies (#210), carried
+    #: for the same reason :attr:`UnresolvedClaim.parked` is: the enumeration
+    #: reports the ledger, and the callers decide. It is the ONLY place the
+    #: settlement of a parked row is observable, because a row is parked
+    #: precisely when its payload cannot be rebuilt - so "it is missing from
+    #: the schedulable enumeration" would be evidence of the decode failure and
+    #: of nothing this quarantine did. There is no ``re_admissible`` twin: an
+    #: unreadable row is not re-admissible whatever its disposition, and one
+    #: predicate answering for two independent reasons is how the settlement
+    #: stopped being provable in the first place.
+    parked: bool = False
 
     @property
     def quarantine_key(self) -> str:
@@ -513,22 +554,23 @@ class PendingWorkClaimStore(Protocol):
         ledger forever. Rows whose payload cannot be rebuilt are reported by
         :meth:`list_unreadable_claims` instead of being skipped in silence.
 
-        A row a quarantine has PARKED is not here (#210). While that quarantine
-        stands, an operator has been told to work out what the run was doing and
-        re-queue it by hand if it is needed; re-admitting it underneath them
-        would launch that work behind a live ``needs-human`` block, which is the
-        manual-plus-automatic double execution this boundary exists to prevent.
-        The exclusion lasts exactly as long as the quarantine does - releasing
-        one un-parks the row it settled, and ordinary recovery resumes.
+        This reports what the ledger HOLDS, and answers no policy question
+        itself (#210). A row a quarantine has PARKED is here, carrying
+        :attr:`UnresolvedClaim.parked`, because its two readers want opposite
+        answers about it: re-admission must skip it, and the escalation sweep
+        must keep seeing it — that row is precisely the live trouble the
+        operator's block was raised for. Filtering it away here answered only
+        the first, and silently gave the second the wrong answer.
         """
         ...
 
     def list_unreadable_claims(self) -> tuple[UnreadableClaim, ...]:
         """Stored rows that cannot be rebuilt, for the same recovery sweep.
 
-        Parked rows ARE included: a quarantine's cause is still present while
-        the row it could not read is still there, and dropping them here would
-        let the release reconciliation retract a live escalation (#210).
+        Parked rows ARE included, carrying :attr:`UnreadableClaim.parked`: a
+        quarantine's cause is still present while the row it could not read is
+        still there, and dropping them here would let the release
+        reconciliation retract a live escalation (#210).
         """
         ...
 
@@ -696,11 +738,14 @@ class ClaimQuarantineStore(Protocol):
         announced exactly once.
 
         ``settlement`` is applied to the ledger row in the SAME transaction
-        (#210). The local safety disposition — this run is quarantined, and its
-        claim is therefore no longer work — has to commit as one fact and
-        without depending on anything remote. Splitting it left the two halves
-        able to disagree, and the half that decided whether the claim stayed
-        active was the one that needed a GitHub write to succeed.
+        (#210), in BOTH directions. The local safety disposition — this run is
+        quarantined, and whether its claim is still work — has to commit as one
+        fact and without depending on anything remote. Splitting it left the two
+        halves able to disagree, and the half that decided whether the claim
+        stayed active was the one that needed a GitHub write to succeed. Since
+        every sweep re-records the quarantine, the settlement it carries is the
+        row's disposition NOW, not a one-shot applied when the row first
+        appeared: a re-observation that reaches the other verdict moves it back.
 
         Only the ledger row of the SAME run generation this quarantine was
         recorded against is settled, so a replacement run that reused the

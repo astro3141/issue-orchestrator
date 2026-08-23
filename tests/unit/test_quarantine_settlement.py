@@ -212,12 +212,17 @@ def test_a_claim_settles_durably_when_the_announcement_never_commits(
     (record,) = reopened.list_quarantines()
     assert record.issue_number == _ISSUE
     assert not record.announced  # the remote half never landed...
-    # ...and the local half is complete anyway: the claim is no longer work.
-    assert reopened.list_unresolved_claims() == ()
-    # The evidence is NOT destroyed to achieve that - the row is still there,
-    # still unreadable, still nameable by the escalation an operator will read.
+    # ...and the local half is complete anyway: the claim is settled where it
+    # lies. The evidence is NOT destroyed to achieve that - the row is still
+    # there, still unreadable, still nameable by the escalation an operator
+    # will read.
     (still_unreadable,) = reopened.list_unreadable_claims()
     assert still_unreadable.quarantine_key == record.quarantine_key
+    assert still_unreadable.parked  # ...and it has stopped being work
+    # Asked of the row's own disposition, never of "is it missing from the
+    # schedulable enumeration": a row this build cannot decode is missing from
+    # that enumeration whether anything settled it or not, so the absence would
+    # have proved the decode failure and nothing about #210.
 
 
 def test_settlement_commits_before_anything_remote_is_attempted(
@@ -228,7 +233,10 @@ def test_settlement_commits_before_anything_remote_is_attempted(
     A settlement that happened to run after a successful comment would look
     identical in a passing test and would restore the original defect the moment
     the comment failed. So the claim is asked about from INSIDE the announce
-    call, which is the one moment the remote has not answered yet.
+    call, which is the one moment the remote has not answered yet - and it is
+    asked for the row's own recorded disposition, from a connection that has
+    not seen this process's writes, so an uncommitted settlement would read as
+    absent.
     """
     store, run = _ledger_with_unreadable_claim(tmp_path)
     settled_at_announce_time: list[bool] = []
@@ -236,7 +244,8 @@ def test_settlement_commits_before_anything_remote_is_attempted(
     class _AsksMidFlight(_Labels):
         def announce(self, issue_number: int, comment: str) -> bool:
             probe = SqlitePendingWorkClaimStore.for_repo(tmp_path)
-            settled_at_announce_time.append(probe.list_unresolved_claims() == ())
+            (row,) = probe.list_unreadable_claims()
+            settled_at_announce_time.append(row.parked)
             return super().announce(issue_number, comment)
 
     _owner(tmp_path, _AsksMidFlight(announce_succeeds=False)).quarantine(
@@ -274,7 +283,11 @@ def test_a_settled_claim_is_not_re_admitted_by_the_recovery_sweep(
     )
 
     assert readmitted == 0
-    assert reopened.list_unresolved_claims() == ()
+    # The row is enumerable to that build - it decodes now - and the sweep
+    # still declined it, because the settlement says so rather than because
+    # the payload was unreadable.
+    (settled,) = reopened.list_unresolved_claims()
+    assert not settled.re_admissible
 
 
 # ---------------------------------------------------------------------------
@@ -542,7 +555,8 @@ def test_releasing_a_quarantine_gives_its_claim_back_to_recovery(
     labels = _Labels()
     owner = _owner(tmp_path, labels)
     owner.quarantine(_subject_for(store, run))
-    assert SqlitePendingWorkClaimStore.for_repo(tmp_path).list_unresolved_claims() == ()
+    (settled,) = SqlitePendingWorkClaimStore.for_repo(tmp_path).list_unreadable_claims()
+    assert settled.parked
 
     _rewrite_payload(tmp_path, run, encode_claim(_tech_lead_claim()))
     owner.reconcile_released(frozenset())
@@ -552,6 +566,82 @@ def test_releasing_a_quarantine_gives_its_claim_back_to_recovery(
     assert labels.released == [_ISSUE]
     (recovered,) = reopened.list_unresolved_claims()
     assert recovered.claim == _tech_lead_claim()
+    assert recovered.re_admissible  # the settlement went with the quarantine
+
+
+def test_a_parked_row_that_becomes_readable_under_a_live_run_stays_blocked(
+    tmp_path: Path,
+) -> None:
+    """The transition a parked row must survive: readable, but still in trouble.
+
+    A pinned runtime lagging ``main`` is a NORMAL operating condition (#209),
+    so a payload no build here could read becoming readable is an ordinary
+    event, not an exotic one. When it happens under a run that is STILL live
+    and STILL unrestorable, the trouble has not gone anywhere - only its name
+    has changed, from "neither trackable nor identifiable" to "unrestorable".
+
+    Settling that row must not make it invisible to the sweep that escalates
+    live trouble. It did: the escalation loop and the re-admission loop read
+    one enumeration, the parked row was filtered out of both, and a sweep that
+    found nothing to raise released the quarantine and took ``needs-human`` off
+    an issue whose terminal nobody could track was still running - re-applying
+    the label and posting a fresh comment one tick later.
+    """
+    from issue_orchestrator.control.in_flight_work import (
+        ClaimRestoration,
+        InFlightWorkLedger,
+    )
+
+    store, run = _ledger_with_unreadable_claim(tmp_path)
+    labels = _Labels()
+    owner = _owner(tmp_path, labels)
+    state = MagicMock()
+    state.in_flight_work = []
+    state.active_sessions = []
+
+    def sweep() -> int:
+        """One pass over a run discovery finds but restoration cannot rebuild."""
+        ledger = InFlightWorkLedger(
+            state, SqlitePendingWorkClaimStore.for_repo(tmp_path)
+        )
+        accounting = ledger.account_for_discovered(
+            [{"run_dir": str(run.run_dir)}], ClaimRestoration((), ()), owner
+        )
+        return ledger.recover_unresolved(
+            owner,
+            live_run_keys=accounting.live_run_keys,
+            live_quarantine_keys=accounting.live_quarantine_keys,
+        )
+
+    sweep()
+    (record,) = SqlitePendingWorkClaimStore.for_repo(tmp_path).list_quarantines()
+    assert record.story == AnnouncedStory(
+        QuarantineCause.RUN_UNRESTORABLE_CLAIM_UNREADABLE,
+        ClaimReadability.UNREADABLE_CORRUPT,
+    )
+
+    # The runtime is promoted; the same bytes now decode. Nothing else changed:
+    # the terminal is alive and the orchestrator still cannot track it.
+    _rewrite_payload(tmp_path, run, encode_claim(_tech_lead_claim()))
+    readmitted = sweep()
+
+    reopened = SqlitePendingWorkClaimStore.for_repo(tmp_path)
+    # The block never came off, so nothing re-applied it and no second comment
+    # was written for a story the operator had already been told.
+    assert labels.released == []
+    assert reopened.quarantined_issue_numbers() == frozenset({_ISSUE})
+    # ...under the cause that is now true, not the one that was.
+    (record,) = reopened.list_quarantines()
+    assert record.story == AnnouncedStory(
+        QuarantineCause.RUN_UNRESTORABLE, ClaimReadability.READABLE
+    )
+    # And the settlement moved with it. That escalation promises an operator
+    # that stopping the terminal lets the next sweep re-queue the work, which a
+    # row still parked by the previous verdict would make false.
+    (unparked,) = reopened.list_unresolved_claims()
+    assert unparked.re_admissible
+    # Not re-queued NOW, though - the terminal is still running it.
+    assert readmitted == 0
 
 
 # ---------------------------------------------------------------------------
@@ -598,7 +688,8 @@ def test_a_readable_claim_behind_an_unrestorable_run_is_left_alone(
     _owner(tmp_path, _Labels()).quarantine(subject)
 
     reopened = SqlitePendingWorkClaimStore.for_repo(tmp_path)
-    assert len(reopened.list_unresolved_claims()) == 1
+    (left_alone,) = reopened.list_unresolved_claims()
+    assert left_alone.re_admissible
 
 
 def test_a_replacement_run_reusing_the_directory_keeps_its_own_claim(
@@ -627,7 +718,8 @@ def test_a_replacement_run_reusing_the_directory_keeps_its_own_claim(
     _owner(tmp_path, _Labels()).quarantine(stale)
 
     reopened = SqlitePendingWorkClaimStore.for_repo(tmp_path)
-    assert len(reopened.list_unresolved_claims()) == 1
+    (untouched,) = reopened.list_unresolved_claims()
+    assert untouched.re_admissible
 
 
 # ---------------------------------------------------------------------------
@@ -714,6 +806,8 @@ def test_an_older_ledger_learns_to_settle_without_losing_a_claim(
         settlement=ClaimSettlement.PARK,
     )
 
-    assert store.list_unresolved_claims() == ()
+    (settled,) = store.list_unresolved_claims()
+    assert not settled.re_admissible
     store.release_quarantine("/runs/a@t1")
-    assert len(store.list_unresolved_claims()) == 1
+    (given_back,) = store.list_unresolved_claims()
+    assert given_back.re_admissible
