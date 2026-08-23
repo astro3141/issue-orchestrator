@@ -12,27 +12,34 @@ outcome asserting a review nothing can evidence.
 
 So the promotion is a DECISION, not a side effect, and this module is its owner.
 It answers one question — *may this run settle?* — and the answer is a member of
-:class:`ReviewEvidence` rather than a bool, because two of the five ways to
-arrive at "no" are indistinguishable in a log line and all five differ in what
-the operator should do about them.
+:class:`ReviewEvidence` rather than a bool, because several of the ways to
+arrive at "no" are indistinguishable in a log line and each differs in what the
+operator should do about it.
 
 Two properties are the whole contract:
 
 * **A completion that actually completed a review exchange settles only on a
-  promoted exact-``A`` binding.** Missing, corrupt and ``A'``-bound all refuse.
-  Nothing is synthesised from the pull request, the board, or the exchange's
-  prose — the binding is the sole review authority, exactly as it was.
-* **A completion that ran NO exchange is unchanged.** It never had review
-  evidence to hold, so requiring some would fail-close the one path this leaf
-  is not about.
+  promoted exact-``A`` binding.** Missing, unlocatable, corrupt and ``A'``-bound
+  all refuse. Nothing is synthesised from the pull request, the board, or the
+  exchange's prose — the binding is the sole review authority, exactly as it was.
+* **A completion that ran NO exchange, and says so, is unchanged.** It never had
+  review evidence to hold, so requiring some would fail-close the one path this
+  leaf is not about. Read off the result's own
+  ``review_exchange_completed`` rather than off the absence of a run, so the one
+  outcome that permits settlement without evidence cannot be reached by a result
+  that claims a finished exchange.
 
 A refusal is not a failure of the run: it leaves the recorded intent
 undischarged, so the operation stays live and the next reconciliation re-enters
-the pipeline (finding, and reusing, whatever pull request already exists). That
-retry is bounded by #149's own run allowance — every re-entry opens a run and
-spends one — so a candidate whose exchange can never produce a readable exact-
-``A`` binding reaches ``RUNS_EXHAUSTED`` and returns to ordinary rework rather
-than looping.
+the pipeline. Under the pull-request collision strategies that permit it —
+``new_branch`` (the default) and ``reuse_open`` — that re-entry finds and reuses
+whatever pull request already exists, so a withheld settlement costs a run
+rather than a duplicate; a repository configured ``pr_collision: fail`` refuses
+the second publication instead, and reaches the same bound one pass later.
+That retry is bounded by #149's own run allowance — every re-entry opens a run
+and spends one — so a candidate whose exchange can never produce a readable
+exact-``A`` binding reaches ``RUNS_EXHAUSTED`` and returns to ordinary rework
+rather than looping.
 
 **Nothing here raises.** A corrupt binding is read through a port that raises on
 purpose (a corrupt authority artifact is not an absent one), and letting that
@@ -41,7 +48,10 @@ the operation would stay live carrying it, and ``engine_holds_open_run`` would
 hold the candidate above the allowance bound that is supposed to end it — an
 unbounded re-entry over an artifact that will not parse on the next pass either.
 Caught here it becomes what it is: evidence that cannot be read, therefore no
-settlement, therefore one spent allowance and the ordinary hand-back.
+settlement, therefore one spent allowance and the ordinary hand-back. The catch
+can stay narrow because the parser it protects against answers every corrupt
+shape with the same exception family
+(:meth:`~..domain.review_verdict_binding.BoundReviewVerdict.from_payload`).
 """
 
 from __future__ import annotations
@@ -72,6 +82,12 @@ class ReviewEvidence(Enum):
     #: This run completed no review exchange, so it holds no review evidence and
     #: was never asked to. The pre-existing no-verdict path, unchanged.
     NO_EXCHANGE = ("no_exchange", True)
+    #: The result says an exchange completed and names no run to read its
+    #: binding from. Distinct from ``UNRECORDED`` because the exchange may well
+    #: have bound a verdict — nothing here can find out — and distinct from
+    #: ``NO_EXCHANGE`` because a completed exchange is exactly the case that
+    #: owes evidence. Whoever built the result dropped the run.
+    UNLOCATED = ("unlocated", False)
     #: The exchange's exact-``A`` binding was read and written onto the attempt.
     PROMOTED = ("promoted", True)
     #: The exchange ran and reached no verdict it could bind. Absent evidence is
@@ -141,17 +157,16 @@ class ContinuationReviewEvidence:
         """
         exchange_run = result.review_exchange_run
         if exchange_run is None:
-            logger.info(
-                "[CONTINUATION] %s ran no review exchange this run",
-                operation.key,
-            )
-            return ReviewEvidence.NO_EXCHANGE
+            return self._without_a_run(operation, result)
         try:
             binding = self._review_verdicts.for_exchange_run(exchange_run)
         except (OSError, ValueError) as exc:
             # Narrow on purpose: these are the ways reading a stored authority
-            # artifact fails. Anything else is a defect and escapes, because a
-            # broken reader must not be reported as unreadable evidence.
+            # artifact fails — the file, and its contents. Every corrupt shape
+            # of the contents lands in the second, because the parser answers
+            # all of them with ``ValueError`` and reserves nothing for one
+            # field. Anything else is a defect and escapes, because a broken
+            # reader must not be reported as unreadable evidence.
             logger.error(
                 "[CONTINUATION] %s settles nothing: its review exchange's"
                 " verdict binding could not be read: %s",
@@ -175,6 +190,39 @@ class ContinuationReviewEvidence:
             )
             return ReviewEvidence.MISBOUND
         return self._record(operation, binding)
+
+    def _without_a_run(
+        self, operation: "LiveContinuation", result: "ProcessingResult"
+    ) -> ReviewEvidence:
+        """Decide what a result naming no exchange run permits.
+
+        The permissive answer is stated from the POSITIVE fact and not from the
+        absence: ``review_exchange_completed`` is False, so no exchange reached
+        an outcome on this pass and none owed evidence. The two ways a live
+        exchange leaves no run — deferral and the validation reroute — are
+        non-terminal and never reach here, so today the two spellings agree.
+
+        They agree because another module keeps them paired
+        (:meth:`~.completion_types.ActionExecutionOutcome.of`). Deriving the one
+        member that permits settlement without evidence from an invariant held
+        somewhere else is how a fail-open gets built: it would be a defect
+        there, and a settled continuation asserting an unevidenced review here.
+        Asked of the result's own claim, that outcome is unspellable rather
+        than merely unreachable.
+        """
+        if result.review_exchange_completed:
+            logger.error(
+                "[CONTINUATION] %s settles nothing: its completion reports a"
+                " finished review exchange and names no run its verdict"
+                " binding could be read from",
+                operation.key,
+            )
+            return ReviewEvidence.UNLOCATED
+        logger.info(
+            "[CONTINUATION] %s ran no review exchange this run",
+            operation.key,
+        )
+        return ReviewEvidence.NO_EXCHANGE
 
     def _record(
         self, operation: "LiveContinuation", binding: "BoundReviewVerdict"

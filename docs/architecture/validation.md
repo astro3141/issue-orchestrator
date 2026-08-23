@@ -618,17 +618,24 @@ It reaches that finalizer only through
 `control/continuation_review_evidence.py` ([#178]). A run whose completion
 actually completed a review exchange settles **only** once that exchange's
 exact-`A` `BoundReviewVerdict` has been read and promoted onto the attempt; a
-binding that is missing, does not parse, or covers `A'` withholds the
-settlement instead of being logged past. Before that, promotion could refuse in
-any of those three ways while the settlement was recorded anyway — the shape
+binding that is missing, unlocatable, does not parse, or covers `A'` withholds
+the settlement instead of being logged past. Before that, promotion could refuse
+in any of those ways while the settlement was recorded anyway — the shape
 observed in production as `continuation_review_verdict = null` beside
 `continuation_settlement = pull_request_opened`, a terminal outcome asserting a
 review nothing could evidence. A refusal is not a failure: the recorded intent
 stays undischarged, so the operation stays live and the next reconciliation
-re-enters the pipeline (finding, and reusing, whatever pull request already
-exists), bounded like every other fruitless run by [#149]'s run allowance. A
-completion that ran **no** exchange is unaffected — it never held review
-evidence, and settles from what it produced exactly as before.
+re-enters the pipeline, bounded like every other fruitless run by [#149]'s run
+allowance. Under the collision strategies that permit it — `new_branch` (the
+default) and `reuse_open` — that re-entry finds and reuses whatever pull request
+already exists, so the retry costs a run rather than a duplicate; a repository
+configured `pr_collision: fail` refuses the second publication and reaches the
+same allowance bound one pass later. A completion that ran **no** exchange is
+unaffected — it never held review evidence, and settles from what it produced
+exactly as before. That carve-out is read off the result's own
+`review_exchange_completed`, not off the absence of a named run, so a result
+claiming a finished exchange without naming one cannot reach the one outcome
+that settles without evidence.
 
 ### A paused engine reconciles but starts nothing
 

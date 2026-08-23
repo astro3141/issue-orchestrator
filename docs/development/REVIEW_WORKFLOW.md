@@ -108,8 +108,9 @@ question — *may this run settle?* A completion that **completed a review
 exchange** settles only on a promoted exact-`A` binding; missing, unparseable
 and `A'`-bound bindings all withhold the settlement, leaving the recorded
 intent undischarged and the operation re-enterable. A completion that ran no
-exchange is unchanged: it never held review evidence, so it settles from what
-it produced.
+exchange — and reports so, via `review_exchange_completed`, rather than merely
+naming no run — is unchanged: it never held review evidence, so it settles from
+what it produced.
 
 ## Review Artifacts
 

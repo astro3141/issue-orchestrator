@@ -359,6 +359,7 @@ class ProcessingOutcome:
     pr_url: str | None = None
     review_exchange_deferred: bool = False
     validation_failed_rerouted: bool = False
+    review_exchange_completed: bool = False
     review_exchange_run: ReviewExchangeRunAssets | None = None
 
     @property
@@ -433,7 +434,18 @@ class FakeCompletionOwner:
         )
         if self.during_process is not None:
             self.during_process()
-        return replace(self.outcome, review_exchange_run=self._run_exchange(worktree))
+        exchange_run = self._run_exchange(worktree)
+        return replace(
+            self.outcome,
+            review_exchange_run=exchange_run,
+            # Kept paired with the run the way the pipeline pairs them
+            # (``ActionExecutionOutcome.of``): an exchange that reached an
+            # outcome reports both facts. A test that wants them UNpaired sets
+            # the outcome's flag itself.
+            review_exchange_completed=(
+                self.outcome.review_exchange_completed or exchange_run is not None
+            ),
+        )
 
     def _run_exchange(self, worktree: Path) -> ReviewExchangeRunAssets | None:
         """Allocate the exchange's own run and bind its verdict into it."""
@@ -1259,8 +1271,8 @@ class TestSettlementRestsOnPromotedReviewEvidence:
     #193's shape is ``continuation_review_verdict = null`` recorded beside
     ``continuation_settlement = pull_request_opened`` — a terminal outcome
     asserting a review nothing can evidence. The promotion had refused, in one
-    of three ways, and the settlement ran anyway because the refusals were
-    logged and dropped. Each way is a case here, and all three must produce the
+    of several ways, and the settlement ran anyway because the refusals were
+    logged and dropped. Each way is a case here, and every one must produce the
     same thing: no settlement, no board signal, and a recorded intent still
     undischarged so the operation stays re-enterable.
 
@@ -1321,6 +1333,65 @@ class TestSettlementRestsOnPromotedReviewEvidence:
         assert stored.continuation_settlement is None
         assert harness.labels.applied == []
         assert harness.runs.holds(operation.key) is False
+
+    def test_a_binding_whose_sha_is_not_a_string_settles_nothing(
+        self, harness: Harness
+    ) -> None:
+        """Proof 2b: "does not parse" is one answer, not one exception family.
+
+        Well-formed JSON, an object, every other field valid, and
+        ``reviewed_sha`` present as ``null``. The parser used to hand that shape
+        to the SHA normaliser, which answers a non-str with ``TypeError`` — past
+        the catch that routes unreadable evidence, out of the runner, leaving
+        the run open and ``engine_holds_open_run`` holding the candidate above
+        the very allowance bound that is supposed to end the retry. The run
+        closing is what distinguishes this from the truncated case.
+        """
+        attempt = self._completed_a_review_and_opened_a_pr(harness)
+        harness.completion.corrupt_binding = json.dumps(
+            {
+                "schema_version": 1,
+                "verdict": "approved",
+                "reviewed_sha": None,
+                "decided_at": "2026-08-23T00:00:00+00:00",
+                "completed_rounds": 1,
+            }
+        )
+        operation = _operation(attempt, ContinuationPhase.APPROVED_PENDING_PR)
+
+        harness.runner.advance(_owned(operation))
+
+        stored = harness.attempts.for_key(attempt.key)
+        assert stored is not None
+        assert stored.continuation_review_verdict is None
+        assert stored.continuation_settlement is None
+        assert harness.labels.applied == []
+        assert harness.runs.holds(operation.key) is False
+
+    def test_a_finished_exchange_that_names_no_run_settles_nothing(
+        self, harness: Harness
+    ) -> None:
+        """The no-exchange carve-out answers the claim, not the absence.
+
+        A result reporting a finished review exchange and naming no run is a
+        pipeline defect, and the two facts are kept paired by the module that
+        builds the result — but deriving the ONE outcome that permits
+        settlement without evidence from an invariant held somewhere else is
+        how a fail-open gets built. Asked of the claim, the unevidenced
+        settlement is unspellable here rather than merely unreachable from
+        there.
+        """
+        attempt = self._completed_a_review_and_opened_a_pr(harness)
+        harness.completion.outcome = replace(
+            harness.completion.outcome, review_exchange_completed=True
+        )
+        harness.completion.runs_exchange = False
+
+        stored = self._advance(harness, attempt)
+
+        assert stored.continuation_review_verdict is None
+        assert stored.continuation_settlement is None
+        assert harness.labels.applied == []
 
     def test_a_binding_for_another_commit_settles_nothing(
         self, harness: Harness
