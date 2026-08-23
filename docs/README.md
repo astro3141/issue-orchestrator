@@ -50,6 +50,7 @@ System design and decision records:
 - [Architecture Decision Records](architecture/ADR/README.md) - Why decisions were made
 - [Guardrails & Safety Model](design/guardrails.md) - Enforcement layers and trust boundaries
 - [Hooks](architecture/hooks.md) - Multi-layer hook enforcement
+- [Codex Workspace Trust](architecture/codex-workspace-trust.md) - Measurement of the Codex trust prerequisite that blocks unattended launches
 - [Validation System](architecture/validation.md) - Publish gate design
 - [Control Center Lifecycle](architecture/control_center_lifecycle_model.md) - UI/engine lifecycle model
 
