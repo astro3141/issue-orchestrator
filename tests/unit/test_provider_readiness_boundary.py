@@ -45,6 +45,7 @@ from issue_orchestrator.control.tech_lead_reaction import (
 from issue_orchestrator.domain.models import DiscoveredFailure, Issue, SessionStatus
 from issue_orchestrator.domain.pending_work import PendingWorkKind
 from issue_orchestrator.ports.pending_work_claim_store import (
+    ClaimReadability,
     ClaimState,
     QuarantineLabelState,
 )
@@ -3518,6 +3519,7 @@ def _unrestorable_subject(
         issue_number=issue_number,
         error="the run's session assets could not be rebuilt",
         cause=QuarantineCause.RUN_UNRESTORABLE,
+        readability=ClaimReadability.READABLE,
     )
 
 
@@ -4972,6 +4974,7 @@ def _quarantined(harness, tmp_path: Path):
         "payload unreadable",
         harness.claims.run_key_for(session.run_assets),
         harness.claims.quarantine_key_for(session.run_assets),
+        ClaimReadability.UNREADABLE_CORRUPT,
     )
 
 
@@ -5085,6 +5088,7 @@ def test_two_runs_of_one_issue_quarantine_independently(tmp_path: Path) -> None:
         "payload unreadable",
         harness.claims.run_key_for(second_session.run_assets),
         harness.claims.quarantine_key_for(second_session.run_assets),
+        ClaimReadability.UNREADABLE_CORRUPT,
     )
     assert first.quarantine_key != second.quarantine_key
     owner = _quarantine_with(harness)
@@ -5139,16 +5143,16 @@ def _write_legacy_claim_row(
 def test_an_upgrade_teaches_an_older_quarantine_table_the_typed_cause(
     tmp_path: Path,
 ) -> None:
-    """A quarantine row written before the cause was durable still works.
+    """A quarantine row written before the story was durable still works.
 
     ``CREATE TABLE IF NOT EXISTS`` leaves an existing table exactly as it was,
     so the columns #6999 F6 added arrive only if something adds them. Without
     that, every read and write of a quarantine on an upgraded database raises
     and the orphan sweep stops escalating anything at all.
 
-    A carried-forward row has no recorded cause, which must read as *different
-    from whatever is observed next* so the next scan re-announces under a cause
-    it can vouch for, rather than standing on a story nothing recorded.
+    A carried-forward row has no recorded story, which must read as *different
+    from whatever is observed next* so the next scan re-announces under a story
+    it can vouch for, rather than standing on one nothing recorded.
     """
     import sqlite3
 
@@ -5157,7 +5161,15 @@ def test_an_upgrade_teaches_an_older_quarantine_table_the_typed_cause(
         SqlitePendingWorkClaimStore,
     )
     from issue_orchestrator.infra.repo_identity import state_dir
-    from issue_orchestrator.ports.pending_work_claim_store import QuarantineCause
+    from issue_orchestrator.ports.pending_work_claim_store import (
+        AnnouncedStory,
+        QuarantineCause,
+    )
+
+    story = AnnouncedStory(
+        QuarantineCause.CLAIM_UNREADABLE_ENDED_RUN,
+        ClaimReadability.UNREADABLE_CORRUPT,
+    )
 
     db_path = state_dir(tmp_path) / STORE_FILENAME
     db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -5188,8 +5200,8 @@ def test_an_upgrade_teaches_an_older_quarantine_table_the_typed_cause(
     (carried,) = store.list_quarantines()
     assert carried.issue_number == 7
     assert carried.announced  # the old flag survived...
-    assert carried.cause is None  # ...but says nothing about which story
-    assert not carried.announces(QuarantineCause.CLAIM_UNREADABLE_ENDED_RUN)
+    assert carried.story is None  # ...but says nothing about which story
+    assert not carried.announces(story)
 
     store.record_quarantine(
         "/runs/a@t1",
@@ -5197,14 +5209,14 @@ def test_an_upgrade_teaches_an_older_quarantine_table_the_typed_cause(
         session_name="issue-7",
         issue_number=7,
         error="still unreadable",
-        cause=QuarantineCause.CLAIM_UNREADABLE_ENDED_RUN,
+        story=story,
         work_kind=None,
     )
 
     refreshed = store.read_quarantine("/runs/a@t1")
     assert refreshed is not None
-    assert refreshed.cause is QuarantineCause.CLAIM_UNREADABLE_ENDED_RUN
-    assert not refreshed.announced  # re-announced under the cause it now holds
+    assert refreshed.story == story
+    assert not refreshed.announced  # re-announced under the story it now holds
     assert refreshed.block_is_ours  # ...without disturbing the block it owns
 
 
@@ -5462,6 +5474,7 @@ def test_an_unresolved_review_claim_escalates_its_ISSUE_not_its_PR(
                 issue_number=7,  # recorded at hold time, from the session's issue
                 error="payload unreadable",
                 started_at="2026-08-07T00:00:00+00:00",
+                readability=ClaimReadability.UNREADABLE_CORRUPT,
             )
         )
     )
@@ -5488,6 +5501,7 @@ def test_an_unresolved_claim_quarantine_is_idempotent_across_sweeps(
         issue_number=7,
         error="payload unreadable",
         started_at="2026-08-07T00:00:00+00:00",
+        readability=ClaimReadability.UNREADABLE_CORRUPT,
     )
     owner = _quarantine_with(harness)
 
@@ -5590,6 +5604,7 @@ def test_a_release_leaves_another_quarantines_block_alone(tmp_path: Path) -> Non
         "payload unreadable",
         harness.claims.run_key_for(second_session.run_assets),
         harness.claims.quarantine_key_for(second_session.run_assets),
+        ClaimReadability.UNREADABLE_CORRUPT,
     )
     assert first.quarantine_key != second.quarantine_key
     owner = _quarantine_with(harness)
@@ -5631,6 +5646,7 @@ def test_a_replacement_run_reusing_the_directory_quarantines_independently(
         "payload unreadable",
         harness.claims.run_key_for(session.run_assets),
         harness.claims.quarantine_key_for(session.run_assets),
+        ClaimReadability.UNREADABLE_CORRUPT,
     )
     owner = _quarantine_with(harness)
     owner.quarantine(QuarantineSubject.live_run_with_unreadable_claim(first))  # The first run finishes and its row goes; a replacement lands on the SAME
@@ -5653,6 +5669,7 @@ def test_a_replacement_run_reusing_the_directory_quarantines_independently(
         "payload unreadable",
         harness.claims.run_key_for(replacement_assets),
         harness.claims.quarantine_key_for(replacement_assets),
+        ClaimReadability.UNREADABLE_CORRUPT,
     )
     assert first.run_key == second.run_key  # the collision is real
     assert first.quarantine_key != second.quarantine_key
@@ -6375,7 +6392,8 @@ def test_an_unverifiable_live_run_does_not_rewrite_an_existing_quarantine(
 
     assert len(_comment_texts(harness)) == 1
     (record,) = harness.claims.list_quarantines()
-    assert record.cause is QuarantineCause.CLAIM_UNREADABLE_ENDED_RUN
+    assert record.story is not None
+    assert record.story.cause is QuarantineCause.CLAIM_UNREADABLE_ENDED_RUN
     assert record.announced
     assert len(_quarantine_narratives(harness)) == 1
 
@@ -6407,7 +6425,8 @@ def test_an_unverifiable_live_run_can_be_reconciled_after_the_terminal_ends(
     assert "already ended" in comments[0]
     assert "still running" not in comments[0]
     (record,) = harness.claims.list_quarantines()
-    assert record.cause is QuarantineCause.CLAIM_UNREADABLE_ENDED_RUN
+    assert record.story is not None
+    assert record.story.cause is QuarantineCause.CLAIM_UNREADABLE_ENDED_RUN
     assert len(_quarantine_narratives(harness)) == 1
 
 

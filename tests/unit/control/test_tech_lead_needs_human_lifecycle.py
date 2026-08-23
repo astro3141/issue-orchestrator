@@ -24,6 +24,7 @@ from issue_orchestrator.control.actions import (
 )
 from issue_orchestrator.control.claim_quarantine import QuarantineSubject
 from issue_orchestrator.control.label_manager import LabelManager
+from issue_orchestrator.ports.pending_work_claim_store import ClaimReadability
 from issue_orchestrator.control.needs_human_block import (
     BlockOutcome,
     NeedsHumanBlock,
@@ -639,7 +640,11 @@ class TestQuarantineProvenanceIsRespected:
             events=MagicMock(),
         )
         quarantined = QuarantinedSession(
-            _session(903, tmp_path), "payload unreadable", "/runs/903", "/runs/903@t1"
+            _session(903, tmp_path),
+            "payload unreadable",
+            "/runs/903",
+            "/runs/903@t1",
+            ClaimReadability.UNREADABLE_CORRUPT,
         )
         owner.quarantine(QuarantineSubject.live_run_with_unreadable_claim(quarantined))
         applier.applied.clear()
@@ -720,6 +725,7 @@ class TestTheSharedBlockIsNotOneOwnersToRetract:
             "payload unreadable",
             f"/runs/{issue_number}",
             f"/runs/{issue_number}@t1",
+            ClaimReadability.UNREADABLE_CORRUPT,
         )
         quarantine.quarantine(
             QuarantineSubject.live_run_with_unreadable_claim(quarantined)
@@ -886,6 +892,7 @@ class TestEveryOrchestratorCauseOwnsTheSharedBlock:
                     "payload unreadable",
                     f"/runs/{issue_number}",
                     f"/runs/{issue_number}@t1",
+                    ClaimReadability.UNREADABLE_CORRUPT,
                 )
             )
         )
@@ -1119,6 +1126,7 @@ class TestTheBlockOwnerIsNotBypassableInProduction:
                     "payload unreadable",
                     f"/runs/{issue_number}",
                     f"/runs/{issue_number}@t1",
+                    ClaimReadability.UNREADABLE_CORRUPT,
                 )
             )
         )
