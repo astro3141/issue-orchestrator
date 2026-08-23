@@ -264,9 +264,34 @@ def _apply_advise_only_authority(args: argparse.Namespace, config: "Config") -> 
 
 
 def _build_orchestrator(config: "Config") -> "Orchestrator":
-    from .bootstrap import build_orchestrator
+    """Build the one-shot orchestrator, endpoint question already answered.
 
-    return build_orchestrator(config=config)
+    Both on-demand commands build here, so this is the smallest place that
+    covers ``tech_lead`` and ``health-review`` without a per-command duplicate.
+
+    A one-shot command binds no Control API — it drives ``tick()`` itself in a
+    blocking loop and exits — so nothing ever publishes a bound port and
+    ``is_ready()`` would stay false forever. The launcher's callback guard then
+    refuses every attempt before a session starts, which is why a targeted
+    dispatch could be admitted and queued and still never launch (#193).
+
+    :func:`declare_no_control_api` is the existing owner of that question for a
+    mode that binds no server (``run_no_dashboard`` answers it the same way),
+    so it is reused verbatim with the ``None`` port these commands always have.
+    The alternative answer — publishing a bound port — would be a lie: there is
+    no server here, and handing an agent an address nothing is listening on is
+    the exact failure this port exists to prevent. Declaring unavailability
+    omits ``ISSUE_ORCHESTRATOR_API_PORT`` from the session environment instead,
+    which is honest and costs a one-shot run nothing: the tech-lead agent
+    completes through the run-directory completion record that this command's
+    own drive loop reads on the next ``tick()``, not over HTTP.
+    """
+    from .bootstrap import build_orchestrator
+    from .cli_run_modes import declare_no_control_api
+
+    orchestrator = build_orchestrator(config=config)
+    declare_no_control_api(orchestrator, None)
+    return orchestrator
 
 
 def _release(orchestrator: "Orchestrator") -> None:

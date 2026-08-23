@@ -10,6 +10,7 @@ They live together because they share a contract: return a
 
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING, Callable
 
 from .session_launch_types import LaunchDisposition, LaunchResult
@@ -18,6 +19,12 @@ from .transition_log import log_transition
 if TYPE_CHECKING:
     from ..domain.models import Session
     from ..ports.agent_callback_endpoint import AgentCallbackEndpoint
+
+logger = logging.getLogger(__name__)
+
+CALLBACK_ENDPOINT_DEFERRAL_REASON = (
+    "Agent callback endpoint not published yet; deferring launch"
+)
 
 
 def callback_endpoint_not_ready(
@@ -30,14 +37,30 @@ def callback_endpoint_not_ready(
     previously lived inside one launcher's precondition helper, which
     review, retrospective-review and rework never reach (#6924 F7-R3).
 
-    Retryable: the next tick launches once the server has published, or
-    a run mode has declared that it serves no Control API.
+    Retryable, and now says so: the refusal carries
+    ``RETRYABLE_FAILURE`` explicitly rather than inheriting
+    ``LaunchResult``'s ``PERMANENT_FAILURE`` default, which sent this
+    branch — alone among the guards here — down the settlement's
+    destructive path. A deferral that drops the pending item and retires
+    its durable claim is not a deferral: the next tick had nothing left
+    to launch once the server published (#193). The disposition the
+    queue owner already reserves for "this attempt failed and may work
+    next time, on a bounded budget" is exactly what a race against the
+    server's publish is.
+
+    The reason is logged here rather than left to the settlement. A
+    retained item is reported by its queue owner as a generic retryable
+    failure and a dropped one said nothing at all, so the one fact that
+    explains both — *which* precondition refused — never reached an
+    operator between "session starting" and "launch declined" (#193).
     """
     if endpoint.is_ready():
         return None
+    logger.warning("[LAUNCH] %s", CALLBACK_ENDPOINT_DEFERRAL_REASON)
     return LaunchResult(
         None, False,
-        "Agent callback endpoint not published yet; deferring launch",
+        CALLBACK_ENDPOINT_DEFERRAL_REASON,
+        disposition=LaunchDisposition.RETRYABLE_FAILURE,
     )
 
 
