@@ -117,7 +117,14 @@ class BoundReviewVerdict:
 
     @classmethod
     def from_payload(cls, payload: Mapping[str, object]) -> "BoundReviewVerdict":
-        """Parse a stored binding, rejecting any payload missing either half."""
+        """Parse a stored binding, rejecting any payload missing either half.
+
+        Every rejection is a :class:`ValueError`, whatever the corrupt shape.
+        Callers reading this record back through a port catch that one family
+        to mean "the stored artifact does not parse" and let anything else
+        escape as a defect in the reader, so a mistyped field leaving here as
+        some other exception would be routed as the opposite of what it is.
+        """
         raw_verdict = payload.get("verdict")
         if not isinstance(raw_verdict, str) or not raw_verdict:
             raise ValueError("review verdict binding requires a verdict")
@@ -129,6 +136,19 @@ class BoundReviewVerdict:
             ) from exc
         if "reviewed_sha" not in payload:
             raise ValueError("review verdict binding requires reviewed_sha")
+        raw_reviewed_sha = payload["reviewed_sha"]
+        if not isinstance(raw_reviewed_sha, str):
+            # Every other mistyped field in a stored payload leaves this parser
+            # as a ValueError, and callers catch exactly that to mean "the
+            # stored artifact does not parse". ``normalize_reviewed_sha`` raises
+            # TypeError for a non-str, so without this check one corrupt shape
+            # would leave by a second exception family and escape those
+            # catches — the same defect reported as a crash instead of as
+            # unreadable evidence.
+            raise ValueError(
+                "review verdict binding requires str reviewed_sha, got "
+                f"{raw_reviewed_sha!r}"
+            )
         decided_at = payload.get("decided_at")
         if not isinstance(decided_at, str) or not decided_at.strip():
             raise ValueError("review verdict binding requires decided_at")
@@ -140,7 +160,7 @@ class BoundReviewVerdict:
             raise ValueError("review verdict binding requires int schema_version")
         return cls(
             verdict=verdict,
-            reviewed_sha=normalize_reviewed_sha(payload["reviewed_sha"]),
+            reviewed_sha=normalize_reviewed_sha(raw_reviewed_sha),
             decided_at=decided_at,
             completed_rounds=completed_rounds,
             schema_version=schema_version,

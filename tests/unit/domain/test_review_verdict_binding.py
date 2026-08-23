@@ -40,6 +40,24 @@ class TestBindingIsOneRecord:
         with pytest.raises(ValueError, match="reviewed_sha"):
             BoundReviewVerdict.from_payload(payload)
 
+    @pytest.mark.parametrize("value", [None, 1, ["a" * 40]])
+    def test_a_mistyped_sha_does_not_parse_as_a_value_error(
+        self, value: object
+    ) -> None:
+        """Present but not a string is a parse failure, like every other field.
+
+        Callers reading a stored binding back catch ``ValueError`` to mean "the
+        artifact does not parse" and let anything else escape as a defect in
+        the reader. ``normalize_reviewed_sha`` answers a non-str with
+        ``TypeError``, so this shape — and only this one — used to leave the
+        parser by the family reserved for reader defects, past the very catch
+        that exists to route corrupt evidence.
+        """
+        payload = _approval().to_payload()
+        payload["reviewed_sha"] = value
+        with pytest.raises(ValueError, match="reviewed_sha"):
+            BoundReviewVerdict.from_payload(payload)
+
     def test_sha_without_verdict_does_not_parse(self) -> None:
         payload = _approval().to_payload()
         del payload["verdict"]

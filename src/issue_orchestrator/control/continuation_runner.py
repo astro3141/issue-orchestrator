@@ -8,6 +8,7 @@ that already exist rather than reimplementing what they decide:
 same-SHA admission, allowance, gate     :class:`~.publication_revalidation.PublicationRevalidation` (#139)
 opening a run at exactly A              :class:`~.continuation_run_open.ContinuationRunOpener` (#149, #153, #173)
 reviewer-first exchange, PR creation    :class:`~.completion_processor.CompletionProcessor`
+promoting the run's exact-A verdict     :class:`~.continuation_review_evidence.ContinuationReviewEvidence` (#178, #180)
 settlement of a discharged intent       :class:`~.continuation_finalize.ContinuationFinalizer`
 ownership and exclusion                 :class:`~.control_operation_ownership.ControlOperationOwnership` (#146)
 ======================================  =====================================
@@ -68,6 +69,15 @@ of ``pr-pending`` observe it. Handing that result to the finalizer is what makes
 the operation terminate; logging it and dropping it is what made
 ``APPROVED_PENDING_PR`` re-run a full reviewer exchange on every reconciliation.
 
+**It never settles on review evidence it does not hold.** A run whose completion
+actually completed a review exchange terminates only once that exchange's
+exact-``A`` :class:`~..domain.review_verdict_binding.BoundReviewVerdict` has been
+read and promoted (#178). The promotion is therefore a decision and has an
+owner — :class:`~.continuation_review_evidence.ContinuationReviewEvidence` — and
+a refusal from it withholds the settlement rather than being logged past. A
+completion that ran no exchange is untouched by the rule: it never had review
+evidence, so requiring some would fail-close the one path this is not about.
+
 **It never outlives its own run.** ``process`` is not necessarily finished when
 it returns: with a background supervisor wired — the only configuration in which
 this runner executes at all — the review exchange becomes its own job and the
@@ -96,6 +106,7 @@ from typing import TYPE_CHECKING, Protocol
 from ..domain.continuation_phase import ContinuationPhase
 from ..domain.review_exchange_rework import ReviewExchangeRework
 from .continuation_live_truth import LiveContinuation
+from .continuation_review_evidence import ContinuationReviewEvidence
 from .continuation_run_open import ContinuationRunOpener
 from .continuation_runs import ContinuationRun
 
@@ -185,7 +196,6 @@ class ControlContinuationRunner:
     ) -> None:
         self._state = state
         self._revalidation = revalidation_route
-        self._attempts = attempts
         # Opening a run is its own subject: an ordered sequence of owners in
         # which every refusal costs the same thing. Composed here from the
         # collaborators this runner is already given, rather than wired
@@ -202,7 +212,13 @@ class ControlContinuationRunner:
             repo_root=repo_root,
         )
         self._completion_processor = completion_processor
-        self._review_verdicts = review_verdicts
+        # Composed here for the reason the opener is: promoting the exchange's
+        # verdict and settling on it are one deployment decision, and a runner
+        # that could settle without having promoted would be precisely the
+        # engine #178 exists to remove.
+        self._review_evidence = ContinuationReviewEvidence(
+            attempts=attempts, review_verdicts=review_verdicts
+        )
         self._finalizer = finalizer
         # The SAME registry live truth reads. The claim taken here is what keeps
         # a reconciliation seconds later from deriving a mid-run candidate as
@@ -419,10 +435,10 @@ class ControlContinuationRunner:
         work, and a coder round here would move the branch to ``A'`` while
         exactly ``A`` was still the thing under review. So a changes-requested
         round terminates the exchange with a durable ``CHANGES_REQUESTED(A)``,
-        which :meth:`_record_review_verdict` promotes onto the attempt so the
-        phase derives ``EXIT_TO_REWORK`` — #149's ordering, in which ownership
-        is released BEFORE ordinary rework is evaluated, and only ordinary
-        rework ever produces ``A'``.
+        which :class:`~.continuation_review_evidence.ContinuationReviewEvidence`
+        promotes onto the attempt so the phase derives ``EXIT_TO_REWORK`` —
+        #149's ordering, in which ownership is released BEFORE ordinary rework
+        is evaluated, and only ordinary rework ever produces ``A'``.
 
         Returns:
             Whether the pipeline reached a TERMINAL result. ``False`` means the
@@ -430,6 +446,13 @@ class ControlContinuationRunner:
             failure was rerouted into rework: the work continues, so the run
             must stay open and neither a verdict nor a settlement has been
             produced to record.
+
+            ``True`` says the pipeline finished with this run's checkout, which
+            is a fact about the pipeline and not about the settlement: a
+            terminal pass that withheld its settlement still closes its run.
+            The intent stays undischarged, so the operation stays live and the
+            next reconciliation opens a fresh run for it — spending one #149
+            allowance, which is what bounds the retry.
         """
         result = self._completion_processor.process(
             run.worktree,
@@ -455,76 +478,27 @@ class ControlContinuationRunner:
                 run.assets.run_id,
             )
             return False
-        self._record_review_verdict(operation, result)
-        # The verdict first, then the settlement: both are facts this run
-        # produced, and the ordering is the crash window. Settled-without-a-
-        # verdict loses only evidence about a PR that demonstrably exists;
-        # verdict-without-settlement re-enters the pipeline, finds the open PR
-        # and reuses it. Only the first ordering can lose the review outcome
-        # for good.
+        # The verdict first, and the settlement ONLY on the strength of it
+        # (#178). The ordering was always the crash window — a
+        # verdict-without-settlement re-enters the pipeline, finds the open pull
+        # request and reuses it, so only the reverse could lose the review
+        # outcome for good — but ordering alone let the second step run on a
+        # promotion that had refused. A completion that completed a review
+        # exchange now settles only on evidence this run actually holds; one
+        # that ran no exchange settles exactly as it did before.
+        evidence = self._review_evidence.promote(operation, result)
+        if not evidence.settles:
+            logger.warning(
+                "[CONTINUATION] %s withholds settlement: its review exchange"
+                " left no promoted exact-%s verdict (%s). The recorded intent"
+                " stays undischarged and the operation stays re-enterable",
+                operation.key,
+                operation.key.head_sha[:12],
+                evidence.value,
+            )
+            return True
         self._finalizer.finalize(operation, result)
         return True
-
-    def _record_review_verdict(
-        self, operation: LiveContinuation, result: "ProcessingResult"
-    ) -> None:
-        """Promote this run's exact-``A`` verdict binding into durable truth.
-
-        The binding the exchange writes lives in the run directory, inside the
-        worktree this run is about to delete — durable enough for the session
-        that made it, and gone before anything could read it back. Copying it
-        onto the attempt is what makes ``EXIT_TO_REWORK``, ``SETTLED_NO_PR``
-        and ``APPROVED_PENDING_PR`` reconstructible after a restart, which is
-        the whole of §8's review half.
-
-        WHICH run is read off the pipeline's own result and not off this
-        route's run (#180). The exchange allocates a run of its own — a sibling
-        under the same worktree's ``sessions/``, not a directory beneath this
-        one — so the continuation cannot derive it, and the version that
-        derived it anyway read an empty directory for every verdict ever bound:
-        approvals as well as rejections, which is why ``EXIT_TO_REWORK`` was
-        unreachable and a rejected candidate spent a second full continuation
-        run before ``RUNS_EXHAUSTED`` released it. The pipeline now names the
-        run it allocated, so there is nothing left to derive.
-
-        A verdict bound to another commit is dropped rather than filed: the
-        attempt would refuse it anyway, and refusing here says why.
-        """
-        exchange_run = result.review_exchange_run
-        if exchange_run is None:
-            logger.info(
-                "[CONTINUATION] %s ran no review exchange this run",
-                operation.key,
-            )
-            return
-        binding = self._review_verdicts.for_exchange_run(exchange_run)
-        if binding is None:
-            logger.info(
-                "[CONTINUATION] %s recorded no review verdict this run",
-                operation.key,
-            )
-            return
-        if not binding.covers(operation.key.head_sha):
-            logger.warning(
-                "[CONTINUATION] discarding %s verdict bound to %s: it is"
-                " evidence about other work",
-                operation.key,
-                binding.reviewed_sha[:12],
-            )
-            return
-        # The attempt's OWN key, not a third spelling rebuilt from the issue and
-        # the operation. ``LiveContinuation`` already carries the record this
-        # operation is about, and the binding between candidate and evidence
-        # should have one spelling wherever it is written.
-        self._attempts.update(
-            operation.attempt.key,
-            lambda attempt: attempt.with_continuation_review_verdict(binding),
-        )
-        logger.info(
-            "[CONTINUATION] %s durable review verdict=%s",
-            operation.key,
-            binding.verdict.value,
-        )
 
 
 def _already_executing(operation: LiveContinuation) -> None:
