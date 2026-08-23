@@ -263,6 +263,36 @@ repo requires PR approval and the same human needs to approve agent PRs, use
 GitHub App auth instead so PRs are authored by a bot identity. See
 [GitHub Auth and Permissions](github-permissions.md#protected-branch-mode-github-app).
 
+### Approve a Repository Root for Codex Workspace Trust
+
+Codex asks, interactively, whether it may let a repository's own files
+configure it — project-local config, hooks and exec policies. That question is
+settled before `--ask-for-approval`, `--sandbox`, and even
+`--dangerously-bypass-approvals-and-sandbox` are applied, so none of them
+suppress it: an unattended Codex launch in a managed worktree parks on the
+dialog until it times out.
+
+Record the approval instead, as one absolute repository root:
+
+```yaml
+security:
+  workspace_trust:
+    approved_repository_root: /Users/you/src/your-repo
+```
+
+- **Absent means deny.** With no key, an interactive Codex launch fails
+  immediately and visibly, rather than parking on a dialog nobody answers.
+- The root is the **repository root** — the checkout that owns the shared
+  `.git` — not a worktree. Every linked worktree of that checkout is covered;
+  no other repository is, including a second checkout of the same project.
+- Before each launch the orchestrator resolves the worktree's actual
+  repository root and refuses to start unless it is the approved one.
+- The grant is materialized per launch, in the launch's own arguments. Nothing
+  is written to `~/.codex/config.toml`, and the grant ends with the process.
+
+The key is intentionally not editable from the settings dialog: it is an
+operator decision that belongs in the config file, under review.
+
 ### Ignore Repo-Local Runtime Artifacts
 
 Use `.issue-orchestrator/runtime-ignore` when a tool writes repo-local runtime

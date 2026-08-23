@@ -10,6 +10,7 @@ from issue_orchestrator.domain.sandbox_scope import SandboxUnsupportedError
 __all__ = [
     "GitWorktreeAccess",
     "git_worktree_filesystem_rules",
+    "resolve_git_common_dir",
     "resolve_git_worktree_access",
 ]
 
@@ -129,6 +130,19 @@ def _resolve_head_ref(git_dir: Path, common_dir: Path) -> Path | None:
             f"(got {raw_ref!r})"
         )
     return common_dir.joinpath(*ref.parts)
+
+
+def resolve_git_common_dir(worktree: Path) -> Path:
+    """Return the Git *common* directory that owns *worktree*'s metadata.
+
+    For a main checkout that is its own ``.git``; for a linked worktree it is
+    the repository's shared ``.git``, reached through the worktree's
+    ``gitdir:`` pointer and the ``commondir`` file beside it. Callers that need
+    only "which repository does this worktree belong to" — Codex workspace
+    trust is keyed to exactly that (#215) — use this rather than resolving the
+    per-worktree HEAD they have no use for.
+    """
+    return _resolve_common_directory(_resolve_git_directory(worktree))
 
 
 def resolve_git_worktree_access(worktree: Path) -> GitWorktreeAccess:

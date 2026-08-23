@@ -15,7 +15,7 @@ import json
 import os
 import shlex
 import pytest
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, cast
@@ -47,6 +47,7 @@ from issue_orchestrator.control.session_launch_types import (
     LaunchResult,
 )
 from tests.unit.continuation_helpers import inert_control_continuation
+from tests.workspace_trust import APPROVAL_FINGERPRINT, approval_for
 from tests.callback_endpoint_helpers import ready_callback_endpoint
 from issue_orchestrator.control.session_launcher import (
     SessionLauncher,
@@ -1756,6 +1757,59 @@ class TestLaunchIssueSession:
         assert identity["configuration_mode"] == "codex"
         assert identity["config_name"] == "main.yaml"
         assert identity["config_fingerprint"] == "effective-config-fingerprint"
+
+    def test_session_identity_records_the_workspace_trust_authority(
+        self, session_launcher, sample_issue
+    ):
+        """The record says which approval the launch carried, and from where.
+
+        The argv records the grant that was materialized; this records the
+        authority behind it, so a reader can reconstruct *why* the repository
+        was trusted rather than only that it was (#215).
+        """
+        agent = session_launcher.config.agents[sample_issue.agent_type]
+        session_launcher.config.agents[sample_issue.agent_type] = replace(
+            agent,
+            workspace_trust=approval_for(
+                Path("/Users/o/io-fork/issue-orchestrator"),
+                authority_path=Path("/Users/o/io-fork/selfhost.yaml"),
+            ),
+        )
+
+        result = session_launcher.launch_issue_session(sample_issue, active_sessions=[])
+
+        assert result.success is True
+        assert result.session is not None
+        identity = json.loads(
+            (result.session.run_dir / "session-identity.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        assert identity["workspace_trust_approved_root"] == (
+            "/Users/o/io-fork/issue-orchestrator"
+        )
+        assert identity["workspace_trust_authority"] == (
+            "/Users/o/io-fork/selfhost.yaml"
+        )
+        assert identity["workspace_trust_authority_fingerprint"] == (
+            APPROVAL_FINGERPRINT
+        )
+
+    def test_session_identity_records_an_absent_approval_as_absent(
+        self, session_launcher, sample_issue
+    ):
+        """Absent approval state is written down, not left to inference."""
+        result = session_launcher.launch_issue_session(sample_issue, active_sessions=[])
+
+        assert result.success is True
+        assert result.session is not None
+        identity = json.loads(
+            (result.session.run_dir / "session-identity.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        assert identity["workspace_trust_approved_root"] == ""
+        assert identity["workspace_trust_authority"] == ""
 
     def test_sets_e2e_pr_labels_env(self, launcher_bundle, sample_issue):
         """Verify E2E_PR_LABELS env var is set (lines 349-350)."""

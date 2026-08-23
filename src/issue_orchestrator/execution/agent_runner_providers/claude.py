@@ -15,6 +15,7 @@ from .base import CLIProvider
 
 if TYPE_CHECKING:
     from issue_orchestrator.domain.sandbox_scope import SandboxScope
+    from issue_orchestrator.domain.workspace_trust import LaunchWorkspace
     from issue_orchestrator.ports.command_runner import CommandRunner
 
 
@@ -57,6 +58,7 @@ class ClaudeCodeProvider(CLIProvider):
         model: str | None = None,
         *,
         sandbox_scope: "SandboxScope | None" = None,
+        launch_workspace: "LaunchWorkspace | None" = None,
         **kwargs: str,
     ) -> list[str]:
         """Build a Claude Code CLI command for interactive mode.
@@ -72,6 +74,11 @@ class ClaudeCodeProvider(CLIProvider):
                 dontAsk`` plus inline ``--settings`` describing the read/write
                 roots, egress, and denied credentials. ``None`` (default) keeps
                 the existing command byte-for-byte.
+            launch_workspace: Accepted for the shared provider contract and
+                deliberately unused. Claude Code's own trust confirmation is
+                answered by the runner's ``claude-trust-worktree`` responder
+                rule, whose semantics #215 leaves unchanged; nothing in a
+                Claude launch materializes repository trust through argv.
             **kwargs: Additional options:
                 - permission_mode: Permission handling mode (default: bypassPermissions).
                   Ignored when ``sandbox_scope`` is set (``dontAsk`` is forced).
@@ -80,6 +87,7 @@ class ClaudeCodeProvider(CLIProvider):
                 - system_prompt: Additional system prompt text
                 - max_turns: Maximum conversation turns
         """
+        del launch_workspace  # Claude materializes no repository-trust grant
         cmd = [self.executable]
 
         # Model (optional - Claude will use default if not specified)

@@ -11,6 +11,7 @@ if TYPE_CHECKING:
     from ..domain.issue_filter import IssueLabelFilter
 
 from ..domain.models import AgentConfig, CommentHeadings
+from ..domain.workspace_trust import ApprovedRepositoryTrust
 from .config_models import (
     AiGateConfig as AiGateConfig,
     ClaimsConfig,
@@ -68,6 +69,7 @@ from .config_paths import (
     selection_from_config_path as selection_from_config_path,
 )
 from . import github_config as _github_config
+from .config_workspace_trust import reject_workspace_trust_overrides, security_section
 from .config_sections import (
     ALLOWED_AGENT_FIELDS as ALLOWED_AGENT_FIELDS,
     ALLOWED_TOP_LEVEL_FIELDS as ALLOWED_TOP_LEVEL_FIELDS,
@@ -264,6 +266,8 @@ class Config(ConfigLaunchIdentity, RuntimeConfigReferenceOwner, TechLeadActivati
     # Enforcement options
     enforce_hooks: bool = True  # Install pre-push hooks (runs project validation + orchestrator checks)
     pre_push_hook: Optional[Path] = None  # Custom pre-push hook path (uses bundled if None)
+    # Human-approved repository-root trust (#215). None denies; see config_workspace_trust.
+    workspace_trust: Optional[ApprovedRepositoryTrust] = None
 
     # Client-repo-specific setup commands (run after worktree creation).
     # No default — users must configure these for their repo (e.g., npm install,
@@ -1181,13 +1185,7 @@ class Config(ConfigLaunchIdentity, RuntimeConfigReferenceOwner, TechLeadActivati
         if retry_dict:
             result["retry"] = retry_dict
 
-        # Security section
-        security_dict: dict = {}
-        if not self.enforce_hooks:
-            security_dict["enforce_hooks"] = False
-        if self.dangerous.allow_unsupported_agents:
-            security_dict["dangerous"] = {"allow_unsupported_agents": True}
-        if security_dict:
+        if security_dict := security_section(self):
             result["security"] = security_dict
 
         # Hooks section (only include if non-default)
@@ -1242,6 +1240,7 @@ class Config(ConfigLaunchIdentity, RuntimeConfigReferenceOwner, TechLeadActivati
             data = yaml.safe_load(f)
         if data is None:
             data = {}
+        reject_workspace_trust_overrides(overrides or [])
         _apply_yaml_overrides(data, overrides or [])
 
         # Expand ${VAR} environment variable references
@@ -1274,6 +1273,8 @@ class Config(ConfigLaunchIdentity, RuntimeConfigReferenceOwner, TechLeadActivati
 
         # Load all sections using helper functions
         load_worktrees_section(config, sections["worktrees"], repo_root, config_path)
+        # Security first: it settles the #215 grant load_agents_section hands on.
+        load_security_section(config, sections["security"], repo_root)
         load_agents_section(config, sections["agents"], repo_root)
         load_execution_section(config, sections["execution"], config_path)
         load_labels_section(config, sections["labels"])
@@ -1281,7 +1282,6 @@ class Config(ConfigLaunchIdentity, RuntimeConfigReferenceOwner, TechLeadActivati
         load_github_write_verify(config, sections["github"])
         load_ui_section(config, sections["ui"])
         load_observability_section(config, sections["observability"])
-        load_security_section(config, sections["security"], repo_root)
         load_review_section(config, sections["review"])
         load_cleanup_section(config, sections["cleanup"])
         load_validation_section(config, sections["validation"])

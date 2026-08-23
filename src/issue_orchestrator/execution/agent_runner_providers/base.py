@@ -18,6 +18,7 @@ from ..agent_runner_errors import classify_provider_output
 
 if TYPE_CHECKING:
     from issue_orchestrator.domain.sandbox_scope import SandboxScope
+    from issue_orchestrator.domain.workspace_trust import LaunchWorkspace
     from issue_orchestrator.ports.command_runner import CommandRunner
 
 
@@ -92,6 +93,7 @@ class CLIProvider(ABC):
         model: str | None = None,
         *,
         sandbox_scope: "SandboxScope | None" = None,
+        launch_workspace: "LaunchWorkspace | None" = None,
         **kwargs: str,
     ) -> list[str]:
         """Build the command-line invocation for this provider.
@@ -102,6 +104,11 @@ class CLIProvider(ABC):
             sandbox_scope: When set, the bounded sandbox the orchestrator
                 computed for this session. ``None`` (the default) preserves the
                 provider's existing unsandboxed command exactly.
+            launch_workspace: Where this launch runs and which operator-approved
+                repository-root trust it carries (#215). A provider whose CLI
+                gates project configuration behind a workspace-trust decision
+                must verify it here and fail closed; one that does not may
+                ignore it.
             **kwargs: Provider-specific options (provider_args from YAML)
 
         Returns:

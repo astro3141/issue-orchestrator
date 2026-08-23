@@ -4985,3 +4985,152 @@ agents:
 
         # Hooks section should not be present when using defaults
         assert "hooks" not in result
+
+
+class TestWorkspaceTrustConfig:
+    """The human-approved repository-root trust grant (#215).
+
+    The grant is operator authority, so the loader is strict in both
+    directions: absent means deny, and anything present but unusable stops the
+    engine rather than degrading to a silent denial nobody would notice until a
+    launch parked.
+    """
+
+    def _config_text(self, tmp_path: Path, security: str = "") -> Path:
+        prompt = tmp_path / "prompt.md"
+        prompt.write_text("Prompt\n", encoding="utf-8")
+        config_file = tmp_path / ".issue-orchestrator.yaml"
+        config_file.write_text(
+            f"""
+worktrees:
+  base: {tmp_path}
+
+agents:
+  agent:test:
+    prompt: {prompt}
+    provider: codex
+{security}""",
+            encoding="utf-8",
+        )
+        return config_file
+
+    def test_absent_section_denies(self, tmp_path):
+        config = Config.load(self._config_text(tmp_path))
+
+        assert config.workspace_trust is None
+        assert config.agents["agent:test"].workspace_trust is None
+
+    def test_approved_root_reaches_every_agent(self, tmp_path):
+        config = Config.load(
+            self._config_text(
+                tmp_path,
+                """
+security:
+  workspace_trust:
+    approved_repository_root: /Users/o/io-fork/issue-orchestrator
+""",
+            )
+        )
+
+        approval = config.workspace_trust
+        assert approval is not None
+        assert approval.repository_root == Path("/Users/o/io-fork/issue-orchestrator")
+        assert config.agents["agent:test"].workspace_trust is approval
+
+    def test_authority_source_identifies_the_document_it_came_from(self, tmp_path):
+        """Launch evidence must be able to name the approving document."""
+        config_file = self._config_text(
+            tmp_path,
+            """
+security:
+  workspace_trust:
+    approved_repository_root: /Users/o/io-fork/issue-orchestrator
+""",
+        )
+
+        config = Config.load(config_file)
+
+        import hashlib
+
+        source = config.workspace_trust.source
+        assert source.path == config_file.resolve()
+        assert source.fingerprint == hashlib.sha256(
+            config_file.read_bytes()
+        ).hexdigest()
+
+    @pytest.mark.parametrize(
+        "section",
+        [
+            pytest.param(
+                """
+security:
+  workspace_trust:
+    approved_repository_root: ../io-fork/issue-orchestrator
+""",
+                id="relative-root",
+            ),
+            pytest.param(
+                """
+security:
+  workspace_trust:
+    approved_repository_root: ""
+""",
+                id="empty-root",
+            ),
+            pytest.param(
+                """
+security:
+  workspace_trust:
+    approved_repository_roots:
+      - /Users/o/io-fork/issue-orchestrator
+""",
+                id="unknown-field",
+            ),
+            pytest.param(
+                """
+security:
+  workspace_trust: true
+""",
+                id="not-a-mapping",
+            ),
+            pytest.param(
+                """
+security:
+  workspace_trust: {}
+""",
+                id="no-root",
+            ),
+        ],
+    )
+    def test_malformed_authority_state_stops_the_engine(self, tmp_path, section):
+        with pytest.raises(ValueError):
+            Config.load(self._config_text(tmp_path, section))
+
+    def test_saving_the_config_preserves_the_grant(self, tmp_path):
+        """A rewrite must not silently revoke a human's approval."""
+        config = Config.load(
+            self._config_text(
+                tmp_path,
+                """
+security:
+  workspace_trust:
+    approved_repository_root: /Users/o/io-fork/issue-orchestrator
+""",
+            )
+        )
+
+        assert config.to_dict()["security"]["workspace_trust"] == {
+            "approved_repository_root": "/Users/o/io-fork/issue-orchestrator",
+        }
+
+    def test_a_cli_override_cannot_rewrite_the_approval(self, tmp_path):
+        """Evidence must not be able to name a document the launch ignored."""
+        config_file = self._config_text(tmp_path)
+
+        with pytest.raises(ValueError, match="cannot be set by a CLI override"):
+            Config.load(
+                config_file,
+                overrides=[
+                    "security.workspace_trust.approved_repository_root=/tmp/anything"
+                ],
+            )

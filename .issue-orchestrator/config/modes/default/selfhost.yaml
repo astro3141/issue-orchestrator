@@ -91,6 +91,31 @@ worktrees:
     pr_collision: new_branch
     push_rebase_retry: true
 
+security:
+  # HUMAN-A APPROVED REPOSITORY-ROOT WORKSPACE TRUST (#215).
+  #
+  # The scoped security decision is #204's Human-A grant, comment 5385523051:
+  # ONE absolute repository root, approved for the managed checkout this fork
+  # orchestrates. It is recorded here — in the operator-owned engine config,
+  # under version control — because that makes it durable, reviewable, and
+  # identifiable: a launch's evidence names this document and a fingerprint of
+  # the bytes it was read from.
+  #
+  # It is deliberately an absolute path and not "the current repository". A
+  # travelling grant (cwd, repo root walk, the running orchestrator's own
+  # checkout) would widen itself to whatever checkout executed it. Concretely:
+  # the recovery checkout at /Users/astro3141/io-recovery/issue-orchestrator
+  # runs this same config and is granted NOTHING by it, because its worktrees
+  # resolve to a different common repository root.
+  #
+  # A Codex launch materializes this per launch, as one root-command
+  # `-c projects={ "<root>" = { trust_level = "trusted" } }` override — nothing
+  # is written to the operator's ~/.codex/config.toml, and the grant's lifetime
+  # is the launch. Removing the key does not "open up" anything: absent = deny,
+  # and an interactive Codex launch then fails closed before spawn.
+  workspace_trust:
+    approved_repository_root: /Users/astro3141/io-fork/issue-orchestrator
+
 execution:
   concurrency:
     max_concurrent_sessions: 1

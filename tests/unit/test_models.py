@@ -17,6 +17,17 @@ from issue_orchestrator.domain.models import (
 from issue_orchestrator.domain.issue_key import FakeIssueKey
 from issue_orchestrator.domain.session_key import SessionKey, TaskKind
 from tests.unit.session_run_helpers import make_session_run_assets
+from tests.workspace_trust import approval_for, make_repository
+
+
+def _codex_worktree(tmp_path: Path) -> Path:
+    """A repository an approved Codex launch can run in (#215).
+
+    Every interactive Codex launch resolves its working directory to a
+    repository root and matches it against the approval it carries, so these
+    tests need a directory that is one.
+    """
+    return make_repository(tmp_path / "repo")
 
 
 def _make_session_key(issue_number: int = 1, task: TaskKind = TaskKind.CODE) -> SessionKey:
@@ -355,20 +366,27 @@ class TestAgentConfig:
         caught live by the real-codex exchange smoke test)."""
         prompt_file = tmp_path / "prompt.txt"
         prompt_file.write_text("p")
-        config = AgentConfig(prompt_path=prompt_file, provider="codex")
+        worktree = _codex_worktree(tmp_path)
+        config = AgentConfig(
+            prompt_path=prompt_file,
+            provider="codex",
+            workspace_trust=approval_for(worktree),
+        )
         command = config.get_command(
-            issue_number=1, issue_title="t", worktree=tmp_path,
+            issue_number=1, issue_title="t", worktree=worktree,
         )
         assert "--model" not in command
 
     def test_provider_command_forwards_explicit_model_for_codex(self, tmp_path):
         prompt_file = tmp_path / "prompt.txt"
         prompt_file.write_text("p")
+        worktree = _codex_worktree(tmp_path)
         config = AgentConfig(
             prompt_path=prompt_file, provider="codex", model="gpt-5-codex",
+            workspace_trust=approval_for(worktree),
         )
         command = config.get_command(
-            issue_number=1, issue_title="t", worktree=tmp_path,
+            issue_number=1, issue_title="t", worktree=worktree,
         )
         assert "--model gpt-5-codex" in command
 
@@ -377,11 +395,15 @@ class TestAgentConfig:
         provider with no ``model:`` — its CLI keeps its own default."""
         prompt_file = tmp_path / "prompt.txt"
         prompt_file.write_text("p")
-        config = AgentConfig(prompt_path=prompt_file, provider="codex", model="")
+        worktree = _codex_worktree(tmp_path)
+        config = AgentConfig(
+            prompt_path=prompt_file, provider="codex", model="",
+            workspace_trust=approval_for(worktree),
+        )
 
         assert config.resolved_model() is None
         command = config.get_command(
-            issue_number=1, issue_title="t", worktree=tmp_path,
+            issue_number=1, issue_title="t", worktree=worktree,
         )
         assert "--model" not in command
 
@@ -526,14 +548,16 @@ class TestAgentConfig:
         prompt_file = tmp_path / "prompt.md"
         prompt_file.write_text("Task instructions")
 
+        worktree = _codex_worktree(tmp_path)
         config = AgentConfig(
             prompt_path=prompt_file,
             prompt_relative="prompt.md",
             provider="codex",
             model="gpt-5-codex",
+            workspace_trust=approval_for(worktree),
         )
 
-        cmd = config.get_command(123, "Test Issue", tmp_path)
+        cmd = config.get_command(123, "Test Issue", worktree)
 
         # Completion commands MUST be present even for non-Claude providers
         assert "CRITICAL" in cmd
@@ -547,15 +571,17 @@ class TestAgentConfig:
         prompt_file = tmp_path / "prompt.md"
         prompt_file.write_text("Task instructions")
 
+        worktree = _codex_worktree(tmp_path)
         config = AgentConfig(
             prompt_path=prompt_file,
             prompt_relative="prompt.md",
             provider="codex",
             model="gpt-5-codex",
             initial_prompt="Do the work on issue #{issue_number}",
+            workspace_trust=approval_for(worktree),
         )
 
-        cmd = config.get_command(123, "Test Issue", tmp_path)
+        cmd = config.get_command(123, "Test Issue", worktree)
 
         # Both completion command docs and the initial prompt should be in the command
         assert "CRITICAL" in cmd
@@ -625,15 +651,17 @@ class TestAgentConfig:
         prompt_file = tmp_path / "prompt.md"
         prompt_file.write_text("Task instructions")
 
+        worktree = _codex_worktree(tmp_path)
         config = AgentConfig(
             prompt_path=prompt_file,
             prompt_relative="prompt.md",
             provider="codex",
             model="gpt-5.4",
             provider_args={"reasoning_effort": "xhigh"},
+            workspace_trust=approval_for(worktree),
         )
 
-        cmd = config.get_command(123, "Test Issue", tmp_path)
+        cmd = config.get_command(123, "Test Issue", worktree)
 
         import shlex
         tokens = shlex.split(cmd)

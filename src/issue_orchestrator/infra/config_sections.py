@@ -42,6 +42,7 @@ from .validation_profiles import profiles_from_mapping
 # the section dispatch table and existing importers keep working.
 from .config_sections_tech_lead import parse_tech_lead_config
 from .config_paths import get_section, resolve_relative_path, resolve_worktree_base
+from .config_workspace_trust import WORKSPACE_TRUST_KEY, parse_workspace_trust
 from .config_value_rules import normalize_optional_mapping
 from . import github_config as _github_config
 
@@ -700,6 +701,11 @@ def load_security_section(config: "Config", security_section: dict, repo_root: P
             allow_unsupported_agents=dangerous_data.get("allow_unsupported_agents", False),
         )
 
+    config.workspace_trust = parse_workspace_trust(
+        security_section.get(WORKSPACE_TRUST_KEY),
+        config_path=config.config_path,
+    )
+
 
 def load_validation_section(config: "Config", validation_section: dict) -> None:
     """Load validation configuration."""
@@ -866,6 +872,12 @@ def load_agents_section(
             "retry_prompt_template": agent_data.get("retry_prompt_template"),
             "validation_profile": agent_data.get("validation_profile"),
             "sandbox": agent_data.get("sandbox", False),  # ADR-0034 opt-in (per-agent)
+            # Repository-root workspace trust (#215) is an OPERATOR grant, not
+            # an agent setting: it is injected from the security section and is
+            # absent from ALLOWED_AGENT_FIELDS, so an ``agents.*`` block that
+            # tries to approve a root is rejected as an unknown field. Requires
+            # load_security_section to have run first (see Config.load).
+            "workspace_trust": config.workspace_trust,
         }
         if "command" in agent_data:
             agent_kwargs["command"] = agent_data["command"]

@@ -8,13 +8,22 @@ Previously in ``_vendor/agent_runner/providers/codex.py``.
 from collections.abc import Mapping
 from typing import TYPE_CHECKING
 
+from issue_orchestrator.domain.workspace_trust import WorkspaceTrustError
 from issue_orchestrator.ports.provider_readiness import ProviderReadiness
 from issue_orchestrator.ports.provider_resilience import ProviderErrorType
 
 from .base import CLIProvider
+from .codex_trust import (
+    authorize_codex_workspace_trust,
+    codex_trust_override_argv,
+)
 
 if TYPE_CHECKING:
     from issue_orchestrator.domain.sandbox_scope import SandboxScope
+    from issue_orchestrator.domain.workspace_trust import (
+        LaunchWorkspace,
+        RepositoryTrustGrant,
+    )
     from issue_orchestrator.ports.command_runner import CommandRunner
 
 
@@ -109,6 +118,7 @@ class CodexProvider(CLIProvider):
         model: str | None = None,
         *,
         sandbox_scope: "SandboxScope | None" = None,
+        launch_workspace: "LaunchWorkspace | None" = None,
         **kwargs: str,
     ) -> list[str]:
         """Build a Codex CLI command.
@@ -118,6 +128,14 @@ class CodexProvider(CLIProvider):
             model: Model name (e.g., gpt-5.3-codex). If None, uses Codex's default.
             sandbox_scope: When set, replaces provider-level approval/sandbox
                 options with the orchestrator-computed Codex permission profile.
+            launch_workspace: Where this launch runs and which operator-approved
+                repository-root trust it carries. **Required for an interactive
+                launch** (#215): Codex settles workspace trust upstream of every
+                approval and sandbox flag, so an unattended TUI launch that
+                cannot prove it runs in the approved repository parks on the
+                trust dialog forever. Absent approval state, an unresolvable
+                root, and a root that is not the approved one all fail closed
+                with ``WorkspaceTrustError`` before anything spawns.
             **kwargs: Additional options:
                 - execution_mode: "interactive" (default) or "exec"
                 - approval_mode: "full-auto" (default), "yolo", or "default"
@@ -147,6 +165,14 @@ class CodexProvider(CLIProvider):
         if execution_mode == "interactive" and json_output:
             raise ValueError("Codex json_output requires execution_mode='exec'")
 
+        # Fail closed before any argv is assembled: an interactive launch that
+        # cannot prove it runs in the approved repository must not spawn.
+        trust_grant = (
+            self._authorize_workspace_trust(launch_workspace)
+            if execution_mode == "interactive"
+            else None
+        )
+
         scope_argv = self.apply_scope(sandbox_scope) if sandbox_scope is not None else []
 
         cmd = [self.executable, *scope_argv]
@@ -158,7 +184,7 @@ class CodexProvider(CLIProvider):
                 execution_mode=execution_mode,
             )
 
-        self._append_config_overrides(cmd, kwargs)
+        self._append_config_overrides(cmd, kwargs, trust_grant=trust_grant)
 
         if execution_mode == "exec":
             cmd.append("exec")
@@ -203,11 +229,31 @@ class CodexProvider(CLIProvider):
             else:
                 cmd.extend(["--ask-for-approval", "never"])
 
+    @staticmethod
+    def _authorize_workspace_trust(
+        launch_workspace: "LaunchWorkspace | None",
+    ) -> "RepositoryTrustGrant":
+        """Return the verified trust grant for an interactive launch.
+
+        A caller that supplies no workspace has declared no approval state at
+        all, which is the same denial as an unapproved repository — "I could
+        not tell" must never be recorded as "trusted".
+        """
+        if launch_workspace is None:
+            raise WorkspaceTrustError(
+                "Refusing to build an interactive Codex launch that declares "
+                "no launch workspace: workspace trust cannot be verified, and "
+                "an unverified launch parks on Codex's trust dialog"
+            )
+        return authorize_codex_workspace_trust(launch_workspace)
+
     @classmethod
     def _append_config_overrides(
         cls,
         cmd: list[str],
         kwargs: Mapping[str, object],
+        *,
+        trust_grant: "RepositoryTrustGrant | None",
     ) -> None:
         """Append every ``-c key=value`` pair, in root-command position.
 
@@ -220,9 +266,13 @@ class CodexProvider(CLIProvider):
         the agent still ran the command
         (``tests/integration/test_sandbox_os_boundary.py``). Emitting every
         override before the subcommand keeps them in one position and one
-        owner, so a new override cannot silently disarm the sandbox.
+        owner, so a new override cannot silently disarm the sandbox — and the
+        workspace-trust grant (#215) joins that list rather than opening a
+        second one.
         """
         cmd.extend(cls.UPDATE_CHECK_OVERRIDE)
+        if trust_grant is not None:
+            cmd.extend(codex_trust_override_argv(trust_grant))
         reasoning_effort = kwargs.get("reasoning_effort")
         if reasoning_effort is None:
             reasoning_effort = kwargs.get("model_reasoning_effort")

@@ -340,9 +340,13 @@ class TestPersistentSessionLifecycle:
                 trust_marker = Path(os.environ["STUB_TRUST_MARKER"])
                 fd = sys.stdin.fileno()
 
-                print("Do you trust the contents of this directory?", flush=True)
-                print("1. Yes, continue", flush=True)
-                print("2. No, quit", flush=True)
+                print(
+                    "Quick safety check: Is this a project you created or "
+                    "one you trust?",
+                    flush=True,
+                )
+                print("1. Yes, I trust this folder", flush=True)
+                print("2. No, exit", flush=True)
 
                 first = os.read(fd, 1)
                 trust_marker.write_text(repr(first), encoding="utf-8")
@@ -369,11 +373,11 @@ class TestPersistentSessionLifecycle:
             response_file,
             STUB_TRUST_MARKER=str(trust_marker),
         )
-        codex_bin = tmp_path / "codex"
-        codex_bin.symlink_to(sys.executable)
+        agent_bin = tmp_path / "claude"
+        agent_bin.symlink_to(sys.executable)
 
         session = open_persistent_session(
-            command=[str(codex_bin), "-u", str(script)],
+            command=[str(agent_bin), "-u", str(script)],
             working_dir=tmp_path,
             env=env,
             recording_path=tmp_path / "terminal-recording.jsonl",
@@ -417,9 +421,13 @@ class TestPersistentSessionLifecycle:
                 while not trust_gate.exists():
                     time.sleep(0.01)
 
-                print("Do you trust the contents of this directory?", flush=True)
-                print("1. Yes, continue", flush=True)
-                print("2. No, quit", flush=True)
+                print(
+                    "Quick safety check: Is this a project you created or "
+                    "one you trust?",
+                    flush=True,
+                )
+                print("1. Yes, I trust this folder", flush=True)
+                print("2. No, exit", flush=True)
                 prompt_ready.write_text("ready", encoding="utf-8")
 
                 first = os.read(fd, 1)
@@ -449,8 +457,8 @@ class TestPersistentSessionLifecycle:
             STUB_TRUST_GATE=str(trust_gate),
             STUB_PROMPT_READY=str(prompt_ready),
         )
-        codex_bin = tmp_path / "codex"
-        codex_bin.symlink_to(sys.executable)
+        agent_bin = tmp_path / "claude"
+        agent_bin.symlink_to(sys.executable)
         clock = _FakeClock()
         gate_opened = False
 
@@ -485,7 +493,7 @@ class TestPersistentSessionLifecycle:
             _real_sleep(seconds)
 
         session = open_persistent_session(
-            command=[str(codex_bin), "-u", str(script)],
+            command=[str(agent_bin), "-u", str(script)],
             working_dir=tmp_path,
             env=env,
         )

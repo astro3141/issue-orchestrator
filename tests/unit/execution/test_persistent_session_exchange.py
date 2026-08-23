@@ -60,7 +60,16 @@ from issue_orchestrator.execution.candidate_execution_identity import (
 from issue_orchestrator.execution.review_exchange_records import load_review_verdict
 from issue_orchestrator.execution.session_output_adapter import FileSystemSessionOutput
 from issue_orchestrator.ports import TraceEvent
+from issue_orchestrator.execution.agent_runner_providers.codex_trust import (
+    resolve_codex_common_repository_root,
+)
+
 from tests.callback_endpoint_helpers import ready_callback_endpoint
+from tests.workspace_trust import (
+    approval_for,
+    make_linked_worktree,
+    make_repository,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -174,12 +183,19 @@ def _identity_recorder(tmp_path: Path) -> CandidateExecutionIdentityRecorder:
     )
 
 
-def _make_codex_agent(prompt_path: Path) -> AgentConfig:
+def _make_codex_agent(prompt_path: Path, worktree: Path) -> AgentConfig:
+    """A Codex agent approved for the repository *worktree* belongs to (#215).
+
+    An interactive Codex launch is refused unless it can prove it runs in the
+    human-approved repository root, so the exchange's reviewer carries the
+    approval its worktree resolves to.
+    """
     return AgentConfig(
         prompt_path=prompt_path,
         provider="codex",
         ai_system="codex",
         timeout_minutes=1,
+        workspace_trust=approval_for(resolve_codex_common_repository_root(worktree)),
     )
 
 
@@ -310,10 +326,15 @@ def _build_pty_writer(recording_path: Path) -> Any:
 
 
 def _setup_worktrees(tmp_path: Path) -> tuple[Path, Path]:
-    coder = tmp_path / "coder-wt"
-    reviewer = tmp_path / "reviewer-wt"
-    coder.mkdir()
-    reviewer.mkdir()
+    """Two linked worktrees of one repository, as the launcher creates them.
+
+    They are real linked worktrees (``.git`` file → ``gitdir:`` → ``commondir``)
+    rather than bare directories so a Codex reviewer can resolve the repository
+    root its workspace-trust grant is keyed to (#215).
+    """
+    repository = make_repository(tmp_path / "repo")
+    coder = make_linked_worktree(repository, tmp_path / "coder-wt")
+    reviewer = make_linked_worktree(repository, tmp_path / "reviewer-wt")
     return coder, reviewer
 
 
@@ -1126,7 +1147,7 @@ class TestPersistentSessionExchangeHappyPath:
             coder_label="agent:backend",
             reviewer_label="agent:reviewer",
             coder_agent=_make_agent(prompt_path),
-            reviewer_agent=_make_codex_agent(prompt_path),
+            reviewer_agent=_make_codex_agent(prompt_path, reviewer_wt),
             runtime_config=_runtime_config(tmp_path),
             max_rounds=3,
             max_no_progress=2,
