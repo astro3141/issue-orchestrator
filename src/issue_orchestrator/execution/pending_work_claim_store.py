@@ -62,12 +62,19 @@ from ..infra.sqlite_connection import open_sqlite
 from ..ports.pending_work_claim_store import (
     AnnouncedStory,
     ClaimLookup,
+    ClaimSettlement,
     ClaimState,
     ConflictingPendingWorkClaimError,
     QuarantineLabelState,
     QuarantineRecord,
     UnreadableClaim,
     UnresolvedClaim,
+    quarantine_key_for_run,
+)
+from .pending_work_claim_schema import (
+    STORE_FILENAME,
+    PendingWorkClaimMigrationError,
+    initialize_schema,
 )
 from .pending_work_codec import (
     CorruptPendingWorkClaimError,
@@ -76,111 +83,7 @@ from .pending_work_codec import (
     encode_claim_text,
 )
 
-_SCHEMA = """
-CREATE TABLE IF NOT EXISTS pending_work_claim (
-    run_key TEXT PRIMARY KEY,
-    work_key TEXT NOT NULL,
-    deferred INTEGER NOT NULL DEFAULT 0,
-    session_name TEXT NOT NULL,
-    run_id TEXT NOT NULL,
-    started_at TEXT NOT NULL,
-    issue_number INTEGER NOT NULL,
-    payload TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS pending_work_claim_work
-    ON pending_work_claim (work_key);
-CREATE TABLE IF NOT EXISTS pending_work_claim_quarantine (
-    quarantine_key TEXT PRIMARY KEY,
-    run_key TEXT NOT NULL,
-    session_name TEXT NOT NULL,
-    issue_number INTEGER NOT NULL,
-    error TEXT NOT NULL,
-    -- Durable state machine (#6999 F12). ``label_state`` records whether THIS
-    -- quarantine actually acquired the shared blocking label or found it
-    -- already there, so release can only ever remove a label it added.
-    -- ``announced`` is separate because AddLabel can land while the comment
-    -- fails. ``releasing`` marks a resolved cause whose cleanup has not yet
-    -- committed, so the row survives to be retried.
-    label_state TEXT NOT NULL DEFAULT 'unknown',
-    announced INTEGER NOT NULL DEFAULT 0,
-    releasing INTEGER NOT NULL DEFAULT 0,
-    -- The story the announcement was written for, and the work it names
-    -- (#6999 F6, #209). Durable because ``announced`` is: a quarantine
-    -- re-observed telling a DIFFERENT story has to rewrite the operator's
-    -- comment, and the only way to know it changed is to have kept the one that
-    -- was announced. One opaque token rather than a column per input, so an
-    -- input added to AnnouncedStory changes what this compares without changing
-    -- this statement. Nullable on purpose - a row from before this column reads
-    -- as "no story recorded", which must differ from every observable story so
-    -- the next scan re-announces rather than standing on one nothing vouches
-    -- for. Databases written by an earlier build keep a vestigial ``cause``
-    -- column, which is nullable, never written and never read.
-    story TEXT,
-    work_kind TEXT
-);
--- Durable provenance for every OTHER cause of the shared needs-human block
--- (#6999 F2 round 2). The tech-lead marker label and the quarantine table
--- above already record their own. A session or planner escalation recorded
--- nothing, so a remover saw an owner-less label and took it off. Rows are
--- meaningful only while the label is present and are dropped with it, so a
--- stale one can never strand an issue in needs-human.
--- NOTE: no semicolons in this comment - the schema is split on them.
-CREATE TABLE IF NOT EXISTS needs_human_cause (
-    issue_number INTEGER NOT NULL,
-    cause TEXT NOT NULL,
-    reason TEXT NOT NULL,
-    PRIMARY KEY (issue_number, cause)
-);
--- Publication-gate refusals whose label write did not commit (#51). The label
--- is the primary record of the verdict, so a row here means only "the gate
--- refused this issue and could not say so remotely" - a fact nothing else
--- durably holds, and one that must outlive the process that observed it or
--- review becomes eligible again for a candidate the gate refused.
--- Latching only ever WITHHOLDS review, so the worst a stale row can do is
--- hold an issue until the next candidate clears the gate and releases it.
--- NOTE: no semicolons in this comment - the schema is split on them.
-CREATE TABLE IF NOT EXISTS publication_refusal_latch (
-    issue_number INTEGER PRIMARY KEY
-);
-"""
-
-# Additive columns the quarantine table gained after it shipped. ``CREATE TABLE
-# IF NOT EXISTS`` leaves an existing table exactly as it is, so a database
-# written by an earlier build keeps the old shape and every later statement
-# referencing these columns fails. Unlike the claim table this needs no
-# all-or-nothing rebuild: quarantines carry no queued work, so a NULL story is
-# recoverable by the next scan re-announcing (#6999 F6).
-_QUARANTINE_ADDED_COLUMNS: tuple[tuple[str, str], ...] = (
-    ("story", "TEXT"),
-    ("work_kind", "TEXT"),
-)
-
-STORE_FILENAME = "pending_work_claims.sqlite"
-
-
-def _schema_statements() -> tuple[str, ...]:
-    """The schema as individual statements.
-
-    ``executescript`` commits any pending transaction before it runs, so it
-    cannot be used inside the migration's single transaction (#6999 F13).
-    """
-    return tuple(
-        statement.strip()
-        for statement in _SCHEMA.split(";")
-        if statement.strip()
-    )
-
 logger = logging.getLogger(__name__)
-
-
-class PendingWorkClaimMigrationError(RuntimeError):
-    """An older ledger holds a row that cannot be carried forward (#6999 F13).
-
-    Raised before anything is renamed or dropped, so the legacy table stays
-    exactly as it was. Failing startup is the correct outcome: the alternative
-    is running with an authoritative record the orchestrator cannot see, which
-    is precisely how a live terminal gets admitted as carrying no work.
-    """
 
 
 def _quarantine_record(row: sqlite3.Row) -> QuarantineRecord:
@@ -195,16 +98,8 @@ def _quarantine_record(row: sqlite3.Row) -> QuarantineRecord:
         releasing=bool(row["releasing"]),
         story=AnnouncedStory.parse(row["story"]),
         work_kind=PendingWorkKind(row["work_kind"]) if row["work_kind"] else None,
+        announce_attempts=int(row["announce_attempts"]),
     )
-
-
-def _issue_number_of(claim: PendingWorkClaim) -> int:
-    """Trusted issue number for a claim being migrated forward."""
-    request = claim.request
-    resolver = getattr(request, "resolve_issue_number", None)
-    if resolver is not None:
-        return int(resolver() or 0)
-    return int(getattr(request, "issue_number", 0))
 
 
 class SqlitePendingWorkClaimStore:
@@ -232,125 +127,7 @@ class SqlitePendingWorkClaimStore:
 
     def initialize(self) -> None:
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
-        conn = self._get_connection()
-        self._migrate(conn)
-        for statement in _schema_statements():
-            conn.execute(statement)
-        self._add_missing_quarantine_columns(conn)
-        conn.commit()
-
-    @staticmethod
-    def _add_missing_quarantine_columns(conn: sqlite3.Connection) -> None:
-        """Bring an earlier quarantine table up to the current column set."""
-        existing = {
-            row[1]
-            for row in conn.execute("PRAGMA table_info(pending_work_claim_quarantine)")
-        }
-        for column, declaration in _QUARANTINE_ADDED_COLUMNS:
-            if column not in existing:
-                conn.execute(
-                    "ALTER TABLE pending_work_claim_quarantine "
-                    f"ADD COLUMN {column} {declaration}"
-                )
-
-    @staticmethod
-    def _migrate(conn: sqlite3.Connection) -> None:
-        """Carry an older table forward WITHOUT losing a single claim.
-
-        ``CREATE TABLE IF NOT EXISTS`` leaves an existing table untouched, so a
-        database written against an earlier shape would keep columns the new
-        statements do not know about. Dropping it is not an option (#6999 F13):
-        these rows are the only authoritative copy of work that has already left
-        its queue, and the whole reason this table exists is that terminal
-        discovery CANNOT reconstruct a typed queued request. An upgrade with a
-        live review, validation retry, rework or failure investigation would
-        delete exactly the record restoration is about to need.
-
-        So the migration is all-or-nothing. Every row is decoded FIRST, before
-        anything is renamed or created. If even one cannot be rebuilt, nothing
-        is touched and initialization raises: the legacy table remains the
-        authority, intact and inspectable. Archiving the bad row into a side
-        table while startup carried on was worse than the drop it replaced -
-        the row became operationally invisible, so a surviving terminal for it
-        read as ABSENT and could be admitted claimless.
-        """
-        leftover = conn.execute(
-            "SELECT name FROM sqlite_master WHERE type = 'table' "
-            "AND name = 'pending_work_claim_old'"
-        ).fetchone()
-        if leftover is not None:
-            # Belt and braces: the single transaction below makes a surviving
-            # ``_old`` table unreachable, but a database that somehow reached
-            # that state must never be started against silently - the whole
-            # point of F13 is that its rows are still the authority.
-            raise PendingWorkClaimMigrationError(
-                "pending_work_claim_old is present, so a previous migration did "
-                "not complete. It still holds authoritative claims; resolve it "
-                "before starting again."
-            )
-        columns = {
-            row[1]
-            for row in conn.execute("PRAGMA table_info(pending_work_claim)")
-        }
-        if not columns or {"work_key", "deferred", "issue_number"} <= columns:
-            return
-        legacy = list(
-            conn.execute(
-                "SELECT run_key, session_name, run_id, started_at, payload "
-                "FROM pending_work_claim"
-            )
-        )
-        migrated: list[tuple[object, ...]] = []
-        for row in legacy:
-            try:
-                claim = decode_claim_text(row["payload"], source=row["run_key"])
-            except PendingWorkClaimDecodeError as exc:
-                raise PendingWorkClaimMigrationError(
-                    f"pending-work claim for run {row['run_key']} cannot be "
-                    f"migrated to the current schema: {exc}. The existing table "
-                    "is left untouched and remains authoritative; resolve or "
-                    "remove that row before starting again."
-                ) from exc
-            migrated.append(
-                (
-                    row["run_key"],
-                    claim.work_key(),
-                    row["session_name"],
-                    row["run_id"],
-                    row["started_at"],
-                    _issue_number_of(claim),
-                    row["payload"],
-                )
-            )
-        # ONE transaction for rename + create + copy + drop (#6999 F13).
-        # ``executescript`` would commit any pending transaction before running,
-        # which is exactly how a stop mid-migration could leave a current-shaped
-        # table beside the renamed original - after which the column check
-        # ABOVE returns early on the next start and the real rows are invisible.
-        # The schema statements are therefore executed individually, inside an
-        # explicit transaction that rolls back as a unit.
-        conn.execute("BEGIN IMMEDIATE")
-        try:
-            conn.execute(
-                "ALTER TABLE pending_work_claim RENAME TO pending_work_claim_old"
-            )
-            for statement in _schema_statements():
-                conn.execute(statement)
-            conn.executemany(
-                "INSERT OR REPLACE INTO pending_work_claim "
-                "(run_key, work_key, deferred, session_name, run_id, started_at, "
-                "issue_number, payload) VALUES (?, ?, 0, ?, ?, ?, ?, ?)",
-                migrated,
-            )
-            conn.execute("DROP TABLE pending_work_claim_old")
-        except BaseException:
-            conn.rollback()
-            raise
-        conn.commit()
-        logger.info(
-            "[WORK] Migrated %d pending-work claim(s) to the current schema",
-            len(migrated),
-        )
+        initialize_schema(self._get_connection())
 
     # -- claim lifecycle ---------------------------------------------------
 
@@ -463,6 +240,11 @@ class SqlitePendingWorkClaimStore:
                     started_at=str(row["started_at"]),
                     issue_number=int(row["issue_number"]),
                     claim=claim,
+                    # Reported, not applied (#210). Whether a settled row may go
+                    # back to a queue is the re-admitting caller's question, and
+                    # the sweep that escalates live trouble asks the opposite one
+                    # of the same rows.
+                    parked=bool(row["parked"]),
                 )
             )
         return tuple(unresolved)
@@ -483,6 +265,11 @@ class SqlitePendingWorkClaimStore:
                         # The decoder's verdict, carried rather than re-derived
                         # from the message text - that guess IS #209.
                         readability=exc.readability,
+                        # Reported, not applied (#210): the escalation sweeps
+                        # keep these rows whatever their disposition, and this
+                        # is where a settlement on a row nothing can decode is
+                        # observable at all.
+                        parked=bool(row["parked"]),
                     )
                 )
         return tuple(unreadable)
@@ -543,7 +330,7 @@ class SqlitePendingWorkClaimStore:
             (key,),
         ).fetchone()
         recorded = row["started_at"] if row else run.identity.started_at
-        return f"{key}@{recorded}"
+        return quarantine_key_for_run(key, str(recorded))
 
     def run_key_for_path(self, run_dir: Path) -> str:
         """The key for a run root the orchestrator recorded, before any parsing.
@@ -655,6 +442,7 @@ class SqlitePendingWorkClaimStore:
         error: str,
         story: AnnouncedStory,
         work_kind: PendingWorkKind | None,
+        settlement: ClaimSettlement,
     ) -> None:
         with self._write_lock, self._transaction() as conn:
             conn.execute(
@@ -674,6 +462,14 @@ class SqlitePendingWorkClaimStore:
                 "announced = CASE WHEN pending_work_claim_quarantine.story "
                 "IS excluded.story THEN pending_work_claim_quarantine.announced "
                 "ELSE 0 END, "
+                # The spent delivery budget belongs to it for the same reason
+                # (#210). A corrected message is a NEW thing to deliver, so it
+                # gets its own bound rather than inheriting an exhausted one -
+                # and an unchanged story keeps every attempt it has spent, so
+                # re-observation can never refund the bound.
+                "announce_attempts = CASE WHEN pending_work_claim_quarantine.story "
+                "IS excluded.story "
+                "THEN pending_work_claim_quarantine.announce_attempts ELSE 0 END, "
                 "story = excluded.story",
                 (
                     quarantine_key,
@@ -685,11 +481,24 @@ class SqlitePendingWorkClaimStore:
                     work_kind.value if work_kind is not None else None,
                 ),
             )
+            # Both arms write. LEAVE is the INVERSE of PARK, not a no-op (#210):
+            # a re-observation that now reads the payload cleanly quarantines
+            # the same run for being unrestorable alone, and that escalation
+            # promises an operator the next sweep re-queues the work once the
+            # terminal stops - which a row still parked by the earlier verdict
+            # would make false.
+            self._set_claim_parked(
+                conn,
+                run_key,
+                quarantine_key,
+                parked=settlement is ClaimSettlement.PARK,
+            )
 
     def read_quarantine(self, quarantine_key: str) -> QuarantineRecord | None:
         row = self._get_connection().execute(
             "SELECT quarantine_key, run_key, session_name, issue_number, error, "
-            "label_state, announced, releasing, story, work_kind "
+            "label_state, announced, releasing, story, work_kind, "
+            "announce_attempts "
             "FROM pending_work_claim_quarantine WHERE quarantine_key = ?",
             (quarantine_key,),
         ).fetchone()
@@ -703,6 +512,16 @@ class SqlitePendingWorkClaimStore:
                 "UPDATE pending_work_claim_quarantine SET label_state = ? "
                 "WHERE quarantine_key = ?",
                 (label_state.value, quarantine_key),
+            )
+
+    def spend_quarantine_announcement_attempt(self, quarantine_key: str) -> None:
+        """Charge the bound BEFORE the remote write it pays for (#210)."""
+        with self._write_lock, self._transaction() as conn:
+            conn.execute(
+                "UPDATE pending_work_claim_quarantine "
+                "SET announce_attempts = announce_attempts + 1 "
+                "WHERE quarantine_key = ?",
+                (quarantine_key,),
             )
 
     def mark_quarantine_announced(self, quarantine_key: str) -> None:
@@ -724,18 +543,66 @@ class SqlitePendingWorkClaimStore:
 
     def release_quarantine(self, quarantine_key: str) -> None:
         with self._write_lock, self._transaction() as conn:
+            row = conn.execute(
+                "SELECT run_key FROM pending_work_claim_quarantine "
+                "WHERE quarantine_key = ?",
+                (quarantine_key,),
+            ).fetchone()
             conn.execute(
                 "DELETE FROM pending_work_claim_quarantine WHERE quarantine_key = ?",
                 (quarantine_key,),
             )
+            if row is not None:
+                # The exact undo of this quarantine's settlement, in the same
+                # transaction (#210). A human who repairs the row must get
+                # ordinary recovery back with it.
+                self._set_claim_parked(
+                    conn, str(row["run_key"]), quarantine_key, parked=False
+                )
+
+    @staticmethod
+    def _set_claim_parked(
+        conn: sqlite3.Connection,
+        run_key: str,
+        quarantine_key: str,
+        *,
+        parked: bool,
+    ) -> None:
+        """Settle, or un-settle, the ledger row ONE quarantine was recorded for.
+
+        Runs in the CALLER's transaction (#210): a quarantine record and the
+        disposition of the claim it names are one local fact, and a settlement
+        that could commit without its record - or the reverse - is exactly the
+        split this closes.
+
+        The generation is checked rather than assumed. A run root is reusable,
+        so the row sitting under it may belong to a REPLACEMENT run whose claim
+        is perfectly live; parking that would take a healthy request out of the
+        world on the strength of its predecessor's escalation, and un-parking it
+        would release a settlement this quarantine never made. The check BUILDS
+        the key the way every other caller does rather than taking the recorded
+        one apart (#6999 F12).
+        """
+        row = conn.execute(
+            "SELECT started_at FROM pending_work_claim WHERE run_key = ?",
+            (run_key,),
+        ).fetchone()
+        if row is None:
+            return
+        if quarantine_key_for_run(run_key, str(row["started_at"])) != quarantine_key:
+            return
+        conn.execute(
+            "UPDATE pending_work_claim SET parked = ? WHERE run_key = ?",
+            (1 if parked else 0, run_key),
+        )
 
     def list_quarantines(self) -> tuple[QuarantineRecord, ...]:
         return tuple(
             _quarantine_record(row)
             for row in self._get_connection().execute(
                 "SELECT quarantine_key, run_key, session_name, issue_number, "
-                "error, label_state, announced, releasing, story, work_kind "
-                "FROM pending_work_claim_quarantine"
+                "error, label_state, announced, releasing, story, work_kind, "
+                "announce_attempts FROM pending_work_claim_quarantine"
             )
         )
 
@@ -767,7 +634,7 @@ class SqlitePendingWorkClaimStore:
     def _all_rows(self) -> list[sqlite3.Row]:
         return list(
             self._get_connection().execute(
-                "SELECT run_key, session_name, deferred, issue_number, "
+                "SELECT run_key, session_name, deferred, parked, issue_number, "
                 "started_at, payload FROM pending_work_claim"
             )
         )

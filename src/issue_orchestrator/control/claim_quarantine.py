@@ -23,8 +23,11 @@ that matters:
 
 So it keeps its own durable per-run marker, applies its own labels and comment,
 and publishes the event only after that durable surface has committed. A failed
-apply leaves the quarantine recorded-but-unescalated, which is what makes the
-next orphan scan retry instead of treating the failure as final.
+apply leaves the quarantine recorded-but-unannounced, which is what makes the
+next orphan scan retry instead of treating the failure as final - but a bounded
+number of times (#210). Retrying is right; retrying forever is what turned one
+undeliverable comment into 96 remote writes, because the retry and the run's own
+settlement were the same fact.
 
 What an operator READS is assembled from two enumerable tables, not from
 branches (#209). The cause answers "which situation is this run in"; the claim's
@@ -52,8 +55,10 @@ from ..events import EventName
 from ..ports import EventSink, make_trace_event
 from ..ports.pending_work_claim_store import (
     AnnouncedStory,
+    AnnouncementDelivery,
     ClaimQuarantineStore,
     ClaimReadability,
+    ClaimSettlement,
     QuarantineCause,
     QuarantineLabelState,
     QuarantineRecord,
@@ -75,6 +80,20 @@ from .needs_human_block import (
 )
 
 logger = logging.getLogger(__name__)
+
+#: How many remote announcement writes one quarantine story is worth (#210).
+#:
+#: The retry itself is sound and is kept: an announcement whose durable half
+#: never landed would otherwise show a warning that vanishes on restart. What it
+#: never had was an end. ``_escalate`` runs on every sweep by design, so an
+#: undeliverable comment inherited that cadence forever - 96 remote writes on
+#: one issue in fifteen minutes.
+#:
+#: Small on purpose. A comment that has failed this many times over successive
+#: sweeps is not failing transiently, and the escalation does not depend on it:
+#: the shared block is already on the issue, the record is already durable, and
+#: giving up publishes an event that says so.
+ANNOUNCEMENT_ATTEMPT_LIMIT = 3
 
 
 @dataclass(frozen=True, slots=True)
@@ -111,6 +130,23 @@ class QuarantineSubject:
         different halves of the same observation (#209).
         """
         return AnnouncedStory(self.cause, self.readability)
+
+    @property
+    def settlement(self) -> ClaimSettlement:
+        """What quarantining this run does to the claim it holds (#210).
+
+        The readability decides it, and nothing else does - not the cause, and
+        certainly not whether a remote write succeeded. A record no build can
+        turn back into a queued request is settled where it lies; a record that
+        reads perfectly is left alone, because the only reason ITS work is not
+        being re-queued is a terminal that is still running, and its escalation
+        promises an operator that stopping the terminal releases the work.
+        """
+        return (
+            ClaimSettlement.LEAVE
+            if self.readability.readable
+            else ClaimSettlement.PARK
+        )
 
     @classmethod
     def live_run_with_unreadable_claim(
@@ -228,13 +264,25 @@ class ClaimQuarantineOwner:
     """The one place a run is quarantined for an unreadable claim.
 
     Escalation and release are a durable state machine, not a pair of one-shot
-    calls (#6999 F12). Four facts are persisted separately because they change
+    calls (#6999 F12). Five facts are persisted separately because they change
     separately: whether this quarantine ACQUIRED the shared blocking label (as
     opposed to finding it already there), whether the operator comment
-    committed, whether a resolved cause still has cleanup outstanding, and WHICH
-    CAUSE the committed comment was written for. The row survives every one of
-    those until its own step succeeds, so anything that failed is retried by the
-    next sweep rather than becoming final.
+    committed, how much of that comment's delivery budget has been spent,
+    whether a resolved cause still has cleanup outstanding, and WHICH STORY the
+    committed comment was written for. The row survives every one of those until
+    its own step succeeds, so anything that failed is retried by the next sweep
+    rather than becoming final.
+
+    What must NOT be one of those facts is whether the run is quarantined at all
+    (#210). Escalating used to commit the local safety disposition and the
+    remote notification through a single boolean: a comment that did not land
+    left the claim held, active, and re-derived as fresh trouble by every sweep,
+    and the notification retried at that same cadence with no end. One
+    undeliverable comment therefore became 96 remote writes on one issue in
+    fifteen minutes. So the local half - the record, and the settlement of the
+    claim it names - commits FIRST, in one transaction, and depends on nothing
+    remote; delivery is a bounded concern that runs afterwards and is allowed to
+    fail permanently without holding anything open.
 
     The STORY is durable for the same reason the announcement is (#6999 F6,
     #209): an announcement remembered without what produced it can only be
@@ -255,6 +303,10 @@ class ClaimQuarantineOwner:
     #: is still the only reason for it, and removing a block another lifecycle
     #: now requires is how a live escalation silently disappears.
     block: SharedNeedsHumanBlock = NO_OTHER_NEEDS_HUMAN_CAUSES
+    #: How many remote writes one story's delivery is worth (#210). Injected
+    #: rather than read from the module so the bound is a property of the owner
+    #: a test can state, not a global a test has to patch.
+    announcement_attempt_limit: int = ANNOUNCEMENT_ATTEMPT_LIMIT
 
     def quarantine(self, subject: QuarantineSubject) -> None:
         """Escalate one run under its own typed cause (#6999 A1).
@@ -401,20 +453,36 @@ class ClaimQuarantineOwner:
                 subject.issue_number,
             )
             return
-        if record.announces(subject.story):
+        self._deliver(subject, record)
+
+    def _deliver(
+        self, subject: QuarantineSubject, record: QuarantineRecord
+    ) -> None:
+        """Tell the operator, at most ``announcement_attempt_limit`` times (#210).
+
+        Everything above this point has already committed, locally and durably.
+        Delivery is therefore free to fail: it can no longer decide whether the
+        run is quarantined, whether the claim is settled, or whether the next
+        sweep sees the same trouble again. All it decides is whether a human has
+        been told - and when the bound is spent it stops deciding even that,
+        because the block on the issue and the durable record say it too.
+        """
+        delivery = record.delivery(
+            subject.story, limit=self.announcement_attempt_limit
+        )
+        if delivery is not AnnouncementDelivery.PENDING:
+            # DELIVERED: this exact story is already in front of the operator.
+            # EXHAUSTED: the bound was spent, and reported, on an earlier pass.
             return
         escalation = _ESCALATIONS[subject.cause]
+        # Spent BEFORE the write it pays for, never after (#210). An attempt
+        # charged on the way out survives a process that dies mid-write, so a
+        # crash loop cannot refund the bound and go on mutating the remote.
+        self.store.spend_quarantine_announcement_attempt(subject.quarantine_key)
         if not self.labels.announce(subject.issue_number, escalation.comment(subject)):
-            # Recorded but NOT announced, so the next sweep retries. The event
-            # is deliberately withheld: announcing a quarantine whose durable
-            # half never landed would show a warning that vanishes on restart.
-            logger.error(
-                "[WORK] Durable quarantine escalation did not commit for %s; "
-                "leaving it unannounced so the next sweep retries",
-                subject.session_name,
-            )
+            self._report_undelivered(subject, record.announce_attempts + 1)
             return
-        self.store.mark_quarantine_announced(quarantine_key)
+        self.store.mark_quarantine_announced(subject.quarantine_key)
         self.events.publish(make_trace_event(
             escalation.event,
             {
@@ -430,6 +498,48 @@ class ClaimQuarantineOwner:
             },
         ))
 
+    def _report_undelivered(
+        self, subject: QuarantineSubject, spent: int
+    ) -> None:
+        """Say what the failed write means, and say it once when it is final.
+
+        The escalation event stays withheld while attempts remain: publishing a
+        quarantine whose comment never landed would show a warning that vanishes
+        on restart. The EXHAUSTED event is the opposite case and is published
+        for the opposite reason - the durable half landed, the remote half never
+        will, and the only channel left that an operator watches is this one.
+        """
+        if spent < self.announcement_attempt_limit:
+            logger.error(
+                "[WORK] Durable quarantine escalation did not commit for %s "
+                "(attempt %d of %d); the quarantine stands and the next sweep "
+                "retries the comment",
+                subject.session_name,
+                spent,
+                self.announcement_attempt_limit,
+            )
+            return
+        logger.error(
+            "[WORK] Giving up on the quarantine comment for %s after %d "
+            "attempt(s). The quarantine itself is committed and issue #%d stays "
+            "blocked; no further comment will be attempted for this story",
+            subject.session_name,
+            spent,
+            subject.issue_number,
+        )
+        self.events.publish(make_trace_event(
+            EventName.SESSION_QUARANTINE_UNANNOUNCED,
+            {
+                "issue_number": subject.issue_number,
+                "session_name": subject.session_name,
+                "run_key": subject.run_key,
+                "cause": subject.cause.value,
+                "readability": subject.readability.value,
+                "attempts": spent,
+                "error": subject.error,
+            },
+        ))
+
     def _record(self, subject: QuarantineSubject) -> None:
         self.store.record_quarantine(
             subject.quarantine_key,
@@ -439,6 +549,7 @@ class ClaimQuarantineOwner:
             error=subject.error,
             story=subject.story,
             work_kind=subject.work_kind,
+            settlement=subject.settlement,
         )
 
 
@@ -665,6 +776,7 @@ def build_claim_quarantine_owner(
 
 
 __all__ = [
+    "ANNOUNCEMENT_ATTEMPT_LIMIT",
     "ClaimQuarantineOwner",
     "QuarantineCause",
     "QuarantineLabelOps",
