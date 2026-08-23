@@ -2,20 +2,52 @@
 
 Sandbox-clean: no subprocess, no network. Asserts on the assembled
 argv only.
+
+Every interactive launch must declare an approved workspace (#215), so these
+tests build one real (empty) repository directory for the whole module — the
+trust resolver reads the launch directory's Git layout off disk, which a
+function-scoped ``tmp_path`` would rebuild ~30 times for no added coverage.
+The trust decision itself is covered in ``test_codex_workspace_trust.py``.
 """
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+from pathlib import Path
 import tomllib
 
 import pytest
 
+from issue_orchestrator.domain.workspace_trust import WorkspaceTrustError
 from issue_orchestrator.execution.agent_runner_providers.codex import CodexProvider
+
+from tests.workspace_trust import approved_workspace, make_repository
+
+_REPOSITORY: Path | None = None
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _approved_repository(tmp_path_factory: pytest.TempPathFactory) -> Iterator[None]:
+    """One approved repository the module's launches run in."""
+    global _REPOSITORY
+    _REPOSITORY = make_repository(tmp_path_factory.mktemp("repo") / "checkout")
+    yield
+    _REPOSITORY = None
 
 
 def _cmd(**kwargs: str) -> list[str]:
     """Build the argv with sane defaults; return the list for assertions."""
-    return CodexProvider().build_command(prompt="task", **kwargs)
+    assert _REPOSITORY is not None
+    return CodexProvider().build_command(
+        prompt="task",
+        launch_workspace=approved_workspace(_REPOSITORY),
+        **kwargs,
+    )
+
+
+def _trust_override(argv: list[str]) -> str:
+    """The emitted workspace-trust override for the module's repository."""
+    return f'projects={{ "{_REPOSITORY}" = {{ trust_level = "trusted" }} }}'
 
 
 def _config_overrides(argv: list[str]) -> dict[str, object]:
@@ -194,10 +226,18 @@ class TestCodexConfigOverridePosition:
         assert all(index < exec_index for index in self._config_flag_positions(cmd))
 
     def test_config_overrides_are_contiguous(self) -> None:
-        """One block, one owner — overrides are emitted from a single place."""
+        """One block, one owner — overrides are emitted from a single place.
+
+        An interactive launch emits three: the update-check suppression, the
+        workspace-trust grant (#215), and the reasoning effort.
+        """
         cmd = _cmd(reasoning_effort="high")
         positions = self._config_flag_positions(cmd)
-        assert positions == list(range(positions[0], positions[0] + 2 * 2, 2))
+        assert len(positions) == 3
+        assert positions == list(
+            range(positions[0], positions[0] + 2 * len(positions), 2)
+        )
+        assert _trust_override(cmd) in cmd
 
 
 class TestCodexBaseCommand:
@@ -243,7 +283,11 @@ class TestCodexBaseCommand:
         )
 
     def test_prompt_is_last_arg(self) -> None:
-        cmd = CodexProvider().build_command(prompt="hello world")
+        assert _REPOSITORY is not None
+        cmd = CodexProvider().build_command(
+            prompt="hello world",
+            launch_workspace=approved_workspace(_REPOSITORY),
+        )
         assert cmd[-1] == "hello world"
 
     def test_provider_is_interactive_by_default(self) -> None:
@@ -253,3 +297,19 @@ class TestCodexBaseCommand:
         assert provider.runs_interactively(execution_mode="exec") is False
         assert provider.needs_fresh_prompt_process() is True
         assert provider.needs_fresh_prompt_process(execution_mode="exec") is False
+
+    def test_workspace_trust_requirement_matches_what_build_command_does(self) -> None:
+        """Config validation must not drift from the launch it predicts (#215).
+
+        The capability is what a config-time check reads; the fail-closed
+        denial is what a launch does. They are asserted together so the pair
+        cannot come apart.
+        """
+        provider = CodexProvider()
+
+        assert provider.requires_workspace_trust() is True
+        with pytest.raises(WorkspaceTrustError):
+            provider.build_command(prompt="hi")
+
+        assert provider.requires_workspace_trust(execution_mode="exec") is False
+        assert provider.build_command(prompt="hi", execution_mode="exec")

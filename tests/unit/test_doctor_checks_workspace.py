@@ -8,6 +8,8 @@ from issue_orchestrator.infra.config import Config, DefaultAgentConfig
 from issue_orchestrator.ports.command_runner import CommandResult, OutputNewlines
 from issue_orchestrator.infra.doctor.checks.workspace import check_agents
 
+from tests.workspace_trust import approval_for
+
 
 def _agent_scripts_check(config: Config):
     return next(check for check in check_agents(config) if check.name == "Agent Scripts")
@@ -21,6 +23,15 @@ class _FakeProvider:
 
     def is_available(self) -> bool:
         return self._available
+
+    def requires_workspace_trust(self, **kwargs: object) -> bool:
+        """Stand-in for a provider that needs no approved repository root.
+
+        Present rather than omitted: the doctor asks every configured
+        provider this, so a fake that could not answer would make the
+        agent-script tests fail for an unrelated reason.
+        """
+        return False
 
 
 def _patch_providers(monkeypatch, providers: dict[str, _FakeProvider]) -> None:
@@ -259,3 +270,142 @@ def test_agent_prompts_use_injected_runner(monkeypatch, tmp_path: Path):
         ["git", "-C", str(repo_root), "cat-file", "-e", "HEAD:.prompts/dev.md"],
         ["git", "-C", str(repo_root), "status", "--porcelain", "--", ".prompts/dev.md"],
     ]
+
+
+class TestWorkspaceTrustCheck:
+    """An agent that cannot launch must be reported before it tries (#215).
+
+    Without this, a configured Codex agent with no approved repository root is
+    only discovered at launch, after the claim, the label, and the provisioned
+    worktree have already been spent, and the operator's only signal is a
+    stack trace.
+    """
+
+    def _check(self, config: Config):
+        return next(
+            (
+                check
+                for check in check_agents(config)
+                if check.name == "Workspace Trust"
+            ),
+            None,
+        )
+
+    def _codex_config(self, tmp_path: Path, **agent_kwargs) -> Config:
+        config = Config()
+        config.agents = {
+            "agent:goal-pilot": AgentConfig(
+                prompt_path=tmp_path / "goal-pilot.md",
+                provider="codex",
+                **agent_kwargs,
+            ),
+        }
+        return config
+
+    def test_interactive_codex_agent_without_an_approval_is_an_error(
+        self, tmp_path: Path
+    ):
+        check = self._check(self._codex_config(tmp_path))
+
+        assert check is not None
+        assert check.status == "error"
+        assert "agent:goal-pilot" in check.detail
+        assert "security.workspace_trust.approved_repository_root" in check.detail
+
+    def test_the_error_names_the_decision_a_human_must_make(self, tmp_path: Path):
+        """The fix is a human authority decision, so the message must carry it."""
+        check = self._check(self._codex_config(tmp_path))
+
+        assert check is not None
+        assert "a human approved" in check.detail
+
+    def test_a_recorded_approval_clears_it_and_names_its_authority(
+        self, tmp_path: Path
+    ):
+        config = self._codex_config(tmp_path)
+        config.workspace_trust = approval_for(
+            tmp_path, authority_path=tmp_path / "selfhost.yaml"
+        )
+
+        check = self._check(config)
+
+        assert check is not None
+        assert check.status == "ok"
+        assert str(tmp_path.resolve()) in check.detail
+        assert "selfhost.yaml" in check.detail
+
+    def test_a_codex_exec_agent_needs_no_approval(self, tmp_path: Path):
+        """``codex exec`` never reaches the trust dialog, so it must not error."""
+        check = self._check(
+            self._codex_config(tmp_path, provider_args={"execution_mode": "exec"})
+        )
+
+        assert check is None
+
+    def test_a_deployment_with_no_trust_requiring_agent_is_not_told_about_the_key(
+        self, tmp_path: Path
+    ):
+        config = Config()
+        config.agents = {
+            "agent:backend": AgentConfig(
+                prompt_path=tmp_path / "backend.md",
+                provider="claude-code",
+            ),
+        }
+
+        assert self._check(config) is None
+
+    def test_a_recorded_approval_is_reported_even_with_no_agent_needing_it(
+        self, tmp_path: Path
+    ):
+        """An operator who edited the key must be able to see it took effect."""
+        config = Config()
+        config.agents = {
+            "agent:backend": AgentConfig(
+                prompt_path=tmp_path / "backend.md",
+                provider="claude-code",
+            ),
+        }
+        config.workspace_trust = approval_for(tmp_path)
+
+        check = self._check(config)
+
+        assert check is not None
+        assert check.status == "ok"
+        assert str(tmp_path.resolve()) in check.detail
+
+    def test_an_uninterpretable_execution_mode_denies(self, tmp_path: Path):
+        """"I could not tell" is a denial here, as it is at launch."""
+        check = self._check(
+            self._codex_config(tmp_path, provider_args={"execution_mode": "sideways"})
+        )
+
+        assert check is not None
+        assert check.status == "error"
+
+    def test_uninterpretable_args_invent_no_requirement_for_claude(
+        self, tmp_path: Path
+    ):
+        """Unreadable args must not manufacture a need the provider never has."""
+        config = Config()
+        config.agents = {
+            "agent:backend": AgentConfig(
+                prompt_path=tmp_path / "backend.md",
+                provider="claude-code",
+                provider_args={"execution_mode": "sideways"},
+            ),
+        }
+
+        assert self._check(config) is None
+
+    def test_an_unknown_provider_is_not_reported_here(self, tmp_path: Path):
+        """Config validation owns that error; this check must not double it."""
+        config = Config()
+        config.agents = {
+            "agent:backend": AgentConfig(
+                prompt_path=tmp_path / "backend.md",
+                provider="nonesuch",
+            ),
+        }
+
+        assert self._check(config) is None

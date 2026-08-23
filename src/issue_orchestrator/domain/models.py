@@ -21,6 +21,7 @@ from .sandbox_scope import (
     compute_session_scope,
 )
 from .session_run import SessionRunAssets
+from .workspace_trust import ApprovedRepositoryTrust, LaunchWorkspace
 from .tech_lead_findings import PromotionUpdate, PromotableFinding, SettledPromotion
 from .tech_lead_session import (
     ApprovedTechLeadOp,
@@ -1029,6 +1030,18 @@ class AgentConfig:
     # ``default`` profile, i.e. top-level validation.quick / validation.publish.
     # Selection is explicit: an unknown name fails config validation.
     validation_profile: Optional[str] = None
+    # The operator-approved repository root this agent's launches may claim
+    # workspace trust for (#215), injected by the config loader from
+    # ``security.workspace_trust``. It is NOT an agent-authored setting: no
+    # ``agents.*`` YAML key writes it, so a repository cannot approve itself by
+    # editing its own agent block.
+    #
+    # ``None`` is *absent approval state*, which is a denial. It is the field
+    # default on purpose: an AgentConfig built anywhere other than a loaded
+    # config grants nothing, and a provider whose CLI gates project
+    # configuration behind workspace trust fails closed rather than parking on
+    # an interactive dialog no unattended launch can answer.
+    workspace_trust: Optional[ApprovedRepositoryTrust] = None
 
     @property
     def effective_permission_mode(self) -> str:
@@ -1244,6 +1257,10 @@ class AgentConfig:
                 task_kind,
                 extra_provider_args,
                 sandbox_scope=sandbox_scope,
+                launch_workspace=LaunchWorkspace(
+                    working_directory=worktree,
+                    approved_trust=self.workspace_trust,
+                ),
             )
 
         # Legacy template-based command building (never sandboxed — guarded above)
@@ -1297,6 +1314,7 @@ class AgentConfig:
         extra_provider_args: dict[str, Any] | None = None,
         *,
         sandbox_scope: SandboxScope | None = None,
+        launch_workspace: LaunchWorkspace,
     ) -> str:
         """Build command using the configured provider.
 
@@ -1309,6 +1327,12 @@ class AgentConfig:
             sandbox_scope: The per-session sandbox scope (ADR-0034), or ``None``
                 when the agent has not opted in. ``None`` yields the exact
                 unsandboxed command as before.
+            launch_workspace: Required. The session worktree this launch runs in
+                plus the operator-approved repository-root trust the agent
+                carries (#215). It is not optional so no orchestrated launch can
+                reach a provider without declaring what it may trust; a provider
+                that gates project configuration on workspace trust fails closed
+                when the approval is absent or does not match.
 
         Returns:
             Shell-safe command string
@@ -1357,6 +1381,7 @@ class AgentConfig:
             prompt=prompt,
             model=self.resolved_model(),
             sandbox_scope=sandbox_scope,
+            launch_workspace=launch_workspace,
             **kwargs,
         )
 

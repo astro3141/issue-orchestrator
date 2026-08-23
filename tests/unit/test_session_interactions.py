@@ -66,17 +66,33 @@ def test_builtin_session_interaction_rules_are_scoped_to_claude() -> None:
     assert builtin_session_interaction_rules("python -m provider_runner --command 'claude foo'") == ()
 
 
-def test_builtin_session_interaction_rules_include_interactive_codex_only() -> None:
-    assert builtin_session_interaction_rules(
+def test_no_builtin_rule_can_answer_the_codex_trust_dialog() -> None:
+    """The TTY responder must never grant Codex workspace trust (#215).
+
+    Trust is a repository-root authority decision settled before spawn: the
+    launch argv carries the human-approved grant, verified against the resolved
+    common repository root. A keystroke responder would answer "Yes" for
+    whatever directory is on screen — and Codex keys the resulting grant to the
+    *repository root*, not the disposable worktree — so a returning dialog must
+    fail visibly instead of being quietly answered. That holds for the exact
+    managed shape the pilot launched with, grant included.
+    """
+    managed_launch = (
         "codex --ask-for-approval never --model gpt-5-codex "
+        '-c check_for_update_on_startup=false '
+        '-c projects={ "/Users/o/repo" = { trust_level = "trusted" } } '
         '--sandbox workspace-write "review this"'
     )
-    assert builtin_session_interaction_rules(
+    for command in (
+        managed_launch,
+        "codex --ask-for-approval never --model gpt-5-codex "
+        '--sandbox workspace-write "review this"',
         "FOO=1 BAR=2 && codex -m gpt-5-codex -c model_reasoning_effort='xhigh' "
-        "'review this'"
-    )
-    assert builtin_session_interaction_rules("codex exec --full-auto") == ()
-    assert builtin_session_interaction_rules("codex --model gpt-5-codex exec") == ()
+        "'review this'",
+        "codex exec --full-auto",
+        "codex --model gpt-5-codex exec",
+    ):
+        assert builtin_session_interaction_rules(command) == (), command
 
 
 def test_session_interaction_rules_only_support_one_shot_rules() -> None:

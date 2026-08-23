@@ -263,6 +263,48 @@ repo requires PR approval and the same human needs to approve agent PRs, use
 GitHub App auth instead so PRs are authored by a bot identity. See
 [GitHub Auth and Permissions](github-permissions.md#protected-branch-mode-github-app).
 
+### Approve a Repository Root for Codex Workspace Trust
+
+Codex asks, interactively, whether it may let a repository's own files
+configure it — project-local config, hooks and exec policies. That question is
+settled before `--ask-for-approval`, `--sandbox`, and even
+`--dangerously-bypass-approvals-and-sandbox` are applied, so none of them
+suppress it: an unattended Codex launch in a managed worktree parks on the
+dialog until it times out.
+
+Record the approval instead, as one absolute repository root:
+
+```yaml
+security:
+  workspace_trust:
+    approved_repository_root: /Users/you/src/your-repo
+```
+
+- **Absent means deny — and startup says so.** Configure an agent that needs
+  workspace trust (any `provider: codex` agent that is not in `exec` execution
+  mode) without this key and `doctor` reports a **Workspace Trust** error
+  naming the agent, which stops the launcher. The denial is stated once,
+  before anything launches, rather than once per attempt after the claim, the
+  label and the worktree have already been spent. It is a doctor check rather
+  than a config error because the approved root is a host-absolute path: a
+  config file shared across machines is not wrong for omitting it, it is
+  simply not yet approved on this one.
+- The root is recorded **canonicalized** (symlinks resolved), because the
+  check compares it against the resolved repository root of the launch. A root
+  spelled through a symlink — macOS `/tmp` → `/private/tmp`, a symlinked home
+  — is therefore still the same approval. A relative root, a `~`, or a `..`
+  segment is rejected outright rather than normalized into a plausible one.
+- The root is the **repository root** — the checkout that owns the shared
+  `.git` — not a worktree. Every linked worktree of that checkout is covered;
+  no other repository is, including a second checkout of the same project.
+- Before each launch the orchestrator resolves the worktree's actual
+  repository root and refuses to start unless it is the approved one.
+- The grant is materialized per launch, in the launch's own arguments. Nothing
+  is written to `~/.codex/config.toml`, and the grant ends with the process.
+
+The key is intentionally not editable from the settings dialog: it is an
+operator decision that belongs in the config file, under review.
+
 ### Ignore Repo-Local Runtime Artifacts
 
 Use `.issue-orchestrator/runtime-ignore` when a tool writes repo-local runtime

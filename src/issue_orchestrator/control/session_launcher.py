@@ -56,6 +56,7 @@ from .worktree_context import WorktreeContext
 from .worktree_provisioning import build_launch_provisioner, provision_launch_worktree, provisioning_failure_facts
 from ..infra.validation_state import DEFAULT_RETRY_TEMPLATE, _truncate_with_tail
 from ..domain.tech_lead_session import TechLeadLaunchScope
+from .session_identity_metadata import session_identity_launch_metadata
 from .tech_lead_session_policy import (
     focused_tech_lead_scratch_identity,
     is_tech_lead_session,
@@ -313,16 +314,11 @@ class SessionLauncher:
         *,
         extra_provider_args: dict[str, str] | None,
     ) -> dict[str, object]:
-        return {
-            "provider": str(agent_config.provider or ""),
-            "model": str(agent_config.model or ""),
-            "permission_mode": agent_config.effective_permission_mode,
-            "timeout_minutes": int(agent_config.timeout_minutes),
-            "extra_provider_args": dict(extra_provider_args or {}),
-            "configuration_mode": self.config.configuration_mode,
-            "config_name": self.config.config_name,
-            "config_fingerprint": self.config.config_fingerprint,
-        }
+        return session_identity_launch_metadata(
+            self.config,
+            agent_config,
+            extra_provider_args=extra_provider_args,
+        )
     def _apply_actions(self, actions: list[Action], *, context: str) -> bool:
         """Apply mutations through the ActionApplier."""
         all_ok = True

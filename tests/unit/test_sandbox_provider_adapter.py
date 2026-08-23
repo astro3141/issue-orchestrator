@@ -22,6 +22,8 @@ from issue_orchestrator.execution.agent_runner_providers.claude import (
     ClaudeCodeProvider,
 )
 from issue_orchestrator.execution.agent_runner_providers.codex import CodexProvider
+
+from tests.workspace_trust import approved_workspace, make_repository
 from issue_orchestrator.execution.agent_runner_providers.sandbox import (
     MODEL_API_DOMAINS,
     CODEX_PERMISSION_PROFILE,
@@ -679,28 +681,34 @@ def test_codex_build_command_places_scope_before_exec_and_ignores_yolo(
 
 def test_codex_build_command_disables_update_check_under_strict_config(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     """A scoped launch still suppresses the startup update prompt (#205).
 
     The scope path adds ``--strict-config``, which fails loudly on unknown
     config keys — so this also proves ``check_for_update_on_startup`` is a
     key Codex recognises rather than a silently dropped one, and that the
-    scope's own ``-c`` overrides do not displace it.
+    scope's own ``-c`` overrides do not displace it. The interactive launch
+    also carries its workspace-trust grant (#215), which shares the same
+    root-command ``-c`` seam and must displace neither.
     """
     monkeypatch.setattr(
         sandbox_module,
         "resolve_git_worktree_access",
         lambda _worktree: _git_access(),
     )
+    repository = make_repository(tmp_path / "repo")
     cmd = CodexProvider().build_command(
         prompt="task",
         model=None,
         sandbox_scope=_scope(),
+        launch_workspace=approved_workspace(repository),
     )
     overrides = _codex_config_overrides(cmd)
     assert "--strict-config" in cmd
     assert overrides["check_for_update_on_startup"] is False
     assert overrides["default_permissions"] == CODEX_PERMISSION_PROFILE
+    assert overrides["projects"] == {str(repository): {"trust_level": "trusted"}}
 
 
 # ---------------------------------------------------------------------------

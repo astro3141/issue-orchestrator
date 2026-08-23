@@ -29,6 +29,7 @@ from .config_models import (
     ValidationProfileConfig,
 )
 from .config_sections import ALLOWED_AGENT_FIELDS, ALLOWED_TOP_LEVEL_FIELDS
+from .config_workspace_trust import APPROVED_ROOT_KEY, WORKSPACE_TRUST_KEY
 
 
 @dataclass(frozen=True)
@@ -145,6 +146,13 @@ def allowed_config_shape() -> dict[str, ConfigShape]:
             "enforce_hooks": LEAF,
             "pre_push_hook": LEAF,
             "dangerous": dataclass_config_shape(DangerousConfig),
+            # The human-approved repository-root trust (#215). It is not a
+            # dataclass field on Config's sections — the loader parses it into
+            # a domain value — so it is declared here explicitly. Spelled out
+            # to its one key rather than left a LEAF: a config that records a
+            # real approval must not be reported as an unknown field, and a
+            # typo inside it must still be caught.
+            WORKSPACE_TRUST_KEY: {APPROVED_ROOT_KEY: LEAF},
         },
         "sqlite_backup": dataclass_config_shape(SqliteBackupConfig),
         "state": _leaf_keys("file"),

@@ -33,6 +33,11 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from issue_orchestrator.execution.agent_runner_providers.codex_trust import (
+    resolve_codex_common_repository_root,
+)
+
+from tests.workspace_trust import approval_for
 from tests.callback_endpoint_helpers import (
     published_callback_endpoint,
     ready_callback_endpoint,
@@ -907,11 +912,19 @@ def test_real_interactive_codex_reviewer_round_trips_through_exchange(
     # Control API, which Codex's workspace-write sandbox blocks. The model is
     # left unset on purpose — the claude-vocabulary field default must NOT leak
     # into the codex invocation (the second bug this smoke test caught).
+    # The approval this launch must carry (#215): an interactive Codex launch
+    # is refused unless it resolves to the human-approved repository root, so
+    # the smoke approves the scratch repository the exchange's reviewer
+    # worktree belongs to. Without it the launch fails closed here instead of
+    # parking on Codex's trust dialog — which is the point.
     reviewer = AgentConfig(
         prompt_path=prompt_path,
         ai_system="codex",
         timeout_minutes=10,
         provider_args={"reasoning_effort": "low", "approval_mode": "yolo"},
+        workspace_trust=approval_for(
+            resolve_codex_common_repository_root(coder_wt)
+        ),
     )
     config = _make_config(tmp_path, coder, reviewer_agent=reviewer)
 
