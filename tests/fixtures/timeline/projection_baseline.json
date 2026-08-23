@@ -851,6 +851,12 @@
     "status": "failed",
     "step": "provider_auth_terminated"
   },
+  "session.quarantine_unannounced": {
+    "level": "detail",
+    "phase": "in_progress",
+    "status": "failed",
+    "step": "quarantine_unannounced"
+  },
   "session.restored": {
     "level": "detail",
     "phase": "in_progress",

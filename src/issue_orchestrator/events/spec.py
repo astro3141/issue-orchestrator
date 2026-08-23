@@ -66,6 +66,7 @@ EVENT_SPEC: dict[PublicEventName, EventSpec] = {
     PublicEventName.SESSION_CLAIM_UNREADABLE: EventSpec(phase='in_progress', step='claim_unreadable', status='failed', level='detail'),
     PublicEventName.SESSION_RUN_UNRESTORABLE: EventSpec(phase='in_progress', step='run_unrestorable', status='failed', level='detail'),
     PublicEventName.SESSION_RUN_UNRESTORABLE_CLAIM_UNREADABLE: EventSpec(phase='in_progress', step='run_unrestorable_claim_unreadable', status='failed', level='detail'),
+    PublicEventName.SESSION_QUARANTINE_UNANNOUNCED: EventSpec(phase='in_progress', step='quarantine_unannounced', status='failed', level='detail'),
     PublicEventName.SESSION_NO_COMPLETION_RECORD: EventSpec(phase='in_progress', step='no_completion_record', status='completed', level='detail'),
     PublicEventName.SESSION_INVALID_COMPLETION_RECORD: EventSpec(phase='in_progress', step='invalid_completion_record', status='failed', level='detail'),
     PublicEventName.SESSION_PROCESSING_COMPLETED: EventSpec(phase='in_progress', step='processing_completed', status='completed', level='detail'),

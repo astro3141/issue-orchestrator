@@ -144,6 +144,12 @@ class EventName(str, Enum):
     SESSION_RUN_UNRESTORABLE_CLAIM_UNREADABLE = (
         "session.run_unrestorable_claim_unreadable"
     )
+    # A quarantine that is committed and durable, whose comment could not be
+    # delivered within its bound (#210). Its own name because it is the OPPOSITE
+    # fact from the three above: those are published once a human has been told,
+    # this one is published precisely because a human has NOT been, and it is
+    # the only channel left saying so. The issue stays blocked either way.
+    SESSION_QUARANTINE_UNANNOUNCED = "session.quarantine_unannounced"
     SESSION_START_FAILED = "session.start_failed"
     SESSION_STOPPED = "session.stopped"
     SESSION_CLEANUP = "session.cleanup"
@@ -476,6 +482,7 @@ class PublicEventName(str, Enum):
     SESSION_RUN_UNRESTORABLE_CLAIM_UNREADABLE = (
         "session.run_unrestorable_claim_unreadable"
     )
+    SESSION_QUARANTINE_UNANNOUNCED = "session.quarantine_unannounced"
     SESSION_NO_COMPLETION_RECORD = "session.no_completion_record"
     SESSION_INVALID_COMPLETION_RECORD = "session.invalid_completion_record"
     SESSION_PROCESSING_COMPLETED = "session.processing_completed"

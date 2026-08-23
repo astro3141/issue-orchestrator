@@ -46,6 +46,7 @@ from issue_orchestrator.domain.models import DiscoveredFailure, Issue, SessionSt
 from issue_orchestrator.domain.pending_work import PendingWorkKind
 from issue_orchestrator.ports.pending_work_claim_store import (
     ClaimReadability,
+    ClaimSettlement,
     ClaimState,
     QuarantineLabelState,
 )
@@ -5211,6 +5212,7 @@ def test_an_upgrade_teaches_an_older_quarantine_table_the_typed_cause(
         error="still unreadable",
         story=story,
         work_kind=None,
+        settlement=ClaimSettlement.PARK,
     )
 
     refreshed = store.read_quarantine("/runs/a@t1")
@@ -5442,12 +5444,18 @@ def test_repeated_scans_never_admit_a_mismatched_identity_terminal(
     conn.commit()
     conn.close()
 
+    from issue_orchestrator.ports.pending_work_claim_store import UnreadableClaimError
+
     for _ in range(3):
         restarted, added, _ = _restore_pair(None, [session], harness)
         assert added == []  # never admitted, on any scan
         assert restarted.active_sessions == []
-        # ...and its row is still authoritative, never re-queued beside it.
-        assert len(harness.claims.list_unresolved_claims()) == 1
+        # ...and its row is still there and still refusing to be read, settled
+        # by the quarantine rather than handed back to a queue beside the
+        # terminal that is still running it (#6999 F11, #210).
+        with pytest.raises(UnreadableClaimError):
+            harness.claims.look_up_pending_work_claim(session.run_assets)
+        assert harness.claims.list_unresolved_claims() == ()
         assert restarted.pending_tech_lead_reviews == []
 
 

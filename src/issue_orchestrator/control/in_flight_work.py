@@ -450,6 +450,13 @@ class InFlightWorkLedger:
         Deferred rows are re-admitted for the same reason: their in-memory
         re-queue did not survive the restart, only the row did.
 
+        A row a live quarantine has PARKED is re-admitted by nothing (#210).
+        It has reached its durable disposition and an operator has been asked
+        what to do with it, so handing it back to a queue underneath them would
+        be the manual-plus-automatic double launch the escalation warns against.
+        Releasing that quarantine un-parks the row and ordinary recovery here
+        resumes, which is how a repaired claim gets its work back.
+
         ``live_run_keys`` carries every run this pass observed alive whatever
         verdict it reached - including quarantined ones, which are deliberately
         missing from ``active_sessions`` and would otherwise look orphaned

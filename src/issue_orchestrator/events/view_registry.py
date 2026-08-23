@@ -242,6 +242,18 @@ VIEW_REGISTRY: dict[str, list[ViewEvent]] = {
             "orchestrator",
         ),
     ],
+    # The quarantine is committed; the comment that was meant to tell a human
+    # about it is not, and will not be retried (#210). User-visible because at
+    # this point it is the ONLY place the escalation is legible - the issue is
+    # blocked and nothing on it says why.
+    "session.quarantine_unannounced": [
+        _user(
+            "session.quarantine_unannounced",
+            "Session quarantined — the issue comment explaining it could not be "
+            "posted",
+            "orchestrator",
+        ),
+    ],
 
     # -- Tech Lead --
     "tech_lead.launching": [

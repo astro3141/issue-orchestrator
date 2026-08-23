@@ -8,7 +8,14 @@ Three durable states cover that whole span:
 * **held** — a live run is doing this work.
 * **deferred** — the run stopped for a provider reason; the work is untouched
   and waiting to be relaunched.
+* **parked** — a quarantine settled it (#210). The row stays as evidence and
+  stops being work: nothing may schedule it, re-admit it, or re-derive fresh
+  trouble from it, and a human decides what happens to it next.
 * **gone** — the row is deleted, and only a true terminal work outcome does that.
+
+Parking is what makes the quarantine a *local* disposition. It commits with the
+quarantine record, in one transaction, on this machine — never through whether a
+remote notification landed.
 
 Why deferral is a state rather than a delete (#6999 F8): re-admitting the
 request to an in-memory queue is not durable, so deleting the row at that moment
@@ -135,8 +142,13 @@ class ClaimLookup:
         return self.claim if self.state is ClaimState.HELD else None
 
 
-def _quarantine_key(run_key: str, started_at: str) -> str:
-    """The one format for a generation-anchored quarantine key (#6999 F12)."""
+def quarantine_key_for_run(run_key: str, started_at: str) -> str:
+    """The one format for a generation-anchored quarantine key (#6999 F12).
+
+    Public because the durable store has to build the same key from the same
+    two fields when it settles the row a quarantine names (#210). Two spellings
+    of one format is how a settlement lands on the wrong generation.
+    """
     return f"{run_key}@{started_at}"
 
 
@@ -169,7 +181,7 @@ class UnresolvedClaim:
         anchoring is the whole point (#6999 F12), and a caller that formats it
         by hand is a caller that can format it differently.
         """
-        return _quarantine_key(self.run_key, self.started_at)
+        return quarantine_key_for_run(self.run_key, self.started_at)
 
 
 class QuarantineCause(Enum):
@@ -261,6 +273,54 @@ class AnnouncedStory:
             return None
 
 
+class ClaimSettlement(Enum):
+    """What a quarantine's durable record does to the ledger row it names (#210).
+
+    A quarantine is a LOCAL safety disposition. Recording one and telling a
+    human about it were committed through a single boolean, so a run whose
+    comment never landed was left with its claim still held and still active —
+    and every sweep re-derived the same trouble from it. Which of the two
+    answers below applies is decided by whether the claim can be READ, not by
+    whether anything remote succeeded:
+
+    * ``PARK`` — nothing in this build, and for a damaged record nothing in any
+      build, can turn the row back into a queued request. It is settled where it
+      lies: the row survives as evidence, and stops being work. That is the
+      whole disposition, and it commits with the quarantine record itself.
+    * ``LEAVE`` — the claim reads perfectly and the ONLY reason it is not being
+      re-queued is that a terminal is still running it. Its escalation promises
+      an operator that stopping the terminal lets the next sweep re-queue the
+      work automatically, so parking it would break that promise and strand the
+      work behind a block instead.
+    """
+
+    PARK = "park"
+    LEAVE = "leave"
+
+
+class AnnouncementDelivery(Enum):
+    """How far a quarantine's notification to an operator has got (#210).
+
+    Deliberately a state of its own rather than a second reading of the local
+    disposition. A remote comment can fail for reasons that say nothing about
+    the quarantine — a token that expired, an API that refused the write, a
+    verification that could not confirm one that did land — and answering "so
+    the quarantine is not settled" is what turned one undeliverable comment into
+    96 remote writes in fifteen minutes.
+
+    ``EXHAUSTED`` is a terminal, durable answer, not a failure to be retried.
+    The escalation still stands: the shared block is on the issue and the record
+    is enumerable, so the operator signal survives the delivery that did not.
+    """
+
+    #: Not yet delivered for the story now recorded, and attempts remain.
+    PENDING = "pending"
+    #: The operator has been told THIS story.
+    DELIVERED = "delivered"
+    #: The bound is spent. No further remote mutation will be attempted for it.
+    EXHAUSTED = "exhausted"
+
+
 class QuarantineLabelState(Enum):
     """Whether a quarantine owns the shared blocking label it needed.
 
@@ -313,6 +373,11 @@ class QuarantineRecord:
     #: is what lets the unrestorable-run story name what it is protecting, so
     #: it is durable for the same reason the story is.
     work_kind: PendingWorkKind | None = None
+    #: Remote announcement attempts SPENT on the story this row now carries
+    #: (#210). Durable because the bound is worthless if a restart refunds it,
+    #: and reset with the story, because a corrected message is a new thing to
+    #: deliver rather than a continuation of the one that failed.
+    announce_attempts: int = 0
 
     def announces(self, story: AnnouncedStory) -> bool:
         """Whether this row's committed announcement already tells ``story``.
@@ -324,6 +389,22 @@ class QuarantineRecord:
         that has since changed is corrected instead of being re-asserted (#209).
         """
         return self.announced and self.story == story
+
+    def delivery(
+        self, story: AnnouncedStory, *, limit: int
+    ) -> AnnouncementDelivery:
+        """How far telling an operator ``story`` has got, as one answer (#210).
+
+        Asked of the record so that "has this been delivered", "may another
+        remote write be attempted", and "has this given up" cannot be answered
+        from different halves of the row. ``limit`` is policy and belongs to the
+        owner, so it is passed in rather than baked in here.
+        """
+        if self.announces(story):
+            return AnnouncementDelivery.DELIVERED
+        if self.announce_attempts >= limit:
+            return AnnouncementDelivery.EXHAUSTED
+        return AnnouncementDelivery.PENDING
 
     @property
     def block_is_ours(self) -> bool:
@@ -381,7 +462,7 @@ class UnreadableClaim:
     @property
     def quarantine_key(self) -> str:
         """The key a quarantine against THIS row is recorded under."""
-        return _quarantine_key(self.run_key, self.started_at)
+        return quarantine_key_for_run(self.run_key, self.started_at)
 
 
 class PendingWorkClaimStore(Protocol):
@@ -431,11 +512,24 @@ class PendingWorkClaimStore(Protocol):
         cannot be found by discovery, so without this its work would sit in the
         ledger forever. Rows whose payload cannot be rebuilt are reported by
         :meth:`list_unreadable_claims` instead of being skipped in silence.
+
+        A row a quarantine has PARKED is not here (#210). While that quarantine
+        stands, an operator has been told to work out what the run was doing and
+        re-queue it by hand if it is needed; re-admitting it underneath them
+        would launch that work behind a live ``needs-human`` block, which is the
+        manual-plus-automatic double execution this boundary exists to prevent.
+        The exclusion lasts exactly as long as the quarantine does - releasing
+        one un-parks the row it settled, and ordinary recovery resumes.
         """
         ...
 
     def list_unreadable_claims(self) -> tuple[UnreadableClaim, ...]:
-        """Stored rows that cannot be rebuilt, for the same recovery sweep."""
+        """Stored rows that cannot be rebuilt, for the same recovery sweep.
+
+        Parked rows ARE included: a quarantine's cause is still present while
+        the row it could not read is still there, and dropping them here would
+        let the release reconciliation retract a live escalation (#210).
+        """
         ...
 
     def retire_deferred_claim(self, work_key: str) -> None:
@@ -589,15 +683,28 @@ class ClaimQuarantineStore(Protocol):
         error: str,
         story: AnnouncedStory,
         work_kind: PendingWorkKind | None,
+        settlement: ClaimSettlement,
     ) -> None:
-        """Record this pass's observation of a quarantined run.
+        """Record this pass's observation of a quarantined run, and settle it.
 
         One durable transition, and the ONLY place the story-change rule lives
         (#6999 F6, #209). Recording a DIFFERENT story than the row carries
-        clears its announcement: keeping the flag would leave an operator
-        reading a story the orchestrator no longer believes. Recording the SAME
-        story preserves it, so a run re-observed on every 30-second scan is
+        clears its announcement AND its spent delivery attempts: keeping either
+        would leave an operator reading a story the orchestrator no longer
+        believes, with no budget left to correct it. Recording the SAME story
+        preserves both, so a run re-observed on every 30-second scan is
         announced exactly once.
+
+        ``settlement`` is applied to the ledger row in the SAME transaction
+        (#210). The local safety disposition — this run is quarantined, and its
+        claim is therefore no longer work — has to commit as one fact and
+        without depending on anything remote. Splitting it left the two halves
+        able to disagree, and the half that decided whether the claim stayed
+        active was the one that needed a GitHub write to succeed.
+
+        Only the ledger row of the SAME run generation this quarantine was
+        recorded against is settled, so a replacement run that reused the
+        directory keeps its own live claim (#6999 F12).
 
         A resolved-but-uncleaned row (``releasing``) is revived by this call:
         the cause it was being released for has come back.
@@ -614,6 +721,15 @@ class ClaimQuarantineStore(Protocol):
         """Record whether THIS quarantine acquired the shared blocking label."""
         ...
 
+    def spend_quarantine_announcement_attempt(self, quarantine_key: str) -> None:
+        """Charge one attempt against this story's delivery bound (#210).
+
+        Written BEFORE the remote call it pays for, never after. An attempt
+        recorded on the way out survives a process that dies mid-write, so a
+        crash loop cannot refund the bound and resume mutating the remote.
+        """
+        ...
+
     def mark_quarantine_announced(self, quarantine_key: str) -> None:
         """Record that the operator-visible comment committed."""
         ...
@@ -628,7 +744,14 @@ class ClaimQuarantineStore(Protocol):
         ...
 
     def release_quarantine(self, quarantine_key: str) -> None:
-        """Delete a quarantine whose cleanup has committed."""
+        """Delete a quarantine whose cleanup has committed, and un-park its claim.
+
+        The exact undo of the settlement :meth:`record_quarantine` committed
+        (#210), in the same transaction, because the reason the claim stopped
+        being work was this quarantine and nothing else. A human who repairs an
+        unreadable row must get ordinary recovery back with it; leaving the row
+        parked would turn a resolved escalation into permanently lost work.
+        """
         ...
 
     def list_quarantines(self) -> tuple[QuarantineRecord, ...]:
@@ -648,9 +771,11 @@ class ClaimQuarantineStore(Protocol):
 
 __all__ = [
     "AnnouncedStory",
+    "AnnouncementDelivery",
     "ClaimLookup",
     "ClaimQuarantineStore",
     "ClaimReadability",
+    "ClaimSettlement",
     "ClaimState",
     "QuarantineCause",
     "QuarantineLabelState",
@@ -661,4 +786,5 @@ __all__ = [
     "UnreadableClaim",
     "UnreadableClaimError",
     "UnresolvedClaim",
+    "quarantine_key_for_run",
 ]
