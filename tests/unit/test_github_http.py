@@ -20,6 +20,7 @@ from issue_orchestrator.adapters.github.auth import (
     build_github_auth,
 )
 from issue_orchestrator.adapters.github.http_client import (
+    CommentReceipt,
     GitHubAuthError,
     GitHubHttpClient,
     GitHubHttpConfig,
@@ -833,6 +834,153 @@ def test_list_issues_since_paginates_and_respects_limit() -> None:
 
     assert [issue["number"] for issue in issues] == [100, 99, 98]
     assert watermark == "2026-01-02T09:58:00Z"
+
+
+def test_add_comment_returns_the_creation_receipt() -> None:
+    """The 201 body is the authoritative record of the write: its ``id`` is
+    what later makes the write verifiable in O(1), so it must be kept rather
+    than discarded in favour of the URL alone."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "POST"
+        assert request.url.path == "/repos/owner/repo/issues/318/comments"
+        return httpx.Response(
+            201,
+            json={
+                "id": 4242,
+                "html_url": "https://github.com/owner/repo/issues/318#issuecomment-4242",
+                "body": "hello",
+            },
+        )
+
+    client = _client_with_transport(httpx.MockTransport(handler))
+
+    assert client.add_comment(318, "hello") == CommentReceipt(
+        comment_id=4242,
+        html_url="https://github.com/owner/repo/issues/318#issuecomment-4242",
+    )
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        pytest.param(["not", "an", "object"], id="non_dict_body"),
+        pytest.param({"html_url": "https://example.invalid/c"}, id="missing_id"),
+        pytest.param(
+            {"id": "4242", "html_url": "https://example.invalid/c"}, id="non_numeric_id"
+        ),
+        pytest.param(
+            {"id": True, "html_url": "https://example.invalid/c"}, id="boolean_id"
+        ),
+        pytest.param({"id": 4242}, id="missing_html_url"),
+        pytest.param({"id": 4242, "html_url": ""}, id="empty_html_url"),
+    ],
+)
+def test_add_comment_fails_loud_without_a_usable_receipt(payload: object) -> None:
+    """Regression: a create response that carries no usable receipt must raise
+    rather than return a synthesised ``/issues/{n}`` URL. That fallback was
+    indistinguishable from a real comment permalink, so a caller could not tell
+    a receipt from a guess -- and the write was left with no identity that
+    verification could address."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(201, json=payload)
+
+    client = _client_with_transport(httpx.MockTransport(handler))
+
+    with pytest.raises(GitHubHttpError):
+        client.add_comment(318, "hello")
+
+
+def test_get_issue_comment_reads_the_comment_by_its_own_id() -> None:
+    """Verification addresses the comment directly, so its cost and its
+    correctness do not depend on how many comments the issue carries."""
+    paths: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        paths.append(request.url.path)
+        # No pagination parameters: this is a single-resource read.
+        assert not request.url.params
+        return httpx.Response(200, json={"id": 4242, "body": "hello"})
+
+    client = _client_with_transport(httpx.MockTransport(handler))
+
+    assert client.get_issue_comment(4242) == {"id": 4242, "body": "hello"}
+    assert paths == ["/repos/owner/repo/issues/comments/4242"]
+
+
+def test_get_issue_comment_reports_a_missing_comment_as_none() -> None:
+    """A 404 is a real "not there (yet)" answer, so read-after-write lag stays
+    retryable instead of surfacing as an infrastructure failure."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(404, json={"message": "Not Found"})
+
+    client = _client_with_transport(httpx.MockTransport(handler))
+
+    assert client.get_issue_comment(4242) is None
+
+
+def test_get_issue_comment_propagates_non_404_read_failures() -> None:
+    """A 5xx says nothing about whether the comment exists, so it must not be
+    reported as absence."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, text="boom")
+
+    client = _client_with_transport(httpx.MockTransport(handler))
+
+    with pytest.raises(GitHubHttpError):
+        client.get_issue_comment(4242)
+
+
+def test_get_issue_comment_fails_loud_on_non_dict_payload() -> None:
+    """A malformed (non-object) 2xx body is proxy/schema drift, not evidence
+    the comment is missing."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=[{"id": 4242}])
+
+    client = _client_with_transport(httpx.MockTransport(handler))
+
+    with pytest.raises(GitHubHttpError):
+        client.get_issue_comment(4242)
+
+
+def test_get_issue_comment_never_answers_from_the_etag_cache() -> None:
+    """Verification must observe the live resource; a conditional request could
+    be answered from a stale cached payload."""
+    headers_seen: list[bool] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        headers_seen.append("If-None-Match" in request.headers)
+        return httpx.Response(
+            200, json={"id": 4242, "body": "hello"}, headers={"ETag": "W/\"abc\""}
+        )
+
+    client = _client_with_transport(httpx.MockTransport(handler))
+
+    client.get_issue_comment(4242)
+    client.get_issue_comment(4242)
+
+    assert headers_seen == [False, False]
+
+
+def test_get_issue_comments_reads_only_the_first_page() -> None:
+    """Pins the documented limit of this reader: one page, no pagination. It
+    exists to stage conversation context, and callers must not treat what it
+    omits as absence."""
+    requests_seen: list[httpx.URL] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests_seen.append(request.url)
+        return httpx.Response(200, json=[{"body": f"chatter {i}"} for i in range(100)])
+
+    client = _client_with_transport(httpx.MockTransport(handler))
+
+    assert len(client.get_issue_comments(318)) == 100
+    assert len(requests_seen) == 1
+    assert requests_seen[0].params.get("page") is None
 
 
 _TEST_MARKER = "<!-- io:test-marker -->"

@@ -242,6 +242,22 @@ def _combine_rollup_signals(*signals: _RollupSignal) -> str | None:
     return "SUCCESS" if present else None
 
 
+@dataclass(frozen=True)
+class CommentReceipt:
+    """What GitHub returns when a comment is created.
+
+    ``comment_id`` is the comment's own REST id, addressable at
+    ``/repos/{repo}/issues/comments/{id}``. It is the only identity that makes
+    a comment write verifiable at O(1) cost and independent of how many
+    comments the issue carries. ``html_url`` is GitHub's real permalink for
+    that comment, never a synthesised issue URL, so a caller can always tell a
+    receipt from a guess.
+    """
+
+    comment_id: int
+    html_url: str
+
+
 @dataclass
 class GitHubRateLimitSnapshot:
     core_remaining: int | None
@@ -1150,7 +1166,22 @@ class GitHubHttpClient:
             caller="delete_label",
         )
 
-    def add_comment(self, issue_number: int, body: str) -> str:
+    def add_comment(self, issue_number: int, body: str) -> CommentReceipt:
+        """Create a comment and return GitHub's creation receipt.
+
+        The 201 body is the authoritative record of the write: it carries the
+        comment's own ``id`` and ``html_url``. Both are kept, because the
+        ``id`` is what makes the write verifiable in O(1) via
+        ``get_issue_comment`` -- independent of how many comments the issue
+        already has, of comment ordering, and of any body normalisation GitHub
+        may apply.
+
+        Fails loud when the response is not a usable receipt (non-dict body,
+        missing/non-numeric ``id``, missing ``html_url``). The previous
+        behaviour -- returning a synthesised ``/issues/{n}`` URL -- produced a
+        value a caller could not distinguish from a real comment URL, and left
+        the write with no verifiable identity at all.
+        """
         payload = self._request_json(
             "POST",
             f"/repos/{self._config.repo}/issues/{issue_number}/comments",
@@ -1158,9 +1189,63 @@ class GitHubHttpClient:
             use_cache=False,
             caller="add_comment",
         )
-        if isinstance(payload, dict):
-            return payload.get("html_url", f"https://github.com/{self._config.repo}/issues/{issue_number}")
-        return f"https://github.com/{self._config.repo}/issues/{issue_number}"
+        if not isinstance(payload, dict):
+            raise GitHubHttpError(
+                f"Comment create on #{issue_number} returned "
+                f"{type(payload).__name__}, not a comment object; the write "
+                f"has no verifiable receipt",
+                issue_number=issue_number,
+            )
+        comment_id = payload.get("id")
+        # `bool` is an `int` subclass; a JSON `true` here is drift, not an id.
+        if not isinstance(comment_id, int) or isinstance(comment_id, bool):
+            raise GitHubHttpError(
+                f"Comment create on #{issue_number} returned no numeric id "
+                f"({comment_id!r}); the write has no verifiable receipt",
+                issue_number=issue_number,
+            )
+        html_url = payload.get("html_url")
+        if not isinstance(html_url, str) or not html_url:
+            raise GitHubHttpError(
+                f"Comment create on #{issue_number} (id {comment_id}) "
+                f"returned no html_url; refusing to synthesise one",
+                issue_number=issue_number,
+            )
+        return CommentReceipt(comment_id=comment_id, html_url=html_url)
+
+    def get_issue_comment(self, comment_id: int) -> dict[str, Any] | None:
+        """Read one comment by its REST id, or ``None`` if it does not exist.
+
+        Addresses the comment directly (``/issues/comments/{id}``), so the
+        answer costs one request and does not depend on the comment's position
+        in the issue's comment list -- the defect that made first-page
+        verification structurally incapable of observing a write to an issue
+        with more than 100 comments.
+
+        A 404 is a real "not there (yet)" answer and is reported as ``None``,
+        so a verification caller can retry through GitHub's read-after-write
+        lag. Every other HTTP/transport failure propagates, and a malformed
+        (non-dict) 2xx body fails loud rather than being read as absence. Not
+        ETag-cached: verification must not be answered from a stale read.
+        """
+        try:
+            payload = self._request_json(
+                "GET",
+                f"/repos/{self._config.repo}/issues/comments/{comment_id}",
+                caller="get_issue_comment",
+                use_cache=False,
+            )
+        except GitHubHttpError as exc:
+            if exc.status_code == 404:
+                return None
+            raise
+        if not isinstance(payload, dict):
+            raise GitHubHttpError(
+                f"Comment {comment_id} read returned "
+                f"{type(payload).__name__}, not a comment object; cannot "
+                f"confirm the comment exists",
+            )
+        return payload
 
     def get_issue_comments(
         self,
@@ -1168,6 +1253,16 @@ class GitHubHttpClient:
         *,
         use_cache: bool = True,
     ) -> list[dict[str, Any]]:
+        """Return the FIRST PAGE (up to 100) of an issue/PR's comments.
+
+        GitHub serves comments oldest-first, so on a long issue this is the
+        *oldest* 100 comments, not the newest. This is adequate for staging
+        conversation context, and is **never** adequate for concluding that a
+        comment is absent: on an issue past 100 comments a newly written
+        comment can never appear here. Use ``issue_comment_marker_present``
+        (all pages, fail-loud) to decide absence, and ``get_issue_comment``
+        (by receipt id) to confirm a write.
+        """
         payload = self._request_json(
             "GET",
             f"/repos/{self._config.repo}/issues/{issue_number}/comments",
@@ -2492,6 +2587,7 @@ def _is_full_scan(method: str, path: str) -> bool:
 
 
 __all__ = [
+    "CommentReceipt",
     "GitHubAppInstallationTokenProvider",
     "GitHubAuthError",
     "GitHubHttpClient",
