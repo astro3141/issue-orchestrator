@@ -60,10 +60,10 @@ from ..domain.session_run import SessionRunAssets
 from ..infra.repo_identity import state_dir
 from ..infra.sqlite_connection import open_sqlite
 from ..ports.pending_work_claim_store import (
+    AnnouncedStory,
     ClaimLookup,
     ClaimState,
     ConflictingPendingWorkClaimError,
-    QuarantineCause,
     QuarantineLabelState,
     QuarantineRecord,
     UnreadableClaim,
@@ -104,14 +104,18 @@ CREATE TABLE IF NOT EXISTS pending_work_claim_quarantine (
     label_state TEXT NOT NULL DEFAULT 'unknown',
     announced INTEGER NOT NULL DEFAULT 0,
     releasing INTEGER NOT NULL DEFAULT 0,
-    -- The observation the announcement was written for, and the work it names
-    -- (#6999 F6). Durable because ``announced`` is: a quarantine re-observed
-    -- under a DIFFERENT cause has to rewrite the operator's story, and the only
-    -- way to know it changed is to have kept the one that was announced.
-    -- Nullable on purpose - a row from before this column read as "no cause
-    -- recorded", which must differ from every observable cause so the next
-    -- scan re-announces rather than standing on a story nothing vouches for.
-    cause TEXT,
+    -- The story the announcement was written for, and the work it names
+    -- (#6999 F6, #209). Durable because ``announced`` is: a quarantine
+    -- re-observed telling a DIFFERENT story has to rewrite the operator's
+    -- comment, and the only way to know it changed is to have kept the one that
+    -- was announced. One opaque token rather than a column per input, so an
+    -- input added to AnnouncedStory changes what this compares without changing
+    -- this statement. Nullable on purpose - a row from before this column reads
+    -- as "no story recorded", which must differ from every observable story so
+    -- the next scan re-announces rather than standing on one nothing vouches
+    -- for. Databases written by an earlier build keep a vestigial ``cause``
+    -- column, which is nullable, never written and never read.
+    story TEXT,
     work_kind TEXT
 );
 -- Durable provenance for every OTHER cause of the shared needs-human block
@@ -144,10 +148,10 @@ CREATE TABLE IF NOT EXISTS publication_refusal_latch (
 # IF NOT EXISTS`` leaves an existing table exactly as it is, so a database
 # written by an earlier build keeps the old shape and every later statement
 # referencing these columns fails. Unlike the claim table this needs no
-# all-or-nothing rebuild: quarantines carry no queued work, so a NULL cause is
+# all-or-nothing rebuild: quarantines carry no queued work, so a NULL story is
 # recoverable by the next scan re-announcing (#6999 F6).
 _QUARANTINE_ADDED_COLUMNS: tuple[tuple[str, str], ...] = (
-    ("cause", "TEXT"),
+    ("story", "TEXT"),
     ("work_kind", "TEXT"),
 )
 
@@ -189,7 +193,7 @@ def _quarantine_record(row: sqlite3.Row) -> QuarantineRecord:
         label_state=QuarantineLabelState(row["label_state"]),
         announced=bool(row["announced"]),
         releasing=bool(row["releasing"]),
-        cause=QuarantineCause(row["cause"]) if row["cause"] else None,
+        story=AnnouncedStory.parse(row["story"]),
         work_kind=PendingWorkKind(row["work_kind"]) if row["work_kind"] else None,
     )
 
@@ -649,34 +653,35 @@ class SqlitePendingWorkClaimStore:
         session_name: str,
         issue_number: int,
         error: str,
-        cause: QuarantineCause,
+        story: AnnouncedStory,
         work_kind: PendingWorkKind | None,
     ) -> None:
         with self._write_lock, self._transaction() as conn:
             conn.execute(
                 "INSERT INTO pending_work_claim_quarantine "
                 "(quarantine_key, run_key, session_name, issue_number, error, "
-                "cause, work_kind) VALUES (?, ?, ?, ?, ?, ?, ?) "
+                "story, work_kind) VALUES (?, ?, ?, ?, ?, ?, ?) "
                 "ON CONFLICT(quarantine_key) DO UPDATE SET "
                 "error = excluded.error, releasing = 0, "
                 "work_kind = excluded.work_kind, "
-                # The announcement belongs to the cause that produced it. A
-                # changed cause invalidates the comment and the event, so the
+                # The announcement belongs to the story that produced it. A
+                # changed story invalidates the comment and the event, so the
                 # flag is cleared in the same statement that records the new
-                # cause - the two can never disagree (#6999 F6). An unchanged
-                # cause keeps it, which is what makes a re-observed quarantine
-                # comment exactly once.
-                "announced = CASE WHEN pending_work_claim_quarantine.cause "
-                "IS excluded.cause THEN pending_work_claim_quarantine.announced "
+                # story - the two can never disagree (#6999 F6). An unchanged
+                # story keeps it, which is what makes a re-observed quarantine
+                # comment exactly once. Comparing ONE token is what lets an
+                # input added to AnnouncedStory reach this rule untouched (#209).
+                "announced = CASE WHEN pending_work_claim_quarantine.story "
+                "IS excluded.story THEN pending_work_claim_quarantine.announced "
                 "ELSE 0 END, "
-                "cause = excluded.cause",
+                "story = excluded.story",
                 (
                     quarantine_key,
                     run_key,
                     session_name,
                     issue_number,
                     error,
-                    cause.value,
+                    story.token,
                     work_kind.value if work_kind is not None else None,
                 ),
             )
@@ -684,7 +689,7 @@ class SqlitePendingWorkClaimStore:
     def read_quarantine(self, quarantine_key: str) -> QuarantineRecord | None:
         row = self._get_connection().execute(
             "SELECT quarantine_key, run_key, session_name, issue_number, error, "
-            "label_state, announced, releasing, cause, work_kind "
+            "label_state, announced, releasing, story, work_kind "
             "FROM pending_work_claim_quarantine WHERE quarantine_key = ?",
             (quarantine_key,),
         ).fetchone()
@@ -729,7 +734,7 @@ class SqlitePendingWorkClaimStore:
             _quarantine_record(row)
             for row in self._get_connection().execute(
                 "SELECT quarantine_key, run_key, session_name, issue_number, "
-                "error, label_state, announced, releasing, cause, work_kind "
+                "error, label_state, announced, releasing, story, work_kind "
                 "FROM pending_work_claim_quarantine"
             )
         )

@@ -16,9 +16,17 @@ Two mechanisms had to be distinguished, not one:
   passed the version check and then failed at enum coercion, into the generic
   branch.
 
-These tests pin the typed three-way verdict that replaces the single untyped
-error, and pin that the newer/unknown verdict never reaches an operator dressed
-as corruption.
+These tests pin the typed verdict that replaces the single untyped error, and
+pin that neither the newer verdict nor a read that reached no verdict at all
+ever reaches an operator dressed as corruption. They also pin that a verdict
+which CHANGES between sweeps posts the correction, since an announcement
+remembered by halves can only be re-asserted.
+
+``monkeypatch.setattr(codec, "TechLeadSessionFlavor", ...)`` below is a
+deliberate exception to ``tests/AGENTS.md``'s steer away from module internals.
+Standing in for a build whose enum value space is genuinely smaller is what the
+proof requires, and no injection seam exists for a type the decoder names
+directly.
 """
 
 from __future__ import annotations
@@ -57,7 +65,9 @@ from issue_orchestrator.execution.pending_work_codec import (
     encode_claim_text,
 )
 from issue_orchestrator.ports.pending_work_claim_store import (
+    AnnouncedStory,
     ClaimReadability,
+    QuarantineCause,
     QuarantineLabelState,
     UnreadableClaim,
 )
@@ -646,15 +656,185 @@ def test_restoration_carries_a_typed_read_failure_through_to_the_verdict() -> No
     )
 
 
-def test_an_unclassified_read_failure_is_not_reported_as_a_healthy_artifact() -> None:
-    """A store fault is not evidence that a newer build wrote the row.
+def test_an_unclassified_read_failure_reaches_no_verdict_about_the_artifact(
+) -> None:
+    """A store fault is a fact about the STORE, not a finding about the row.
 
-    Classification is conservative in one direction only: telling an operator
-    "this is fine, a newer build reads it" on the strength of an exception
-    nobody classified would be the same untyped guess #209 removes, pointing
-    the other way.
+    Both wrong answers were available. Calling it NEWER would hand out "this is
+    fine, a newer build reads it" on the strength of an exception nobody
+    classified. Calling it CORRUPT asserts damage in a record nothing looked at.
     """
     assert (
         _rehydrate_verdict(sqlite3.OperationalError("database is locked"))
-        is ClaimReadability.UNREADABLE_CORRUPT
+        is ClaimReadability.UNEXAMINED
     )
+    # ...and it is still not readable, so every conservative decision that asks
+    # "may this record be trusted" gets the same answer damage gets.
+    assert not ClaimReadability.UNEXAMINED.readable
+
+
+def test_an_unexamined_record_is_never_declared_beyond_repair(
+    tmp_path: Path,
+) -> None:
+    """#209's own harm, restated with a stronger adjective.
+
+    ``look_up_pending_work_claim`` reads sqlite and does not wrap driver
+    errors, so a locked database used to produce a GitHub comment telling an
+    operator that a record which was never even examined "cannot be rebuilt by
+    any build".
+    """
+    comment = _announced(
+        tmp_path,
+        QuarantineSubject.ended_run_with_unreadable_claim(
+            _unreadable(ClaimReadability.UNEXAMINED)
+        ),
+    )
+
+    for damage in _DAMAGE_CLAIMS:
+        assert damage not in comment.lower(), damage
+    assert "NEWER build" not in comment  # nor the reassurance, unearned
+    assert "could not be read AT ALL on this pass" in comment
+    # The queued work is still unknown, so the urgency of not re-queueing by
+    # hand survives - only the claim about the artifact is withdrawn.
+    assert "review, rework, validation retry or tech-lead investigation" in comment
+
+
+def test_a_corrected_verdict_reaches_the_operator_who_read_the_wrong_one(
+    tmp_path: Path,
+) -> None:
+    """The announcement must be correctable, not merely re-assertable (#209).
+
+    Sweep 1 hits a transient store fault and comments. Sweep 2 reads the row
+    properly and finds it NEWER. The CAUSE has not changed across the two, so a
+    quarantine whose durable announcement identity is the cause alone stays
+    silent forever and leaves the operator holding the first story, with
+    ``needs-human`` on the issue and nothing to correct it.
+    """
+    from issue_orchestrator.execution.pending_work_claim_store import (
+        SqlitePendingWorkClaimStore,
+    )
+
+    labels = _RecordingLabels()
+    owner = ClaimQuarantineOwner(
+        store=SqlitePendingWorkClaimStore.for_repo(tmp_path),
+        labels=labels,
+        events=MagicMock(),
+    )
+
+    owner.quarantine(
+        QuarantineSubject.ended_run_with_unreadable_claim(
+            _unreadable(ClaimReadability.UNEXAMINED)
+        )
+    )
+    owner.quarantine(
+        QuarantineSubject.ended_run_with_unreadable_claim(
+            _unreadable(ClaimReadability.UNREADABLE_NEWER)
+        )
+    )
+
+    assert len(labels.comments) == 2
+    assert "could not be read AT ALL on this pass" in labels.comments[0]
+    assert "NEWER build" in labels.comments[1]
+
+    # ...and a THIRD sweep observing the same story again says nothing more.
+    owner.quarantine(
+        QuarantineSubject.ended_run_with_unreadable_claim(
+            _unreadable(ClaimReadability.UNREADABLE_NEWER)
+        )
+    )
+    assert len(labels.comments) == 2
+
+
+def test_the_announced_story_is_durable_in_full(tmp_path: Path) -> None:
+    """Both halves of what an operator was told survive a restart.
+
+    A story remembered by halves is a story that can only be re-asserted: the
+    predicate the escalation is idempotent on compares what was announced
+    against what is now observed, and it can only see the difference in the
+    part that was kept.
+    """
+    from issue_orchestrator.execution.pending_work_claim_store import (
+        SqlitePendingWorkClaimStore,
+    )
+
+    subject = QuarantineSubject.ended_run_with_unreadable_claim(
+        _unreadable(ClaimReadability.UNREADABLE_NEWER)
+    )
+    ClaimQuarantineOwner(
+        store=SqlitePendingWorkClaimStore.for_repo(tmp_path),
+        labels=_RecordingLabels(),
+        events=MagicMock(),
+    ).quarantine(subject)
+
+    # A fresh handle on the same database - the restart this has to survive.
+    reopened = SqlitePendingWorkClaimStore.for_repo(tmp_path)
+    (record,) = reopened.list_quarantines()
+
+    assert record.story == subject.story
+    assert record.announces(subject.story)
+    for readability in ClaimReadability:
+        if readability is subject.readability:
+            continue
+        other = AnnouncedStory(subject.cause, readability)
+        assert not record.announces(other), readability
+
+
+def test_the_quarantine_event_carries_the_verdict_a_consumer_would_guess(
+    tmp_path: Path,
+) -> None:
+    """Machine consumers must not have to parse ``error`` for the verdict.
+
+    That is the same per-reader guess this boundary removed for humans, and
+    this repo's events-vs-logs rule forbids reacting to prose.
+    """
+    from issue_orchestrator.execution.pending_work_claim_store import (
+        SqlitePendingWorkClaimStore,
+    )
+
+    events = MagicMock()
+    ClaimQuarantineOwner(
+        store=SqlitePendingWorkClaimStore.for_repo(tmp_path),
+        labels=_RecordingLabels(),
+        events=events,
+    ).quarantine(
+        QuarantineSubject.ended_run_with_unreadable_claim(
+            _unreadable(ClaimReadability.UNREADABLE_NEWER)
+        )
+    )
+
+    (published,) = [call.args[0] for call in events.publish.call_args_list]
+    assert published.data["readability"] == ClaimReadability.UNREADABLE_NEWER.value
+    assert published.data["cause"] == QuarantineCause.CLAIM_UNREADABLE_ENDED_RUN.value
+
+
+@pytest.mark.parametrize("cause", list(QuarantineCause))
+@pytest.mark.parametrize("readability", list(ClaimReadability))
+def test_every_cause_and_verdict_pairing_composes_into_whole_sentences(
+    cause: QuarantineCause, readability: ClaimReadability, tmp_path: Path
+) -> None:
+    """The two tables vary independently, so all of their products must read.
+
+    Nothing enforced that before: the READABLE finding ended in a colon and
+    relied on the ONE escalation written beside it to continue the sentence, so
+    any other cause paired with it emitted "...knows exactly what it is
+    carrying:" with nothing after it.
+    """
+    comment = _announced(
+        tmp_path,
+        QuarantineSubject(
+            quarantine_key="/runs/tech-lead-23@t1",
+            run_key="/runs/tech-lead-23",
+            session_name="tech-lead-23",
+            issue_number=23,
+            error="claim payload field 'flavor' is 'planning_investigation'",
+            cause=cause,
+            readability=readability,
+            work_kind=PendingWorkKind.TECH_LEAD if readability.readable else None,
+        ),
+    )
+
+    assert "{" not in comment and "}" not in comment  # nothing left unformatted
+    for paragraph in comment.split("\n\n"):
+        assert paragraph.strip(), comment
+        # The defect exactly: a clause that hands off to text that never comes.
+        assert not paragraph.rstrip().endswith(":"), comment

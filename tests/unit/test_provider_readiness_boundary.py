@@ -5143,16 +5143,16 @@ def _write_legacy_claim_row(
 def test_an_upgrade_teaches_an_older_quarantine_table_the_typed_cause(
     tmp_path: Path,
 ) -> None:
-    """A quarantine row written before the cause was durable still works.
+    """A quarantine row written before the story was durable still works.
 
     ``CREATE TABLE IF NOT EXISTS`` leaves an existing table exactly as it was,
     so the columns #6999 F6 added arrive only if something adds them. Without
     that, every read and write of a quarantine on an upgraded database raises
     and the orphan sweep stops escalating anything at all.
 
-    A carried-forward row has no recorded cause, which must read as *different
-    from whatever is observed next* so the next scan re-announces under a cause
-    it can vouch for, rather than standing on a story nothing recorded.
+    A carried-forward row has no recorded story, which must read as *different
+    from whatever is observed next* so the next scan re-announces under a story
+    it can vouch for, rather than standing on one nothing recorded.
     """
     import sqlite3
 
@@ -5161,7 +5161,15 @@ def test_an_upgrade_teaches_an_older_quarantine_table_the_typed_cause(
         SqlitePendingWorkClaimStore,
     )
     from issue_orchestrator.infra.repo_identity import state_dir
-    from issue_orchestrator.ports.pending_work_claim_store import QuarantineCause
+    from issue_orchestrator.ports.pending_work_claim_store import (
+        AnnouncedStory,
+        QuarantineCause,
+    )
+
+    story = AnnouncedStory(
+        QuarantineCause.CLAIM_UNREADABLE_ENDED_RUN,
+        ClaimReadability.UNREADABLE_CORRUPT,
+    )
 
     db_path = state_dir(tmp_path) / STORE_FILENAME
     db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -5192,8 +5200,8 @@ def test_an_upgrade_teaches_an_older_quarantine_table_the_typed_cause(
     (carried,) = store.list_quarantines()
     assert carried.issue_number == 7
     assert carried.announced  # the old flag survived...
-    assert carried.cause is None  # ...but says nothing about which story
-    assert not carried.announces(QuarantineCause.CLAIM_UNREADABLE_ENDED_RUN)
+    assert carried.story is None  # ...but says nothing about which story
+    assert not carried.announces(story)
 
     store.record_quarantine(
         "/runs/a@t1",
@@ -5201,14 +5209,14 @@ def test_an_upgrade_teaches_an_older_quarantine_table_the_typed_cause(
         session_name="issue-7",
         issue_number=7,
         error="still unreadable",
-        cause=QuarantineCause.CLAIM_UNREADABLE_ENDED_RUN,
+        story=story,
         work_kind=None,
     )
 
     refreshed = store.read_quarantine("/runs/a@t1")
     assert refreshed is not None
-    assert refreshed.cause is QuarantineCause.CLAIM_UNREADABLE_ENDED_RUN
-    assert not refreshed.announced  # re-announced under the cause it now holds
+    assert refreshed.story == story
+    assert not refreshed.announced  # re-announced under the story it now holds
     assert refreshed.block_is_ours  # ...without disturbing the block it owns
 
 
@@ -6384,7 +6392,8 @@ def test_an_unverifiable_live_run_does_not_rewrite_an_existing_quarantine(
 
     assert len(_comment_texts(harness)) == 1
     (record,) = harness.claims.list_quarantines()
-    assert record.cause is QuarantineCause.CLAIM_UNREADABLE_ENDED_RUN
+    assert record.story is not None
+    assert record.story.cause is QuarantineCause.CLAIM_UNREADABLE_ENDED_RUN
     assert record.announced
     assert len(_quarantine_narratives(harness)) == 1
 
@@ -6416,7 +6425,8 @@ def test_an_unverifiable_live_run_can_be_reconciled_after_the_terminal_ends(
     assert "already ended" in comments[0]
     assert "still running" not in comments[0]
     (record,) = harness.claims.list_quarantines()
-    assert record.cause is QuarantineCause.CLAIM_UNREADABLE_ENDED_RUN
+    assert record.story is not None
+    assert record.story.cause is QuarantineCause.CLAIM_UNREADABLE_ENDED_RUN
     assert len(_quarantine_narratives(harness)) == 1
 
 

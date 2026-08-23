@@ -60,10 +60,18 @@ class ClaimReadability(Enum):
     * ``UNREADABLE_CORRUPT`` — a shape no build ever wrote. No runtime will
       ever recover the work from it, so a human has to reconstruct it.
 
-    Classification is deliberately conservative in ONE direction only: an
-    unclassified read failure is reported as corrupt rather than as newer,
-    because "a newer build wrote this and it is fine" is a claim about the
-    artifact that has to be established, never assumed.
+    A fourth member exists because a read can fail without reaching a verdict
+    at all. ``UNEXAMINED`` is what a store fault produces — a locked database,
+    an I/O error — and it is NOT the same fact as damage: nothing looked at the
+    payload, so nothing may be said about it. Reporting those failures as
+    corrupt was #209 restated with a stronger adjective, telling an operator
+    that a record which was never examined cannot be rebuilt by any build.
+
+    Only ``READABLE`` is ever evidence that the record can be trusted, which is
+    what keeps the classification conservative where it matters: an unclassified
+    failure answers :attr:`readable` exactly as damage does, and only the story
+    told about it differs. "A newer build wrote this and it is fine" stays a
+    claim that has to be established, never assumed.
     """
 
     #: Rebuilt into the original typed request.
@@ -74,6 +82,9 @@ class ClaimReadability(Enum):
     UNREADABLE_NEWER = "unreadable_newer"
     #: Malformed or self-contradictory.
     UNREADABLE_CORRUPT = "unreadable_corrupt"
+    #: The read failed before the payload could be judged. A fact about the
+    #: store, not a finding about the artifact.
+    UNEXAMINED = "unexamined"
 
     @property
     def readable(self) -> bool:
@@ -199,6 +210,57 @@ class QuarantineCause(Enum):
     RUN_UNRESTORABLE_CLAIM_UNREADABLE = "run_unrestorable_claim_unreadable"
 
 
+@dataclass(frozen=True, slots=True)
+class AnnouncedStory:
+    """Every input an operator's quarantine comment is composed from (#209).
+
+    ONE value rather than a field per input, because the announcement's
+    idempotency rests on comparing it: re-observing the SAME story must not
+    re-comment, and observing a DIFFERENT one must. That rule used to be asked
+    of the cause alone, which held for exactly as long as the cause chose every
+    word. It stopped holding the moment the record's readability chose some of
+    them, and what it produces is the failure this boundary exists to prevent —
+    a sweep that hit a store fault announced "that record cannot be rebuilt by
+    any build", and the sweep that afterwards read the row cleanly found the
+    cause unchanged and never posted the correction.
+
+    It carries its own durable spelling for the same reason it exists. Persisted
+    as one opaque token, a story is compared as one value everywhere — in Python
+    and in the SQL that decides whether an announcement survives — so a THIRD
+    input added to this class is picked up by both without either being edited.
+    A token this build cannot parse, including one written before the story
+    existed, reads as "no story recorded", which differs from every observable
+    story and therefore re-announces rather than standing on a story nothing
+    vouches for.
+    """
+
+    cause: QuarantineCause
+    readability: ClaimReadability
+
+    @property
+    def token(self) -> str:
+        """The one durable spelling of a story. Field order is the format."""
+        return f"{self.cause.value}|{self.readability.value}"
+
+    @classmethod
+    def parse(cls, token: object) -> "AnnouncedStory | None":
+        """Rebuild a stored story, or ``None`` when none was usably recorded.
+
+        Deliberately answers ``None`` rather than raising: the callers are
+        recovery paths reading rows an older build wrote, and "I do not know
+        which story was announced" has a correct and safe handling — announce
+        again. Failing startup over it would strand an issue whose only defect
+        is that the story was invented after the row.
+        """
+        if not isinstance(token, str):
+            return None
+        cause, _, readability = token.partition("|")
+        try:
+            return cls(QuarantineCause(cause), ClaimReadability(readability))
+        except ValueError:
+            return None
+
+
 class QuarantineLabelState(Enum):
     """Whether a quarantine owns the shared blocking label it needed.
 
@@ -241,26 +303,27 @@ class QuarantineRecord:
     label_state: QuarantineLabelState
     announced: bool
     releasing: bool
-    #: The observation this row's announcement was written for (#6999 F6).
-    #: ``None`` only for a row recorded before the cause became durable; it is
-    #: deliberately not collapsed into a default, because "no cause recorded"
-    #: must read as *different from whatever is observed next* so the story is
+    #: What this row's announcement was written for (#6999 F6, #209).
+    #: ``None`` only for a row recorded before the story became durable; it is
+    #: deliberately not collapsed into a default, because "no story recorded"
+    #: must read as *different from whatever is observed next* so the message is
     #: rewritten rather than silently kept.
-    cause: QuarantineCause | None = None
+    story: AnnouncedStory | None = None
     #: The queued work this run is carrying, when the claim reads cleanly. It
     #: is what lets the unrestorable-run story name what it is protecting, so
-    #: it is durable for the same reason the cause is.
+    #: it is durable for the same reason the story is.
     work_kind: PendingWorkKind | None = None
 
-    def announces(self, cause: QuarantineCause) -> bool:
-        """Whether this row's committed announcement already tells ``cause``'s story.
+    def announces(self, story: AnnouncedStory) -> bool:
+        """Whether this row's committed announcement already tells ``story``.
 
         The one predicate the escalation's idempotency rests on (#6999 F6):
-        re-observing the SAME cause must not re-comment, and observing a
-        DIFFERENT one must, because the message and event a cause produces are
-        chosen from the cause alone.
+        re-observing the SAME story must not re-comment, and observing a
+        DIFFERENT one must. It asks about the WHOLE story rather than the cause
+        that used to be all of it, so an announcement written from a verdict
+        that has since changed is corrected instead of being re-asserted (#209).
         """
-        return self.announced and self.cause is cause
+        return self.announced and self.story == story
 
     @property
     def block_is_ours(self) -> bool:
@@ -524,17 +587,16 @@ class ClaimQuarantineStore(Protocol):
         session_name: str,
         issue_number: int,
         error: str,
-        cause: QuarantineCause,
+        story: AnnouncedStory,
         work_kind: PendingWorkKind | None,
     ) -> None:
         """Record this pass's observation of a quarantined run.
 
-        One durable transition, and the ONLY place the cause-change rule lives
-        (#6999 F6). Recording a DIFFERENT cause than the row carries clears its
-        announcement, because the comment and event a quarantine produces are
-        chosen from the cause alone: keeping the flag would leave an operator
+        One durable transition, and the ONLY place the story-change rule lives
+        (#6999 F6, #209). Recording a DIFFERENT story than the row carries
+        clears its announcement: keeping the flag would leave an operator
         reading a story the orchestrator no longer believes. Recording the SAME
-        cause preserves it, so a run re-observed on every 30-second scan is
+        story preserves it, so a run re-observed on every 30-second scan is
         announced exactly once.
 
         A resolved-but-uncleaned row (``releasing``) is revived by this call:
@@ -585,6 +647,7 @@ class ClaimQuarantineStore(Protocol):
 
 
 __all__ = [
+    "AnnouncedStory",
     "ClaimLookup",
     "ClaimQuarantineStore",
     "ClaimReadability",

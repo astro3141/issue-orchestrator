@@ -121,15 +121,21 @@ def _readability_of(exc: BaseException) -> ClaimReadability:
     """How a failed claim read classifies, when the store said so (#209).
 
     A store that raises the port's :class:`UnreadableClaimError` has already
-    reached a verdict and it is carried verbatim. Anything else is an
-    unclassified read failure — a store fault, not a finding about the artifact
-    — and is reported as corrupt on purpose: "a newer build wrote this and it is
-    perfectly fine" is a reassurance that has to be earned, and handing it out
-    on a fault would be the same untyped guess in the opposite direction.
+    reached a verdict and it is carried verbatim. Anything else — a locked
+    database, an I/O error, any fault that stopped the read before it reached
+    the payload — is not a finding about the artifact at all, and is reported as
+    ``UNEXAMINED`` rather than as either verdict.
+
+    Both wrong answers are available here and both were taken at some point.
+    Calling it NEWER would hand out "this is fine, a newer build reads it" on
+    the strength of an exception nobody classified. Calling it CORRUPT, which
+    this did, told an operator that a record which was never examined cannot be
+    rebuilt by any build. ``UNEXAMINED`` is not readable either, so every
+    conservative decision this feeds is unchanged; only the sentence differs.
     """
     if isinstance(exc, UnreadableClaimError):
         return exc.readability
-    return ClaimReadability.UNREADABLE_CORRUPT
+    return ClaimReadability.UNEXAMINED
 
 
 @dataclass(frozen=True, slots=True)

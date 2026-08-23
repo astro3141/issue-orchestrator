@@ -30,9 +30,14 @@ What an operator READS is assembled from two enumerable tables, not from
 branches (#209). The cause answers "which situation is this run in"; the claim's
 :class:`~..ports.pending_work_claim_store.ClaimReadability` answers "what is
 true of its record". They vary independently - an unrestorable live run can hold
-an intact claim, an intact one this build simply cannot interpret, or a damaged
-one - and folding the second into the first is how a claim written by a newer
-build got announced as unrecoverable.
+an intact claim, an intact one this build simply cannot interpret, a damaged
+one, or one a store fault stopped anybody from looking at - and folding the
+second into the first is how a claim written by a newer build got announced as
+unrecoverable.
+
+Both halves are therefore durable, as one
+:class:`~..ports.pending_work_claim_store.AnnouncedStory`. What an operator has
+been told is only correctable if the orchestrator remembers all of what it said.
 """
 
 from __future__ import annotations
@@ -46,6 +51,7 @@ from ..domain.pending_work import PendingWorkKind
 from ..events import EventName
 from ..ports import EventSink, make_trace_event
 from ..ports.pending_work_claim_store import (
+    AnnouncedStory,
     ClaimQuarantineStore,
     ClaimReadability,
     QuarantineCause,
@@ -95,6 +101,16 @@ class QuarantineSubject:
     #: Known only when the claim reads cleanly; it is what makes the
     #: unrestorable-run message able to name the work it is protecting.
     work_kind: PendingWorkKind | None = None
+
+    @property
+    def story(self) -> AnnouncedStory:
+        """Every input the operator's comment is composed from, as one value.
+
+        Asked of the subject rather than assembled by whatever needs it, so the
+        durable record and the rendered comment can never be built from
+        different halves of the same observation (#209).
+        """
+        return AnnouncedStory(self.cause, self.readability)
 
     @classmethod
     def live_run_with_unreadable_claim(
@@ -220,13 +236,15 @@ class ClaimQuarantineOwner:
     those until its own step succeeds, so anything that failed is retried by the
     next sweep rather than becoming final.
 
-    The cause is durable for the same reason the announcement is (#6999 F6).
-    Every word an operator reads - and the event name the dashboard reacts to -
-    is chosen from the cause alone, so an announcement remembered without the
-    cause that produced it can only be re-asserted, never corrected. A run
-    announced as ended and then rediscovered alive kept telling a human it had
-    finished and could be re-queued by hand, over a terminal still doing the
-    work.
+    The STORY is durable for the same reason the announcement is (#6999 F6,
+    #209): an announcement remembered without what produced it can only be
+    re-asserted, never corrected. A run announced as ended and then rediscovered
+    alive kept telling a human it had finished and could be re-queued by hand,
+    over a terminal still doing the work. The durable half is the whole story
+    rather than the cause that was once all of it, because a claim's readability
+    now chooses words too - a sweep that hit a store fault and one that
+    afterwards read the row cleanly share a cause, and the second has a
+    correction to post.
     """
 
     store: ClaimQuarantineStore
@@ -383,7 +401,7 @@ class ClaimQuarantineOwner:
                 subject.issue_number,
             )
             return
-        if record.announces(subject.cause):
+        if record.announces(subject.story):
             return
         escalation = _ESCALATIONS[subject.cause]
         if not self.labels.announce(subject.issue_number, escalation.comment(subject)):
@@ -404,6 +422,10 @@ class ClaimQuarantineOwner:
                 "session_name": subject.session_name,
                 "run_key": subject.run_key,
                 "cause": subject.cause.value,
+                # The verdict a machine consumer would otherwise have to guess
+                # out of ``error`` - which is the same per-reader guess this
+                # boundary removed for humans (#209).
+                "readability": subject.readability.value,
                 "error": subject.error,
             },
         ))
@@ -415,7 +437,7 @@ class ClaimQuarantineOwner:
             session_name=subject.session_name,
             issue_number=subject.issue_number,
             error=subject.error,
-            cause=subject.cause,
+            story=subject.story,
             work_kind=subject.work_kind,
         )
 
@@ -433,10 +455,14 @@ class _Escalation:
     instruction: str
 
     def comment(self, subject: QuarantineSubject) -> str:
-        finding = self.finding.format(
-            work=_work_phrase(subject.work_kind),
-            claim=_CLAIM_FINDINGS[subject.readability],
+        # Each table renders its OWN sentence and nothing else's: the claim
+        # finding owns the ``{work}`` slot it needs, so a cause paired with a
+        # readability it has never met still composes into whole sentences
+        # rather than trailing off where the other table used to continue it.
+        claim = _CLAIM_FINDINGS[subject.readability].format(
+            work=_work_phrase(subject.work_kind)
         )
+        finding = self.finding.format(claim=claim)
         return (
             f"🔒 **{self.headline}**\n\n"
             f"`{subject.session_name}` took a queued request off one of the "
@@ -463,10 +489,14 @@ _UNTRACKED_CONSEQUENCE = (
 # is true of its claim", and the two are independent questions (#209). Merging
 # them would multiply four causes by three verdicts into twelve stories, which
 # is how the value-space growth that caused #209 got told as corruption.
+#
+# Each entry is a COMPLETE finding, including the ``{work}`` it needs, because
+# the pairing is what has to compose: an escalation that continued its claim
+# finding for it could only do so for the readabilities it was written beside.
 _CLAIM_FINDINGS: dict[ClaimReadability, str] = {
     ClaimReadability.READABLE: (
         "Its pending-work record is intact and this build reads it, so the "
-        "orchestrator knows exactly what it is carrying:"
+        "orchestrator knows exactly what it is carrying: {work}."
     ),
     ClaimReadability.UNREADABLE_NEWER: (
         "Its pending-work record is intact and nothing in it has been lost — "
@@ -477,9 +507,22 @@ _CLAIM_FINDINGS: dict[ClaimReadability, str] = {
         f"repair or reconstruct here. {_UNTRACKED_CONSEQUENCE}"
     ),
     ClaimReadability.UNREADABLE_CORRUPT: (
-        "That record cannot be rebuilt by any build, so which review, rework, "
-        "validation retry or tech-lead investigation it is carrying is "
+        "Its pending-work record was read and found to be a shape no build "
+        "ever wrote, so it cannot be rebuilt by any build and which review, "
+        "rework, validation retry or tech-lead investigation it is carrying is "
         f"unknown. {_UNTRACKED_CONSEQUENCE}"
+    ),
+    # Deliberately says nothing about the artifact. Nothing examined it, so
+    # "cannot be rebuilt by any build" would be #209's own harm with a stronger
+    # adjective - an operator sent hunting for damage in a record that may be
+    # perfectly intact and merely momentarily unreachable.
+    ClaimReadability.UNEXAMINED: (
+        "Its pending-work record could not be read AT ALL on this pass — the "
+        "read failed before reaching the record itself — so nothing has been "
+        "established about the record's condition, and which review, rework, "
+        "validation retry or tech-lead investigation it is carrying is unknown "
+        "here. The next sweep re-reads it and replaces this with whatever it "
+        f"finds. {_UNTRACKED_CONSEQUENCE}"
     ),
 }
 
@@ -524,7 +567,7 @@ _ESCALATIONS: dict[QuarantineCause, _Escalation] = {
         ),
         headline="Session quarantined: its run could not be rebuilt",
         finding=(
-            "The terminal is still running. {claim} {work}. What failed is the "
+            "The terminal is still running. {claim} What failed is the "
             "run's own session assets, so the terminal cannot be tracked.\n\n"
             "The work is deliberately NOT being re-queued: a re-queue would "
             "start a second session beside the one still running it."
