@@ -102,6 +102,15 @@ from anything else reads an empty directory and drops every verdict, approvals
 included; the continuation then settles nothing and pays a second full reviewer
 exchange over the same rejected commit before its run allowance runs out.
 
+That reading is also what permits the continuation to settle at all (#178).
+`control/continuation_review_evidence.py` owns the promotion and answers one
+question — *may this run settle?* A completion that **completed a review
+exchange** settles only on a promoted exact-`A` binding; missing, unparseable
+and `A'`-bound bindings all withhold the settlement, leaving the recorded
+intent undischarged and the operation re-enterable. A completion that ran no
+exchange is unchanged: it never held review evidence, so it settles from what
+it produced.
+
 ## Review Artifacts
 
 Before PR creation, each review exchange produces a paired artifact set:

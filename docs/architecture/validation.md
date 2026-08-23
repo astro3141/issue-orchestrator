@@ -446,7 +446,7 @@ and nothing about what to do with it, so [#149] adds the missing half:
 | Fact | Where it lives | Written by |
 |------|----------------|------------|
 | Recorded intent (`requested_actions`, `implementation`, `problems`) plus the contract identity | `Attempt.continuation_descriptor` | `control/continuation_descriptor_writer.py`, at the gate's verdict, **only when the verdict refuses** |
-| The exact-`A` review outcome | `Attempt.continuation_review_verdict` | `control/continuation_runner.py`, promoted from the run's own verdict binding before its worktree is discarded |
+| The exact-`A` review outcome | `Attempt.continuation_review_verdict` | `control/continuation_review_evidence.py`, promoted from the run's own verdict binding before its worktree is discarded |
 | What the continuation run produced — the pull request, or that none was asked for | `Attempt.continuation_settlement` | `control/continuation_finalize.py`, from the `ProcessingResult` the run's own completion pipeline returned |
 | How many runs the continuation has opened for this candidate | `Attempt.continuation_runs_used` | `control/continuation_run_open.py`, spent before a run is opened |
 
@@ -613,6 +613,22 @@ announces the pull request on the board and *then* records the settlement, so a
 board signal that could not be applied leaves the operation retryable rather
 than terminating it while the issue's lane reopens with an approved PR already
 open.
+
+It reaches that finalizer only through
+`control/continuation_review_evidence.py` ([#178]). A run whose completion
+actually completed a review exchange settles **only** once that exchange's
+exact-`A` `BoundReviewVerdict` has been read and promoted onto the attempt; a
+binding that is missing, does not parse, or covers `A'` withholds the
+settlement instead of being logged past. Before that, promotion could refuse in
+any of those three ways while the settlement was recorded anyway — the shape
+observed in production as `continuation_review_verdict = null` beside
+`continuation_settlement = pull_request_opened`, a terminal outcome asserting a
+review nothing could evidence. A refusal is not a failure: the recorded intent
+stays undischarged, so the operation stays live and the next reconciliation
+re-enters the pipeline (finding, and reusing, whatever pull request already
+exists), bounded like every other fruitless run by [#149]'s run allowance. A
+completion that ran **no** exchange is unaffected — it never held review
+evidence, and settles from what it produced exactly as before.
 
 ### A paused engine reconciles but starts nothing
 
