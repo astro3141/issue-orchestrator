@@ -76,6 +76,19 @@ class CLIProvider(ABC):
         """
         return self.interactive
 
+    def requires_workspace_trust(self, **kwargs: object) -> bool:
+        """Whether this invocation denies without an approved repository root.
+
+        Config-time question, answered from the same ``provider_args`` a launch
+        would build its command from, so a deployment learns that an agent can
+        never launch *before* it burns a claim, a label, and a worktree finding
+        out (#215). ``False`` here must mean "this invocation ignores
+        ``launch_workspace``"; a provider that fails closed on absent approval
+        in :meth:`build_command` must return ``True`` for the same arguments,
+        or the denial goes back to being launch-time-only.
+        """
+        return False
+
     def needs_fresh_prompt_process(self, **kwargs: object) -> bool:
         """Whether a completed prompt turn should respawn before follow-up input.
 

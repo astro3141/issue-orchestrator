@@ -18,6 +18,7 @@ import tomllib
 
 import pytest
 
+from issue_orchestrator.domain.workspace_trust import WorkspaceTrustError
 from issue_orchestrator.execution.agent_runner_providers.codex import CodexProvider
 
 from tests.workspace_trust import approved_workspace, make_repository
@@ -296,3 +297,19 @@ class TestCodexBaseCommand:
         assert provider.runs_interactively(execution_mode="exec") is False
         assert provider.needs_fresh_prompt_process() is True
         assert provider.needs_fresh_prompt_process(execution_mode="exec") is False
+
+    def test_workspace_trust_requirement_matches_what_build_command_does(self) -> None:
+        """Config validation must not drift from the launch it predicts (#215).
+
+        The capability is what a config-time check reads; the fail-closed
+        denial is what a launch does. They are asserted together so the pair
+        cannot come apart.
+        """
+        provider = CodexProvider()
+
+        assert provider.requires_workspace_trust() is True
+        with pytest.raises(WorkspaceTrustError):
+            provider.build_command(prompt="hi")
+
+        assert provider.requires_workspace_trust(execution_mode="exec") is False
+        assert provider.build_command(prompt="hi", execution_mode="exec")

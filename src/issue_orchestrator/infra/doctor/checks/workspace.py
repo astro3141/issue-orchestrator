@@ -128,6 +128,45 @@ def _check_agent_scripts(config: Config) -> Check:
     return Check(name="Agent Scripts", status="ok", detail="All found")
 
 
+def _check_workspace_trust(config: Config) -> Check | None:
+    """Report agents that cannot launch for want of an approved root (#215).
+
+    Reported here rather than left to the launch: without it, the denial costs
+    a claim, a label and a provisioned worktree per attempt, and shows up only
+    as a stack trace in the log. A recorded approval is reported too, so an
+    operator who edited the key can see it took effect and which document it
+    was read from. Silent only when there is nothing to say in either
+    direction — no approval, and no agent that would ever need one.
+    """
+    from ...workspace_trust_readiness import (
+        MISSING_APPROVAL_REMEDY,
+        agents_needing_workspace_trust,
+        unlaunchable_agents_without_workspace_trust,
+    )
+
+    approved = config.workspace_trust
+    if approved is None and not agents_needing_workspace_trust(config):
+        return None
+
+    if approved is None:
+        blocked = unlaunchable_agents_without_workspace_trust(config)
+        return Check(
+            name="Workspace Trust",
+            status="error",
+            detail=(
+                f"No approved repository root recorded, so {', '.join(blocked[:3])}"
+                f"{'...' if len(blocked) > 3 else ''} cannot launch; "
+                f"{MISSING_APPROVAL_REMEDY}"
+            ),
+        )
+
+    return Check(
+        name="Workspace Trust",
+        status="ok",
+        detail=f"{approved.repository_root} approved by {approved.source.path}",
+    )
+
+
 def _check_retry_templates(config: Config) -> Check | None:
     """Check if retry templates exist. Returns None if no templates configured."""
     repo_root = config.repo_root
@@ -271,6 +310,10 @@ def check_agents(
 
     checks.append(Check(name="Agents", status="ok", detail=f"{agent_count} configured"))
     checks.append(_check_agent_scripts(config))
+
+    trust_check = _check_workspace_trust(config)
+    if trust_check:
+        checks.append(trust_check)
 
     prompt_check = _check_agent_prompts(config, runner)
     if prompt_check:

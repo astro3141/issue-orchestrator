@@ -5134,3 +5134,77 @@ security:
                     "security.workspace_trust.approved_repository_root=/tmp/anything"
                 ],
             )
+
+    def test_the_approved_root_is_recorded_canonicalized(self, tmp_path):
+        """A root spelled through a symlink must still match a resolved launch.
+
+        The provider resolves the launch's common repository root and the
+        grant compares the two for equality, so an approval left in the
+        operator's (symlinked) spelling would be a correct approval that
+        denies every launch.
+        """
+        real_root = tmp_path / "real" / "issue-orchestrator"
+        real_root.mkdir(parents=True)
+        link_parent = tmp_path / "linked"
+        link_parent.symlink_to(tmp_path / "real", target_is_directory=True)
+
+        config = Config.load(
+            self._config_text(
+                tmp_path,
+                f"""
+security:
+  workspace_trust:
+    approved_repository_root: {link_parent / "issue-orchestrator"}
+""",
+            )
+        )
+
+        assert config.workspace_trust.repository_root == real_root.resolve()
+
+    def test_a_recorded_approval_is_not_an_unknown_field(self, tmp_path):
+        """The approval is declared config, not a stray key.
+
+        Unknown fields are errors here, so a config carrying a real approval
+        would otherwise fail validation for recording it.
+        """
+        config = Config.load(
+            self._config_text(
+                tmp_path,
+                f"""
+security:
+  workspace_trust:
+    approved_repository_root: {tmp_path}
+""",
+            )
+        )
+
+        assert config.validate_unknown_fields() == []
+
+    def test_a_typo_inside_the_approval_still_stops_the_engine(self, tmp_path):
+        with pytest.raises(ValueError):
+            Config.load(
+                self._config_text(
+                    tmp_path,
+                    f"""
+security:
+  workspace_trust:
+    approved_repository_roots: {tmp_path}
+""",
+                )
+            )
+
+    def test_canonicalization_does_not_launder_a_relative_root(self, tmp_path):
+        """Resolving first would turn a relative root into a plausible one."""
+        with pytest.raises(ValueError, match="must be absolute"):
+            Config.load(
+                self._config_text(
+                    tmp_path,
+                    """
+security:
+  workspace_trust:
+    approved_repository_root: io-fork/issue-orchestrator
+""",
+                )
+            )
+
+

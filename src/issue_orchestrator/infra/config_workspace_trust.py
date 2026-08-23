@@ -12,6 +12,7 @@ the only code that reads or writes the key.
 from __future__ import annotations
 
 import hashlib
+from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -73,6 +74,12 @@ def parse_workspace_trust(
     The authority's identity travels with the grant: the config document that
     carries it, and a fingerprint of the exact bytes read from it, so launch
     evidence can name *which* document approved the root.
+
+    The approved root is recorded **canonicalized** (see
+    :func:`_canonical_approved_root`). Resolved-path equality is the assumption
+    the whole mechanism rests on: the provider resolves the launch's common
+    repository root, the grant compares the two with ``!=``, and the resolved
+    spelling is what is handed to Codex as the ``projects`` key.
     """
     if trust_section is None:
         return None
@@ -100,12 +107,33 @@ def parse_workspace_trust(
             "in-memory config cannot be identified"
         )
     try:
-        return ApprovedRepositoryTrust(
+        # Validate the document's spelling exactly as written, *then*
+        # canonicalize. The order is load-bearing in both directions.
+        #
+        # Validate first: ``Path.resolve`` would launder a relative root, a
+        # ``..`` segment, or a home-anchored path into an innocent-looking
+        # absolute one — a relative root would silently mean "wherever the
+        # engine happened to start". ``ApprovedRepositoryTrust`` rejects all
+        # three, so it sees the operator's own text.
+        #
+        # Canonicalize second: the provider resolves the launch's common
+        # repository root and the grant compares the two with ``!=``. An
+        # approval written through a symlink (macOS ``/tmp`` →
+        # ``/private/tmp``, a symlinked home or checkout parent) would
+        # otherwise be a *correct* approval that denies every launch. It
+        # denies safely, but a human who approved the right directory deserves
+        # it to work, so both sides are brought to one spelling here — once,
+        # at the only place an approval enters the system. ``replace`` re-runs
+        # the domain's validation, so the canonical form is checked too.
+        declared = ApprovedRepositoryTrust(
             repository_root=Path(raw_root.strip()),
             source=TrustAuthoritySource(
                 path=config_path,
                 fingerprint=_config_document_fingerprint(config_path),
             ),
+        )
+        return replace(
+            declared, repository_root=declared.repository_root.resolve()
         )
     except WorkspaceTrustError as exc:
         raise ValueError(

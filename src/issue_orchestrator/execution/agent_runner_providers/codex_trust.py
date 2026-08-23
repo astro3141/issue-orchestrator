@@ -121,16 +121,27 @@ def resolve_codex_common_repository_root(working_directory: Path) -> Path:
 
 
 def authorize_codex_workspace_trust(
-    workspace: LaunchWorkspace,
+    workspace: LaunchWorkspace | None,
 ) -> RepositoryTrustGrant:
     """Authorize one Codex launch, or fail closed.
 
-    Raises :class:`WorkspaceTrustError` when the launch carries no approval,
-    when the working directory's common repository root cannot be resolved,
-    and when that root is not the approved one. The returned grant exists only
-    for a verified match, and its evidence is logged at the moment of the
-    decision so an operator can reconstruct why the repository was trusted.
+    Raises :class:`WorkspaceTrustError` when the launch declares no workspace
+    at all, when it carries no approval, when the working directory's common
+    repository root cannot be resolved, and when that root is not the approved
+    one. The returned grant exists only for a verified match, and its evidence
+    is logged at the moment of the decision so an operator can reconstruct why
+    the repository was trusted.
+
+    ``workspace is None`` and ``approved_trust is None`` are the same denial —
+    "I could not tell" must never be recorded as "trusted" — so both live here
+    rather than being restated by each caller.
     """
+    if workspace is None:
+        raise WorkspaceTrustError(
+            "Refusing to build an interactive Codex launch that declares no "
+            "launch workspace: workspace trust cannot be verified, and an "
+            "unverified launch parks on Codex's trust dialog"
+        )
     approved = workspace.approved_trust
     if approved is None:
         raise WorkspaceTrustError(

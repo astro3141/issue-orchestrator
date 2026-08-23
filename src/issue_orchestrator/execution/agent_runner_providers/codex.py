@@ -8,7 +8,6 @@ Previously in ``_vendor/agent_runner/providers/codex.py``.
 from collections.abc import Mapping
 from typing import TYPE_CHECKING
 
-from issue_orchestrator.domain.workspace_trust import WorkspaceTrustError
 from issue_orchestrator.ports.provider_readiness import ProviderReadiness
 from issue_orchestrator.ports.provider_resilience import ProviderErrorType
 
@@ -112,6 +111,16 @@ class CodexProvider(CLIProvider):
     def needs_fresh_prompt_process(self, **kwargs: object) -> bool:
         return self.runs_interactively(**kwargs)
 
+    def requires_workspace_trust(self, **kwargs: object) -> bool:
+        """Exactly the interactive launches, which is where the dialog is.
+
+        ``build_command`` authorizes workspace trust for ``execution_mode``
+        ``interactive`` and skips it for ``exec``; this answers the same
+        question from the same arguments, so config validation cannot drift
+        from what the launch will actually do.
+        """
+        return self.runs_interactively(**kwargs)
+
     def build_command(
         self,
         prompt: str,
@@ -168,7 +177,7 @@ class CodexProvider(CLIProvider):
         # Fail closed before any argv is assembled: an interactive launch that
         # cannot prove it runs in the approved repository must not spawn.
         trust_grant = (
-            self._authorize_workspace_trust(launch_workspace)
+            authorize_codex_workspace_trust(launch_workspace)
             if execution_mode == "interactive"
             else None
         )
@@ -228,24 +237,6 @@ class CodexProvider(CLIProvider):
                 cmd.extend(["--ask-for-approval", "on-request"])
             else:
                 cmd.extend(["--ask-for-approval", "never"])
-
-    @staticmethod
-    def _authorize_workspace_trust(
-        launch_workspace: "LaunchWorkspace | None",
-    ) -> "RepositoryTrustGrant":
-        """Return the verified trust grant for an interactive launch.
-
-        A caller that supplies no workspace has declared no approval state at
-        all, which is the same denial as an unapproved repository — "I could
-        not tell" must never be recorded as "trusted".
-        """
-        if launch_workspace is None:
-            raise WorkspaceTrustError(
-                "Refusing to build an interactive Codex launch that declares "
-                "no launch workspace: workspace trust cannot be verified, and "
-                "an unverified launch parks on Codex's trust dialog"
-            )
-        return authorize_codex_workspace_trust(launch_workspace)
 
     @classmethod
     def _append_config_overrides(
