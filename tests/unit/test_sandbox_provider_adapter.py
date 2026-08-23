@@ -677,6 +677,32 @@ def test_codex_build_command_places_scope_before_exec_and_ignores_yolo(
     assert cmd[-1] == "task"
 
 
+def test_codex_build_command_disables_update_check_under_strict_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A scoped launch still suppresses the startup update prompt (#205).
+
+    The scope path adds ``--strict-config``, which fails loudly on unknown
+    config keys — so this also proves ``check_for_update_on_startup`` is a
+    key Codex recognises rather than a silently dropped one, and that the
+    scope's own ``-c`` overrides do not displace it.
+    """
+    monkeypatch.setattr(
+        sandbox_module,
+        "resolve_git_worktree_access",
+        lambda _worktree: _git_access(),
+    )
+    cmd = CodexProvider().build_command(
+        prompt="task",
+        model=None,
+        sandbox_scope=_scope(),
+    )
+    overrides = _codex_config_overrides(cmd)
+    assert "--strict-config" in cmd
+    assert overrides["check_for_update_on_startup"] is False
+    assert overrides["default_permissions"] == CODEX_PERMISSION_PROFILE
+
+
 # ---------------------------------------------------------------------------
 # Claude build_command integration + byte-for-byte OFF regression guard
 # ---------------------------------------------------------------------------

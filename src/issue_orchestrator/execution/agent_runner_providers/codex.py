@@ -48,6 +48,23 @@ class CodexProvider(CLIProvider):
     AUTH_STATUS_ARGV = ("login", "status")
     _LOGGED_IN_MARKER = "logged in using"
 
+    # Codex checks for a newer upstream release on startup and, when one
+    # exists, paints an interactive nag ("✨ Update available!") that waits on
+    # Enter before the composer is reachable. An unattended launch parks there
+    # forever. The trigger is upstream advancing, not anything IO does, so
+    # pinning a runtime does not suppress the prompt — it guarantees the prompt
+    # recurs, and its offered remedy (`brew upgrade --cask codex`) would mutate
+    # the pinned host toolchain. ``check_for_update_on_startup`` is Codex's
+    # documented ConfigToml field for exactly this: it gates the startup check
+    # and its prompt only, orthogonal to ``approval_policy``, ``sandbox_mode``,
+    # ``permissions`` and ``projects.*.trust_level``. It grants no capability
+    # and leaves ``codex update`` available. Emitting it as a ``-c`` override
+    # keeps it the highest-precedence config layer (so no user, project, or
+    # system layer can re-enable it), scopes it to this launch, writes no
+    # host-wide state, and leaves the decision auditable in the recorded argv
+    # (#205).
+    UPDATE_CHECK_OVERRIDE = ("-c", "check_for_update_on_startup=false")
+
     def check_readiness(self, runner: "CommandRunner") -> ProviderReadiness:
         """Probe Codex's local credential state without spawning a TUI."""
         if not self.is_available():
@@ -147,6 +164,8 @@ class CodexProvider(CLIProvider):
         # Model (optional - Codex will use default if not specified)
         if model:
             cmd.extend(["--model", model])
+
+        cmd.extend(self.UPDATE_CHECK_OVERRIDE)
 
         self._append_reasoning_effort(cmd, kwargs)
 

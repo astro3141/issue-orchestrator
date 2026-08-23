@@ -642,8 +642,13 @@ class TestAgentConfig:
         assert "--ask-for-approval" in tokens
         assert "never" in tokens
         assert "gpt-5.4" in tokens
-        config_idx = tokens.index("-c")
-        assert tokens[config_idx + 1] == 'model_reasoning_effort="xhigh"'
+        # Codex takes several ``-c`` overrides; locate this one by its key
+        # rather than assuming it is the first pair emitted.
+        config_idx = tokens.index('model_reasoning_effort="xhigh"')
+        assert tokens[config_idx - 1] == "-c"
+        # Every launch this config path builds also disables the interactive
+        # startup update prompt, which would otherwise park the TUI (#205).
+        assert tokens[tokens.index("check_for_update_on_startup=false") - 1] == "-c"
 
 
 class TestSession:
