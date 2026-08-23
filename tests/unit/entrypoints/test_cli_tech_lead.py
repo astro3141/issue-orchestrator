@@ -158,3 +158,135 @@ class TestCmdHealthReview:
         assert "TERMINATION INCOMPLETE" in out  # not a bare "session terminated"
         assert "/wt/repo-tech-lead-200-abc" in out  # the exact leaked path
         assert "remove it manually" in out
+
+
+class TestOneShotAnswersTheCallbackEndpointLifecycle:
+    """A one-shot command must answer the endpoint question before it launches.
+
+    Neither command binds a Control API — each drives ``tick()`` itself in a
+    blocking loop and exits — so nothing ever publishes a bound port. Until
+    #193 neither declared unavailability either, leaving ``is_ready()`` false
+    forever: the launcher's callback guard refused every attempt, and a
+    dispatch that admission had already queued never reached a session start.
+
+    These pin the answer at the moment of dispatch, and pin it through the
+    production guard rather than through a boolean, so a change that satisfies
+    ``is_ready()`` some other way still has to satisfy the launcher.
+    """
+
+    @staticmethod
+    def _orchestrator_with_real_endpoint() -> Mock:
+        from issue_orchestrator.infra.agent_callback_endpoint import (
+            RuntimeAgentCallbackEndpoint,
+        )
+
+        orchestrator = Mock()
+        # The real runtime endpoint, in the unresolved state a freshly built
+        # orchestrator starts in. A mock here would report ready by accident.
+        orchestrator.deps.agent_callback_endpoint = RuntimeAgentCallbackEndpoint()
+        return orchestrator
+
+    @staticmethod
+    def _gate_verdict_at_dispatch(orchestrator: Mock):
+        """What the launcher's own guard says, captured when dispatch runs."""
+        from issue_orchestrator.control.launch_guards import (
+            callback_endpoint_not_ready,
+        )
+
+        return callback_endpoint_not_ready(orchestrator.deps.agent_callback_endpoint)
+
+    def test_targeted_dispatch_passes_the_launchers_callback_guard(self) -> None:
+        from issue_orchestrator.control.tech_lead_trigger import (
+            InvestigationResult,
+            TechLeadOutcomeStatus,
+        )
+
+        config = Config()
+        orchestrator = self._orchestrator_with_real_endpoint()
+        verdicts = []
+        load_p, log_p = _patches(config)
+        with load_p, log_p, _lock_held_ok(), patch(
+            "issue_orchestrator.entrypoints.bootstrap.build_orchestrator",
+            return_value=orchestrator,
+        ), patch(
+            "issue_orchestrator.control.tech_lead_trigger.run_targeted_investigations",
+            side_effect=lambda *a, **k: verdicts.append(
+                self._gate_verdict_at_dispatch(orchestrator)
+            )
+            or [
+                InvestigationResult(
+                    23, status=TechLeadOutcomeStatus.COMPLETED, detail="done"
+                )
+            ],
+        ):
+            rc = cli_tech_lead.cmd_tech_lead(
+                _args(issues=[23], flavor="planning_investigation")
+            )
+
+        assert rc == 0
+        assert verdicts == [None], (
+            "the launcher's callback guard would still have refused this dispatch"
+        )
+
+    def test_health_review_shares_the_same_answer(self) -> None:
+        """Scope item 3: one owner, no ``tech_lead``-specific duplicate."""
+        config = Config()
+        orchestrator = self._orchestrator_with_real_endpoint()
+        verdicts = []
+        load_p, log_p = _patches(config)
+        with load_p, log_p, _lock_held_ok(), patch(
+            "issue_orchestrator.entrypoints.bootstrap.build_orchestrator",
+            return_value=orchestrator,
+        ), patch(
+            "issue_orchestrator.control.tech_lead_trigger.run_health_review",
+            side_effect=lambda *a, **k: verdicts.append(
+                self._gate_verdict_at_dispatch(orchestrator)
+            )
+            or HealthReviewResult(
+                200, status=TechLeadOutcomeStatus.COMPLETED, detail="done"
+            ),
+        ):
+            rc = cli_tech_lead.cmd_health_review(_args())
+
+        assert rc == 0
+        assert verdicts == [None]
+
+    def test_the_answer_hands_agents_no_address_at_all(self) -> None:
+        """Ready is not the same as reachable, and the difference matters.
+
+        Satisfying the guard by publishing a port would be a lie — nothing is
+        listening in a one-shot run — and would hand every spawned agent a dead
+        ``localhost:<port>``, which is the exact failure the endpoint port
+        exists to prevent (#6913, #6924). The honest answer resolves to no port
+        at all, so the session environment simply omits it.
+        """
+        from issue_orchestrator.control.tech_lead_trigger import (
+            InvestigationResult,
+            TechLeadOutcomeStatus,
+        )
+        from issue_orchestrator.control.session_env import api_port_export
+
+        config = Config()
+        orchestrator = self._orchestrator_with_real_endpoint()
+        exports = []
+        load_p, log_p = _patches(config)
+        with load_p, log_p, _lock_held_ok(), patch(
+            "issue_orchestrator.entrypoints.bootstrap.build_orchestrator",
+            return_value=orchestrator,
+        ), patch(
+            "issue_orchestrator.control.tech_lead_trigger.run_targeted_investigations",
+            side_effect=lambda *a, **k: exports.append(
+                api_port_export(
+                    config.control_api_port,
+                    orchestrator.deps.agent_callback_endpoint,
+                )
+            )
+            or [
+                InvestigationResult(
+                    23, status=TechLeadOutcomeStatus.COMPLETED, detail="done"
+                )
+            ],
+        ):
+            cli_tech_lead.cmd_tech_lead(_args(issues=[23], flavor=None))
+
+        assert exports == [""], f"agents were handed an endpoint: {exports!r}"

@@ -5,6 +5,10 @@ concerns, and because all three modes share one easily-missed
 obligation: each either binds a Control API or must say it serves none.
 Agents are launched with an environment pointing at that endpoint, so a
 mode that does neither strands every callback (#6924 F7).
+
+:func:`declare_no_control_api` is the half of that obligation for a mode
+that binds nothing, and it is not exclusive to ``start`` — the one-shot
+``tech_lead`` / ``health-review`` commands reuse it too (#193).
 """
 
 from __future__ import annotations
@@ -57,6 +61,10 @@ def declare_no_control_api(orchestrator, api_port: int | None) -> None:
     explicitly is what lets the launcher tell "no Control API here" from
     "the server has not published yet" — only the second must block
     agent launch.
+
+    Shared beyond ``start``: the one-shot ``tech_lead`` / ``health-review``
+    commands bind no server at all and answer through this same owner with
+    ``None`` (#193), rather than growing a second answer of their own.
     """
     if api_port is None:
         orchestrator.deps.agent_callback_endpoint.declare_unavailable()
