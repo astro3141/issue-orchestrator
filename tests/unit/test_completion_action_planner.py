@@ -3062,6 +3062,29 @@ class TestMilestoneResolutionBoundary:
         ]
         assert create.milestone == TechLeadMilestoneIntent(explicit_name="M5")
 
+    def test_a_planning_run_still_settles_its_authorized_create_issue(
+        self, tmp_path: Path
+    ) -> None:
+        """The zero-code lane suppresses PUBLICATION intent, nothing else (#202).
+
+        A planning run's authorized ``create_issue`` settles through the same
+        owner it always did — the effect planner reads the decision artifact,
+        which the completion path neither consumes nor rewrites.
+        """
+        from unittest.mock import MagicMock
+
+        config = make_tech_lead_config(tmp_path)
+        session = make_tech_lead_session(tmp_path)
+        arm_planning_session(config, session)
+        self._plant_pair_with_create_issue(session)
+
+        actions = self._completed_actions(config, session, MagicMock())
+
+        [create] = [
+            action for action in actions if isinstance(action, CreateTechLeadIssueAction)
+        ]
+        assert create.title == "Stabilize CI runner"
+
 
 def test_provider_blocked_rework_restores_its_needs_rework_trigger(
     tmp_path: Path,

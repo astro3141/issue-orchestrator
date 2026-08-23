@@ -12,7 +12,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -36,6 +36,7 @@ from issue_orchestrator.domain.tech_lead_session import (
     TechLeadLaunchScope,
     TechLeadSessionFlavor,
 )
+from issue_orchestrator.ports.working_copy import WorkingCopy
 from issue_orchestrator.ports.tech_lead_authority import (
     InMemoryTechLeadAuthorityStore,
     TechLeadAuthorityConflictError,
@@ -877,6 +878,16 @@ class TestOrdinaryLaneThroughThePolicyOwner:
 
         return _Downloader()
 
+    @staticmethod
+    def _working_copy():
+        """A checkout whose HEAD reads back, so the launch base is recorded."""
+
+        class _WorkingCopy:
+            def get_head_sha(self, worktree):
+                return "a" * 40
+
+        return _WorkingCopy()
+
     def _prepare(self, tmp_path: Path, subject, host, store):
         run_dir = tmp_path / "worktree" / ".issue-orchestrator" / "sessions" / "run"
         run_dir.mkdir(parents=True)
@@ -887,6 +898,7 @@ class TestOrdinaryLaneThroughThePolicyOwner:
             manifest_downloader=self._manifest_downloader(),
             tech_lead_authority=store,
             board_snapshot_provider=self._board_provider(),
+            working_copy=cast("WorkingCopy", self._working_copy()),
             issue=subject,
             ctx=ctx,
             tech_lead_scope=TechLeadLaunchScope(

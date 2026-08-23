@@ -196,6 +196,60 @@ def test_health_problem_cohort_round_trips_and_is_validated() -> None:
         )
 
 
+def _planning(launch_base_sha: str = "a" * 40) -> TechLeadLaunchAuthority:
+    return TechLeadLaunchAuthority(
+        flavor=TechLeadSessionFlavor.PLANNING_INVESTIGATION,
+        anchor_issue_number=23,
+        focus_issue_number=23,
+        launch_base_sha=launch_base_sha,
+    )
+
+
+def test_launch_base_sha_survives_serialization_and_the_store(
+    tmp_path: Path,
+) -> None:
+    """The zero-code lane's launch-time half must outlive the process (#202)."""
+    store = SqliteTechLeadAuthorityStore.for_repo(tmp_path)
+    store.record(run_id="r1", session_name="issue-23", authority=_planning())
+
+    assert TechLeadLaunchAuthority.from_dict(_planning().to_dict()) == _planning()
+    reopened = SqliteTechLeadAuthorityStore.for_repo(tmp_path)
+    loaded = reopened.load(run_id="r1", session_name="issue-23")
+    assert loaded is not None
+    assert loaded.launch_base_sha == "a" * 40
+
+
+def test_a_row_written_before_the_launch_base_existed_still_loads(
+    tmp_path: Path,
+) -> None:
+    """Legacy rows load — they simply carry no launch base to be exempt on.
+
+    Refusing to PARSE them would be a different, much worse failure: the run
+    would lose its scope authority entirely rather than merely its lane.
+    """
+    legacy = _planning().to_dict()
+    del legacy["launch_base_sha"]
+
+    restored = TechLeadLaunchAuthority.from_dict(legacy)
+
+    assert restored.launch_base_sha == ""
+    assert restored.flavor is TechLeadSessionFlavor.PLANNING_INVESTIGATION
+
+
+def test_a_non_string_launch_base_fails_loudly() -> None:
+    """The store is orchestrator-owned; corruption is a bug, not input."""
+    corrupt = _planning().to_dict()
+    corrupt["launch_base_sha"] = 42
+
+    with pytest.raises(ValueError, match="launch_base_sha"):
+        TechLeadLaunchAuthority.from_dict(corrupt)
+
+
+def test_a_padded_launch_base_is_refused_at_construction() -> None:
+    with pytest.raises(ValueError, match="launch_base_sha"):
+        _planning(launch_base_sha=" " + "a" * 40 + "\n")
+
+
 def test_discard_removes_only_the_named_run(tmp_path: Path) -> None:
     """Retention (#6769 F3): discard drops one run's row and nothing else."""
     store = SqliteTechLeadAuthorityStore.for_repo(tmp_path)

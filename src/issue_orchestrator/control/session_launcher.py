@@ -644,6 +644,7 @@ class SessionLauncher:
             manifest_downloader=self._manifest_downloader,
             tech_lead_authority=self._tech_lead_authority,
             board_snapshot_provider=self._board_snapshot_provider,
+            working_copy=self._working_copy,
             issue=issue,
             ctx=ctx,
             tech_lead_scope=tech_lead_scope,

@@ -51,6 +51,7 @@ from __future__ import annotations
 
 import json
 import logging
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable
 
@@ -238,20 +239,43 @@ def load_validated_tech_lead_pair(
     return result
 
 
-def tech_lead_decision_processing_error(
+@dataclass(frozen=True, slots=True)
+class TechLeadCompletionAdmission:
+    """Whether a COMPLETED tech_lead session is admitted, and under what.
+
+    Exactly one of the two is set. ``authority`` is the verified launch record
+    the run is admitted under, handed back so the seam that just validated it
+    is also the seam that hands it on — a caller needing the run's authoritative
+    flavor (the zero-code lane, #202) must not re-derive it from a second store
+    read taken after the decision it belongs to was judged.
+    """
+
+    authority: TechLeadLaunchAuthority | None
+    error: str | None
+
+    def __post_init__(self) -> None:
+        if (self.authority is None) == (self.error is None):
+            raise ValueError(
+                "TechLeadCompletionAdmission carries either the verified launch"
+                " authority or the reason there is none, never both and never"
+                f" neither (authority={self.authority!r}, error={self.error!r})"
+            )
+
+
+def admit_tech_lead_completion(
     config: "Config",
     *,
     tech_lead_authority: "TechLeadAuthorityStore",
     run_dir: Path,
     run_id: str,
     session_name: str,
-) -> str | None:
+) -> TechLeadCompletionAdmission:
     """Authoritative scope + pair validation for a COMPLETED tech_lead session.
 
     Called from the completion processing path's PRE-ACTION policy phase —
     before the completion record is preserved and before ANY requested action
     executes (#6769 finding 1). A missing/tampered launch authority (#6761
-    re-review F1) or a missing/rejected artifact pair (#6761 F3) returns a
+    re-review F1) or a missing/rejected artifact pair (#6761 F3) yields a
     tagged processing error; the processor rejects the completion outright
     (zero push/PR/comment calls) and ``critical_processing_errors``
     classifies the error critical so history records FAILED and the failure
@@ -261,16 +285,44 @@ def tech_lead_decision_processing_error(
         tech_lead_authority, run_dir=run_dir, run_id=run_id, session_name=session_name
     )
     if authority is None:
-        return f"{ERROR_PREFIX_TECH_LEAD_AUTHORITY}: missing_authority: {tamper}"
+        return TechLeadCompletionAdmission(
+            None, f"{ERROR_PREFIX_TECH_LEAD_AUTHORITY}: missing_authority: {tamper}"
+        )
     if tamper is not None:
-        return f"{ERROR_PREFIX_TECH_LEAD_AUTHORITY}: scope_tampered: {tamper}"
+        return TechLeadCompletionAdmission(
+            None, f"{ERROR_PREFIX_TECH_LEAD_AUTHORITY}: scope_tampered: {tamper}"
+        )
     result = load_validated_tech_lead_pair(
         run_dir, authority, config=config, labels=LabelManager(config)
     )
     if result.ok:
-        return None
+        return TechLeadCompletionAdmission(authority, None)
     failure = result.failure.value if result.failure else "unknown"
-    return f"{ERROR_PREFIX_TECH_LEAD_DECISION}: {failure}: {result.detail}"
+    return TechLeadCompletionAdmission(
+        None, f"{ERROR_PREFIX_TECH_LEAD_DECISION}: {failure}: {result.detail}"
+    )
+
+
+def tech_lead_decision_processing_error(
+    config: "Config",
+    *,
+    tech_lead_authority: "TechLeadAuthorityStore",
+    run_dir: Path,
+    run_id: str,
+    session_name: str,
+) -> str | None:
+    """Why a COMPLETED tech_lead session is inadmissible, or None.
+
+    The error-only view of :func:`admit_tech_lead_completion`, for callers that
+    ask nothing of the record beyond whether it stands.
+    """
+    return admit_tech_lead_completion(
+        config,
+        tech_lead_authority=tech_lead_authority,
+        run_dir=run_dir,
+        run_id=run_id,
+        session_name=session_name,
+    ).error
 
 
 _TECH_LEAD_ERROR_PREFIXES = (ERROR_PREFIX_TECH_LEAD_DECISION, ERROR_PREFIX_TECH_LEAD_AUTHORITY)
