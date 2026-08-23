@@ -15,11 +15,22 @@ restart. Every decoder here fails loudly on a payload it cannot rebuild.
 one durable spelling of a key shared with the publish-retry locators. Encoding
 it a second time here would let two artifacts naming the same work item
 round-trip to keys that compare unequal.
+
+Failing loudly is not the same as failing usefully, though (#209). This
+orchestrator PINS trusted runtimes while ``main`` advances, so an older build
+meeting durable state written by a newer one is a designed-for condition rather
+than an accident. Every refusal here therefore carries a
+:class:`~..ports.pending_work_claim_store.ClaimReadability`: an artifact this
+build merely lacks the vocabulary for is intact and recoverable by the build
+that wrote it, and saying otherwise sends an operator hunting for damage that
+does not exist.
 """
 
 from __future__ import annotations
 
-from typing import Any, Callable
+import json
+from enum import Enum
+from typing import Any, Callable, TypeVar
 
 from ..domain.issue_key import IssueKey
 from ..domain.issue_key_codec import (
@@ -42,15 +53,50 @@ from ..domain.pending_work import (
 )
 from ..domain.session_key import TaskKind
 from ..domain.tech_lead_session import TechLeadSessionFlavor
+from ..ports.pending_work_claim_store import ClaimReadability, UnreadableClaimError
 
 CLAIM_ARTIFACT_NAME = "pending-work-claim.json"
 # Bumped only when an encoding change cannot be read by the previous decoder.
 # A payload from a different version is refused rather than guessed at.
+#
+# It is deliberately NOT bumped when a persisted enum merely gains a member
+# (#209). The version gate is an EQUALITY check, so a bump makes every already
+# stored payload unreadable to the build that bumped it — trading a
+# forward-compatibility problem for a strictly worse backward-compatibility one,
+# on artifacts that are the only record of work in flight. Growth in an enum's
+# value space is handled where it actually shows up instead: see
+# :func:`_persisted_enum`.
 CLAIM_SCHEMA_VERSION = 1
 
+_EnumT = TypeVar("_EnumT", bound=Enum)
 
-class PendingWorkClaimDecodeError(ValueError):
-    """A stored claim could not be rebuilt into its original typed request."""
+
+class PendingWorkClaimDecodeError(UnreadableClaimError):
+    """A stored claim could not be rebuilt into its original typed request.
+
+    Never raised directly — every refusal is one of the two subclasses below,
+    which is what lets a caller branch on WHY without parsing a message. The
+    base survives as the thing to catch when only "unreadable" matters, and as
+    the name every existing caller already spells.
+    """
+
+
+class NewerPendingWorkClaimError(PendingWorkClaimDecodeError):
+    """The payload is well-formed; this build's vocabulary is too small.
+
+    A pinned runtime reading state written by ``main`` is the ordinary case, so
+    this is a statement about the reader, not about the artifact: the bytes are
+    intact, nothing has been discarded, and the build that wrote them still
+    reads them.
+    """
+
+    readability = ClaimReadability.UNREADABLE_NEWER
+
+
+class CorruptPendingWorkClaimError(PendingWorkClaimDecodeError):
+    """The payload is a shape no build ever wrote, or contradicts itself."""
+
+    readability = ClaimReadability.UNREADABLE_CORRUPT
 
 
 def encode_claim(claim: PendingWorkClaim) -> dict[str, Any]:
@@ -62,27 +108,58 @@ def encode_claim(claim: PendingWorkClaim) -> dict[str, Any]:
     }
 
 
-def decode_claim(payload: object) -> PendingWorkClaim:
-    """Rebuild a claim, raising when the payload cannot produce the original."""
-    if not isinstance(payload, dict):
-        raise PendingWorkClaimDecodeError(
-            f"claim payload must be an object, got {type(payload).__name__}"
-        )
-    version = payload.get("schema_version")
-    if version != CLAIM_SCHEMA_VERSION:
-        raise PendingWorkClaimDecodeError(
-            f"unsupported claim schema version {version!r}; "
-            f"this build writes {CLAIM_SCHEMA_VERSION}"
+def encode_claim_text(claim: PendingWorkClaim) -> str:
+    """The claim exactly as a store writes it: one canonical JSON document.
+
+    Key order is fixed, so two encodings of the same claim compare equal as
+    TEXT - which is what an idempotent re-hold rests on when it compares a
+    stored payload against the one it is about to write.
+    """
+    return json.dumps(encode_claim(claim), sort_keys=True)
+
+
+def decode_claim_text(text: object, *, source: str) -> PendingWorkClaim:
+    """Rebuild a claim from stored text, with the refusal classified (#209).
+
+    The JSON framing is part of the durable artifact, so it is decoded and
+    classified HERE rather than by each store: a store that unwrapped the text
+    itself had to invent its own verdict for "that is not JSON", and a verdict
+    invented per call site is the untyped branch this module now exists to
+    remove. Text that is not JSON at all is a shape no build ever wrote.
+
+    ``source`` names the row for the operator - a run key, a file - and is
+    never parsed.
+    """
+    if not isinstance(text, str):
+        raise CorruptPendingWorkClaimError(
+            f"stored claim for {source} is {type(text).__name__}, not text"
         )
     try:
-        kind = PendingWorkKind(payload["kind"])
-    except (KeyError, ValueError) as exc:
-        raise PendingWorkClaimDecodeError(
-            f"claim payload has no known pending work kind: {payload.get('kind')!r}"
+        loaded = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise CorruptPendingWorkClaimError(
+            f"stored claim for {source} is unreadable: {exc}"
         ) from exc
+    return decode_claim(loaded)
+
+
+def decode_claim(payload: object) -> PendingWorkClaim:
+    """Rebuild a claim, raising a CLASSIFIED refusal when it cannot (#209).
+
+    Returning the claim is the ``READABLE`` verdict; the other two arrive as
+    :class:`NewerPendingWorkClaimError` and :class:`CorruptPendingWorkClaimError`
+    so that no caller has to read an error message to tell an intact artifact
+    from a damaged one.
+    """
+    if not isinstance(payload, dict):
+        raise CorruptPendingWorkClaimError(
+            f"claim payload must be an object, got {type(payload).__name__}"
+        )
+    _require_supported_schema_version(payload.get("schema_version"))
+    kind = _persisted_enum(PendingWorkKind, payload, "kind")
     request = payload.get("request")
     if not isinstance(request, dict):
-        raise PendingWorkClaimDecodeError(
+        raise CorruptPendingWorkClaimError(
             f"{kind.value} claim payload has no request object"
         )
     try:
@@ -90,18 +167,76 @@ def decode_claim(payload: object) -> PendingWorkClaim:
     except PendingWorkClaimDecodeError:
         raise
     except (KeyError, TypeError, ValueError) as exc:
-        raise PendingWorkClaimDecodeError(
+        raise CorruptPendingWorkClaimError(
             f"{kind.value} claim payload could not be rebuilt: {exc}"
+        ) from exc
+
+
+def _require_supported_schema_version(version: object) -> None:
+    """Refuse a version this build has no decoder for, saying which kind it is.
+
+    A version number that is an integer is a well-formed field whatever its
+    value; the artifact is simply spoken in a dialect this build does not
+    implement, which is what ``UNREADABLE_NEWER`` means. Anything else — absent,
+    a string, ``true`` — is a shape the encoder never produces.
+    """
+    if isinstance(version, bool) or not isinstance(version, int):
+        raise CorruptPendingWorkClaimError(
+            f"claim payload carries no usable schema version: {version!r}"
+        )
+    if version != CLAIM_SCHEMA_VERSION:
+        raise NewerPendingWorkClaimError(
+            f"claim schema version {version} is not the {CLAIM_SCHEMA_VERSION} "
+            "this build implements; the stored claim is intact and a build that "
+            "implements that version reads it unchanged"
+        )
+
+
+def _persisted_enum(
+    enum_cls: type[_EnumT], payload: dict[str, Any], field: str
+) -> _EnumT:
+    """Rebuild a persisted enum member, telling "unknown" apart from "wrong".
+
+    The whole of #209 lives in this distinction. An enum's VALUE SPACE grows
+    without the payload's SHAPE changing — ``TechLeadSessionFlavor`` gained
+    ``planning_investigation`` in #136 — so the schema version cannot see it and
+    the old runtime sails through the version gate before failing at coercion.
+    Treating that as corruption told an operator an intact claim could not be
+    recovered.
+
+    A well-formed string this build's enum does not carry therefore means the
+    artifact was written by a build that knows more members than this one. Only
+    an ABSENT field or a value of the wrong TYPE is a shape no build ever wrote.
+    """
+    if field not in payload:
+        raise CorruptPendingWorkClaimError(
+            f"claim payload has no {field!r} field"
+        )
+    raw = payload[field]
+    if not isinstance(raw, str):
+        raise CorruptPendingWorkClaimError(
+            f"claim payload field {field!r} must be a string, "
+            f"got {type(raw).__name__}"
+        )
+    try:
+        return enum_cls(raw)
+    except ValueError as exc:
+        raise NewerPendingWorkClaimError(
+            f"claim payload field {field!r} is {raw!r}, which this build's "
+            f"{enum_cls.__name__} does not carry; the claim was written by a "
+            "build whose value space is larger, and is intact for that build"
         ) from exc
 
 
 def _decode_issue_key(payload: object) -> IssueKey:
     # Re-raised as this artifact's own decode error: a caller catching a bad
     # claim should not have to know which shared codec spelled the failure.
+    # An issue key has no value space that can grow, so a rejected one is
+    # malformed rather than merely unfamiliar.
     try:
         return decode_issue_key(payload)
     except IssueKeyDecodeError as exc:
-        raise PendingWorkClaimDecodeError(str(exc)) from exc
+        raise CorruptPendingWorkClaimError(str(exc)) from exc
 
 
 def _encode_review(request: PendingWorkRequest) -> dict[str, Any]:
@@ -211,7 +346,7 @@ def _decode_validation_retry(payload: dict[str, Any]) -> PendingValidationRetry:
         validation_error=str(payload["validation_error"]),
         validation_error_file=payload["validation_error_file"],
         retry_count=int(payload["retry_count"]),
-        source_task=TaskKind(payload["source_task"]),
+        source_task=_persisted_enum(TaskKind, payload, "source_task"),
         validation_cmd=payload["validation_cmd"],
     )
 
@@ -235,7 +370,7 @@ def _decode_tech_lead(payload: dict[str, Any]) -> PendingTechLeadReview:
     item = PendingTechLeadReview(
         issue_number=int(payload["issue_number"]),
         title=str(payload["title"]),
-        flavor=TechLeadSessionFlavor(payload["flavor"]),
+        flavor=_persisted_enum(TechLeadSessionFlavor, payload, "flavor"),
         failure=(
             DiscoveredFailure.from_dict(failure_payload)
             if failure_payload is not None
@@ -277,7 +412,12 @@ assert set(_DECODERS) == set(PendingWorkKind)
 __all__ = [
     "CLAIM_ARTIFACT_NAME",
     "CLAIM_SCHEMA_VERSION",
+    "ClaimReadability",
+    "CorruptPendingWorkClaimError",
+    "NewerPendingWorkClaimError",
     "PendingWorkClaimDecodeError",
     "decode_claim",
+    "decode_claim_text",
     "encode_claim",
+    "encode_claim_text",
 ]

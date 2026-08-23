@@ -45,6 +45,58 @@ class ConflictingPendingWorkClaimError(RuntimeError):
     """A different claim already exists for this run."""
 
 
+class ClaimReadability(Enum):
+    """Whether THIS build can interpret a stored claim, and if not, why not.
+
+    The two unreadable members are opposite instructions to an operator, so
+    collapsing them into one "cannot be read" is what made a healthy artifact
+    look destroyed (#209):
+
+    * ``UNREADABLE_NEWER`` — the artifact is intact and self-consistent; it
+      simply says something this build's vocabulary does not contain. Pinning a
+      trusted runtime while ``main`` advances makes that a NORMAL operating
+      condition, not damage: a build that carries the newer vocabulary reads
+      the same bytes without complaint, and nothing has been lost.
+    * ``UNREADABLE_CORRUPT`` — a shape no build ever wrote. No runtime will
+      ever recover the work from it, so a human has to reconstruct it.
+
+    Classification is deliberately conservative in ONE direction only: an
+    unclassified read failure is reported as corrupt rather than as newer,
+    because "a newer build wrote this and it is fine" is a claim about the
+    artifact that has to be established, never assumed.
+    """
+
+    #: Rebuilt into the original typed request.
+    READABLE = "readable"
+    #: Well-formed, but written against a schema this build does not implement
+    #: — a version number it has no decoder for, or a value outside the value
+    #: space of one of its persisted enums.
+    UNREADABLE_NEWER = "unreadable_newer"
+    #: Malformed or self-contradictory.
+    UNREADABLE_CORRUPT = "unreadable_corrupt"
+
+    @property
+    def readable(self) -> bool:
+        return self is ClaimReadability.READABLE
+
+
+class UnreadableClaimError(ValueError):
+    """A recorded claim exists but this build could not rebuild it.
+
+    Declared here rather than beside any one implementation because the
+    classification is part of the port's contract: a caller that catches this
+    must be able to tell "written by a build that knows more than I do" from
+    "damaged" WITHOUT knowing which store raised it.
+
+    ``readability`` is a class attribute set by each concrete subclass, so the
+    base cannot be raised without a verdict — reading it off an unclassified
+    instance raises ``AttributeError`` rather than silently answering
+    "corrupt".
+    """
+
+    readability: ClaimReadability
+
+
 class ClaimState(Enum):
     """What the ledger says about one run's claim.
 
@@ -257,6 +309,11 @@ class UnreadableClaim:
     # one session can reuse the path; started_at has sub-second precision and
     # is what tells the two apart (#6999 F12).
     started_at: str
+    #: WHY it could not be rebuilt, as a verdict rather than a sentence (#209).
+    #: Required, with no default: a row reported as unreadable without saying
+    #: which kind of unreadable is exactly the untyped state that told an
+    #: operator an intact artifact could not be recovered.
+    readability: ClaimReadability
 
     @property
     def quarantine_key(self) -> str:
@@ -295,9 +352,12 @@ class PendingWorkClaimStore(Protocol):
     def look_up_pending_work_claim(self, run: SessionRunAssets) -> ClaimLookup:
         """What ``run`` is holding, as a typed state rather than a maybe-value.
 
-        Raises rather than answering ABSENT when a record exists but cannot be
-        trusted or rebuilt: "no claim" and "a claim I cannot read" are different
-        facts, and conflating them drops work while looking like a clean start.
+        Raises :class:`UnreadableClaimError` rather than answering ABSENT when a
+        record exists but cannot be trusted or rebuilt: "no claim" and "a claim
+        I cannot read" are different facts, and conflating them drops work while
+        looking like a clean start. The raised error carries a
+        :class:`ClaimReadability`, so a caller can also tell "a build that knows
+        more than I do wrote this" from "this is damaged" (#209).
         """
         ...
 
@@ -527,6 +587,7 @@ class ClaimQuarantineStore(Protocol):
 __all__ = [
     "ClaimLookup",
     "ClaimQuarantineStore",
+    "ClaimReadability",
     "ClaimState",
     "QuarantineCause",
     "QuarantineLabelState",
@@ -535,5 +596,6 @@ __all__ = [
     "NeedsHumanCauseStore",
     "PendingWorkClaimStore",
     "UnreadableClaim",
+    "UnreadableClaimError",
     "UnresolvedClaim",
 ]

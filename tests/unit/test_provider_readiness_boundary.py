@@ -45,6 +45,7 @@ from issue_orchestrator.control.tech_lead_reaction import (
 from issue_orchestrator.domain.models import DiscoveredFailure, Issue, SessionStatus
 from issue_orchestrator.domain.pending_work import PendingWorkKind
 from issue_orchestrator.ports.pending_work_claim_store import (
+    ClaimReadability,
     ClaimState,
     QuarantineLabelState,
 )
@@ -3518,6 +3519,7 @@ def _unrestorable_subject(
         issue_number=issue_number,
         error="the run's session assets could not be rebuilt",
         cause=QuarantineCause.RUN_UNRESTORABLE,
+        readability=ClaimReadability.READABLE,
     )
 
 
@@ -4972,6 +4974,7 @@ def _quarantined(harness, tmp_path: Path):
         "payload unreadable",
         harness.claims.run_key_for(session.run_assets),
         harness.claims.quarantine_key_for(session.run_assets),
+        ClaimReadability.UNREADABLE_CORRUPT,
     )
 
 
@@ -5085,6 +5088,7 @@ def test_two_runs_of_one_issue_quarantine_independently(tmp_path: Path) -> None:
         "payload unreadable",
         harness.claims.run_key_for(second_session.run_assets),
         harness.claims.quarantine_key_for(second_session.run_assets),
+        ClaimReadability.UNREADABLE_CORRUPT,
     )
     assert first.quarantine_key != second.quarantine_key
     owner = _quarantine_with(harness)
@@ -5462,6 +5466,7 @@ def test_an_unresolved_review_claim_escalates_its_ISSUE_not_its_PR(
                 issue_number=7,  # recorded at hold time, from the session's issue
                 error="payload unreadable",
                 started_at="2026-08-07T00:00:00+00:00",
+                readability=ClaimReadability.UNREADABLE_CORRUPT,
             )
         )
     )
@@ -5488,6 +5493,7 @@ def test_an_unresolved_claim_quarantine_is_idempotent_across_sweeps(
         issue_number=7,
         error="payload unreadable",
         started_at="2026-08-07T00:00:00+00:00",
+        readability=ClaimReadability.UNREADABLE_CORRUPT,
     )
     owner = _quarantine_with(harness)
 
@@ -5590,6 +5596,7 @@ def test_a_release_leaves_another_quarantines_block_alone(tmp_path: Path) -> Non
         "payload unreadable",
         harness.claims.run_key_for(second_session.run_assets),
         harness.claims.quarantine_key_for(second_session.run_assets),
+        ClaimReadability.UNREADABLE_CORRUPT,
     )
     assert first.quarantine_key != second.quarantine_key
     owner = _quarantine_with(harness)
@@ -5631,6 +5638,7 @@ def test_a_replacement_run_reusing_the_directory_quarantines_independently(
         "payload unreadable",
         harness.claims.run_key_for(session.run_assets),
         harness.claims.quarantine_key_for(session.run_assets),
+        ClaimReadability.UNREADABLE_CORRUPT,
     )
     owner = _quarantine_with(harness)
     owner.quarantine(QuarantineSubject.live_run_with_unreadable_claim(first))  # The first run finishes and its row goes; a replacement lands on the SAME
@@ -5653,6 +5661,7 @@ def test_a_replacement_run_reusing_the_directory_quarantines_independently(
         "payload unreadable",
         harness.claims.run_key_for(replacement_assets),
         harness.claims.quarantine_key_for(replacement_assets),
+        ClaimReadability.UNREADABLE_CORRUPT,
     )
     assert first.run_key == second.run_key  # the collision is real
     assert first.quarantine_key != second.quarantine_key

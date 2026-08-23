@@ -41,7 +41,12 @@ from typing import TYPE_CHECKING, Sequence
 from ..domain.models import PendingRework, Session
 from ..domain.pending_work import InFlightWork, PendingWorkClaim, PendingWorkKind
 from ..domain.session_key import SessionKey, TaskKind
-from ..ports.pending_work_claim_store import ClaimState, PendingWorkClaimStore
+from ..ports.pending_work_claim_store import (
+    ClaimReadability,
+    ClaimState,
+    PendingWorkClaimStore,
+    UnreadableClaimError,
+)
 from ..ports.provider_resilience import ProviderErrorType
 
 if TYPE_CHECKING:
@@ -105,6 +110,26 @@ class QuarantinedSession:
     # ...and the generation-aware key the quarantine marker itself uses, so a
     # replacement run reusing the directory gets its own (#6999 F12).
     quarantine_key: str
+    #: WHY the record could not be read (#209). Required: what an operator is
+    #: told about a live terminal differs completely between "this build lacks
+    #: the vocabulary, the artifact is fine" and "the record is damaged", and a
+    #: caller that has to infer it from ``error`` is a caller that will not.
+    readability: ClaimReadability
+
+
+def _readability_of(exc: BaseException) -> ClaimReadability:
+    """How a failed claim read classifies, when the store said so (#209).
+
+    A store that raises the port's :class:`UnreadableClaimError` has already
+    reached a verdict and it is carried verbatim. Anything else is an
+    unclassified read failure — a store fault, not a finding about the artifact
+    — and is reported as corrupt on purpose: "a newer build wrote this and it is
+    perfectly fine" is a reassurance that has to be earned, and handing it out
+    on a fault would be the same untyped guess in the opposite direction.
+    """
+    if isinstance(exc, UnreadableClaimError):
+        return exc.readability
+    return ClaimReadability.UNREADABLE_CORRUPT
 
 
 @dataclass(frozen=True, slots=True)
@@ -287,7 +312,8 @@ class InFlightWorkLedger:
             except Exception as exc:  # adapter-defined decode/identity failure
                 logger.error(
                     "[WORK] Quarantining %s: its claim record exists but could "
-                    "not be read, so what work it holds is unknown: %s",
+                    "not be read by this build, so what work it holds is "
+                    "unknown here: %s",
                     session.terminal_id,
                     exc,
                 )
@@ -297,6 +323,7 @@ class InFlightWorkLedger:
                         str(exc),
                         self.claims.run_key_for(session.run_assets),
                         self.claims.quarantine_key_for(session.run_assets),
+                        _readability_of(exc),
                     )
                 )
                 continue

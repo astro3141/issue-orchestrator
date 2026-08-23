@@ -47,7 +47,6 @@ database already is.
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 import sqlite3
@@ -71,9 +70,10 @@ from ..ports.pending_work_claim_store import (
     UnresolvedClaim,
 )
 from .pending_work_codec import (
+    CorruptPendingWorkClaimError,
     PendingWorkClaimDecodeError,
-    decode_claim,
-    encode_claim,
+    decode_claim_text,
+    encode_claim_text,
 )
 
 _SCHEMA = """
@@ -299,8 +299,8 @@ class SqlitePendingWorkClaimStore:
         migrated: list[tuple[object, ...]] = []
         for row in legacy:
             try:
-                claim = decode_claim(json.loads(row["payload"]))
-            except (PendingWorkClaimDecodeError, json.JSONDecodeError, TypeError) as exc:
+                claim = decode_claim_text(row["payload"], source=row["run_key"])
+            except PendingWorkClaimDecodeError as exc:
                 raise PendingWorkClaimMigrationError(
                     f"pending-work claim for run {row['run_key']} cannot be "
                     f"migrated to the current schema: {exc}. The existing table "
@@ -354,7 +354,7 @@ class SqlitePendingWorkClaimStore:
         self, run: SessionRunAssets, claim: PendingWorkClaim, *, issue_number: int
     ) -> None:
         key = self.run_key_for(run)
-        payload = json.dumps(encode_claim(claim), sort_keys=True)
+        payload = encode_claim_text(claim)
         identity = run.identity
         work_key = claim.work_key()
         with self._write_lock, self._transaction() as conn:
@@ -427,13 +427,14 @@ class SqlitePendingWorkClaimStore:
             # Identity comes from the worktree manifest, which the agent can
             # write; refusing here is what turns a rewritten manifest into a
             # quarantined terminal instead of a silently claimless one.
-            raise PendingWorkClaimDecodeError(
+            # Corrupt, not merely unfamiliar: it contradicts itself (#209).
+            raise CorruptPendingWorkClaimError(
                 f"run {key} holds a claim recorded for run {row['run_id']}, "
                 f"session {row['session_name']!r}, started {row['started_at']!r}; "
                 f"asked for run {identity.run_id}, session "
                 f"{identity.session_name!r}, started {identity.started_at!r}"
             )
-        claim = self._decode(row["payload"], key)
+        claim = decode_claim_text(row["payload"], source=key)
         if row["deferred"]:
             # Deferred work belongs to the queue, not to this run. Answering
             # ABSENT would let a stale terminal be admitted as claimless and
@@ -447,7 +448,7 @@ class SqlitePendingWorkClaimStore:
         unresolved: list[UnresolvedClaim] = []
         for row in self._all_rows():
             try:
-                claim = self._decode(row["payload"], row["run_key"])
+                claim = decode_claim_text(row["payload"], source=row["run_key"])
             except PendingWorkClaimDecodeError:
                 continue  # reported by list_unreadable_claims
             unresolved.append(
@@ -466,7 +467,7 @@ class SqlitePendingWorkClaimStore:
         unreadable: list[UnreadableClaim] = []
         for row in self._all_rows():
             try:
-                self._decode(row["payload"], row["run_key"])
+                decode_claim_text(row["payload"], source=row["run_key"])
             except PendingWorkClaimDecodeError as exc:
                 unreadable.append(
                     UnreadableClaim(
@@ -475,6 +476,9 @@ class SqlitePendingWorkClaimStore:
                         issue_number=int(row["issue_number"]),
                         error=str(exc),
                         started_at=str(row["started_at"]),
+                        # The decoder's verdict, carried rather than re-derived
+                        # from the message text - that guess IS #209.
+                        readability=exc.readability,
                     )
                 )
         return tuple(unreadable)
@@ -497,7 +501,7 @@ class SqlitePendingWorkClaimStore:
         the caller spending a bounded retry budget has to be able to tell them
         apart.
         """
-        payload = json.dumps(encode_claim(claim), sort_keys=True)
+        payload = encode_claim_text(claim)
         with self._write_lock, self._transaction() as conn:
             cursor = conn.execute(
                 "UPDATE pending_work_claim SET payload = ? "
@@ -754,16 +758,6 @@ class SqlitePendingWorkClaimStore:
             and row["run_id"] == identity.run_id
             and row["started_at"] == identity.started_at
         )
-
-    @staticmethod
-    def _decode(payload: str, key: str) -> PendingWorkClaim:
-        try:
-            loaded = json.loads(payload)
-        except json.JSONDecodeError as exc:
-            raise PendingWorkClaimDecodeError(
-                f"pending work claim for run {key} is unreadable: {exc}"
-            ) from exc
-        return decode_claim(loaded)
 
     def _all_rows(self) -> list[sqlite3.Row]:
         return list(
