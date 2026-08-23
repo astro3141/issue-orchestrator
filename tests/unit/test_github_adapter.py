@@ -15,6 +15,7 @@ from unittest.mock import MagicMock, Mock, patch, call
 from issue_orchestrator.adapters.github import GitHubAdapter
 from issue_orchestrator.adapters.github.cache import GitHubCache
 from issue_orchestrator.adapters.github.http_client import (
+    CommentReceipt,
     CommitCheckRollup,
     GitHubHttpError,
     GitHubTransportError,
@@ -1494,17 +1495,95 @@ class TestPROperations:
 
     def test_add_comment_success(self, adapter, mock_http_client, mock_verification_service):
         """Test successfully adding a comment."""
-        mock_http_client.add_comment.return_value = "https://github.com/owner/repo/issues/42#comment"
-        mock_http_client.get_issue_comments.return_value = [
-            {"body": "Test comment"}
-        ]
+        mock_http_client.add_comment.return_value = CommentReceipt(
+            comment_id=4242,
+            html_url="https://github.com/owner/repo/issues/42#issuecomment-4242",
+        )
+        mock_http_client.get_issue_comment.return_value = {"id": 4242}
 
         url = adapter.add_comment(42, "Test comment")
 
-        assert url == "https://github.com/owner/repo/issues/42#comment"
+        # The receipt's own permalink is returned, never a synthesised URL.
+        assert url == "https://github.com/owner/repo/issues/42#issuecomment-4242"
         mock_http_client.add_comment.assert_called_once_with(42, "Test comment")
         # Should verify comment was added
         mock_verification_service.verify_condition.assert_called_once()
+
+    def test_add_comment_verifies_by_receipt_not_by_comment_listing(
+        self, adapter, mock_http_client, mock_verification_service
+    ):
+        """Regression (#207): verification reads the created comment by the id
+        the write returned, not the issue's comment list.
+
+        The listing read only the first page of an oldest-first endpoint, so on
+        an issue with more than 100 comments a just-written comment could never
+        appear in it. Verification was therefore deterministically false, the
+        caller treated a successful write as failed, and each retry posted
+        another duplicate comment.
+        """
+        def _verify_condition(*_args, check=None, **_kwargs):
+            assert check is not None
+            verified, _observed = check()
+            assert verified is True
+            return (VerificationResult.SUCCESS, None)
+
+        mock_verification_service.verify_condition.side_effect = _verify_condition
+        mock_http_client.add_comment.return_value = CommentReceipt(
+            comment_id=4242,
+            html_url="https://github.com/owner/repo/issues/23#issuecomment-4242",
+        )
+        # The issue is long: its first comment page holds none of the newest
+        # comments, and certainly not the one just written.
+        mock_http_client.get_issue_comments.return_value = [
+            {"body": f"chatter {i}"} for i in range(100)
+        ]
+        mock_http_client.get_issue_comment.return_value = {"id": 4242}
+
+        url = adapter.add_comment(23, "Test comment")
+
+        assert url == "https://github.com/owner/repo/issues/23#issuecomment-4242"
+        mock_http_client.get_issue_comment.assert_called_once_with(4242)
+        mock_http_client.get_issue_comments.assert_not_called()
+
+    def test_add_comment_verification_stays_false_until_the_comment_is_readable(
+        self, adapter, mock_http_client, mock_verification_service
+    ):
+        """A receipt that is not yet readable (GitHub read-after-write lag)
+        reports False so the verify loop retries, rather than raising and
+        driving the caller into a duplicate-posting retry."""
+        checks: list[bool] = []
+
+        def _verify_condition(*_args, check=None, **_kwargs):
+            assert check is not None
+            for payload in (None, {"id": 4242}):
+                mock_http_client.get_issue_comment.return_value = payload
+                verified, _observed = check()
+                checks.append(verified)
+            return (VerificationResult.SUCCESS, None)
+
+        mock_verification_service.verify_condition.side_effect = _verify_condition
+        mock_http_client.add_comment.return_value = CommentReceipt(
+            comment_id=4242,
+            html_url="https://github.com/owner/repo/issues/42#issuecomment-4242",
+        )
+
+        adapter.add_comment(42, "Test comment")
+
+        assert checks == [False, True]
+
+    def test_add_comment_propagates_a_write_without_a_receipt(
+        self, adapter, mock_http_client, mock_verification_service
+    ):
+        """A create response the client could not turn into a receipt must
+        surface as an error, not as a comment URL that cannot be verified."""
+        mock_http_client.add_comment.side_effect = GitHubHttpError(
+            "Comment create on #42 returned no numeric id"
+        )
+
+        with pytest.raises(GitHubHttpError):
+            adapter.add_comment(42, "Test comment")
+
+        mock_verification_service.verify_condition.assert_not_called()
 
     def test_close_pr(self, adapter, mock_http_client, mock_verification_service):
         """Test closing a PR."""

@@ -129,9 +129,13 @@ class IssueTracker(Protocol):
         """Get the conversation comments on an issue or pull request.
 
         GitHub serves issue and PR conversation comments from the same
-        endpoint, so this also returns the timeline comments on a PR. Used
-        by lifecycle code that needs to dedupe orchestrator-authored marker
-        comments before re-posting them.
+        endpoint, so this also returns the timeline comments on a PR.
+
+        Returns at most ONE page (the oldest 100 comments), which is enough to
+        stage conversation context but is **never** evidence that a comment is
+        absent: on an issue past 100 comments a recently written comment
+        cannot appear here at all. Use ``issue_comment_marker_present``, which
+        scans every page and fails loud, for any absence decision.
 
         Args:
             issue_number: The issue or PR number to read comments for.

@@ -1376,24 +1376,36 @@ class GitHubAdapter:
                 issue_key=str(issue_or_pr_number),
                 scope=gh_audit.AuditScope.UNKNOWN,
             ):
-                comment_url = self._client.add_comment(issue_or_pr_number, body)
+                receipt = self._client.add_comment(issue_or_pr_number, body)
             logger.debug(f"Added comment to issue/PR {issue_or_pr_number}")
 
-            last_comments: list[dict] = []
+            # Verify by the creation receipt, not by searching the comment
+            # list. Searching read only the first page of an oldest-first
+            # listing, so on an issue past 100 comments a just-written comment
+            # could never appear there: verification was deterministically
+            # false, the caller retried a write that had in fact succeeded,
+            # and every retry posted another duplicate (#207). Reading the
+            # comment by its own id is O(1), unaffected by comment count or
+            # ordering, and does not depend on body equality surviving any
+            # normalisation GitHub applies.
+            observed: dict[str, Any] | None = None
 
             def _check() -> bool:
-                nonlocal last_comments
-                last_comments = self._client.get_issue_comments(issue_or_pr_number)
-                return any(c.get("body") == body for c in last_comments)
+                nonlocal observed
+                observed = self._client.get_issue_comment(receipt.comment_id)
+                return observed is not None
 
             self._verify_write(
                 f"comment add #{issue_or_pr_number}",
                 _check,
-                detail_fn=lambda: {"comment_count": len(last_comments)},
+                detail_fn=lambda: {
+                    "comment_id": receipt.comment_id,
+                    "readable": observed is not None,
+                },
                 issue_number=issue_or_pr_number,
             )
 
-            return comment_url
+            return receipt.html_url
         except GitHubHttpError:
             logger.error(f"Failed to add comment to issue/PR {issue_or_pr_number}")
             raise
@@ -1810,7 +1822,11 @@ class GitHubAdapter:
         )
 
     def get_issue_comments(self, issue_number: int) -> list[dict[str, Any]]:
-        """Get comments on an issue.
+        """Get the first page (oldest 100) of comments on an issue.
+
+        Not an absence oracle: a comment beyond the first page is invisible
+        here. Absence decisions belong to ``issue_comment_marker_present``,
+        which scans every page and fails loud on a truncated read.
 
         Args:
             issue_number: The issue number to get comments for.
