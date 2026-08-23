@@ -305,6 +305,16 @@ def _launch_base_sha(working_copy: "WorkingCopy", worktree_path: Path) -> str:
     launch base was never observed". That does not fail the launch: the run is
     perfectly able to do its work, it merely forfeits the zero-code lane at
     completion, which is the fail-closed direction.
+
+    Read BEFORE the worktree provisioner runs the target repo's setup
+    commands, so anything setup writes is judged as the run's own change. That
+    is deliberate and fail-closed, but it has a cost worth knowing: in a repo
+    whose setup touches a *tracked* file — a refreshed lockfile, a formatter, a
+    regenerated artifact — every planning run afterwards is refused the lane
+    for dirt it did not author and takes the publish path, with only the
+    settler's INFO detail to say why. The fix if that ever bites is a
+    launch-time dirt baseline recorded here beside the base commit, not a
+    path filter at completion.
     """
     return working_copy.get_head_sha(worktree_path) or ""
 

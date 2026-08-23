@@ -16,7 +16,12 @@ import pytest
 from issue_orchestrator.control.tech_lead_zero_code import (
     settle_zero_code_planning_completion,
 )
-from issue_orchestrator.domain.models import RequestedAction
+from issue_orchestrator.domain.models import (
+    PUBLICATION_ACTIONS,
+    CompletionOutcome,
+    CompletionRecord,
+    RequestedAction,
+)
 from issue_orchestrator.domain.tech_lead_session import (
     TechLeadLaunchAuthority,
     TechLeadSessionFlavor,
@@ -100,6 +105,52 @@ class TestTheProvenZeroCodeRun:
 
         assert RequestedAction.PUSH_BRANCH not in settlement.requested_actions
         assert RequestedAction.CREATE_PR not in settlement.requested_actions
+
+    def test_exactly_what_the_domain_calls_publication_is_dropped(self) -> None:
+        """The publication vocabulary has one owner; this asks it too.
+
+        Offered EVERY action there is, so the set the settler removes is
+        pinned to :data:`PUBLICATION_ACTIONS` itself rather than to a literal
+        restated here: an action the domain later adopts into the publication
+        family leaves this lane in the same edit, and one it does not adopt is
+        never quietly dropped from a planning run's settlement.
+        """
+        every_action = tuple(RequestedAction)
+
+        settlement = settle_zero_code_planning_completion(
+            authority=planning_authority(),
+            requested_actions=every_action,
+            worktree=Path("/scratch/tech-lead-planning-23"),
+            worktree_reader=FakeWorktreeReader(),
+        )
+
+        assert set(every_action) - set(settlement.requested_actions) == set(
+            PUBLICATION_ACTIONS
+        )
+        # Order among the survivors is the caller's, untouched.
+        assert settlement.requested_actions == tuple(
+            action for action in every_action if action not in PUBLICATION_ACTIONS
+        )
+
+    def test_what_survives_no_longer_reaches_the_remote(self) -> None:
+        """The other consumer of the same vocabulary agrees, on the record.
+
+        ``reaches_the_remote`` is what the pre-publish guards ask and
+        ``offers_a_change_for_review`` is what the publish gate asks; both read
+        the owner this settler drops from, so a settled zero-code record is
+        false to both.
+        """
+        settlement = settle(planning_authority(), FakeWorktreeReader())
+        record = CompletionRecord(
+            session_id="tech-lead-planning-23",
+            timestamp="2026-08-23T00:00:00Z",
+            outcome=CompletionOutcome.COMPLETED,
+            summary="planning proposal",
+            requested_actions=list(settlement.requested_actions),
+        )
+
+        assert record.reaches_the_remote is False
+        assert record.offers_a_change_for_review is False
 
     def test_the_dirt_question_is_asked_of_tracked_content(self) -> None:
         """The dirt vocabulary has one owner; this asks it, it does not re-answer it."""

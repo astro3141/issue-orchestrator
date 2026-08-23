@@ -27,7 +27,7 @@ Policy summary:
 * Every COMPLETED tech_lead session (any flavor) must produce a valid
   decision artifact pair — a missing/invalid pair is a contract violation.
   The authoritative classification runs in the completion processing path's
-  PRE-ACTION policy phase (``tech_lead_decision_processing_error``, called by
+  PRE-ACTION policy phase (``admit_tech_lead_completion``, called by
   ``completion_processor`` before any requested push/PR/comment executes —
   #6769 finding 1) so a rejected completion produces zero GitHub effects and
   the session's history outcome is FAILED, not a quiet success; the action
@@ -301,28 +301,6 @@ def admit_tech_lead_completion(
     return TechLeadCompletionAdmission(
         None, f"{ERROR_PREFIX_TECH_LEAD_DECISION}: {failure}: {result.detail}"
     )
-
-
-def tech_lead_decision_processing_error(
-    config: "Config",
-    *,
-    tech_lead_authority: "TechLeadAuthorityStore",
-    run_dir: Path,
-    run_id: str,
-    session_name: str,
-) -> str | None:
-    """Why a COMPLETED tech_lead session is inadmissible, or None.
-
-    The error-only view of :func:`admit_tech_lead_completion`, for callers that
-    ask nothing of the record beyond whether it stands.
-    """
-    return admit_tech_lead_completion(
-        config,
-        tech_lead_authority=tech_lead_authority,
-        run_dir=run_dir,
-        run_id=run_id,
-        session_name=session_name,
-    ).error
 
 
 _TECH_LEAD_ERROR_PREFIXES = (ERROR_PREFIX_TECH_LEAD_DECISION, ERROR_PREFIX_TECH_LEAD_AUTHORITY)

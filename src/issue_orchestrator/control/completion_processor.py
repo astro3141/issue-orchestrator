@@ -45,6 +45,7 @@ from ..domain.completion_finalization import (
 from ..domain.models import (
     CompletionOutcome,
     CompletionRecord,
+    PUBLICATION_ACTIONS,
     RequestedAction,
     COMPLETION_RECORD_PATH,
 )
@@ -1826,7 +1827,7 @@ class CompletionProcessor:
                 "exception_type": type(e).__name__,
                 "traceback": traceback.format_exc(),
             })
-            if action in {RequestedAction.PUSH_BRANCH, RequestedAction.CREATE_PR}:
+            if action in PUBLICATION_ACTIONS:
                 self._emit_publish_failed(
                     issue_number=issue_number,
                     stage=action.value,

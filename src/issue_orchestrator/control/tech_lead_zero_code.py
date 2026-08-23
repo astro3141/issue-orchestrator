@@ -29,6 +29,12 @@ Unobservable is never read as zero-code, for the reason
 :mod:`.candidate_integrity` states about the same two reads: a checkout whose
 state could not be read is not a checkout that was proven unchanged.
 
+**Neither vocabulary this module uses is re-answered here.** *Which actions
+publish* belongs to :data:`~..domain.models.PUBLICATION_ACTIONS`, and the
+dropping is stated as intent via
+:func:`~..domain.models.without_publication_intent`, so an action that joins
+the publication family joins it for this lane too, in one edit.
+
 **What counts as dirt is not decided here.** ``list_dirty_files`` owns that
 vocabulary and is asked for :data:`~.candidate_integrity.CANDIDATE_DIRT_MODE`,
 the same tracked-content question the candidate postflight asks. Untracked
@@ -50,20 +56,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
-from ..domain.models import RequestedAction
+from ..domain.models import RequestedAction, without_publication_intent
 from ..domain.tech_lead_session import TechLeadLaunchAuthority, TechLeadSessionFlavor
 from .candidate_integrity import CANDIDATE_DIRT_MODE
-
-PUBLICATION_INTENTS = frozenset(
-    {RequestedAction.PUSH_BRANCH, RequestedAction.CREATE_PR}
-)
-"""The intents a completion offering no change must not carry.
-
-Both, together — dropping only ``PUSH_BRANCH`` would leave
-:attr:`~..domain.models.CompletionRecord.offers_a_change_for_review` true, so
-the publication gate and the review exchange would both still run for a
-completion that offers nothing to review.
-"""
 
 _DIRT_PREVIEW = 5
 """How many altered paths a refusal names before summarising."""
@@ -135,10 +130,7 @@ def settle_zero_code_planning_completion(
             f"({authority.launch_base_sha}) with no tracked change; it offers "
             "no code candidate, so its publication intent is dropped"
         ),
-        tuple(
-            action for action in requested_actions
-            if action not in PUBLICATION_INTENTS
-        ),
+        without_publication_intent(requested_actions),
     )
 
 
@@ -183,7 +175,6 @@ def _summarise(paths: list[str]) -> str:
 
 
 __all__ = [
-    "PUBLICATION_INTENTS",
     "ZeroCodePlanningSettlement",
     "ZeroCodeWorktreeReader",
     "settle_zero_code_planning_completion",
