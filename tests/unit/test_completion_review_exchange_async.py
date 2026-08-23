@@ -39,6 +39,7 @@ from issue_orchestrator.infra.config import Config
 from issue_orchestrator.domain.models import AgentConfig
 from issue_orchestrator.ports.background_job import CompletedJob
 from issue_orchestrator.ports.session_output import ReviewExchangeSummary, SessionOutput
+from issue_orchestrator.domain.review_exchange_rework import ReviewExchangeRework
 from tests.callback_endpoint_helpers import ready_callback_endpoint
 
 
@@ -392,6 +393,7 @@ class TestExchangeRecordScope:
                 issue_title="Example",
                 session_name="coding-1",
                 agent_label="agent:backend",
+                rework=ReviewExchangeRework.IN_EXCHANGE,
             )
 
     def test_records_are_scoped_by_the_resolved_repo(self, tmp_path: Path) -> None:
@@ -418,6 +420,7 @@ class TestExchangeRecordScope:
             issue_title="[M1-011] Example",
             session_name="coding-1",
             agent_label="agent:backend",
+            rework=ReviewExchangeRework.IN_EXCHANGE,
         )
 
         assert len(keys) == 1

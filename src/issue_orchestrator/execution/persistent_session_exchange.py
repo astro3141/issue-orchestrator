@@ -88,10 +88,16 @@ from ..domain.review_exchange_turn import (
 )
 from ..ports.turn_mailbox import TurnMailbox
 from ..domain.review_exchange_run import ReviewExchangeRun, ReviewExchangeRunAssets
+from ..domain.review_exchange_rework import ReviewExchangeRework
 from ..domain.review_exchange_summary import ReviewExchangeReason, ReviewExchangeStatus
 from ..domain.review_verdict_binding import ReviewVerdictOutcome
 from .candidate_execution_identity import CandidateExecutionIdentityRecorder
-from .review_exchange_records import bind_review_verdict, write_exchange_summary
+from .review_exchange_records import write_exchange_summary
+from .review_exchange_terminals import (
+    ReviewerRoundTerminals,
+    complete_with_reviewer_decision,
+    emit_built_event,
+)
 from .reviewer_worktree import ReviewerCandidatePresentation
 from ..domain.runtime_config import RuntimeConfigReference
 from ..domain import review_exchange_turn_artifacts as turn_artifacts
@@ -102,7 +108,6 @@ from ..infra.repo_identity import get_repo_head_sha
 from ..infra.terminal_recording import TERMINAL_RECORDING_FILENAME
 from ..ports import (
     EventSink,
-    TraceEvent,
     make_review_exchange_completed_event,
     make_review_exchange_round_completed_event,
     make_trace_event,
@@ -408,6 +413,12 @@ def run_persistent_session_exchange(  # noqa: PLR0913
     max_rounds: int,
     max_no_progress: int,
     require_validation: bool,
+    # The one place the #180 policy still carries a default. Its sole
+    # production caller is ``PersistentReviewExchangeRunner.run``, where the
+    # port makes it required, so no production path can reach this value; what
+    # it serves is the several dozen direct test call sites that never enter
+    # the handoff at all.
+    rework: ReviewExchangeRework = ReviewExchangeRework.IN_EXCHANGE,
     nit_policy: str = "surface",
     initial_validation_record_path: Path | None = None,
     approval_gate: ReviewExchangeApprovalGate | None = None,
@@ -778,6 +789,7 @@ def run_persistent_session_exchange(  # noqa: PLR0913
                 max_rounds=max_rounds,
                 max_no_progress=max_no_progress,
                 require_validation=require_validation,
+                rework=rework,
                 nit_policy=_coerce_runtime_nit_policy(nit_policy),
                 approval_gate=approval_gate,
                 coder_provider=agent_provider(coder_agent),
@@ -1555,13 +1567,6 @@ class _ReviewerDecisionResult:
     policy_rework_feedback: str | None = None
 
 
-def _emit_built_event(
-    emit: Callable[[EventName, dict[str, Any]], None],
-    event: TraceEvent,
-) -> None:
-    emit(event.event_type, event.data)
-
-
 def _finalize_reviewer_decision(
     *,
     exchange_dir: Path,
@@ -1763,6 +1768,7 @@ class _DriveRoundsCommand:
     max_rounds: int
     max_no_progress: int
     require_validation: bool
+    rework: ReviewExchangeRework
     nit_policy: NitPolicy
     approval_gate: ReviewExchangeApprovalGate | None
     coder_provider: AgentProvider
@@ -1804,6 +1810,7 @@ def _drive_rounds(command: _DriveRoundsCommand) -> ReviewExchangeOutcome:
     max_rounds = command.max_rounds
     max_no_progress = command.max_no_progress
     require_validation = command.require_validation
+    rework = command.rework
     nit_policy = command.nit_policy
     approval_gate = command.approval_gate
     coder_provider = command.coder_provider
@@ -1816,7 +1823,9 @@ def _drive_rounds(command: _DriveRoundsCommand) -> ReviewExchangeOutcome:
     turn_mailbox = command.turn_mailbox
     response_channels = command.response_channels
 
-    no_progress_count = 0
+    round_terminals = ReviewerRoundTerminals(
+        rework=rework, max_no_progress=max_no_progress
+    )
     last_reviewer_text: str | None = None
     last_coder_text: str | None = None
 
@@ -1999,34 +2008,15 @@ def _drive_rounds(command: _DriveRoundsCommand) -> ReviewExchangeOutcome:
             round_index=round_index,
         )
 
-        if reviewer.response_type == "ok":
-            return _complete_with_reviewer_decision(
+        # One question, asked of the owner that knows every way a reviewer
+        # round can end the exchange and carries the no-progress budget across
+        # rounds. ``None`` is the only answer that continues into a coder turn.
+        terminal = round_terminals.for_round(reviewer)
+        if terminal is not None:
+            return complete_with_reviewer_decision(
                 run_assets=run_assets,
                 exchange_dir=exchange_dir,
-                status=ReviewExchangeStatus.OK,
-                reason=ReviewExchangeReason.REVIEWER_OK,
-                round_index=round_index,
-                reviewer=reviewer,
-                decision=artifact_pair.decision,
-                verdict=decision_result.effective_verdict,
-                review_artifacts=artifact_pair.to_event_artifacts(),
-                emit=emit,
-                issue_number=issue_number,
-                session_name=session_name,
-                validation_record_path=validation_record_path,
-                presented_head_sha=presented_head_sha,
-                execution_identities=execution_identities,
-            )
-        if reviewer.getting_closer is False:
-            no_progress_count += 1
-        else:
-            no_progress_count = 0
-        if max_no_progress > 0 and no_progress_count >= max_no_progress:
-            return _complete_with_reviewer_decision(
-                run_assets=run_assets,
-                exchange_dir=exchange_dir,
-                status=ReviewExchangeStatus.STOPPED,
-                reason=ReviewExchangeReason.REVIEWER_REPORTS_NO_PROGRESS,
+                terminal=terminal,
                 round_index=round_index,
                 reviewer=reviewer,
                 decision=artifact_pair.decision,
@@ -2184,7 +2174,7 @@ def _drive_rounds(command: _DriveRoundsCommand) -> ReviewExchangeOutcome:
             return protocol_outcome
 
         decision = artifact_pair.decision
-        _emit_built_event(
+        emit_built_event(
             emit,
             make_review_exchange_round_completed_event(
                 {
@@ -2211,7 +2201,7 @@ def _drive_rounds(command: _DriveRoundsCommand) -> ReviewExchangeOutcome:
         reviewer_response=None,
         validation_record_path=validation_record_path,
     )
-    _emit_built_event(emit, make_review_exchange_completed_event({
+    emit_built_event(emit, make_review_exchange_completed_event({
         "issue_number": issue_number,
         "session_name": session_name,
         "rounds": max_rounds,
@@ -2809,85 +2799,6 @@ def _persist_turn_result(
 # ---------------------------------------------------------------------------
 
 
-def _complete_with_reviewer_decision(
-    *,
-    run_assets: ReviewExchangeRunAssets,
-    exchange_dir: Path,
-    status: ReviewExchangeStatus,
-    reason: ReviewExchangeReason,
-    round_index: int,
-    reviewer: ReviewExchangeResponse,
-    decision: ReviewDecision,
-    verdict: ReviewVerdictOutcome,
-    review_artifacts: list[dict[str, str]],
-    emit: Callable[[EventName, dict[str, Any]], None],
-    issue_number: int,
-    session_name: str,
-    validation_record_path: Path,
-    presented_head_sha: str | None,
-    execution_identities: CandidateExecutionIdentityRecorder,
-) -> ReviewExchangeOutcome:
-    """Close the exchange at a terminal the reviewer decided.
-
-    The two such terminals — the reviewer's ``ok`` and the no-progress stop —
-    differ only in ``status``/``reason``. They used to be two functions with
-    one body, which is how a durable authority record can end up written at one
-    terminal and not the other; the Foundation records (#15, #34) are bound
-    here so both terminals have one derivation site by construction.
-    """
-    summary = write_exchange_summary(
-        exchange_dir, round_index,
-        status=status,
-        reason=reason,
-        reviewer_response=reviewer,
-        review_artifacts=review_artifacts,
-        validation_record_path=validation_record_path,
-    )
-    # The orchestrator's single derivation, passed in rather than assumed
-    # here: binding states what it concluded, and never promotes the
-    # reviewer's own claim to authority.
-    bind_review_verdict(
-        exchange_dir=exchange_dir,
-        verdict=verdict,
-        presented_head_sha=presented_head_sha,
-        completed_rounds=round_index,
-    )
-    # §4's other half, bound to the same observation and therefore to the same
-    # commit: who executed this candidate, as the orchestrator launched them.
-    execution_identities.record(presented_head_sha)
-    _emit_built_event(emit, make_review_exchange_round_completed_event({
-        "issue_number": issue_number,
-        "session_name": session_name,
-        "round_index": round_index,
-        "reviewer_response_type": reviewer.response_type,
-        "reviewer_response_text": reviewer.response_text,
-        "review_decision_verdict": decision.verdict,
-        "review_nit_policy": decision.nit_policy,
-        "review_abstraction_status": decision.abstraction_review.status,
-        "artifacts": review_artifacts,
-        "coder_response_type": None,
-    }))
-    _emit_built_event(emit, make_review_exchange_completed_event({
-        "issue_number": issue_number,
-        "session_name": session_name,
-        "rounds": round_index,
-        "status": status.value,
-        "reason": reason.value,
-        "review_decision_verdict": decision.verdict,
-        "review_nit_policy": decision.nit_policy,
-        "review_abstraction_status": decision.abstraction_review.status,
-        "artifacts": review_artifacts,
-    }))
-    return ReviewExchangeOutcome(
-        status=status,
-        rounds=round_index,
-        reason=reason,
-        run_assets=run_assets,
-        reviewer_response=reviewer,
-        summary=summary,
-    )
-
-
 def _build_outcome_for_reviewer_decision_error(
     *,
     run_assets: ReviewExchangeRunAssets,
@@ -2909,7 +2820,7 @@ def _build_outcome_for_reviewer_decision_error(
         validation_record_path=validation_record_path,
         detail=detail,
     )
-    _emit_built_event(emit, make_review_exchange_round_completed_event({
+    emit_built_event(emit, make_review_exchange_round_completed_event({
         "issue_number": issue_number,
         "session_name": session_name,
         "round_index": round_index,
@@ -2918,7 +2829,7 @@ def _build_outcome_for_reviewer_decision_error(
         "coder_response_type": None,
         "detail": detail,
     }))
-    _emit_built_event(emit, make_review_exchange_completed_event({
+    emit_built_event(emit, make_review_exchange_completed_event({
         "issue_number": issue_number,
         "session_name": session_name,
         "rounds": round_index,
@@ -2957,7 +2868,7 @@ def _build_outcome_for_role_timeout(
         reviewer_response=last_reviewer,
         validation_record_path=validation_record_path,
     )
-    _emit_built_event(emit, make_review_exchange_completed_event({
+    emit_built_event(emit, make_review_exchange_completed_event({
         "issue_number": issue_number,
         "session_name": session_name,
         "rounds": round_index,
@@ -3008,7 +2919,7 @@ def _build_outcome_for_protocol_error(
         reviewer_response=last_reviewer,
         validation_record_path=validation_record_path,
     )
-    _emit_built_event(emit, make_review_exchange_round_completed_event({
+    emit_built_event(emit, make_review_exchange_round_completed_event({
         "issue_number": issue_number,
         "session_name": session_name,
         "round_index": round_index,
@@ -3018,7 +2929,7 @@ def _build_outcome_for_protocol_error(
         "coder_response_text": last_coder.response_text if last_coder else None,
         "detail": protocol_error,
     }))
-    _emit_built_event(emit, make_review_exchange_completed_event({
+    emit_built_event(emit, make_review_exchange_completed_event({
         "issue_number": issue_number,
         "session_name": session_name,
         "rounds": round_index,

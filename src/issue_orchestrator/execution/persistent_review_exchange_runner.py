@@ -28,6 +28,7 @@ from ..domain.execution_identity import (
 from ..domain.issue_key import IssueKey
 from ..domain.models import AgentConfig
 from ..domain.review_exchange import ReviewExchangeOutcome
+from ..domain.review_exchange_rework import ReviewExchangeRework
 from ..domain.review_exchange_run import ReviewExchangeRun
 from ..domain.runtime_config import RuntimeConfigReference
 from ..events import EventContext
@@ -206,6 +207,9 @@ class PersistentReviewExchangeRunner:
         max_rounds: int,
         max_no_progress: int,
         require_validation: bool,
+        # Required, as the port requires it: this implementation is the last
+        # place the caller's answer could be replaced by an inference (#180).
+        rework: ReviewExchangeRework,
         nit_policy: str = "surface",
         initial_validation_record_path: Path | None = None,
         approval_gate: ReviewExchangeApprovalGate | None = None,
@@ -270,6 +274,7 @@ class PersistentReviewExchangeRunner:
             max_rounds=max_rounds,
             max_no_progress=max_no_progress,
             require_validation=require_validation,
+            rework=rework,
             nit_policy=nit_policy,
             initial_validation_record_path=initial_validation_record_path,
             approval_gate=approval_gate,

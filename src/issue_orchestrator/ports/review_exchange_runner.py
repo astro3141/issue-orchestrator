@@ -19,6 +19,7 @@ from typing import Any, Protocol, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from ..domain.issue_key import IssueKey
+    from ..domain.review_exchange_rework import ReviewExchangeRework
     from ..domain.models import AgentConfig
     from ..domain.review_exchange import ReviewExchangeOutcome
     from ..domain.review_exchange_run import ReviewExchangeRun
@@ -40,6 +41,14 @@ class ReviewExchangeRunner(Protocol):
     reconstruct: identity derivation is a control-layer concern, and a runner
     inventing its own spelling of it would file a candidate's admission
     evidence (#34) under a key nothing else uses.
+
+    ``rework`` is the caller's answer to "who moves the candidate when this
+    review asks for changes" (#180). It is the caller's because only the caller
+    knows whether it owns the coder this exchange would hand feedback to; a
+    runner cannot infer it, and inferring it wrongly is how a control
+    continuation's exchange reworked a candidate its owner was still holding.
+    It therefore carries no default here: a port that supplied the inference it
+    says cannot be made would answer for a caller that forgot to.
     """
 
     def run(
@@ -58,6 +67,7 @@ class ReviewExchangeRunner(Protocol):
         max_rounds: int,
         max_no_progress: int,
         require_validation: bool,
+        rework: "ReviewExchangeRework",
         nit_policy: str = "surface",
         initial_validation_record_path: Path | None = None,
         approval_gate: "ReviewExchangeApprovalGate | None" = None,

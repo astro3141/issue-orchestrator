@@ -12,6 +12,7 @@ import sys
 import pytest
 
 from issue_orchestrator.domain.models import Issue, AgentConfig
+from issue_orchestrator.domain.review_exchange_rework import ReviewExchangeRework
 from issue_orchestrator.domain.review_exchange_run import ReviewExchangeRunAssets
 from issue_orchestrator.execution.agent_runner import AgentRunner, AgentSpec
 from issue_orchestrator.ports.working_copy import (
@@ -186,6 +187,7 @@ def _stub_persistent_review_exchange_setup(monkeypatch, request):
         max_rounds,
         max_no_progress,
         require_validation,
+        rework=ReviewExchangeRework.IN_EXCHANGE,
         initial_validation_record_path=None,
         approval_gate=None,
         web_port=None,  # noqa: ARG001
@@ -303,6 +305,13 @@ def _stub_persistent_review_exchange_setup(monkeypatch, request):
             if response_type == "ok":
                 terminating_status = "ok"
                 terminating_reason = "reviewer_ok"
+                break
+            # Mirrors the production round loop (#180): a caller that owns no
+            # coder ends here rather than running one, and before the
+            # no-progress budget, which measures coder turns.
+            if not rework.runs_coder_rounds:
+                terminating_status = "stopped"
+                terminating_reason = "reviewer_requested_changes"
                 break
             if not getting_closer:
                 no_progress_streak += 1

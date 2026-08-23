@@ -10,6 +10,7 @@ from typing import Any, Protocol
 
 from ..domain.events import SessionEvent
 from ..domain.models import COMPLETION_RECORD_PATH, CompletionRecord, RequestedAction
+from ..domain.review_exchange_run import ReviewExchangeRunAssets
 from ..domain.runtime_identity import RuntimeIdentity
 from ..domain.session_run import SessionRunAssets
 from ..ports.session_output import SessionOutput
@@ -47,6 +48,7 @@ def build_processing_result(
     branch: str | None,
     pr_url: str | None,
     review_exchange_completed: bool,
+    review_exchange_run: ReviewExchangeRunAssets | None,
     actions_taken: list[str],
     errors: list[str],
     error_details: list[dict[str, Any]],
@@ -152,6 +154,7 @@ def build_processing_result(
         errors=errors if errors else None,
         review_exchange_completed=review_exchange_completed,
         review_exchange_halted=review_exchange_halted,
+        review_exchange_run=review_exchange_run,
     )
 
 
