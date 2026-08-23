@@ -45,6 +45,7 @@ if TYPE_CHECKING:
     from ..infra.config import Config
     from ..ports import ManifestDownloader, RepositoryHost
     from ..ports.issue import Issue
+    from ..ports.working_copy import WorkingCopy
     from ..ports.tech_lead_authority import TechLeadAuthorityStore
     from .worktree_context import ScratchWorktreeIdentity, WorktreeContext
 
@@ -293,6 +294,31 @@ def _resolve_health_review_cohort(
     return tuple(sorted({problem.issue_number for problem in cohort or ()}))
 
 
+def _launch_base_sha(working_copy: "WorkingCopy", worktree_path: Path) -> str:
+    """The commit this run's checkout stands at, right now, before the spawn.
+
+    Read from the checkout the orchestrator just provisioned — not from the
+    run-dir note the agent can also read and write, which is evidence *about*
+    the agent and never evidence held *against* it (#202).
+
+    An unreadable HEAD yields ``""``, which the durable record defines as "the
+    launch base was never observed". That does not fail the launch: the run is
+    perfectly able to do its work, it merely forfeits the zero-code lane at
+    completion, which is the fail-closed direction.
+
+    Read BEFORE the worktree provisioner runs the target repo's setup
+    commands, so anything setup writes is judged as the run's own change. That
+    is deliberate and fail-closed, but it has a cost worth knowing: in a repo
+    whose setup touches a *tracked* file — a refreshed lockfile, a formatter, a
+    regenerated artifact — every planning run afterwards is refused the lane
+    for dirt it did not author and takes the publish path, with only the
+    settler's INFO detail to say why. The fix if that ever bites is a
+    launch-time dirt baseline recorded here beside the base commit, not a
+    path filter at completion.
+    """
+    return working_copy.get_head_sha(worktree_path) or ""
+
+
 def prepare_tech_lead_session_data(
     *,
     config: "Config",
@@ -300,6 +326,7 @@ def prepare_tech_lead_session_data(
     manifest_downloader: "ManifestDownloader",
     tech_lead_authority: "TechLeadAuthorityStore",
     board_snapshot_provider: "BoardSnapshotProvider",
+    working_copy: "WorkingCopy",
     issue: "Issue",
     ctx: "WorktreeContext",
     tech_lead_scope: "TechLeadLaunchScope | None",
@@ -316,7 +343,9 @@ def prepare_tech_lead_session_data(
     run's identity, which completion reads as the only scope authority
     (#6761 re-review F1). Health reviews record no focus/manifest scope plus
     their OWNED problem cohort (#6780); act-level proposals may target only
-    that cohort.
+    that cohort. Every flavor's record also carries the orchestrator-observed
+    ``launch_base_sha`` this checkout stands at right now — the launch-time
+    half of the zero-code lane decided at completion (#202).
 
     A PLANNING_INVESTIGATION additionally receives the canonical governing
     context of its subject (#183) — the exact sources the subject declares,
@@ -383,6 +412,7 @@ def prepare_tech_lead_session_data(
             if tech_lead_manifest
             else (),
             problem_issue_numbers=problem_issue_numbers,
+            launch_base_sha=_launch_base_sha(working_copy, ctx.worktree_path),
         ),
     )
     logger.info("[tech_lead] Wrote %s assignment: %s", flavor.value, assignment_path)

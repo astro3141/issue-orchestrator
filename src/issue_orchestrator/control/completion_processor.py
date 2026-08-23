@@ -45,6 +45,7 @@ from ..domain.completion_finalization import (
 from ..domain.models import (
     CompletionOutcome,
     CompletionRecord,
+    PUBLICATION_ACTIONS,
     RequestedAction,
     COMPLETION_RECORD_PATH,
 )
@@ -129,8 +130,9 @@ from .review_exchange_pr_comment import (
 )
 from .test_skip_guard import added_test_paths, scan_added_test_skip_guards
 from .tech_lead_approval_gate import build_tech_lead_decision_approval_gate
-from .tech_lead_completion import tech_lead_decision_processing_error
+from .tech_lead_completion import admit_tech_lead_completion
 from .tech_lead_session_policy import is_benign_tech_lead_no_commits, is_tech_lead_session, shape_requested_actions_for_tech_lead
+from .tech_lead_zero_code import settle_zero_code_planning_completion
 from .worktree_head import current_worktree_head_sha
 from ..ports.pull_request_tracker import PRInfo
 from ..ports.working_copy import PushResult
@@ -853,9 +855,10 @@ class CompletionProcessor:
             cleanup_completion_record_fn=self._cleanup_completion_record,
         )
 
-    def _reject_tech_lead_completion_if_invalid(
+    def _admit_tech_lead_completion(
         self,
         *,
+        worktree: Path,
         record: CompletionRecord,
         agent_label: str | None,
         issue_number: int,
@@ -871,30 +874,51 @@ class CompletionProcessor:
         comment calls and a failed processing result whose tagged error is
         classified critical, so history records FAILED for every flavor and
         the tech_lead failure labeling path fires downstream.
+
+        Only once the run is ADMITTED does its lane get settled (#202): a
+        planning run proven to have changed no code drops the publication
+        intent the completion CLI hands every ``completed``, so the publish
+        gate, the review exchange, the push and the PR are never reached. That
+        order is the invariant — suppressing intent for a completion whose
+        decision has not been judged would turn a rejection into a settlement.
         """
         if self._config is None or not self._is_tech_lead_session(agent_label):
             return None
         if record.outcome is not CompletionOutcome.COMPLETED:
             return None
-        tech_lead_error = tech_lead_decision_processing_error(
+        admission = admit_tech_lead_completion(
             self._config,
             tech_lead_authority=self._tech_lead_authority,
             run_dir=run_assets.run_dir,
             run_id=run_assets.run_id,
             session_name=run_assets.session_name,
         )
-        if tech_lead_error is None:
-            return None
-        logger.warning(
-            "Tech Lead completion rejected before any action for issue #%d: %s",
+        if admission.error is not None:
+            logger.warning(
+                "Tech Lead completion rejected before any action for issue #%d: %s",
+                issue_number,
+                admission.error,
+            )
+            return ProcessingResult(
+                success=False,
+                message=f"Tech Lead completion rejected: {admission.error}",
+                errors=[admission.error],
+            )
+        assert admission.authority is not None  # admitted <=> a verified record
+        settlement = settle_zero_code_planning_completion(
+            authority=admission.authority,
+            requested_actions=tuple(record.requested_actions),
+            worktree=worktree,
+            worktree_reader=self.git_adapter,
+        )
+        record.requested_actions = list(settlement.requested_actions)
+        logger.info(
+            "Tech Lead completion lane for issue #%d: zero_code=%s (%s)",
             issue_number,
-            tech_lead_error,
+            settlement.zero_code,
+            settlement.detail,
         )
-        return ProcessingResult(
-            success=False,
-            message=f"Tech Lead completion rejected: {tech_lead_error}",
-            errors=[tech_lead_error],
-        )
+        return None
 
     def _review_exchange_approval_gate(
         self,
@@ -930,8 +954,11 @@ class CompletionProcessor:
         # First: tech_lead scope/decision authority (#6769 finding 1). Checked
         # ahead of the worktree policies because a rejected tech_lead completion
         # must produce zero GitHub calls — the worktree handlers below post
-        # diagnostic comments.
-        tech_lead_rejection = self._reject_tech_lead_completion_if_invalid(
+        # diagnostic comments. Admission also settles which lane the run's
+        # publication intent belongs to, which is why it runs before every
+        # publish precondition below (#202).
+        tech_lead_rejection = self._admit_tech_lead_completion(
+            worktree=worktree,
             record=record,
             agent_label=agent_label,
             issue_number=issue_number,
@@ -1800,7 +1827,7 @@ class CompletionProcessor:
                 "exception_type": type(e).__name__,
                 "traceback": traceback.format_exc(),
             })
-            if action in {RequestedAction.PUSH_BRANCH, RequestedAction.CREATE_PR}:
+            if action in PUBLICATION_ACTIONS:
                 self._emit_publish_failed(
                     issue_number=issue_number,
                     stage=action.value,

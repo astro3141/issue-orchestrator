@@ -136,6 +136,40 @@ class RequestedAction(Enum):
     PUSH_BRANCH = "push_branch"
 
 
+PUBLICATION_ACTIONS: frozenset[RequestedAction] = frozenset({
+    RequestedAction.PUSH_BRANCH,
+    RequestedAction.CREATE_PR,
+})
+"""The actions that reach the remote — the vocabulary, owned in one place.
+
+Every consumer of "is this publication?" reads from here rather than
+re-spelling the set: :attr:`CompletionRecord.reaches_the_remote`, the
+completion processor's publish-failure branch, and the zero-code planning
+settler that drops the intent a run proven to offer nothing never meant. A
+publication action added to :class:`RequestedAction` joins the family once,
+here, instead of leaving one path silently permitting what the others refuse.
+"""
+
+
+def without_publication_intent(
+    actions: Iterable[RequestedAction],
+) -> tuple[RequestedAction, ...]:
+    """``actions`` minus everything that reaches the remote, order preserved.
+
+    The command form of :data:`PUBLICATION_ACTIONS`, so a caller that has
+    proven a completion offers nothing to publish states that intent instead
+    of restating which actions publish.
+
+    Both publication actions go together on purpose: dropping only
+    ``PUSH_BRANCH`` would leave :attr:`CompletionRecord.offers_a_change_for_review`
+    true, so the publish gate and the review exchange would both still run for
+    a completion that offers nothing to review.
+    """
+    return tuple(
+        action for action in actions if action not in PUBLICATION_ACTIONS
+    )
+
+
 # ---------------------------------------------------------------------------
 # CompletionRecord untrusted-input bounds
 #
@@ -468,12 +502,11 @@ class CompletionRecord:
         the narrower :attr:`offers_a_change_for_review` (#25).
 
         Beside its sibling predicate rather than on a processor, so both
-        questions about what a record ASKS FOR are answered by the record.
+        questions about what a record ASKS FOR are answered by the record —
+        against the one :data:`PUBLICATION_ACTIONS` vocabulary every other
+        consumer of the same question reads.
         """
-        return bool(
-            {RequestedAction.PUSH_BRANCH, RequestedAction.CREATE_PR}
-            & set(self.requested_actions)
-        )
+        return bool(PUBLICATION_ACTIONS & set(self.requested_actions))
 
     @property
     def offers_a_change_for_review(self) -> bool:

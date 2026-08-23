@@ -400,6 +400,11 @@ class TechLeadLaunchAuthority:
     issue, manifest PR set, and anchor issue. Completion effects (labels,
     close, decision-target scope) key off this record; the worktree copies
     exist only for the agent to read.
+
+    It also carries the launch-time FACT the completion lane needs to tell a
+    zero-code run from a code-bearing one — :attr:`launch_base_sha` — for the
+    same reason: the orchestrator observed it, and nothing the agent can write
+    stands in for it.
     """
 
     flavor: TechLeadSessionFlavor
@@ -412,12 +417,29 @@ class TechLeadLaunchAuthority:
     # board snapshot, whose failure list is deliberately broader context.
     # Immutable act-level authority, not agent-provided scope.
     problem_issue_numbers: tuple[int, ...] = ()
+    # The commit this run's checkout stood at when the orchestrator handed it
+    # over, read from the worktree itself immediately BEFORE the agent was
+    # spawned (#202). It is the only trustworthy answer to "did this run change
+    # any code", because the run-dir note the agent can also see is written
+    # into agent-writable space and is therefore evidence *about* the agent
+    # rather than evidence held *against* it.
+    #
+    # Empty means the fact was never recorded — a row written before this field
+    # existed, or a launch whose HEAD read failed. Empty is NOT "unchanged":
+    # readers must refuse the zero-code lane for such a row rather than guess,
+    # infer, or backfill it.
+    launch_base_sha: str = ""
     schema_version: int = _SCHEMA_VERSION
 
     def __post_init__(self) -> None:
         if self.schema_version != _SCHEMA_VERSION:
             raise ValueError(
                 f"Unsupported tech_lead authority schema_version: {self.schema_version!r}"
+            )
+        if self.launch_base_sha != self.launch_base_sha.strip():
+            raise ValueError(
+                "TechLeadLaunchAuthority launch_base_sha must be the bare commit "
+                f"id, unpadded; got {self.launch_base_sha!r}"
             )
         if self.flavor.is_issue_focused and self.focus_issue_number is None:
             raise ValueError(
@@ -517,6 +539,7 @@ class TechLeadLaunchAuthority:
             "focus_issue_number": self.focus_issue_number,
             "manifest_pr_numbers": list(self.manifest_pr_numbers),
             "problem_issue_numbers": list(self.problem_issue_numbers),
+            "launch_base_sha": self.launch_base_sha,
         }
 
     @classmethod
@@ -561,12 +584,23 @@ class TechLeadLaunchAuthority:
                 "tech_lead authority problem_issue_numbers must be a list of ints, "
                 f"got {raw_problems!r}"
             )
+        # Absent is the LEGACY row (written before #202) and it is kept
+        # distinguishable from a recorded value rather than defaulted into one:
+        # an empty launch base makes the run ineligible for the zero-code lane,
+        # which is the fail-closed direction.
+        raw_base_sha = data.get("launch_base_sha", "")
+        if not isinstance(raw_base_sha, str):
+            raise ValueError(
+                "tech_lead authority launch_base_sha must be a string, "
+                f"got {raw_base_sha!r}"
+            )
         return cls(
             flavor=flavor,
             anchor_issue_number=anchor,
             focus_issue_number=focus,
             manifest_pr_numbers=tuple(raw_prs),
             problem_issue_numbers=tuple(raw_problems),
+            launch_base_sha=raw_base_sha,
             schema_version=raw_schema,
         )
 

@@ -415,6 +415,46 @@ Constraints that make this safe to leave on:
   its scope label so they are discoverable, and every other gate (dependencies,
   claims, review) applies unchanged. Promotion files issues, full stop.
 
+### 4b. A zero-code planning completion settles in its own lane (#202 amendment)
+
+`coding-done completed` hands EVERY completion `push_branch` + `create_pr`.
+That is right for a coder and wrong for a `planning_investigation`, which is
+launched into a disposable scratch checkout to read an issue and propose work,
+and is not asked to write code. Held to the code-candidate publish contract
+anyway, such a run had its already-authorized planning effects gated behind a
+publication it was never offering.
+
+So the completion path decides a LANE, once, immediately after the run's launch
+authority and decision have been validated:
+
+- **The launch-time half.** `TechLeadLaunchAuthority` carries
+  `launch_base_sha`, the commit the run's checkout stood at, read from the
+  checkout by the launch owner immediately before the agent is spawned. The
+  agent-visible run-directory copies are evidence *about* the agent and never
+  stand in for it. A record without the field — one written before it existed,
+  or a launch whose HEAD read failed — is ineligible; nothing infers, guesses,
+  or backfills it.
+- **The completion-time half.** `control/tech_lead_zero_code.py` requires all
+  six of: authoritative flavor `planning_investigation`, a durable
+  `launch_base_sha`, a successful HEAD read, HEAD equal to that launch base, a
+  successful tracked-dirt enumeration, and nothing dirty. Unobservable is never
+  read as zero-code.
+- **What follows.** Both publication intents are dropped together, ahead of the
+  publication and review seams — dropping only `push_branch` would leave
+  `offers_a_change_for_review` true, so the publication gate and the review
+  exchange would still run for a completion offering nothing. The already
+  validated decision's effects (`create_issue` and peers) then settle through
+  their existing owner, dedup, and durable-receipt semantics, unchanged.
+
+Order is load-bearing: publication-intent suppression never precedes validation
+of the decision, so a malformed, tampered, or unauthorized planning output
+still produces zero effects rather than a quietly settled zero-code run. And
+the boundary holds in the other direction too — a planning run with
+orchestrator-observed commit or tracked-content changes keeps the ordinary
+publication and review path, as does every other flavor and every ordinary
+coder, rework, and review completion. What "validated" means for a code
+candidate is untouched.
+
 ### 5. Sequencing and scope boundaries
 
 Hygiene precedes construction: the dead batch-trigger engine and its

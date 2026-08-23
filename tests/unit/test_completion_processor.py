@@ -3462,6 +3462,527 @@ class TestTechLeadCompletionEffects:
         assert not result.errors
 
 
+class TestZeroCodePlanningLane:
+    """A planning run that changed no code settles without the publish gate (#202).
+
+    ``coding-done completed`` hands EVERY completion ``push_branch`` +
+    ``create_pr``, so a planning run — launched into a disposable scratch
+    checkout and never asked to write code — was held to the code-candidate
+    publish contract and its already-authorized planning effects never settled.
+
+    These tests fix both halves of the boundary: the proven zero-code run must
+    reach none of the publication or review seams, and a run whose zero-code
+    status is anything less than proven must keep today's behaviour exactly.
+    """
+
+    LAUNCH_SHA = "c" * 40
+    MOVED_SHA = "d" * 40
+
+    def _make_processor(
+        self,
+        tmp_path,
+        mock_label_adapter,
+        mock_pr_adapter,
+        mock_git_adapter,
+        event_bus,
+        tech_lead_authority_store,
+        *,
+        publication_gate=None,
+        review_exchange_runner=None,
+    ) -> CompletionProcessor:
+        prompt = tmp_path / "tech-lead.md"
+        prompt.write_text("Tech Lead prompt")
+        config = Config()
+        config.repo_root = tmp_path  # authority store home
+        config.tech_lead_review_agent = "agent:tech-lead"
+        config.agents = {"agent:tech-lead": AgentConfig(prompt_path=prompt)}
+        if review_exchange_runner is not None:
+            config.review_enabled = True
+            config.review_exchange_mode = "via-local-loop"
+            config.review_exchange_require_validation = False
+            config.code_review_agent = "agent:reviewer"
+            config.config_path = _write_test_config(tmp_path)
+            config.agents["agent:reviewer"] = AgentConfig(prompt_path=prompt)
+            config.repo = "acme/widgets"
+        mock_git_adapter.default_branch.return_value = "main"
+        return CompletionProcessor(
+            agent_callback_endpoint=ready_callback_endpoint(),
+            label_adapter=mock_label_adapter,
+            pr_adapter=mock_pr_adapter,
+            git_adapter=mock_git_adapter,
+            session_output=FileSystemSessionOutput(),
+            publication_gate=publication_gate,
+            review_exchange_runner=review_exchange_runner,
+            event_bus=event_bus,
+            label_config={},
+            config=config,
+            tech_lead_authority=tech_lead_authority_store,
+        )
+
+    @staticmethod
+    def _completed_record() -> CompletionRecord:
+        """What ``coding-done completed`` writes, planning runs included."""
+        return make_record(
+            outcome=CompletionOutcome.COMPLETED,
+            requested_actions=[
+                RequestedAction.PUSH_BRANCH,
+                RequestedAction.CREATE_PR,
+                RequestedAction.POST_COMMENT,
+            ],
+            summary="Prepared #123",
+            implementation="Read the issue and proposed follow-up work",
+            comment_body="## Implementation\n\nPrepared #123.",
+        )
+
+    def _arm_planning_run(
+        self,
+        authority_store,
+        worktree,
+        *,
+        launch_base_sha: str,
+        flavor=None,
+    ):
+        """Plant the assignment copy, the launch authority, and a valid pair."""
+        from issue_orchestrator.domain.tech_lead_session import (
+            TECH_LEAD_ASSIGNMENT_FILENAME,
+            TechLeadAssignment,
+            TechLeadLaunchAuthority,
+            TechLeadSessionFlavor,
+        )
+
+        flavor = flavor or TechLeadSessionFlavor.PLANNING_INVESTIGATION
+        run_assets = make_session_run_assets(worktree)
+        run_dir = run_assets.run_dir
+        focused = flavor.is_issue_focused
+        assignment_path = (
+            run_dir / "tech-lead-data" / TECH_LEAD_ASSIGNMENT_FILENAME
+        )
+        TechLeadAssignment(
+            flavor=flavor,
+            focus_issue_number=123 if focused else None,
+            focus_reason="Prepare: open and unblocked" if focused else "",
+        ).write(assignment_path)
+        manifest_path = run_dir / "manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        manifest["tech_lead_assignment"] = str(assignment_path)
+        manifest_path.write_text(json.dumps(manifest))
+        self._plant_pair_proposing_an_issue(run_dir)
+        authority_store.record(
+            run_id=run_assets.run_id,
+            session_name=run_assets.session_name,
+            authority=TechLeadLaunchAuthority(
+                flavor=flavor,
+                anchor_issue_number=123,
+                focus_issue_number=123 if focused else None,
+                launch_base_sha=launch_base_sha,
+            ),
+        )
+        return run_assets
+
+    @staticmethod
+    def _plant_pair_proposing_an_issue(run_dir) -> None:
+        """A valid decision carrying a scope-free ``create_issue`` effect.
+
+        The diagnosis comment rides along so the SAME pair is admissible for a
+        failure investigation too, which is what lets the wrong-flavor test
+        vary only the flavor.
+        """
+        data_dir = run_dir / "tech-lead-data"
+        data_dir.mkdir(parents=True, exist_ok=True)
+        (data_dir / "tech-lead-decision.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "summary": "Preparation complete.",
+                    "findings": [
+                        {
+                            "id": "T1",
+                            "title": "Missing groundwork",
+                            "classification": "task",
+                            "evidence": ["issue #123 body"],
+                        }
+                    ],
+                    "proposed_actions": [
+                        {
+                            "id": "A1",
+                            "action_type": "post_comment",
+                            "target_number": 123,
+                            "body": "Preparation notes for #123.",
+                            "finding_ids": ["T1"],
+                        },
+                        {
+                            "id": "A2",
+                            "action_type": "create_issue",
+                            "title": "Land the groundwork",
+                            "body": "Do the thing first.",
+                            "finding_ids": ["T1"],
+                        },
+                    ],
+                }
+            )
+        )
+        (data_dir / "tech-lead-report.md").write_text(
+            "# Report\n\nFinding T1 prepared.\n\nProposals: A1, A2.\n"
+        )
+
+    def _process(self, processor, worktree, run_assets):
+        return processor.process(
+            worktree,
+            run_assets=run_assets,
+            issue_number=123,
+            issue_title="Planning Investigation",
+            agent_label="agent:tech-lead",
+            issue_key=None,
+        )
+
+    # -- The proven zero-code run ---------------------------------------
+
+    def test_a_proven_zero_code_run_reaches_no_publication_or_review_seam(
+        self,
+        tmp_path,
+        mock_label_adapter,
+        mock_pr_adapter,
+        mock_git_adapter,
+        event_bus,
+        tech_lead_authority_store,
+        worktree_with_completion,
+    ):
+        """The positive proof: gate, exchange, push and PR are all untouched."""
+        gate = Mock()
+        gate.check = Mock(side_effect=publish_gate_outcome())
+        exchange_runner = _CapturingReviewExchangeRunner()
+        processor = self._make_processor(
+            tmp_path,
+            mock_label_adapter,
+            mock_pr_adapter,
+            mock_git_adapter,
+            event_bus,
+            tech_lead_authority_store,
+            publication_gate=gate,
+            review_exchange_runner=exchange_runner,
+        )
+        mock_git_adapter.get_head_sha.return_value = self.LAUNCH_SHA
+        worktree = worktree_with_completion(self._completed_record())
+        run_assets = self._arm_planning_run(
+            tech_lead_authority_store, worktree, launch_base_sha=self.LAUNCH_SHA
+        )
+
+        result = self._process(processor, worktree, run_assets)
+
+        assert result.success is True
+        assert not result.errors
+        gate.check.assert_not_called()
+        assert exchange_runner.calls == []
+        mock_git_adapter.push.assert_not_called()
+        mock_pr_adapter.create_pr.assert_not_called()
+
+    def test_a_proven_zero_code_run_leaves_its_decision_for_the_effect_owner(
+        self,
+        tmp_path,
+        mock_label_adapter,
+        mock_pr_adapter,
+        mock_git_adapter,
+        event_bus,
+        tech_lead_authority_store,
+        worktree_with_completion,
+    ):
+        """Dropping publication intent settles nothing else.
+
+        The authorized ``create_issue`` still travels to its existing owner —
+        the action planner reads the same decision artifact, and this asserts
+        the completion path neither consumed nor invalidated it.
+        """
+        processor = self._make_processor(
+            tmp_path,
+            mock_label_adapter,
+            mock_pr_adapter,
+            mock_git_adapter,
+            event_bus,
+            tech_lead_authority_store,
+        )
+        mock_git_adapter.get_head_sha.return_value = self.LAUNCH_SHA
+        worktree = worktree_with_completion(self._completed_record())
+        run_assets = self._arm_planning_run(
+            tech_lead_authority_store, worktree, launch_base_sha=self.LAUNCH_SHA
+        )
+
+        result = self._process(processor, worktree, run_assets)
+
+        assert result.success is True
+        decision = json.loads(
+            (run_assets.run_dir / "tech-lead-data" / "tech-lead-decision.json")
+            .read_text()
+        )
+        assert "create_issue" in [
+            action["action_type"] for action in decision["proposed_actions"]
+        ]
+
+    # -- The hard boundary ----------------------------------------------
+
+    @pytest.mark.parametrize(
+        ("head_sha", "dirty_files", "why"),
+        [
+            ("d" * 40, [], "HEAD moved after launch"),
+            ("c" * 40, ["src/thing.py"], "blocking tracked dirt is present"),
+            (None, [], "HEAD is unreadable"),
+            ("c" * 40, None, "tracked dirt is unenumerable"),
+        ],
+    )
+    def test_an_unproven_planning_run_keeps_the_publication_path(
+        self,
+        tmp_path,
+        mock_label_adapter,
+        mock_pr_adapter,
+        mock_git_adapter,
+        event_bus,
+        tech_lead_authority_store,
+        worktree_with_completion,
+        head_sha,
+        dirty_files,
+        why,
+    ):
+        """Observed change, and unobservable state, both keep today's behaviour."""
+        processor = self._make_processor(
+            tmp_path,
+            mock_label_adapter,
+            mock_pr_adapter,
+            mock_git_adapter,
+            event_bus,
+            tech_lead_authority_store,
+        )
+        mock_git_adapter.get_head_sha.return_value = head_sha
+        mock_git_adapter.list_dirty_files.return_value = dirty_files
+        worktree = worktree_with_completion(self._completed_record())
+        run_assets = self._arm_planning_run(
+            tech_lead_authority_store, worktree, launch_base_sha=self.LAUNCH_SHA
+        )
+
+        self._process(processor, worktree, run_assets)
+
+        assert mock_git_adapter.push.called, why
+        assert mock_pr_adapter.create_pr.called, why
+
+    def test_a_legacy_authority_row_keeps_the_publication_path(
+        self,
+        tmp_path,
+        mock_label_adapter,
+        mock_pr_adapter,
+        mock_git_adapter,
+        event_bus,
+        tech_lead_authority_store,
+        worktree_with_completion,
+    ):
+        """A row written before the launch base existed is never exempt."""
+        processor = self._make_processor(
+            tmp_path,
+            mock_label_adapter,
+            mock_pr_adapter,
+            mock_git_adapter,
+            event_bus,
+            tech_lead_authority_store,
+        )
+        mock_git_adapter.get_head_sha.return_value = self.LAUNCH_SHA
+        worktree = worktree_with_completion(self._completed_record())
+        run_assets = self._arm_planning_run(
+            tech_lead_authority_store, worktree, launch_base_sha=""
+        )
+
+        self._process(processor, worktree, run_assets)
+
+        mock_git_adapter.push.assert_called_once()
+        mock_pr_adapter.create_pr.assert_called_once()
+
+    def test_a_failure_investigation_keeps_the_publication_path(
+        self,
+        tmp_path,
+        mock_label_adapter,
+        mock_pr_adapter,
+        mock_git_adapter,
+        event_bus,
+        tech_lead_authority_store,
+        worktree_with_completion,
+    ):
+        """Wrong flavor: an unchanged checkout buys another role nothing."""
+        from issue_orchestrator.domain.tech_lead_session import TechLeadSessionFlavor
+
+        processor = self._make_processor(
+            tmp_path,
+            mock_label_adapter,
+            mock_pr_adapter,
+            mock_git_adapter,
+            event_bus,
+            tech_lead_authority_store,
+        )
+        mock_git_adapter.get_head_sha.return_value = self.LAUNCH_SHA
+        worktree = worktree_with_completion(self._completed_record())
+        run_assets = self._arm_planning_run(
+            tech_lead_authority_store,
+            worktree,
+            launch_base_sha=self.LAUNCH_SHA,
+            flavor=TechLeadSessionFlavor.FAILURE_INVESTIGATION,
+        )
+
+        self._process(processor, worktree, run_assets)
+
+        mock_git_adapter.push.assert_called_once()
+        mock_pr_adapter.create_pr.assert_called_once()
+
+    def test_an_ordinary_coder_completion_is_untouched(
+        self,
+        tmp_path,
+        mock_label_adapter,
+        mock_pr_adapter,
+        mock_git_adapter,
+        event_bus,
+        tech_lead_authority_store,
+        worktree_with_completion,
+    ):
+        """Control: nothing about code-candidate publication moved."""
+        processor = self._make_processor(
+            tmp_path,
+            mock_label_adapter,
+            mock_pr_adapter,
+            mock_git_adapter,
+            event_bus,
+            tech_lead_authority_store,
+        )
+        processor._config.agents["agent:coder"] = (  # noqa: SLF001
+            processor._config.agents["agent:tech-lead"]  # noqa: SLF001
+        )
+        mock_git_adapter.get_head_sha.return_value = self.LAUNCH_SHA
+        worktree = worktree_with_completion(self._completed_record())
+
+        result = processor.process(
+            worktree,
+            run_assets=make_session_run_assets(worktree),
+            issue_number=123,
+            issue_title="Ordinary work",
+            agent_label="agent:coder",
+            issue_key=None,
+        )
+
+        assert result.success is True
+        mock_git_adapter.push.assert_called_once()
+        mock_pr_adapter.create_pr.assert_called_once()
+        mock_pr_adapter.add_comment.assert_called_once()
+
+    # -- Ordering: validation first, suppression second -------------------
+
+    def test_a_malformed_decision_still_produces_zero_effects(
+        self,
+        tmp_path,
+        mock_label_adapter,
+        mock_pr_adapter,
+        mock_git_adapter,
+        event_bus,
+        tech_lead_authority_store,
+        worktree_with_completion,
+    ):
+        """Suppression must never precede validation of the decision.
+
+        A zero-code planning run whose decision does not parse is REJECTED —
+        it must not be quietly converted into a settled zero-code completion.
+        """
+        from issue_orchestrator.control.completion_types import (
+            ERROR_PREFIX_TECH_LEAD_DECISION,
+        )
+
+        processor = self._make_processor(
+            tmp_path,
+            mock_label_adapter,
+            mock_pr_adapter,
+            mock_git_adapter,
+            event_bus,
+            tech_lead_authority_store,
+        )
+        mock_git_adapter.get_head_sha.return_value = self.LAUNCH_SHA
+        worktree = worktree_with_completion(self._completed_record())
+        run_assets = self._arm_planning_run(
+            tech_lead_authority_store, worktree, launch_base_sha=self.LAUNCH_SHA
+        )
+        (
+            run_assets.run_dir / "tech-lead-data" / "tech-lead-decision.json"
+        ).write_text("{not json")
+
+        result = self._process(processor, worktree, run_assets)
+
+        assert result.success is False
+        assert any(
+            error.startswith(ERROR_PREFIX_TECH_LEAD_DECISION)
+            for error in result.errors
+        )
+        mock_git_adapter.push.assert_not_called()
+        mock_pr_adapter.create_pr.assert_not_called()
+        mock_pr_adapter.add_comment.assert_not_called()
+
+    def test_an_unauthorized_recovery_proposal_is_refused(
+        self,
+        tmp_path,
+        mock_label_adapter,
+        mock_pr_adapter,
+        mock_git_adapter,
+        event_bus,
+        tech_lead_authority_store,
+        worktree_with_completion,
+    ):
+        """The least-authority role's capability boundary is unchanged (#136)."""
+        from issue_orchestrator.control.completion_types import (
+            ERROR_PREFIX_TECH_LEAD_DECISION,
+        )
+
+        processor = self._make_processor(
+            tmp_path,
+            mock_label_adapter,
+            mock_pr_adapter,
+            mock_git_adapter,
+            event_bus,
+            tech_lead_authority_store,
+        )
+        mock_git_adapter.get_head_sha.return_value = self.LAUNCH_SHA
+        worktree = worktree_with_completion(self._completed_record())
+        run_assets = self._arm_planning_run(
+            tech_lead_authority_store, worktree, launch_base_sha=self.LAUNCH_SHA
+        )
+        (
+            run_assets.run_dir / "tech-lead-data" / "tech-lead-decision.json"
+        ).write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "summary": "Reset it.",
+                    "findings": [
+                        {
+                            "id": "T1",
+                            "title": "Stuck",
+                            "classification": "infra",
+                            "evidence": ["run log"],
+                        }
+                    ],
+                    "proposed_actions": [
+                        {
+                            "id": "A1",
+                            "action_type": "reset_retry",
+                            "target_number": 123,
+                            "body": "Stuck run; reset it.",
+                            "finding_ids": ["T1"],
+                        }
+                    ],
+                }
+            )
+        )
+
+        result = self._process(processor, worktree, run_assets)
+
+        assert result.success is False
+        assert any(
+            error.startswith(ERROR_PREFIX_TECH_LEAD_DECISION)
+            and "capability is limited to" in error
+            for error in result.errors
+        )
+        mock_git_adapter.push.assert_not_called()
+        mock_pr_adapter.create_pr.assert_not_called()
+
+
 class TestCompletionProcessorGitActions:
     """Tests for git-related actions from completion records."""
 

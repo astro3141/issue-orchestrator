@@ -402,6 +402,106 @@ class TestStageEvidenceMap:
         assert "evidence_map" not in manifest
 
 
+class TestLaunchBaseSha:
+    """The launch owner records the commit the run was handed (#202).
+
+    The zero-code lane at completion rests entirely on this fact being
+    orchestrator-observed at launch: the agent-writable run directory carries
+    copies for the agent to READ, and none of them may stand in for it.
+    """
+
+    LAUNCH_SHA = "e" * 40
+
+    @staticmethod
+    def _config(tmp_path: Path):
+        from issue_orchestrator.infra.config import Config
+
+        config = Config(repo="owner/repo")
+        config.tech_lead_review_agent = "agent:tech-lead"
+        config.repo_root = tmp_path / "repo"
+        config.repo_root.mkdir(parents=True, exist_ok=True)
+        return config
+
+    @staticmethod
+    def _ctx(tmp_path: Path):
+        worktree = tmp_path / "scratch"
+        run_dir = worktree / ".issue-orchestrator" / "sessions" / "run"
+        run_dir.mkdir(parents=True)
+        return SimpleNamespace(
+            run=SimpleNamespace(
+                run_dir=run_dir, run_id="run-1", session_name="issue-109"
+            ),
+            worktree_path=worktree,
+            update_manifest=lambda _entries: None,
+        )
+
+    @staticmethod
+    def _board_provider():
+        from issue_orchestrator.domain.board_snapshot import BoardSnapshot
+
+        return SimpleNamespace(
+            snapshot=lambda focus, problems=(): BoardSnapshot(
+                generated_at="2026-08-23T00:00:00Z", orchestrator_paused=False
+            )
+        )
+
+    def _record(self, tmp_path: Path, working_copy):
+        from issue_orchestrator.control.tech_lead_session_policy import (
+            prepare_tech_lead_session_data,
+        )
+        from issue_orchestrator.domain.tech_lead_session import TechLeadLaunchScope
+        from issue_orchestrator.ports.tech_lead_authority import (
+            InMemoryTechLeadAuthorityStore,
+        )
+
+        store = InMemoryTechLeadAuthorityStore()
+        prepare_tech_lead_session_data(
+            config=self._config(tmp_path),
+            repository_host=SimpleNamespace(),
+            manifest_downloader=SimpleNamespace(),
+            tech_lead_authority=store,
+            board_snapshot_provider=self._board_provider(),
+            working_copy=working_copy,
+            issue=SimpleNamespace(
+                number=109, title="Investigate", agent_type="agent:tech-lead", labels=[]
+            ),
+            ctx=self._ctx(tmp_path),
+            tech_lead_scope=TechLeadLaunchScope(
+                flavor=TechLeadSessionFlavor.FAILURE_INVESTIGATION
+            ),
+        )
+        return store.load(run_id="run-1", session_name="issue-109")
+
+    def test_the_recorded_base_is_the_checkout_head_the_orchestrator_read(
+        self, tmp_path: Path
+    ) -> None:
+        seen: list[Path] = []
+
+        def _head(worktree: Path) -> str:
+            seen.append(worktree)
+            return self.LAUNCH_SHA
+
+        authority = self._record(
+            tmp_path, SimpleNamespace(get_head_sha=_head)
+        )
+
+        assert authority is not None
+        assert authority.launch_base_sha == self.LAUNCH_SHA
+        # Read from the run's OWN checkout, not the repo root or the run dir.
+        assert seen == [tmp_path / "scratch"]
+
+    def test_an_unreadable_head_records_nothing_and_still_launches(
+        self, tmp_path: Path
+    ) -> None:
+        """Forfeiting the lane is the fail-closed cost; failing the launch is not."""
+        authority = self._record(
+            tmp_path, SimpleNamespace(get_head_sha=lambda _worktree: None)
+        )
+
+        assert authority is not None
+        assert authority.launch_base_sha == ""
+
+
 class TestFocusedScratchWorktree:
     """A focused run reads its subject's branch; it must never write to it."""
 

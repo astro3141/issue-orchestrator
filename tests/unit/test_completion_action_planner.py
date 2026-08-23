@@ -26,7 +26,7 @@ from issue_orchestrator.control.completion_types import (
     ERROR_PREFIX_PUSH,
 )
 from issue_orchestrator.control.tech_lead_completion import (
-    tech_lead_decision_processing_error,
+    admit_tech_lead_completion,
 )
 from issue_orchestrator.control.label_manager import LabelManager
 from tests.conftest import make_provider_availability
@@ -750,13 +750,13 @@ def test_health_review_decision_targeting_anchor_passes_scope_validation(
     arm_health_review_session(config, session)
     plant_tech_lead_decision_pair(session, comment_targets=(session.issue.number,))
 
-    error = tech_lead_decision_processing_error(
+    error = admit_tech_lead_completion(
         config,
         tech_lead_authority=SqliteTechLeadAuthorityStore.for_repo(config.repo_root),
         run_dir=session.run_dir,
         run_id=session.run_assets.run_id,
         session_name=session.run_assets.session_name,
-    )
+    ).error
 
     assert error is None
 
@@ -775,13 +775,13 @@ def test_health_review_decision_targeting_other_issue_is_rejected(
     arm_health_review_session(config, session)
     plant_tech_lead_decision_pair(session, comment_targets=(999,))
 
-    error = tech_lead_decision_processing_error(
+    error = admit_tech_lead_completion(
         config,
         tech_lead_authority=SqliteTechLeadAuthorityStore.for_repo(config.repo_root),
         run_dir=session.run_dir,
         run_id=session.run_assets.run_id,
         session_name=session.run_assets.session_name,
-    )
+    ).error
     assert error is not None
     assert "outside this session's launch scope" in error
 
@@ -849,13 +849,13 @@ def test_health_review_flag_pattern_is_scope_free_and_opens_case_file(
     _plant_flag_pattern_decision(session)
 
     # Scope-free: no out-of-scope error even though it is not the anchor.
-    error = tech_lead_decision_processing_error(
+    error = admit_tech_lead_completion(
         config,
         tech_lead_authority=SqliteTechLeadAuthorityStore.for_repo(config.repo_root),
         run_dir=session.run_dir,
         run_id=session.run_assets.run_id,
         session_name=session.run_assets.session_name,
-    )
+    ).error
     assert error is None
 
     actions = make_planner(config).generate_completion_actions(
@@ -1780,13 +1780,13 @@ class TestDecisionTargetScope:
         )
 
         # Authoritative processing seam rejects the whole completion.
-        error = tech_lead_decision_processing_error(
+        error = admit_tech_lead_completion(
             config,
             tech_lead_authority=SqliteTechLeadAuthorityStore.for_repo(config.repo_root),
             run_dir=session.run_dir,
             run_id=session.run_assets.run_id,
             session_name=session.run_assets.session_name,
-        )
+        ).error
         assert error is not None
         assert "A1 (reset_retry) is not an action kind" in error
         assert "batch_review" in error
@@ -1831,13 +1831,13 @@ class TestDecisionTargetScope:
             ],
         )
 
-        error = tech_lead_decision_processing_error(
+        error = admit_tech_lead_completion(
             config,
             tech_lead_authority=SqliteTechLeadAuthorityStore.for_repo(config.repo_root),
             run_dir=session.run_dir,
             run_id=session.run_assets.run_id,
             session_name=session.run_assets.session_name,
-        )
+        ).error
 
         assert error is None
 
@@ -1871,13 +1871,13 @@ class TestDecisionTargetScope:
             ],
         )
 
-        error = tech_lead_decision_processing_error(
+        error = admit_tech_lead_completion(
             config,
             tech_lead_authority=SqliteTechLeadAuthorityStore.for_repo(config.repo_root),
             run_dir=session.run_dir,
             run_id=session.run_assets.run_id,
             session_name=session.run_assets.session_name,
-        )
+        ).error
 
         assert error is not None
         assert "immutable problem cohort" in error
@@ -1914,13 +1914,13 @@ class TestDecisionTargetScope:
             ],
         )
 
-        error = tech_lead_decision_processing_error(
+        error = admit_tech_lead_completion(
             config,
             tech_lead_authority=SqliteTechLeadAuthorityStore.for_repo(config.repo_root),
             run_dir=session.run_dir,
             run_id=session.run_assets.run_id,
             session_name=session.run_assets.session_name,
-        )
+        ).error
 
         assert error is not None
         assert "immutable problem cohort" in error
@@ -1957,13 +1957,13 @@ class TestDecisionTargetScope:
             ],
         )
 
-        error = tech_lead_decision_processing_error(
+        error = admit_tech_lead_completion(
             config,
             tech_lead_authority=SqliteTechLeadAuthorityStore.for_repo(config.repo_root),
             run_dir=session.run_dir,
             run_id=session.run_assets.run_id,
             session_name=session.run_assets.session_name,
-        )
+        ).error
 
         assert error is None
 
@@ -1985,13 +1985,13 @@ class TestDecisionTargetScope:
             problem_cohort=[99],
         ).write(session.run_dir / "tech-lead-data" / "board-snapshot.json")
 
-        error = tech_lead_decision_processing_error(
+        error = admit_tech_lead_completion(
             config,
             tech_lead_authority=SqliteTechLeadAuthorityStore.for_repo(config.repo_root),
             run_dir=session.run_dir,
             run_id=session.run_assets.run_id,
             session_name=session.run_assets.session_name,
-        )
+        ).error
 
         assert error is not None
         assert error.startswith("tech_lead_authority: scope_tampered")
@@ -2032,13 +2032,13 @@ class TestDecisionTargetScope:
             ],
         )
 
-        error = tech_lead_decision_processing_error(
+        error = admit_tech_lead_completion(
             config,
             tech_lead_authority=SqliteTechLeadAuthorityStore.for_repo(config.repo_root),
             run_dir=session.run_dir,
             run_id=session.run_assets.run_id,
             session_name=session.run_assets.session_name,
-        )
+        ).error
         assert error is not None
         assert "multiple act-level proposed actions target #1: A2, A3" in error
 
@@ -2128,13 +2128,13 @@ class TestFlavorActionKindCapabilities:
         return config, session
 
     def _processing_error(self, config: Config, session: Session) -> str | None:
-        return tech_lead_decision_processing_error(
+        return admit_tech_lead_completion(
             config,
             tech_lead_authority=SqliteTechLeadAuthorityStore.for_repo(config.repo_root),
             run_dir=session.run_dir,
             run_id=session.run_assets.run_id,
             session_name=session.run_assets.session_name,
-        )
+        ).error
 
     @pytest.mark.parametrize(
         ("flavor", "action_type"),
@@ -2559,13 +2559,13 @@ class TestLaunchScopeTamperResistance:
         )
         plant_tech_lead_decision_pair(session, comment_targets=())
 
-        error = tech_lead_decision_processing_error(
+        error = admit_tech_lead_completion(
             config,
             tech_lead_authority=SqliteTechLeadAuthorityStore.for_repo(config.repo_root),
             run_dir=session.run_dir,
             run_id=session.run_assets.run_id,
             session_name=session.run_assets.session_name,
-        )
+        ).error
         assert error is not None and error.startswith(
             "tech_lead_authority: scope_tampered"
         )
@@ -2589,13 +2589,13 @@ class TestLaunchScopeTamperResistance:
         )
         assignment_path.unlink()
 
-        error = tech_lead_decision_processing_error(
+        error = admit_tech_lead_completion(
             config,
             tech_lead_authority=SqliteTechLeadAuthorityStore.for_repo(config.repo_root),
             run_dir=session.run_dir,
             run_id=session.run_assets.run_id,
             session_name=session.run_assets.session_name,
-        )
+        ).error
 
         assert error is not None and error.startswith(
             "tech_lead_authority: scope_tampered"
@@ -2616,13 +2616,13 @@ class TestLaunchScopeTamperResistance:
         manifest_path = tmp_path / "tech-lead-manifest.json"
         tampered.write(manifest_path)
 
-        error = tech_lead_decision_processing_error(
+        error = admit_tech_lead_completion(
             config,
             tech_lead_authority=SqliteTechLeadAuthorityStore.for_repo(config.repo_root),
             run_dir=session.run_dir,
             run_id=session.run_assets.run_id,
             session_name=session.run_assets.session_name,
-        )
+        ).error
         assert error is not None and error.startswith(
             "tech_lead_authority: scope_tampered"
         )
@@ -2646,13 +2646,13 @@ class TestLaunchScopeTamperResistance:
             session, TechLeadAssignment(flavor=TechLeadSessionFlavor.BATCH_REVIEW)
         )
 
-        error = tech_lead_decision_processing_error(
+        error = admit_tech_lead_completion(
             config,
             tech_lead_authority=SqliteTechLeadAuthorityStore.for_repo(config.repo_root),
             run_dir=session.run_dir,
             run_id=session.run_assets.run_id,
             session_name=session.run_assets.session_name,
-        )
+        ).error
 
         assert error is not None and error.startswith(
             "tech_lead_authority: missing_authority"
@@ -2787,13 +2787,13 @@ class TestTechLeadDecisionFailureTransition:
                 TechLeadSessionFlavor.PLANNING_INVESTIGATION, "reset_retry"
             ),
         )
-        error = tech_lead_decision_processing_error(
+        error = admit_tech_lead_completion(
             config,
             tech_lead_authority=SqliteTechLeadAuthorityStore.for_repo(config.repo_root),
             run_dir=session.run_dir,
             run_id=session.run_assets.run_id,
             session_name=session.run_assets.session_name,
-        )
+        ).error
         assert error is not None and "reset_retry" in error
 
         actions = make_planner(config).generate_completion_actions(
@@ -3061,6 +3061,29 @@ class TestMilestoneResolutionBoundary:
             action for action in actions if isinstance(action, CreateTechLeadIssueAction)
         ]
         assert create.milestone == TechLeadMilestoneIntent(explicit_name="M5")
+
+    def test_a_planning_run_still_settles_its_authorized_create_issue(
+        self, tmp_path: Path
+    ) -> None:
+        """The zero-code lane suppresses PUBLICATION intent, nothing else (#202).
+
+        A planning run's authorized ``create_issue`` settles through the same
+        owner it always did — the effect planner reads the decision artifact,
+        which the completion path neither consumes nor rewrites.
+        """
+        from unittest.mock import MagicMock
+
+        config = make_tech_lead_config(tmp_path)
+        session = make_tech_lead_session(tmp_path)
+        arm_planning_session(config, session)
+        self._plant_pair_with_create_issue(session)
+
+        actions = self._completed_actions(config, session, MagicMock())
+
+        [create] = [
+            action for action in actions if isinstance(action, CreateTechLeadIssueAction)
+        ]
+        assert create.title == "Stabilize CI runner"
 
 
 def test_provider_blocked_rework_restores_its_needs_rework_trigger(
