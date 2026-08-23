@@ -6,6 +6,8 @@ argv only.
 
 from __future__ import annotations
 
+import tomllib
+
 import pytest
 
 from issue_orchestrator.execution.agent_runner_providers.codex import CodexProvider
@@ -14,6 +16,17 @@ from issue_orchestrator.execution.agent_runner_providers.codex import CodexProvi
 def _cmd(**kwargs: str) -> list[str]:
     """Build the argv with sane defaults; return the list for assertions."""
     return CodexProvider().build_command(prompt="task", **kwargs)
+
+
+def _config_overrides(argv: list[str]) -> dict[str, object]:
+    """Decode every ``-c key=<toml>`` pair in *argv* the way Codex would."""
+    overrides: dict[str, object] = {}
+    for index, token in enumerate(argv):
+        if token != "-c":
+            continue
+        key, raw = argv[index + 1].split("=", 1)
+        overrides[key] = tomllib.loads(f"value = {raw}")["value"]
+    return overrides
 
 
 class TestCodexJsonOutputDefault:
@@ -80,6 +93,111 @@ class TestCodexJsonOutputDefault:
         default safe even when someone passes a typo."""
         cmd = _cmd(json_output=no_value)
         assert "--json" not in cmd
+
+
+class TestCodexUpdateCheckSuppression:
+    """Every Codex launch disables the startup update check (#205).
+
+    In a fully trusted repository the interactive TUI still stops before
+    the composer on::
+
+        ✨ Update available!  0.147.0 -> 0.149.0
+          › 1. Update now  2. Skip  3. Skip until next version
+        Press enter to continue
+
+    Nothing in an unattended launch answers that prompt, and the trigger is
+    upstream releasing a newer version — not anything IO does — so pinning a
+    runtime guarantees the prompt recurs rather than suppressing it. The
+    launch argv carries Codex's documented ``check_for_update_on_startup``
+    field as a ``-c`` override, which is the highest-precedence config layer
+    and therefore holds whatever the user, project, or system layer says.
+    """
+
+    def test_interactive_launch_disables_update_check(self) -> None:
+        assert _config_overrides(_cmd())["check_for_update_on_startup"] is False
+
+    def test_exec_launch_disables_update_check(self) -> None:
+        cmd = _cmd(execution_mode="exec")
+        assert _config_overrides(cmd)["check_for_update_on_startup"] is False
+
+    def test_override_is_emitted_as_an_adjacent_c_pair(self) -> None:
+        """``-c`` and its assignment must stay adjacent, and the value must be
+        a TOML boolean — ``check_for_update_on_startup="false"`` would be a
+        string, which is not what the field accepts."""
+        cmd = _cmd()
+        assert "check_for_update_on_startup=false" in cmd
+        assert cmd[cmd.index("check_for_update_on_startup=false") - 1] == "-c"
+
+    def test_override_is_emitted_exactly_once(self) -> None:
+        cmd = _cmd(reasoning_effort="high")
+        assert cmd.count("check_for_update_on_startup=false") == 1
+
+    def test_override_survives_alongside_reasoning_effort(self) -> None:
+        """Both overrides ride the same ``-c`` seam; neither may displace the
+        other."""
+        overrides = _config_overrides(_cmd(reasoning_effort="high"))
+        assert overrides["check_for_update_on_startup"] is False
+        assert overrides["model_reasoning_effort"] == "high"
+
+    def test_override_precedes_the_prompt(self) -> None:
+        cmd = _cmd()
+        assert cmd.index("check_for_update_on_startup=false") < cmd.index("task")
+
+    @pytest.mark.parametrize(
+        "kwargs",
+        [
+            {},
+            {"execution_mode": "exec"},
+            {"approval_mode": "yolo"},
+            {"execution_mode": "exec", "approval_mode": "yolo"},
+            {"execution_mode": "exec", "json_output": "true"},
+        ],
+    )
+    def test_every_supported_launch_shape_disables_update_check(
+        self, kwargs: dict[str, str],
+    ) -> None:
+        """The prompt is a startup-time gate, so no approval mode, execution
+        mode, or output mode may leave it armed."""
+        overrides = _config_overrides(_cmd(**kwargs))
+        assert overrides["check_for_update_on_startup"] is False
+
+
+class TestCodexConfigOverridePosition:
+    """``-c`` pairs are root-command options and must precede ``exec``.
+
+    Position is not cosmetic. A ``-c`` pair placed after the subcommand binds
+    to the subcommand's own occurrence of the option, and the root-level
+    overrides — including the permission profile a ``SandboxScope`` emits — are
+    then not applied. The live boundary test caught this: a scoped
+    ``codex exec`` launch still ran the requested command, but its write into
+    the worktree was denied, because one post-``exec`` override had displaced
+    the profile (#205). Guard the rule here too, deterministically, so a new
+    override cannot re-introduce it without a live run.
+    """
+
+    @staticmethod
+    def _config_flag_positions(argv: list[str]) -> list[int]:
+        return [index for index, token in enumerate(argv) if token == "-c"]
+
+    def test_update_override_precedes_the_exec_subcommand(self) -> None:
+        cmd = _cmd(execution_mode="exec")
+        assert cmd.index("check_for_update_on_startup=false") < cmd.index("exec")
+
+    def test_reasoning_effort_override_precedes_the_exec_subcommand(self) -> None:
+        cmd = _cmd(execution_mode="exec", reasoning_effort="high")
+        assert cmd.index('model_reasoning_effort="high"') < cmd.index("exec")
+
+    def test_every_config_flag_precedes_the_exec_subcommand(self) -> None:
+        cmd = _cmd(execution_mode="exec", reasoning_effort="high")
+        exec_index = cmd.index("exec")
+        assert self._config_flag_positions(cmd), "expected at least one -c pair"
+        assert all(index < exec_index for index in self._config_flag_positions(cmd))
+
+    def test_config_overrides_are_contiguous(self) -> None:
+        """One block, one owner — overrides are emitted from a single place."""
+        cmd = _cmd(reasoning_effort="high")
+        positions = self._config_flag_positions(cmd)
+        assert positions == list(range(positions[0], positions[0] + 2 * 2, 2))
 
 
 class TestCodexBaseCommand:

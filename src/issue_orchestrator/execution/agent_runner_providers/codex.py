@@ -48,6 +48,23 @@ class CodexProvider(CLIProvider):
     AUTH_STATUS_ARGV = ("login", "status")
     _LOGGED_IN_MARKER = "logged in using"
 
+    # Codex checks for a newer upstream release on startup and, when one
+    # exists, paints an interactive nag ("✨ Update available!") that waits on
+    # Enter before the composer is reachable. An unattended launch parks there
+    # forever. The trigger is upstream advancing, not anything IO does, so
+    # pinning a runtime does not suppress the prompt — it guarantees the prompt
+    # recurs, and its offered remedy (`brew upgrade --cask codex`) would mutate
+    # the pinned host toolchain. ``check_for_update_on_startup`` is Codex's
+    # documented ConfigToml field for exactly this: it gates the startup check
+    # and its prompt only, orthogonal to ``approval_policy``, ``sandbox_mode``,
+    # ``permissions`` and ``projects.*.trust_level``. It grants no capability
+    # and leaves ``codex update`` available. Emitting it as a ``-c`` override
+    # keeps it the highest-precedence config layer (so no user, project, or
+    # system layer can re-enable it), scopes it to this launch, writes no
+    # host-wide state, and leaves the decision auditable in the recorded argv
+    # (#205).
+    UPDATE_CHECK_OVERRIDE = ("-c", "check_for_update_on_startup=false")
+
     def check_readiness(self, runner: "CommandRunner") -> ProviderReadiness:
         """Probe Codex's local credential state without spawning a TUI."""
         if not self.is_available():
@@ -141,14 +158,14 @@ class CodexProvider(CLIProvider):
                 execution_mode=execution_mode,
             )
 
+        self._append_config_overrides(cmd, kwargs)
+
         if execution_mode == "exec":
             cmd.append("exec")
 
         # Model (optional - Codex will use default if not specified)
         if model:
             cmd.extend(["--model", model])
-
-        self._append_reasoning_effort(cmd, kwargs)
 
         if sandbox_scope is None:
             self._append_sandbox_flags(
@@ -186,11 +203,26 @@ class CodexProvider(CLIProvider):
             else:
                 cmd.extend(["--ask-for-approval", "never"])
 
-    @staticmethod
-    def _append_reasoning_effort(
+    @classmethod
+    def _append_config_overrides(
+        cls,
         cmd: list[str],
         kwargs: Mapping[str, object],
     ) -> None:
+        """Append every ``-c key=value`` pair, in root-command position.
+
+        Position is load-bearing, not cosmetic. ``-c`` is a root-command
+        option; a pair placed *after* the ``exec`` subcommand binds to the
+        subcommand's own occurrence and the root-level overrides are then not
+        applied — including the permission profile a ``SandboxScope`` emits in
+        ``scope_argv``. Proven live: adding one unrelated post-``exec`` pair to
+        a scoped ``codex exec`` launch made its in-worktree write fail while
+        the agent still ran the command
+        (``tests/integration/test_sandbox_os_boundary.py``). Emitting every
+        override before the subcommand keeps them in one position and one
+        owner, so a new override cannot silently disarm the sandbox.
+        """
+        cmd.extend(cls.UPDATE_CHECK_OVERRIDE)
         reasoning_effort = kwargs.get("reasoning_effort")
         if reasoning_effort is None:
             reasoning_effort = kwargs.get("model_reasoning_effort")
