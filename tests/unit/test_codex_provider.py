@@ -162,6 +162,44 @@ class TestCodexUpdateCheckSuppression:
         assert overrides["check_for_update_on_startup"] is False
 
 
+class TestCodexConfigOverridePosition:
+    """``-c`` pairs are root-command options and must precede ``exec``.
+
+    Position is not cosmetic. A ``-c`` pair placed after the subcommand binds
+    to the subcommand's own occurrence of the option, and the root-level
+    overrides — including the permission profile a ``SandboxScope`` emits — are
+    then not applied. The live boundary test caught this: a scoped
+    ``codex exec`` launch still ran the requested command, but its write into
+    the worktree was denied, because one post-``exec`` override had displaced
+    the profile (#205). Guard the rule here too, deterministically, so a new
+    override cannot re-introduce it without a live run.
+    """
+
+    @staticmethod
+    def _config_flag_positions(argv: list[str]) -> list[int]:
+        return [index for index, token in enumerate(argv) if token == "-c"]
+
+    def test_update_override_precedes_the_exec_subcommand(self) -> None:
+        cmd = _cmd(execution_mode="exec")
+        assert cmd.index("check_for_update_on_startup=false") < cmd.index("exec")
+
+    def test_reasoning_effort_override_precedes_the_exec_subcommand(self) -> None:
+        cmd = _cmd(execution_mode="exec", reasoning_effort="high")
+        assert cmd.index('model_reasoning_effort="high"') < cmd.index("exec")
+
+    def test_every_config_flag_precedes_the_exec_subcommand(self) -> None:
+        cmd = _cmd(execution_mode="exec", reasoning_effort="high")
+        exec_index = cmd.index("exec")
+        assert self._config_flag_positions(cmd), "expected at least one -c pair"
+        assert all(index < exec_index for index in self._config_flag_positions(cmd))
+
+    def test_config_overrides_are_contiguous(self) -> None:
+        """One block, one owner — overrides are emitted from a single place."""
+        cmd = _cmd(reasoning_effort="high")
+        positions = self._config_flag_positions(cmd)
+        assert positions == list(range(positions[0], positions[0] + 2 * 2, 2))
+
+
 class TestCodexBaseCommand:
     """Sanity-check the rest of the argv shape so a refactor that
     moves the ``--json`` decision around doesn't accidentally drop

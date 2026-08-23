@@ -667,12 +667,20 @@ def test_generated_codex_profile_enforced_by_os(tmp_path: Path) -> None:
         f"this exact command, without changing it:\n{exact_command}\n"
         "Do not use any other tool. After the command finishes, reply DONE."
     )
+    # ``reasoning_effort`` is set so this lane also carries a caller-supplied
+    # ``-c`` override alongside the scope's own. Position is load-bearing: a
+    # ``-c`` pair emitted after the ``exec`` subcommand binds to the
+    # subcommand and the root-level permission profile is then not applied,
+    # so the agent runs the command but its in-worktree write is denied. That
+    # is exactly what this test caught (#205), and it is invisible to any
+    # argv-shape assertion — only a live launch shows the boundary move.
     cmd = CodexProvider().build_command(
         prompt=prompt,
         model=None,
         sandbox_scope=scope,
         execution_mode="exec",
         json_output="true",
+        reasoning_effort="low",
     )
     result = _run(cmd, cwd=worktree, timeout=180)
     combined = (result.stdout or "") + (result.stderr or "")
