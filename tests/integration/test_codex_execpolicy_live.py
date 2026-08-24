@@ -159,7 +159,7 @@ class TestShippedRulesAgainstTheInstalledCli:
         result = CodexAdapter().verify_hooks(installed_project)
 
         assert result.success, result.checks_failed
-        assert "execpolicy_allows:git push origin main" in result.checks_passed
+        assert "execpolicy_not_blocked:git push origin main" in result.checks_passed
         assert "execpolicy_blocks:git push --no-verify" in result.checks_passed
 
     def test_neutralizing_the_forbidden_rule_fails_the_gate(

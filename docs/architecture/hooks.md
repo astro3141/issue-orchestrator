@@ -253,6 +253,17 @@ matched rule, output that is not the documented no-match shape, and a nonzero
 `tests/integration/test_codex_execpolicy_live.py` re-measures it against the
 installed CLI.
 
+The verifier reports what it measured. The safe sample passes as
+`execpolicy_not_blocked:git push origin main` — not `execpolicy_allows`, which
+would say "allow" about a no-match — and fails as `execpolicy_wrongly_blocks`;
+the dangerous sample passes as `execpolicy_blocks` and fails as
+`execpolicy_should_block`. A policy that cannot answer at all — an absent or
+unrunnable CLI, a timeout, a nonzero exit, unclassifiable output — reaches the
+verifier as a single `ExecPolicyResultError` and is reported as
+`execpolicy_check_failed`, per sample. That is the only exception the verifier
+catches: any other error from a checker is a bug and is left to crash rather
+than being dressed up as a policy verdict.
+
 ### Hook Validation Config
 
 To exercise AI gate tests for all supported CLIs without changing your main config, use:

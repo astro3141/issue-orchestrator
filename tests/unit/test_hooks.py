@@ -1231,11 +1231,12 @@ class TestCodexAdapter:
 
         assert adapter.is_installed(temp_project)
 
-    def test_verify_hooks_passes_after_install(self, temp_project, monkeypatch):
+    def test_verify_hooks_passes_after_install(
+        self, adapter, temp_project, monkeypatch
+    ):
         # The shipped rules answer the safe sample with the no-match shape, not
         # with an allow decision (#252); classification lives in
         # tests/unit/test_codex_execpolicy_verification.py.
-        adapter = CodexAdapter(execpolicy=_StubExecPolicy())
         adapter.install_hooks(temp_project)
 
         monkeypatch.setattr(shutil, "which", lambda _cmd: "/usr/local/bin/codex")

@@ -70,7 +70,14 @@ class RecordedExecPolicy:
 
 
 class RefusingExecPolicy:
-    """A policy that cannot answer — a broken CLI, a timeout, an exit code."""
+    """A policy that cannot answer — a broken CLI, a timeout, an exit code.
+
+    Those reach the gate as ``ExecPolicyResultError`` because that is the
+    channel ``ExecPolicyChecker`` declares and ``CodexCliExecPolicy`` honours
+    (``TestCodexCliExecPolicy`` proves the wrapping). Any *other* exception is
+    a bug rather than a policy answer, which
+    ``test_an_unexpected_error_is_not_reported_as_a_policy_failure`` pins.
+    """
 
     def __init__(self, error: Exception) -> None:
         self._error = error
@@ -179,7 +186,7 @@ class TestHookVerification:
         )
 
         assert result.success, result.checks_failed
-        assert "execpolicy_allows:git push origin main" in result.checks_passed
+        assert "execpolicy_not_blocked:git push origin main" in result.checks_passed
         assert "execpolicy_blocks:git push --no-verify" in result.checks_passed
 
     def test_explicit_allow_on_the_safe_command_also_passes(
@@ -214,7 +221,7 @@ class TestHookVerification:
 
         assert not result.success
         assert not any(
-            check.startswith("execpolicy_allows") for check in result.checks_passed
+            check.startswith("execpolicy_not_blocked") for check in result.checks_passed
         )
         assert any(
             check.startswith("execpolicy_check_failed:git push origin main")
@@ -230,14 +237,14 @@ class TestHookVerification:
 
         assert not result.success
         assert not any(
-            check.startswith("execpolicy_allows") for check in result.checks_passed
+            check.startswith("execpolicy_not_blocked") for check in result.checks_passed
         )
 
     def test_a_policy_that_cannot_answer_fails_closed(self, project: Path) -> None:
         """A nonzero exit, a timeout, a missing binary: all the same verdict."""
         adapter = CodexAdapter(
             execpolicy=RefusingExecPolicy(
-                subprocess.TimeoutExpired(cmd="codex", timeout=120)
+                ExecPolicyResultError("codex execpolicy check timed out after 120s")
             )
         )
         adapter.install_hooks(project)
@@ -259,6 +266,24 @@ class TestHookVerification:
             == 2
         )
 
+    def test_an_unexpected_error_is_not_reported_as_a_policy_failure(
+        self, project: Path
+    ) -> None:
+        """A bug in a checker is a bug, not a verdict about the rules.
+
+        The gate catches exactly the failure channel ``ExecPolicyChecker``
+        declares. Anything else -- an ``AttributeError`` in classification, say
+        -- would otherwise be reported as ``execpolicy_check_failed`` truncated
+        to 40 characters, which hides the bug behind a policy answer.
+        """
+        adapter = CodexAdapter(
+            execpolicy=RefusingExecPolicy(AttributeError("classifier bug"))
+        )
+        adapter.install_hooks(project)
+
+        with pytest.raises(AttributeError, match="classifier bug"):
+            adapter.verify_hooks(project)
+
     def test_one_unanswerable_check_does_not_hide_the_other(
         self, project: Path
     ) -> None:
@@ -269,7 +294,7 @@ class TestHookVerification:
         )
 
         assert not result.success
-        assert "execpolicy_allows:git push origin main" in result.checks_passed
+        assert "execpolicy_not_blocked:git push origin main" in result.checks_passed
 
     def test_neutralizing_the_dangerous_rule_fails_verification(
         self, project: Path
@@ -312,7 +337,43 @@ class TestHookVerification:
 
 
 class TestCodexCliExecPolicy:
-    """The process boundary: what the CLI's exit code means."""
+    """The process boundary, and the one door every failure leaves through.
+
+    ``ExecPolicyChecker`` promises that a policy which cannot answer raises
+    ``ExecPolicyResultError``. These pin that the production implementation
+    keeps that promise for every way running a subprocess can fail, so the
+    caller's narrow ``except`` is the boundary rather than an accident.
+    """
+
+    def test_a_timeout_raises_the_declared_error(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """A CLI that never answers is not a CLI that answered permissively."""
+
+        def _times_out(*args: object, **kwargs: object):
+            raise subprocess.TimeoutExpired(cmd="codex", timeout=120)
+
+        monkeypatch.setattr(subprocess, "run", _times_out)
+
+        with pytest.raises(ExecPolicyResultError, match="timed out") as raised:
+            CodexCliExecPolicy().check(tmp_path / "orchestrator.rules", SAFE_COMMAND)
+
+        assert isinstance(raised.value.__cause__, subprocess.TimeoutExpired)
+
+    def test_a_missing_binary_raises_the_declared_error(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """The checker is exported and called directly, not only behind ``which``."""
+
+        def _no_such_binary(*args: object, **kwargs: object):
+            raise FileNotFoundError(2, "No such file or directory", "codex")
+
+        monkeypatch.setattr(subprocess, "run", _no_such_binary)
+
+        with pytest.raises(ExecPolicyResultError, match="could not run") as raised:
+            CodexCliExecPolicy().check(tmp_path / "orchestrator.rules", SAFE_COMMAND)
+
+        assert isinstance(raised.value.__cause__, FileNotFoundError)
 
     def test_nonzero_exit_raises_rather_than_classifying(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path

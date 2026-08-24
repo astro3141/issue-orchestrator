@@ -17,6 +17,7 @@ from .codex_execpolicy import (
     CodexCliExecPolicy,
     ExecPolicyChecker,
     ExecPolicyOutcome,
+    ExecPolicyResultError,
 )
 
 logger = logging.getLogger(__name__)
@@ -42,7 +43,15 @@ class _ExecPolicySample:
 
     @property
     def passed_check(self) -> str:
-        verb = "blocks" if self.expect_forbidden else "allows"
+        """What was measured, not what it was mistaken for.
+
+        The safe sample passes by coming back *not blocked* -- which the
+        shipped rules satisfy by matching no rule at all. Reporting that as
+        ``execpolicy_allows`` would say "allow" about a no-match, which is the
+        very conflation #252 removed, so the passing check is named
+        ``execpolicy_not_blocked`` and reads against ``execpolicy_wrongly_blocks``.
+        """
+        verb = "blocks" if self.expect_forbidden else "not_blocked"
         return f"execpolicy_{verb}:{self.label}"
 
     @property
@@ -75,7 +84,9 @@ class CodexAdapter(AiAgentAdapter):
         its own rules; tests inject a checker rather than reaching into the
         adapter.
         """
-        self._execpolicy: ExecPolicyChecker = execpolicy or CodexCliExecPolicy()
+        self._execpolicy: ExecPolicyChecker = (
+            CodexCliExecPolicy() if execpolicy is None else execpolicy
+        )
 
     @property
     def agent_type(self) -> AiAgentType:
@@ -183,15 +194,21 @@ class CodexAdapter(AiAgentAdapter):
         Each sample is asked and judged independently, so one unanswerable
         check cannot hide the verdict on the other. Any failure to classify --
         an unrecognized decision such as ``prompt``, malformed output, a CLI
-        that exited nonzero, a timeout -- is a verification failure, never a
-        silent pass.
+        that exited nonzero, a timeout, an absent binary -- is a verification
+        failure, never a silent pass.
+
+        Only ``ExecPolicyResultError`` is caught, because that is the failure
+        channel :class:`ExecPolicyChecker` declares and the whole channel: a
+        checker that raises anything else has a bug, and a bug reported as a
+        truncated policy-failure string is the same guess-at-an-unreadable-answer
+        this module exists to remove. It is left to crash where it happened.
         """
         passed: list[str] = []
         failed: list[str] = []
         for sample in _EXECPOLICY_SAMPLES:
             try:
                 outcome = self._execpolicy.check(rules_file, sample.command)
-            except Exception as exc:
+            except ExecPolicyResultError as exc:
                 failed.append(f"execpolicy_check_failed:{sample.label}:{str(exc)[:40]}")
                 continue
             is_forbidden = outcome is ExecPolicyOutcome.FORBIDDEN

@@ -129,22 +129,43 @@ class CodexCliExecPolicy:
     timeout_seconds: int = 120
 
     def check(self, rules_file: Path, command: Sequence[str]) -> ExecPolicyOutcome:
-        result = subprocess.run(
-            [
-                "codex",
-                "execpolicy",
-                "check",
-                "--rules",
-                str(rules_file),
-                "--pretty",
-                "--",
-                *command,
-            ],
-            capture_output=True,
-            text=True,
-            timeout=self.timeout_seconds,
-            check=False,
-        )
+        """Classify *command* by running ``codex execpolicy check``.
+
+        Every way this adapter can fail to produce a classifiable answer leaves
+        through one door, so the caller has a single failure channel to catch:
+        a CLI that is absent or not executable, a run that outlives the
+        timeout, a nonzero exit, and output that cannot be classified all raise
+        :class:`ExecPolicyResultError`.
+
+        Raises:
+            ExecPolicyResultError: the policy gave no classifiable answer.
+        """
+        argv = [
+            "codex",
+            "execpolicy",
+            "check",
+            "--rules",
+            str(rules_file),
+            "--pretty",
+            "--",
+            *command,
+        ]
+        try:
+            result = subprocess.run(
+                argv,
+                capture_output=True,
+                text=True,
+                timeout=self.timeout_seconds,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise ExecPolicyResultError(
+                f"codex execpolicy check timed out after {self.timeout_seconds}s"
+            ) from exc
+        except OSError as exc:
+            raise ExecPolicyResultError(
+                f"could not run codex execpolicy check: {exc}"
+            ) from exc
         if result.returncode != 0:
             raise ExecPolicyResultError(
                 result.stderr.strip()
