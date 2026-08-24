@@ -28,15 +28,15 @@ asserts is.
 
 Read, in the worktree you were given, before you read the diff:
 
-- `AGENTS.md` — project principles, architecture, conventions, fail-fast design,
-  abstraction heuristics, the final abstraction pass (`CLAUDE.md` is a symlink
-  to the same content)
+- `AGENTS.md` — project principles, architecture, conventions, fail-fast
+  design, abstraction heuristics, the final abstraction pass (`CLAUDE.md` is a
+  symlink to the same content)
 - the `AGENTS.md` of any directory the change touches (for example
   `src/issue_orchestrator/AGENTS.md`, `tests/unit/AGENTS.md`,
   `tests/integration/AGENTS.md`, `tests/e2e/AGENTS.md`)
 - the issue body — the bounded scope and acceptance criteria
-- `docs/development/REVIEW_WORKFLOW.md` — the review loop, exchange mechanisms,
-  the review artifact contract, and the exact-SHA verdict binding
+- `docs/development/REVIEW_WORKFLOW.md` — the review loop, exchange
+  mechanisms, the review artifact contract, and the exact-SHA verdict binding
 - `.claude/skills/review-workflow/SKILL.md` — the canonical strict decision
   policy (nit vs non-nit, allowed outcomes)
 
@@ -81,7 +81,9 @@ git status --short
   finding, whether or not they look harmless.
 - The working tree is clean. Generated artifacts are committed, and
   regeneration is deterministic: `python scripts/generate_public_contracts.py`
-  must produce byte-identical output and leave no dirt.
+  must produce byte-identical output and leave no dirt. You are read-only and
+  the worktree you are given may be unprovisioned, so judge this by inspecting
+  the committed artifact against its source — do not run the generator.
 
 **Semantics**
 
@@ -208,6 +210,13 @@ acceptance path, an uncommitted generated artifact, a layering violation, a
 silent fallback, a missing bounded abstraction, an accessibility failure, an
 out-of-scope file. These are the normal case: they are fixable, and they belong
 in this exchange.
+
+**Disagree** is the third outcome the exchange protocol offers, for when the
+approach itself is wrong or the rounds have stopped converging — not for a
+defect rework can fix. A conflict with repository authority is not a
+disagreement with the implementer: route that through `NEEDS_HUMAN:` plus a
+request for changes, as below, so the decision reaches a human instead of
+stalling the exchange.
 
 Do not request changes for style preference. Do not downgrade a real concern to
 a nit to avoid blocking; if you are unsure whether something is a nit, it is
