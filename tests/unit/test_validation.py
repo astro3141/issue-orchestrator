@@ -59,9 +59,8 @@ def _timing_marker_command() -> str:
     return (
         "printf '%s\\n' "
         "'[validate-timing] CONFIG validate_jobs=10 unit_parallel=auto "
-        "simulated_parallel=auto integration_parallel=auto "
-        "integration_agent_parallel=0 static_jobs=10 test_jobs=1 "
-        "web_jobs=1 live_web_jobs=2 agent_jobs=1 e2e_jobs=1' "
+        "simulated_parallel=auto integration_parallel=auto static_jobs=10 "
+        "test_jobs=1 web_jobs=1 agent_jobs=1 e2e_jobs=1' "
         "'[validate-timing] START target=test-unit at=2026-03-14T09:10:13-0600' "
         "'[validate-timing] END target=test-unit status=0 elapsed=12s "
         "at=2026-03-14T09:10:25-0600'"
@@ -414,7 +413,7 @@ class TestValidationRunner:
         assert target_record["target"] == "test-unit"
         assert target_record["elapsed_seconds"] == 12
         assert target_record["validate_jobs"] == "10"
-        assert target_record["integration_agent_parallel"] == "0"
+        assert target_record["web_jobs"] == "1"
         assert target_record["started_at"] == "2026-03-14T09:10:13-0600"
         assert target_record["ended_at"] == "2026-03-14T09:10:25-0600"
 

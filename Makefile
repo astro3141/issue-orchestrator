@@ -515,13 +515,16 @@ test-integration: sync-deps
 # aggregate is NOT what any gate invokes, and it does spawn the real Codex CLI.
 test-integration-core: test-integration-core-local test-integration-core-live-codex
 
+# Files its timing under its own name: `test-integration-core` is now a
+# distinct aggregate that does spawn the real Codex CLI, so attributing this
+# deterministic slice to that name would misreport what the gate scheduled.
 test-integration-core-local: sync-deps
 ifeq ($(INTEGRATION_PARALLEL),0)
-	$(call TIMED_RUN,test-integration-core,\
+	$(call TIMED_RUN,test-integration-core-local,\
 		$(PYTEST) tests/integration -x -q --tb=short -m "not requires_infra and not live_codex and not $(LIVE_AGENT_MARKER)" \
 			$(PYTEST_TIMINGS))
 else
-	$(call TIMED_RUN,test-integration-core,\
+	$(call TIMED_RUN,test-integration-core-local,\
 		$(PYTEST) tests/integration -x -q --tb=short -m "not requires_infra and not live_codex and not $(LIVE_AGENT_MARKER)" -n $(INTEGRATION_PARALLEL) --dist=loadgroup \
 			$(PYTEST_TIMINGS))
 endif
@@ -541,6 +544,11 @@ endif
 # codex emitting protocol-valid verdict JSON. Run it deliberately; it is
 # provider/model compliance evidence, not per-candidate validation, and it files
 # no record that any gate reads.
+#
+# Evidence has to be able to say it ran: with codex absent or logged out this
+# lane fails, through `require_probe_ran`, naming the missing prerequisite. A
+# skip would exit 0 having proven nothing, which is indistinguishable from a
+# pass in exactly the reading this lane exists for.
 test-integration-core-live-codex: sync-deps
 	$(call TIMED_RUN,test-integration-core-live-codex,\
 		$(PYTEST) tests/integration -x -q --tb=short -m "live_codex and not requires_infra and not $(LIVE_AGENT_MARKER)" \

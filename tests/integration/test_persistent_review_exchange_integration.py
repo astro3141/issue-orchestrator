@@ -37,6 +37,8 @@ from issue_orchestrator.execution.agent_runner_providers.codex_trust import (
     resolve_codex_common_repository_root,
 )
 
+from tests.fixtures.live_agent_cli import is_codex_authenticated
+from tests.live_assurance import require_probe_ran
 from tests.workspace_trust import approval_for
 from tests.callback_endpoint_helpers import (
     published_callback_endpoint,
@@ -99,30 +101,36 @@ def _synthetic_review_exchange_tui_command() -> str:
     )
 
 
-def _codex_ready() -> bool:
-    """Real interactive codex available: CLI on PATH and authenticated.
-
-    ``codex login status`` exits 0 when logged in; any failure (missing
-    binary, not logged in, network-down auth check) skips the live test
-    rather than failing it on machines without codex.
-    """
-    import shutil
-
-    if shutil.which("codex") is None:
-        return False
-    try:
-        result = subprocess.run(
-            ["codex", "login", "status"],
-            capture_output=True,
-            text=True,
-            timeout=15,
-        )
-        return result.returncode == 0
-    except (subprocess.SubprocessError, OSError):
-        return False
-
-
-_CODEX_READY = _codex_ready()
+# Readiness for the live-Codex smoke below (#227). Deliberately a fixture and
+# not a module-scope constant or a `skipif` condition:
+#
+#   - `-m "... and not live_codex"` is a deselect applied *after* collection,
+#     so blocking validation imports this module — which holds deterministic
+#     tests — in every xdist worker on every run. A module-scope probe is a real
+#     `codex login status` inside the publish gate, for a test that gate is
+#     about to throw away. That is the dependency #194 removed for `live_agent`
+#     and #227 removes here; a `skipif` condition is module scope too, because
+#     the decorator expression is evaluated on import.
+#   - Collection also runs before `tests/codex_home.py`'s autouse isolation
+#     fixtures, so an import-time spawn would reach the operator's live
+#     `~/.codex`, which `tests/CLAUDE.md` forbids.
+#   - It reports through `require_probe_ran`, not a skip. This lane loads no
+#     assurance-lane plugin, so an absent or logged-out CLI is a loud failure
+#     naming the missing prerequisite — which is what makes the lane usable as
+#     the provider-compliance evidence the Makefile documents it as. A skip
+#     cannot tell "ran and passed" from "never ran".
+#
+# The probe itself lives in the shared registry rather than here, so the
+# import-time guardrail in tests/unit/test_makefile_validation_phases.py covers
+# it by name.
+@pytest.fixture
+def require_authenticated_codex() -> None:
+    require_probe_ran(
+        is_codex_authenticated(),
+        "the Codex CLI is not installed or not logged in on this host, so the "
+        "real-Codex reviewer never reached the review exchange; install and "
+        "`codex login`, then re-run `make test-integration-core-live-codex`",
+    )
 
 
 def _git(cwd: Path, *args: str) -> None:
@@ -871,10 +879,11 @@ def test_synthetic_raw_tui_review_exchange_suppresses_bootstrap_response(
     )
 
 
-@pytest.mark.skipif(not _CODEX_READY, reason="codex CLI not installed or not logged in")
 @pytest.mark.live_codex
 def test_real_interactive_codex_reviewer_round_trips_through_exchange(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    require_authenticated_codex: None,
 ) -> None:
     """LIVE smoke: REAL interactive codex as the reviewer through the REAL
     exchange loop — the seams no stub covers:

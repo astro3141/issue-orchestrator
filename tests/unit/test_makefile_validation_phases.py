@@ -318,16 +318,42 @@ def _import_time_calls(path: Path) -> set[str]:
     return visitor.names
 
 
-def _any_scope_calls(path: Path) -> set[str]:
-    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+def _calls_in(node: ast.AST) -> set[str]:
+    """The functions called anywhere inside one AST node."""
     names = set()
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Call):
+    for child in ast.walk(node):
+        if not isinstance(child, ast.Call):
             continue
-        dotted = _dotted_name(node.func)
+        dotted = _dotted_name(child.func)
         if dotted is not None:
             names.add(dotted.rsplit(".", 1)[-1])
     return names
+
+
+def _any_scope_calls(path: Path) -> set[str]:
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    return _calls_in(tree)
+
+
+def _is_fixture(node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
+    """Whether a function is decorated ``@pytest.fixture`` (bare or called)."""
+    for decorator in node.decorator_list:
+        for element in ast.walk(decorator):
+            dotted = _dotted_name(element)
+            if dotted is not None and dotted.startswith("pytest.fixture"):
+                return True
+    return False
+
+
+def _fixture_functions(
+    tree: ast.Module,
+) -> dict[str, ast.FunctionDef | ast.AsyncFunctionDef]:
+    """Module-level ``@pytest.fixture`` definitions, by fixture name."""
+    return {
+        node.name: node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef) and _is_fixture(node)
+    }
 
 
 def test_validate_impl_runs_core_phases_with_separate_job_caps():
@@ -420,7 +446,7 @@ def test_core_validation_runs_live_codex_marker_serially():
     assert len(starts) == 2
     assert len(ends) == 2
 
-    core_index = _find_line(lines, 'target="test-integration-core"')
+    core_index = _find_line(lines, 'target="test-integration-core-local"')
     live_codex_index = _find_line(lines, 'target="test-integration-core-live-codex"')
     non_live_marker_index = _find_line(
         lines,
@@ -697,6 +723,81 @@ class TestTheRealCodexSmokeIsOutOfBlockingPublication:
             "about"
         )
 
+    def test_the_readiness_probe_is_registered_and_deferred_to_call_time(self):
+        """Proof 5: deselection is not enough — the gate still imports this.
+
+        ``live_codex`` deselects after collection, exactly like ``live_agent``,
+        and the module holding the smoke also holds deterministic tests the
+        gate does run. So every blocking validation imports it, once per xdist
+        worker. A module-scope readiness probe — a ``skipif`` condition is one,
+        the decorator expression runs on import — would therefore be a real
+        ``codex login status`` spawn inside the publish gate, for the one test
+        that gate is about to throw away.
+
+        Import-time probing is already forbidden by
+        ``test_no_integration_module_calls_a_live_provider_at_import``, but
+        that rule can only see probes named in ``LIVE_PROVIDER_PROBES``. A
+        module-local helper is invisible to it and reads green. What this pins
+        is the registration, which is what gives the general rule its subject.
+        """
+        module = REPO_ROOT / LIVE_CODEX_SMOKE_MODULE
+        probes = set(LIVE_PROVIDER_PROBES)
+
+        assert _any_scope_calls(module) & probes, (
+            "the real-Codex smoke's readiness check is not a registered "
+            "live-provider probe, so the import-time guardrail reads past it; "
+            f"register it in tests/fixtures/live_agent_cli.py ({probes})"
+        )
+        assert not (_import_time_calls(module) & probes), (
+            "the readiness probe runs while this module is imported, which "
+            "blocking validation does on every run — and at collection time, "
+            "before tests/codex_home.py's isolation fixtures, so against the "
+            "operator's own ~/.codex"
+        )
+
+    def test_the_lane_cannot_report_success_without_running_the_smoke(self):
+        """Proof 5's other half: an absent CLI fails, it does not skip.
+
+        This lane is the only place the coverage lives now, and the Makefile
+        documents it as provider-compliance evidence someone reads. A
+        ``skipif`` would let ``make test-integration-core-live-codex`` exit 0
+        having run nothing, so the evidence could not tell *ran and passed*
+        from *never ran*. Readiness reports through ``require_probe_ran``
+        instead, from the fixture that also defers the probe — one edit site
+        for both halves.
+        """
+        module = REPO_ROOT / LIVE_CODEX_SMOKE_MODULE
+        tree = ast.parse(module.read_text(encoding="utf-8"), filename=str(module))
+        module_markers = _module_scope_markers(tree)
+        smoke = next(
+            node
+            for name, node in collected_tests(tree)
+            if name == LIVE_CODEX_SMOKE_TEST
+        )
+
+        assert not ({"skip", "skipif"} & _markers_on(smoke, module_markers)), (
+            "the real-Codex smoke skips instead of failing when codex is "
+            "unavailable, so its lane exits 0 having proven nothing"
+        )
+
+        fixtures = _fixture_functions(tree)
+        requested = {argument.arg for argument in smoke.args.args}
+        gates = [
+            fixtures[name]
+            for name in sorted(requested & fixtures.keys())
+            if _calls_in(fixtures[name]) & set(LIVE_PROVIDER_PROBES)
+        ]
+
+        assert gates, (
+            "the smoke requests no fixture that probes codex readiness, so "
+            "nothing checks the prerequisite at call time"
+        )
+        assert any("require_probe_ran" in _calls_in(gate) for gate in gates), (
+            "codex readiness is enforced by something other than "
+            "require_probe_ran; an unusable provider must surface as a loud "
+            "failure naming the missing prerequisite"
+        )
+
     def test_the_publish_gate_names_neither_the_module_nor_the_nodeid(self):
         """Proof 2: no blocking recipe reaches for it by path either."""
         lines = _dry_run_closure("_validate-pr-impl")
@@ -763,9 +864,7 @@ class TestTheRealCodexSmokeIsOutOfBlockingPublication:
         for target in (
             "test-unit",
             "test-simulated-core",
-            # the local integration target reports its timing under the
-            # aggregate's name, which is what the gate actually schedules
-            "test-integration-core",
+            "test-integration-core-local",
             "test-web",
             "test-simulated-agent",
         ):
@@ -973,7 +1072,7 @@ class TestDeterministicCoverageStaysInBlockingValidation:
         lines = _dry_run_closure("_validate-pr-impl")
 
         _find_line(lines, 'target="test-unit"')
-        _find_line(lines, 'target="test-integration-core"')
+        _find_line(lines, 'target="test-integration-core-local"')
 
 
 def test_live_agent_transport_is_scheduled_by_e2e_not_integration_assurance():

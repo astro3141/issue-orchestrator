@@ -43,10 +43,14 @@ Three things to know when you run it or add to it:
   working-tree state from the checkout it is pointed at. Run it dirty and it
   still runs, but the record is marked `working_tree_dirty` and assures nothing,
   because the probes exercised a tree that commit does not name.
-- **A readiness probe in a `live_agent` module must run at call time.** Blocking
-  validation deselects the marker but still imports the module, so a
-  module-scope `is_claude_authenticated()` would put a real provider call inside
-  the publish gate. Use an autouse fixture, as
+- **A readiness probe must run at call time — for either marker.** Blocking
+  validation deselects `live_agent` and `live_codex` but still imports the
+  module, so a module-scope `is_claude_authenticated()` or
+  `is_codex_authenticated()` would put a real provider call inside the publish
+  gate. Both live in `tests/fixtures/live_agent_cli.py` and are registered in
+  `LIVE_PROVIDER_PROBES`, which is what the import-time guardrail reads — a
+  probe written as a private helper in the test that needs it is invisible to
+  the rule and reads green (#227). Use a fixture, as
   `tests/integration/test_live_agent_chain.py` does — a `skipif` condition is
   module scope, because a decorator expression is evaluated on import. Report an
   unusable provider from that fixture with `require_probe_ran(...)`, not by
@@ -71,6 +75,10 @@ a developer who wants both in one command. Blocking validation runs
 
 Unlike `test-live-assurance` this lane files no record, so it authorizes
 nothing; it is provider/model compliance evidence you read from the run itself.
+For that to mean anything the lane must not exit 0 having run nothing, so an
+absent or logged-out Codex CLI fails it through `require_probe_ran(...)` naming
+the missing prerequisite, rather than skipping. Expect a failure, not a skip, on
+a host without codex.
 A test marked `live_codex` also carries `live_agent` when it belongs to the
 assurance lane — `test_codex_workspace_trust_live.py` carries both, and the
 assurance lane owns it.
