@@ -45,7 +45,15 @@ CREATE TABLE IF NOT EXISTS pending_work_claim (
     -- survives as the evidence the escalation points at, and a human decides
     -- what becomes of it.
     -- NOTE: no semicolons in this comment - the schema is split on them.
-    parked INTEGER NOT NULL DEFAULT 0
+    parked INTEGER NOT NULL DEFAULT 0,
+    -- Retired by an OPERATOR (#245). Its own bit rather than a second reading
+    -- of ``parked`` because the two have different owners and different
+    -- lifetimes: parking belongs to a quarantine and is undone by that
+    -- quarantine's release, while a retirement is a human decision that no
+    -- release path may revoke. The row survives, and so does its payload - the
+    -- evidence is the point.
+    -- NOTE: no semicolons in this comment - the schema is split on them.
+    retired INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS pending_work_claim_work
     ON pending_work_claim (work_key);
@@ -108,6 +116,31 @@ CREATE TABLE IF NOT EXISTS needs_human_cause (
 CREATE TABLE IF NOT EXISTS publication_refusal_latch (
     issue_number INTEGER PRIMARY KEY
 );
+-- What an operator retired, and on whose authority (#245). Separate from the
+-- ledger row it settles because it records an ACT rather than a state: the row
+-- is addressed by ``work_key`` and ``run_key`` by every ordinary claim
+-- operation, and a decision must not be reachable only through the state it was
+-- taken on. The payload is copied here for the same reason - the audit trail
+-- has to answer "what exactly was abandoned" without depending on a row that a
+-- later relaunch of unrelated work could have superseded.
+-- The key is the run generation, not the run root: a root can be reused by a
+-- replacement run, and a retirement names the generation it settled
+-- (#6999 F12).
+-- NOTE: no semicolons in this comment - the schema is split on them.
+CREATE TABLE IF NOT EXISTS pending_work_claim_retirement (
+    run_key TEXT NOT NULL,
+    started_at TEXT NOT NULL,
+    session_name TEXT NOT NULL,
+    issue_number INTEGER NOT NULL,
+    work_key TEXT NOT NULL,
+    work_kind TEXT NOT NULL,
+    flavor TEXT,
+    payload TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    authority TEXT NOT NULL,
+    recorded_at TEXT NOT NULL,
+    PRIMARY KEY (run_key, started_at)
+);
 """
 
 # Additive columns the quarantine table gained after it shipped. ``CREATE TABLE
@@ -122,12 +155,16 @@ QUARANTINE_ADDED_COLUMNS: tuple[tuple[str, str], ...] = (
     ("announce_attempts", "INTEGER NOT NULL DEFAULT 0"),
 )
 
-# The same treatment for the CLAIM table's one additive column (#210). It is
-# additive on the same terms: an older row simply has not been parked, which is
-# what an unquarantined claim's state already was, so nothing has to be rebuilt
-# and no claim can be lost by adding it.
+# The same treatment for the CLAIM table's additive columns (#210, #245). They
+# are additive on the same terms: an older row simply has not been parked and
+# has not been retired, which is what an unquarantined, unretired claim's state
+# already was, so nothing has to be rebuilt and no claim can be lost by adding
+# them. The direction matters for ``retired`` in particular - the default is the
+# permissive value, so a database that has never seen this build keeps ordinary
+# recovery, and only a deliberate write takes it away.
 CLAIM_ADDED_COLUMNS: tuple[tuple[str, str], ...] = (
     ("parked", "INTEGER NOT NULL DEFAULT 0"),
+    ("retired", "INTEGER NOT NULL DEFAULT 0"),
 )
 
 #: Where the ledger lives. Owned here, with the shape it describes, and

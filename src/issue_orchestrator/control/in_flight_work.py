@@ -470,6 +470,12 @@ class InFlightWorkLedger:
         by the enumeration - the escalation sweep reads the same rows and needs
         the opposite answer about them.
 
+        A row an OPERATOR has RETIRED is re-admitted by nothing either, and
+        permanently (#245). Unlike a parked row it is not waiting for a verdict:
+        one was recorded, with an authority and a reason, and this sweep is
+        exactly the thing it was recorded to stop. It is also not escalated
+        below - there is nobody left to ask.
+
         ``live_run_keys`` carries every run this pass observed alive whatever
         verdict it reached - including quarantined ones, which are deliberately
         missing from ``active_sessions`` and would otherwise look orphaned
@@ -501,6 +507,17 @@ class InFlightWorkLedger:
                 # A live one is already escalated under the cause that names
                 # BOTH of its failures (#6999 F2); re-escalating it here would
                 # overwrite that with the ended-run story.
+                continue
+            if unreadable.retired:
+                # An operator has already decided what becomes of this row
+                # (#245), so there is nothing to ask them. Escalating anyway
+                # would be a recovery sweep mutating GitHub - a block and a
+                # comment - on the strength of a decision that has been taken,
+                # and doing it again every time a pinned runtime meets a
+                # payload written in a larger vocabulary. The quarantine key
+                # stays in the reconciliation set above, so an escalation
+                # raised BEFORE the retirement is not silently released here
+                # either.
                 continue
             # No work can be recovered from it, and it is not attached to any
             # live terminal, so the only honest move is to tell a human.

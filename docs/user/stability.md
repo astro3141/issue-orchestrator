@@ -133,6 +133,7 @@ The console scripts installed by the package:
 | `exchange-respond` | Review-exchange agents | Experimental |
 | `prepush-check` | Agents and git hooks | Supported |
 | `trusted-runtime-promote` | Self-hosting operators | Experimental |
+| `claim-retire` | Self-hosting operators | Experimental |
 | `verify-agent-sandbox` | Guardrail verification | Internal |
 
 ### Agent completion contracts — supported
@@ -144,6 +145,16 @@ them, so the subcommand names (`completed`, `blocked`, `needs_human`,
 `approved`, `changes_requested`) are stable within a minor version, while flags
 may gain options between minors. See
 [`AGENT_PROTOCOL.md`](../../AGENT_PROTOCOL.md).
+
+### Operator ledger commands — experimental
+
+`claim-retire record` is the only supported way to retire a pending-work claim
+whose run has ended: it refuses unless the one ledger row carrying the work key
+is exactly the claim you describe, requires an explicit `--authority` and
+`--reason`, writes both the disposition and its evidence in one local
+transaction, and touches nothing remote. `claim-retire evidence` reads the
+resulting record back. Nothing calls either one automatically. Retirement is
+irreversible — rehearse it with `--dry-run` first.
 
 ### MCP server tools — experimental
 
