@@ -60,6 +60,8 @@ wording must not be able to fail an unrelated candidate."""
 
 LIVE_PROVIDER_SEAMS = (
     "CodexProvider",
+    "CodexAdapter",
+    "CodexCliExecPolicy",
     "ClaudeCodeAdapter",
     "build_claude_sandbox_argv",
 )
