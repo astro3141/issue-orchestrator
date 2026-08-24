@@ -46,6 +46,16 @@ the publish gate, for tests that gate is about to throw away — and a
 on import. `test_live_agent_chain.py` shows the shape, the probe registry lives
 in `tests/fixtures/live_agent_cli.py`, and a guardrail proves the rule by AST.
 
+The rule is per **provider**, and so is the registry: `live_codex` deselects
+after collection exactly like `live_agent`, so
+`is_codex_authenticated()` belongs in the same module and the same
+`LIVE_PROVIDER_PROBES` tuple. A probe written as a private helper in the test
+that needs it is structurally invisible to the guardrail, which is how a
+module-scope `codex login status` sat inside the publish gate while the rule
+forbidding it read green (#227). Collection also runs *before*
+`tests/codex_home.py`'s autouse isolation fixtures, so an import-time codex
+spawn hits the operator's real `~/.codex`.
+
 That fixture reports an unusable provider with `require_probe_ran(...)`, not by
 skipping. An unauthenticated CLI leaves the boundary exactly as unexercised as
 a model that declined to issue the tool call, so the lane should reach

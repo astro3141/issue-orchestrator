@@ -32,7 +32,9 @@ help:
 	@echo "  test-unit-cov       Run unit tests with coverage report"
 	@echo "  test-unit-cov-html  Run unit tests with HTML coverage (open htmlcov/index.html)"
 	@echo "  test-integration    Run integration tests"
-	@echo "  test-integration-core   Run fast integration slice used by local validate"
+	@echo "  test-integration-core   Run the whole core integration slice (local + real-Codex smoke)"
+	@echo "  test-integration-core-local  Run the deterministic integration slice used by local validate"
+	@echo "  test-integration-core-live-codex  Run the real-Codex provider smoke (not in any blocking gate)"
 	@echo "  test-live-assurance     Run the live-agent assurance lane (PASS/SECURITY_FAIL/INCONCLUSIVE)"
 	@echo "  test-e2e            Run e2e tests (stops on first failure, use NOFAST=1 to run all)"
 	@echo "  test-e2e-heavy      Run expensive journey-level onboarding/orchestration tests"
@@ -309,8 +311,10 @@ endif
 	@# the SHA-keyed pre-push cache from an uncommitted tree.
 	@#
 	@# The live-agent integration probes moved out of every blocking gate in #194
-	@# and are NOT run here. A dependency batch that wants them exercised must run
-	@# `make test-live-assurance` explicitly and read its recorded outcome.
+	@# and the real-Codex provider smoke followed in #227, so neither is run here.
+	@# A dependency batch that wants them exercised must run
+	@# `make test-live-assurance` explicitly and read its recorded outcome, and
+	@# `make test-integration-core-live-codex` for the Codex exchange round trip.
 	@$(GMAKE) --no-print-directory validate-pr-raw
 	@echo ""
 	@echo "==> Upgraded manifests:"
@@ -414,6 +418,14 @@ INTEGRATION_PARALLEL ?= $(PARALLEL)
 # blocking validation and collected by `test-live-assurance`, with no second
 # edit anywhere. `live_codex` was already selected this way; this makes the two
 # consistent.
+#
+# #227: being selected by marker was never the whole of it. `live_codex` was
+# deselected from `test-integration-core-local` and then run anyway, by a
+# blocking phase that named its target directly — so the marker segregated it
+# from one lane while the graph put it back in front of publication. Marker
+# selection and gate membership are two separate facts, and
+# `tests/unit/test_makefile_validation_phases.py` now pins both for both
+# markers.
 LIVE_AGENT_MARKER := live_agent
 # Keep this list in sync with the -k exclusion in test-simulated-core.
 # New agent-backed tests added to test_foreign_repo_lifecycle.py must be listed here
@@ -498,20 +510,45 @@ test-integration: sync-deps
 	$(PYTEST) tests/integration -x -q --tb=short $(PYTEST_TIMINGS)
 
 # Integration tests excluding those that require external infrastructure (GitHub token, etc.)
-# Used in pre-push validation where full infra may not be available
+# Both halves of the core slice, for a developer who wants them in one command.
+# Blocking validation runs `test-integration-core-local` on its own; this
+# aggregate is NOT what any gate invokes, and it does spawn the real Codex CLI.
 test-integration-core: test-integration-core-local test-integration-core-live-codex
 
+# Files its timing under its own name: `test-integration-core` is now a
+# distinct aggregate that does spawn the real Codex CLI, so attributing this
+# deterministic slice to that name would misreport what the gate scheduled.
 test-integration-core-local: sync-deps
 ifeq ($(INTEGRATION_PARALLEL),0)
-	$(call TIMED_RUN,test-integration-core,\
+	$(call TIMED_RUN,test-integration-core-local,\
 		$(PYTEST) tests/integration -x -q --tb=short -m "not requires_infra and not live_codex and not $(LIVE_AGENT_MARKER)" \
 			$(PYTEST_TIMINGS))
 else
-	$(call TIMED_RUN,test-integration-core,\
+	$(call TIMED_RUN,test-integration-core-local,\
 		$(PYTEST) tests/integration -x -q --tb=short -m "not requires_infra and not live_codex and not $(LIVE_AGENT_MARKER)" -n $(INTEGRATION_PARALLEL) --dist=loadgroup \
 			$(PYTEST_TIMINGS))
 endif
 
+# The real-Codex provider smoke lane (#227, completing #194). NOT part of
+# validate-pr-raw: its one subject launches the real Codex CLI and drives a
+# real model through the review exchange, so whether it gets as far as an
+# assertion depends on an external provider answering. While it sat in the
+# blocking live-web phase a candidate whose changes had nothing to do with the
+# exchange failed publication on `prompt_not_accepted` after 120s idle — the
+# same shape #194 removed for `live_agent`, arriving by the one path #194 left
+# behind.
+#
+# It stays an explicit, runnable lane because nothing else covers those seams:
+# the production reviewer prompt driving real codex, the exchange-built provider
+# command, codex booting in the exchange-created reviewer worktree, and real
+# codex emitting protocol-valid verdict JSON. Run it deliberately; it is
+# provider/model compliance evidence, not per-candidate validation, and it files
+# no record that any gate reads.
+#
+# Evidence has to be able to say it ran: with codex absent or logged out this
+# lane fails, through `require_probe_ran`, naming the missing prerequisite. A
+# skip would exit 0 having proven nothing, which is indistinguishable from a
+# pass in exactly the reading this lane exists for.
 test-integration-core-live-codex: sync-deps
 	$(call TIMED_RUN,test-integration-core-live-codex,\
 		$(PYTEST) tests/integration -x -q --tb=short -m "live_codex and not requires_infra and not $(LIVE_AGENT_MARKER)" \
@@ -679,15 +716,17 @@ validate-pr:
 VALIDATE_JOBS ?= $(shell sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 5)
 VALIDATE_STATIC_JOBS ?= $(VALIDATE_JOBS)
 VALIDATE_TEST_JOBS ?= 1
+# The browser smoke lane, after the local xdist-heavy core tests pass. It used
+# to share this phase with the real-Codex core check under a second knob,
+# VALIDATE_LIVE_WEB_JOBS; #227 took that check out of the blocking graph, so the
+# phase is web alone and the knob TROUBLESHOOTING.md already documents is the
+# one that controls it.
 VALIDATE_WEB_JOBS ?= 1
-# Run the browser smoke lane beside the single live-Codex core check after
-# local xdist-heavy core tests pass.
-VALIDATE_LIVE_WEB_JOBS ?= 2
 VALIDATE_AGENT_JOBS ?= 1
 VALIDATE_E2E_JOBS ?= 1
 
 define VALIDATE_CONFIG
-	@echo "[validate-timing] CONFIG validate_jobs=$(VALIDATE_JOBS) unit_parallel=$(UNIT_PARALLEL) simulated_parallel=$(SIMULATED_PARALLEL) integration_parallel=$(INTEGRATION_PARALLEL) static_jobs=$(VALIDATE_STATIC_JOBS) test_jobs=$(VALIDATE_TEST_JOBS) web_jobs=$(VALIDATE_WEB_JOBS) live_web_jobs=$(VALIDATE_LIVE_WEB_JOBS) agent_jobs=$(VALIDATE_AGENT_JOBS) e2e_jobs=$(VALIDATE_E2E_JOBS)"
+	@echo "[validate-timing] CONFIG validate_jobs=$(VALIDATE_JOBS) unit_parallel=$(UNIT_PARALLEL) simulated_parallel=$(SIMULATED_PARALLEL) integration_parallel=$(INTEGRATION_PARALLEL) static_jobs=$(VALIDATE_STATIC_JOBS) test_jobs=$(VALIDATE_TEST_JOBS) web_jobs=$(VALIDATE_WEB_JOBS) agent_jobs=$(VALIDATE_AGENT_JOBS) e2e_jobs=$(VALIDATE_E2E_JOBS)"
 endef
 
 validate-raw:
@@ -712,13 +751,19 @@ validate-pr-raw:
 # Keep pytest suite fan-out low by default:
 # each suite may already use xdist internally, so running many suites together
 # can oversubscribe local CPUs and starve browser/subprocess tests.
+#
+# Every phase below is deterministic. No target here spawns a provider CLI:
+# #194 took the `live_agent` lane out, and #227 took the last one — the
+# real-Codex smoke that used to share the web phase — out with it. Both are
+# still runnable, as `test-live-assurance` and
+# `test-integration-core-live-codex`, and neither is in any blocking gate.
 _validate-impl:
 	$(call TIMED_RUN,validate-static-phase,\
 		$(GMAKE) -j$(VALIDATE_STATIC_JOBS) --output-sync=target _validate-static-impl)
 	$(call TIMED_RUN,validate-core-tests-phase,\
 		$(GMAKE) -j$(VALIDATE_TEST_JOBS) --output-sync=target _validate-core-tests-impl)
-	$(call TIMED_RUN,validate-live-web-phase,\
-		$(GMAKE) -j$(VALIDATE_LIVE_WEB_JOBS) --output-sync=target test-integration-core-live-codex test-web)
+	$(call TIMED_RUN,validate-web-phase,\
+		$(GMAKE) -j$(VALIDATE_WEB_JOBS) --output-sync=target test-web)
 
 _validate-static-impl: typecheck lint-arch lint-complexity
 

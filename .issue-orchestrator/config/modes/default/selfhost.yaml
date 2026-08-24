@@ -225,6 +225,15 @@ validation:
     # `test-live-assurance` — which is in no blocking phase — owns those tests.
     # Removing the override changes nothing about what runs; it stops two places
     # stating the same rule.
+    #
+    # #227 COMPLETES THAT: "the way they already deselected `live_codex`" was
+    # true of the selector and false of the graph. `validate-pr-raw`'s live-web
+    # phase named `test-integration-core-live-codex` directly, so the real Codex
+    # CLI ran on every candidate anyway — and one failed publication on
+    # `prompt_not_accepted` after 120s idle, with nothing of its own at fault.
+    # That phase is web-only now. `validate-pr-raw` reaches no live-provider
+    # target at all; the Codex smoke is `make test-integration-core-live-codex`,
+    # run deliberately, and its result carries no publication authority.
     cmd: "make validate-pr-raw"
     timeout_seconds: 5400
 

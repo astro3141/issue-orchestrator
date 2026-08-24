@@ -80,6 +80,21 @@ fourth live-agent module requires no other edit, and
 `tests/unit/test_makefile_validation_phases.py` fails if the publish gate ever
 names one by path again.
 
+**Being deselected by a marker is not the same as being out of the gate**
+([#227]). `live_codex` is the case that proved it: every blocking *selector*
+deselected the marker, and `validate-pr-raw`'s live-web phase then named
+`test-integration-core-live-codex` — whose selector is `-m "live_codex"` —
+directly. So the one real-Codex test in `tests/integration` was segregated from
+one lane and run by another, and a candidate with nothing of its own at fault
+failed publication on `prompt_not_accepted` after 120 s idle. Marker selection
+and target membership are two separate facts about a test, and the guardrails
+pin both, for both markers.
+
+The lane is still there, as `make test-integration-core-live-codex` —
+provider/model compliance evidence for the exchange round trip, run
+deliberately. Unlike the assurance lane it files no record at all, so there is
+nothing it could produce that any gate would read.
+
 **The marker is module scope, so what it takes out has to be checked test by
 test.** `pytestmark` applies to the whole file: mark a module and every case in
 it leaves every blocking gate, and the lane that collects them files a record

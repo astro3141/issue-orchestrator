@@ -67,8 +67,12 @@ def _dry_run(target: str, **overrides: str) -> list[str]:
         {
             "VALIDATE_JOBS": "10",
             "VALIDATE_TEST_JOBS": "1",
-            "VALIDATE_WEB_JOBS": "1",
-            "VALIDATE_LIVE_WEB_JOBS": "2",
+            # Deliberately not 1: the web phase used to be scheduled by a
+            # second knob (VALIDATE_LIVE_WEB_JOBS) that existed only because it
+            # shared the phase with the real-Codex check. A distinct value here
+            # is what proves the phase now reads the knob TROUBLESHOOTING.md
+            # documents rather than a neighbour's default.
+            "VALIDATE_WEB_JOBS": "2",
             "VALIDATE_AGENT_JOBS": "1",
             "VALIDATE_E2E_JOBS": "1",
             **overrides,
@@ -146,6 +150,63 @@ def _has_marker(path: Path, marker: str) -> bool:
         _dotted_name(node) == f"pytest.mark.{marker}"
         for node in ast.walk(tree)
         if isinstance(node, ast.Attribute)
+    )
+
+
+def _module_scope_markers(tree: ast.Module) -> set[str]:
+    """Marker names a ``pytestmark`` assignment applies to the whole file."""
+    markers: set[str] = set()
+    for node in tree.body:
+        if not isinstance(node, ast.Assign):
+            continue
+        if not any(
+            isinstance(target, ast.Name) and target.id == "pytestmark"
+            for target in node.targets
+        ):
+            continue
+        for element in ast.walk(node.value):
+            dotted = _dotted_name(element) if isinstance(element, ast.Attribute) else None
+            if dotted is not None and dotted.startswith("pytest.mark."):
+                markers.add(dotted.removeprefix("pytest.mark."))
+    return markers
+
+
+def _markers_on(node: ast.AST, module_markers: set[str]) -> set[str]:
+    """Every marker pytest would apply to one collected test."""
+    markers = set(module_markers)
+    decorators = getattr(node, "decorator_list", [])
+    for decorator in decorators:
+        for element in ast.walk(decorator):
+            dotted = _dotted_name(element) if isinstance(element, ast.Attribute) else None
+            if dotted is not None and dotted.startswith("pytest.mark."):
+                markers.add(dotted.removeprefix("pytest.mark."))
+    return markers
+
+
+def _tests_declaring(path: Path, marker: str) -> tuple[str, ...]:
+    """Nodeid suffixes in ``path`` that carry ``marker``, module scope included."""
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    module_markers = _module_scope_markers(tree)
+    return tuple(
+        name
+        for name, node in collected_tests(tree)
+        if marker in _markers_on(node, module_markers)
+    )
+
+
+def _marker_expressions(lines: list[str]) -> list[str]:
+    """Every ``-m "<expr>"`` selector in a dry run, as its expression text."""
+    return [
+        match.group(1)
+        for line in lines
+        for match in re.finditer(r'-m\s+"([^"]*)"', line)
+    ]
+
+
+def _positively_selects(expression: str, marker: str) -> bool:
+    """Whether ``expression`` selects ``marker`` rather than deselecting it."""
+    return (
+        re.search(rf"(?<!not )\b{re.escape(marker)}\b", expression) is not None
     )
 
 
@@ -257,16 +318,42 @@ def _import_time_calls(path: Path) -> set[str]:
     return visitor.names
 
 
-def _any_scope_calls(path: Path) -> set[str]:
-    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+def _calls_in(node: ast.AST) -> set[str]:
+    """The functions called anywhere inside one AST node."""
     names = set()
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Call):
+    for child in ast.walk(node):
+        if not isinstance(child, ast.Call):
             continue
-        dotted = _dotted_name(node.func)
+        dotted = _dotted_name(child.func)
         if dotted is not None:
             names.add(dotted.rsplit(".", 1)[-1])
     return names
+
+
+def _any_scope_calls(path: Path) -> set[str]:
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    return _calls_in(tree)
+
+
+def _is_fixture(node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
+    """Whether a function is decorated ``@pytest.fixture`` (bare or called)."""
+    for decorator in node.decorator_list:
+        for element in ast.walk(decorator):
+            dotted = _dotted_name(element)
+            if dotted is not None and dotted.startswith("pytest.fixture"):
+                return True
+    return False
+
+
+def _fixture_functions(
+    tree: ast.Module,
+) -> dict[str, ast.FunctionDef | ast.AsyncFunctionDef]:
+    """Module-level ``@pytest.fixture`` definitions, by fixture name."""
+    return {
+        node.name: node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef) and _is_fixture(node)
+    }
 
 
 def test_validate_impl_runs_core_phases_with_separate_job_caps():
@@ -278,18 +365,13 @@ def test_validate_impl_runs_core_phases_with_separate_job_caps():
         "validate-core-tests-phase",
         "_validate-core-tests-impl",
     )
-    live_web_index = _find_line(
-        lines,
-        "validate-live-web-phase",
-        "test-integration-core-live-codex",
-        "test-web",
-    )
+    web_index = _find_line(lines, "validate-web-phase", "test-web")
 
     _assert_job_count(lines[static_index], 10)
     _assert_job_count(lines[core_tests_index], 1)
-    _assert_job_count(lines[live_web_index], 2)
+    _assert_job_count(lines[web_index], 2)
 
-    assert static_index < core_tests_index < live_web_index
+    assert static_index < core_tests_index < web_index
 
 
 def test_validate_pr_impl_runs_agent_phase_after_validate_phase():
@@ -364,7 +446,7 @@ def test_core_validation_runs_live_codex_marker_serially():
     assert len(starts) == 2
     assert len(ends) == 2
 
-    core_index = _find_line(lines, 'target="test-integration-core"')
+    core_index = _find_line(lines, 'target="test-integration-core-local"')
     live_codex_index = _find_line(lines, 'target="test-integration-core-live-codex"')
     non_live_marker_index = _find_line(
         lines,
@@ -575,6 +657,226 @@ class TestPublicationIsNotModelGated:
         )
 
 
+# ---------------------------------------------------------------------------
+# #227 — the real-Codex provider smoke is not blocking candidate publication
+# ---------------------------------------------------------------------------
+
+
+LIVE_CODEX_SMOKE_MODULE = (
+    "tests/integration/test_persistent_review_exchange_integration.py"
+)
+LIVE_CODEX_SMOKE_TEST = "test_real_interactive_codex_reviewer_round_trips_through_exchange"
+LIVE_CODEX_TARGET = "test-integration-core-live-codex"
+RETRY_FLAGS = ("--reruns", "--only-rerun", "--last-failed", "--lf")
+
+
+class TestTheRealCodexSmokeIsOutOfBlockingPublication:
+    """#194 segregated the marker; the graph put it back (#227).
+
+    ``live_codex`` was deselected by every blocking *selector* and then run
+    anyway, because ``_validate-impl``'s live-web phase named
+    ``test-integration-core-live-codex`` — whose selector is ``-m
+    "live_codex"`` — as a target. A candidate with nothing of its own at fault
+    failed publication on ``prompt_not_accepted`` after 120 s idle.
+
+    Marker selection and target membership are two independent facts, so both
+    are asserted here. Either alone is satisfiable while the real Codex CLI
+    still runs in front of every candidate.
+    """
+
+    def test_no_blocking_phase_names_the_live_codex_target(self):
+        """Proof 1: target membership."""
+        lines = _dry_run_closure("_validate-pr-impl")
+
+        assert all(LIVE_CODEX_TARGET not in line for line in lines), (
+            "the real-Codex smoke lane is a blocking target again; a provider "
+            "that never accepts the prompt would fail an unrelated candidate"
+        )
+
+    def test_no_blocking_selector_selects_the_live_codex_marker(self):
+        """Proof 1: marker selection, over every pytest invocation in the gate."""
+        expressions = _marker_expressions(_dry_run_closure("_validate-pr-impl"))
+
+        assert expressions, "no marker selector in the gate; the proof is vacuous"
+        for expression in expressions:
+            assert not _positively_selects(expression, "live_codex"), expression
+            assert not _positively_selects(expression, "live_agent"), expression
+
+    def test_the_blocking_integration_selector_still_deselects_it(self):
+        """Proof 4, and proof 2's other half: deselection is stated, not implied."""
+        expressions = _marker_expressions(
+            _dry_run("test-integration-core-local", INTEGRATION_PARALLEL="0")
+        )
+
+        assert expressions
+        for expression in expressions:
+            assert "not live_codex" in expression, expression
+            assert "not live_agent" in expression, expression
+
+    def test_the_named_smoke_is_the_marked_test(self):
+        """Otherwise the deselection above is about nothing in particular."""
+        marked = _tests_declaring(REPO_ROOT / LIVE_CODEX_SMOKE_MODULE, "live_codex")
+
+        assert LIVE_CODEX_SMOKE_TEST in marked, (
+            f"{LIVE_CODEX_SMOKE_TEST} no longer declares live_codex, so nothing "
+            "connects the blocking selectors' deselection to the test #227 is "
+            "about"
+        )
+
+    def test_the_readiness_probe_is_registered_and_deferred_to_call_time(self):
+        """Proof 5: deselection is not enough — the gate still imports this.
+
+        ``live_codex`` deselects after collection, exactly like ``live_agent``,
+        and the module holding the smoke also holds deterministic tests the
+        gate does run. So every blocking validation imports it, once per xdist
+        worker. A module-scope readiness probe — a ``skipif`` condition is one,
+        the decorator expression runs on import — would therefore be a real
+        ``codex login status`` spawn inside the publish gate, for the one test
+        that gate is about to throw away.
+
+        Import-time probing is already forbidden by
+        ``test_no_integration_module_calls_a_live_provider_at_import``, but
+        that rule can only see probes named in ``LIVE_PROVIDER_PROBES``. A
+        module-local helper is invisible to it and reads green. What this pins
+        is the registration, which is what gives the general rule its subject.
+        """
+        module = REPO_ROOT / LIVE_CODEX_SMOKE_MODULE
+        probes = set(LIVE_PROVIDER_PROBES)
+
+        assert _any_scope_calls(module) & probes, (
+            "the real-Codex smoke's readiness check is not a registered "
+            "live-provider probe, so the import-time guardrail reads past it; "
+            f"register it in tests/fixtures/live_agent_cli.py ({probes})"
+        )
+        assert not (_import_time_calls(module) & probes), (
+            "the readiness probe runs while this module is imported, which "
+            "blocking validation does on every run — and at collection time, "
+            "before tests/codex_home.py's isolation fixtures, so against the "
+            "operator's own ~/.codex"
+        )
+
+    def test_the_lane_cannot_report_success_without_running_the_smoke(self):
+        """Proof 5's other half: an absent CLI fails, it does not skip.
+
+        This lane is the only place the coverage lives now, and the Makefile
+        documents it as provider-compliance evidence someone reads. A
+        ``skipif`` would let ``make test-integration-core-live-codex`` exit 0
+        having run nothing, so the evidence could not tell *ran and passed*
+        from *never ran*. Readiness reports through ``require_probe_ran``
+        instead, from the fixture that also defers the probe — one edit site
+        for both halves.
+        """
+        module = REPO_ROOT / LIVE_CODEX_SMOKE_MODULE
+        tree = ast.parse(module.read_text(encoding="utf-8"), filename=str(module))
+        module_markers = _module_scope_markers(tree)
+        smoke = next(
+            node
+            for name, node in collected_tests(tree)
+            if name == LIVE_CODEX_SMOKE_TEST
+        )
+
+        assert not ({"skip", "skipif"} & _markers_on(smoke, module_markers)), (
+            "the real-Codex smoke skips instead of failing when codex is "
+            "unavailable, so its lane exits 0 having proven nothing"
+        )
+
+        fixtures = _fixture_functions(tree)
+        requested = {argument.arg for argument in smoke.args.args}
+        gates = [
+            fixtures[name]
+            for name in sorted(requested & fixtures.keys())
+            if _calls_in(fixtures[name]) & set(LIVE_PROVIDER_PROBES)
+        ]
+
+        assert gates, (
+            "the smoke requests no fixture that probes codex readiness, so "
+            "nothing checks the prerequisite at call time"
+        )
+        assert any("require_probe_ran" in _calls_in(gate) for gate in gates), (
+            "codex readiness is enforced by something other than "
+            "require_probe_ran; an unusable provider must surface as a loud "
+            "failure naming the missing prerequisite"
+        )
+
+    def test_the_publish_gate_names_neither_the_module_nor_the_nodeid(self):
+        """Proof 2: no blocking recipe reaches for it by path either."""
+        lines = _dry_run_closure("_validate-pr-impl")
+
+        assert all(LIVE_CODEX_SMOKE_MODULE not in line for line in lines)
+        assert all(LIVE_CODEX_SMOKE_TEST not in line for line in lines)
+
+    def test_the_explicit_lane_still_collects_it(self):
+        """Proof 3: retained as its own runnable regression lane."""
+        lines = _dry_run(LIVE_CODEX_TARGET)
+        pytest_line = lines[_find_line(lines, "tests/integration")]
+
+        assert '-m "live_codex and not requires_infra and not live_agent"' in pytest_line
+        assert "--ignore" not in pytest_line
+        assert "--deselect" not in pytest_line
+
+        module = REPO_ROOT / LIVE_CODEX_SMOKE_MODULE
+        excluded = {"requires_infra", "live_agent"}
+        tree = ast.parse(module.read_text(encoding="utf-8"), filename=str(module))
+        module_markers = _module_scope_markers(tree)
+        smoke = next(
+            node
+            for name, node in collected_tests(tree)
+            if name == LIVE_CODEX_SMOKE_TEST
+        )
+
+        assert not (_markers_on(smoke, module_markers) & excluded), (
+            "the smoke test acquired a marker the lane's own selector "
+            "deselects, so the lane it was retained for no longer runs it"
+        )
+
+    def test_the_lane_declares_no_retry_semantics(self):
+        """Proof 7: availability handling is not smuggled in as re-runs."""
+        lane_lines = _dry_run(LIVE_CODEX_TARGET)
+        gate_lines = _dry_run_closure("_validate-pr-impl")
+
+        for flag in RETRY_FLAGS:
+            assert all(flag not in line for line in lane_lines), flag
+            assert all(flag not in line for line in gate_lines), flag
+
+    def test_the_lane_files_nothing_a_gate_could_read(self):
+        """Proof 8: no evidence identity to cross over in the first place.
+
+        The assurance lane files a record and is refused a `publish_gate`
+        suite by `LiveAssuranceRecord`. This lane has no record at all — it
+        loads no lane plugin, resolves no artifact root, and writes into
+        neither evidence directory — so there is nothing for a reader to
+        mistake for publication authority.
+        """
+        lines = _dry_run(LIVE_CODEX_TARGET)
+
+        for forbidden in (
+            "--live-assurance-root",
+            "tests.live_assurance_lane",
+            ".issue-orchestrator/live-assurance",
+            ".issue-orchestrator/validation",
+        ):
+            assert all(forbidden not in line for line in lines), forbidden
+
+    def test_the_deterministic_phases_are_all_still_required(self):
+        """Proof 6: nothing else left the gate along with the smoke lane."""
+        lines = _dry_run_closure("_validate-pr-impl")
+
+        for target in (
+            "test-unit",
+            "test-simulated-core",
+            "test-integration-core-local",
+            "test-web",
+            "test-simulated-agent",
+        ):
+            _find_line(lines, f'target="{target}"')
+        for phase in ("validate-static-phase", "validate-core-tests-phase"):
+            _find_line(lines, phase)
+
+        # test-vscode hangs off validate-pr-raw itself rather than the phased
+        # graph, and that recipe line carries no `;` for the closure to follow.
+        _find_line(_dry_run("validate-pr-raw"), "test-vscode")
+
+
 class TestTheAssuranceLane:
     """Proofs 3 and 8, at the lane's command surface."""
 
@@ -770,7 +1072,7 @@ class TestDeterministicCoverageStaysInBlockingValidation:
         lines = _dry_run_closure("_validate-pr-impl")
 
         _find_line(lines, 'target="test-unit"')
-        _find_line(lines, 'target="test-integration-core"')
+        _find_line(lines, 'target="test-integration-core-local"')
 
 
 def test_live_agent_transport_is_scheduled_by_e2e_not_integration_assurance():
