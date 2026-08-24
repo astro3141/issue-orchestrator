@@ -54,6 +54,27 @@ Three things to know when you run it or add to it:
   that declined to issue the tool call, so the lane should reach `INCONCLUSIVE`
   the same way. Expect errors, not skips, on a host without the CLIs.
 
+### The real-Codex provider smoke lane
+
+One integration test drives the real Codex CLI through the real review exchange
+and is marked `live_codex` for it. Like the assurance lane it is in **no**
+blocking gate — a provider that never accepted the prompt used to be recorded as
+the candidate failing (#227) — and like it, it runs on its own:
+
+```bash
+make test-integration-core-live-codex    # requires an authenticated codex CLI
+```
+
+`make test-integration-core` runs it together with the deterministic slice, for
+a developer who wants both in one command. Blocking validation runs
+`test-integration-core-local`, which is the deterministic slice alone.
+
+Unlike `test-live-assurance` this lane files no record, so it authorizes
+nothing; it is provider/model compliance evidence you read from the run itself.
+A test marked `live_codex` also carries `live_agent` when it belongs to the
+assurance lane — `test_codex_workspace_trust_live.py` carries both, and the
+assurance lane owns it.
+
 See
 [validation.md](../architecture/validation.md#live-agent-assurance-is-not-publication-validation).
 

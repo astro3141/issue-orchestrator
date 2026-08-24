@@ -75,7 +75,7 @@ Local PR guardrails use `make validate-pr`, the cache-aware wrapper that runs th
 | `test-unit` | `pytest tests/unit packages/agent_runner/tests` | Unit tests |
 | `test-simulated-core` | `pytest tests/simulated_scenarios/` excluding agent-backed foreign repo cases | Simulated scenario core tests |
 | `test-simulated-agent` | `$(SIMULATED_AGENT_FILES)` | Agent-backed simulated scenarios |
-| `test-integration-core` | `pytest tests/integration -m "not requires_infra and not live_codex and not live_agent"` | Integration tests without external infra or a live provider |
+| `test-integration-core-local` | `pytest tests/integration -m "not requires_infra and not live_codex and not live_agent"` | Integration tests without external infra or a live provider |
 | `test-web` | `pytest tests/web/` | Web UI tests |
 | `test-vscode` | VS Code extension tests | VS Code integration, run sequentially after parallel validation |
 
@@ -151,12 +151,17 @@ grep -A 5 "python_bin_dir\|sys.executable" tests/simulated_scenarios/conftest.py
 ```bash
 # Run locally to reproduce
 make test-unit
-make test-integration-core
+make test-integration-core-local
 make test-web
 
 # Agent-backed slices from the validate-agent CI job
 make test-simulated-agent
+
+# Live-provider lanes. Neither is in a blocking gate, so neither can be the
+# cause of a failed candidate publication -- run them when the provider seams
+# themselves are what you are chasing.
 make test-live-assurance
+make test-integration-core-live-codex
 
 # Run specific failing test
 pytest tests/unit/test_foo.py::test_bar -v
@@ -189,7 +194,8 @@ make test-simulated-core
 make test-simulated-agent
 
 # Integration slices
-make test-integration-core
+make test-integration-core-local          # what blocking validation runs
+make test-integration-core-live-codex     # real-Codex smoke, no gate owns it
 make test-live-assurance
 
 # Full validation, including live E2E

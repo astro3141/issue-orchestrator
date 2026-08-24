@@ -100,14 +100,20 @@ of a change. A dependency whose only coverage is that lane — `pexpect` today �
 needs `make test-live-assurance` run explicitly, and its recorded outcome read,
 before the upgrade is trusted.
 
+**Nor the real-Codex provider smoke.** #227 took
+`make test-integration-core-live-codex` out of `validate-pr-raw` for the same
+reason, so the Codex review-exchange round trip is a second lane a batch has to
+ask for. It files no record, so read the run.
+
 ### Verify locally with `make deps-batch` — for the rest
 
 `make deps-batch` is a **human maintainer** task, run at a terminal — not an
 orchestrated coding-agent flow. It runs `validate-pr-raw`, which covers the VS
-Code harness that CI cannot. It does **not** cover the live-agent lane — since
-#194 that lane is in no blocking gate, `validate-pr-raw` included — so a
-dependency whose only coverage is that lane needs `make test-live-assurance`
-run separately, as the section above says.
+Code harness that CI cannot. It reaches **no live-provider lane at all**: since
+#194 the live-agent lane is in no blocking gate, and since #227 neither is the
+real-Codex smoke. A dependency whose only coverage is one of those needs
+`make test-live-assurance` or `make test-integration-core-live-codex` run
+separately, as the section above says.
 
 **Driving it end-to-end.** Two entry points wrap the steps below:
 - `/deps-batch` (`.claude/commands/deps-batch.md`) — interactive Claude runs the
