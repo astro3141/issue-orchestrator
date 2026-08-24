@@ -165,6 +165,7 @@ from issue_orchestrator.infra.hooks.hooks import (
     detect_agents_from_config,
     TEMPLATES_DIR,
 )
+from issue_orchestrator.adapters.hooks import ExecPolicyOutcome
 from issue_orchestrator.infra.hooks.block_no_verify import (
     HookDecision,
     evaluate_command,
@@ -1180,6 +1181,15 @@ class TestCopilotAdapter:
         assert not decision.allowed
 
 
+class _StubExecPolicy:
+    """A policy shaped like the shipped rules: dangerous denied, safe unmatched."""
+
+    def check(self, rules_file, command):
+        if tuple(command) == ("git", "push", "--no-verify"):
+            return ExecPolicyOutcome.FORBIDDEN
+        return ExecPolicyOutcome.NO_MATCH
+
+
 class TestCodexAdapter:
     """Tests for CodexAdapter.
 
@@ -1188,7 +1198,7 @@ class TestCodexAdapter:
 
     @pytest.fixture
     def adapter(self):
-        return CodexAdapter()
+        return CodexAdapter(execpolicy=_StubExecPolicy())
 
     @pytest.fixture
     def temp_project(self, tmp_path):
@@ -1224,12 +1234,11 @@ class TestCodexAdapter:
     def test_verify_hooks_passes_after_install(
         self, adapter, temp_project, monkeypatch
     ):
+        # The shipped rules answer the safe sample with the no-match shape, not
+        # with an allow decision (#252); classification lives in
+        # tests/unit/test_codex_execpolicy_verification.py.
         adapter.install_hooks(temp_project)
 
-        def _fake_execpolicy(_rules_file, command):
-            return False if command == ["git", "push", "--no-verify"] else True
-
-        monkeypatch.setattr(adapter, "_execpolicy_allows", _fake_execpolicy)
         monkeypatch.setattr(shutil, "which", lambda _cmd: "/usr/local/bin/codex")
 
         result = adapter.verify_hooks(temp_project)

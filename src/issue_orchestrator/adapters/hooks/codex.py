@@ -1,9 +1,8 @@
 """Codex hook adapter."""
 
-import json
 import logging
 import shutil
-import subprocess
+from dataclasses import dataclass
 from pathlib import Path
 
 from ...infra.hooks._types import (
@@ -14,8 +13,60 @@ from ...infra.hooks._types import (
     TEMPLATES_DIR,
     VerificationResult,
 )
+from .codex_execpolicy import (
+    CodexCliExecPolicy,
+    ExecPolicyChecker,
+    ExecPolicyOutcome,
+    ExecPolicyResultError,
+)
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class _ExecPolicySample:
+    """A command whose classification by the installed policy is pinned.
+
+    ``expect_forbidden`` is the whole assertion: the dangerous sample must come
+    back explicitly forbidden, and the safe sample must come back *not*
+    forbidden -- which the shipped rules satisfy by matching no rule at all
+    (#252). Anything the policy cannot classify raises before it reaches here,
+    so an unreadable answer never satisfies either expectation.
+    """
+
+    command: tuple[str, ...]
+    expect_forbidden: bool
+
+    @property
+    def label(self) -> str:
+        return " ".join(self.command)
+
+    @property
+    def passed_check(self) -> str:
+        """What was measured, not what it was mistaken for.
+
+        The safe sample passes by coming back *not blocked* -- which the
+        shipped rules satisfy by matching no rule at all. Reporting that as
+        ``execpolicy_allows`` would say "allow" about a no-match, which is the
+        very conflation #252 removed, so the passing check is named
+        ``execpolicy_not_blocked`` and reads against ``execpolicy_wrongly_blocks``.
+        """
+        verb = "blocks" if self.expect_forbidden else "not_blocked"
+        return f"execpolicy_{verb}:{self.label}"
+
+    @property
+    def failed_check(self) -> str:
+        verb = "should_block" if self.expect_forbidden else "wrongly_blocks"
+        return f"execpolicy_{verb}:{self.label}"
+
+
+_EXECPOLICY_SAMPLES = (
+    _ExecPolicySample(command=("git", "push", "--no-verify"), expect_forbidden=True),
+    _ExecPolicySample(
+        command=("git", "push", "origin", "main"), expect_forbidden=False
+    ),
+)
+"""The dangerous positive and the safe negative the hook gate verifies."""
 
 
 class CodexAdapter(AiAgentAdapter):
@@ -25,6 +76,17 @@ class CodexAdapter(AiAgentAdapter):
     Project-scoped rules override user-global defaults.
     Rules use prefix_rule() with decision="forbidden" to block commands.
     """
+
+    def __init__(self, execpolicy: ExecPolicyChecker | None = None) -> None:
+        """Take the policy that answers ``execpolicy`` questions.
+
+        Defaults to the installed Codex CLI, which is the only authority on
+        its own rules; tests inject a checker rather than reaching into the
+        adapter.
+        """
+        self._execpolicy: ExecPolicyChecker = (
+            CodexCliExecPolicy() if execpolicy is None else execpolicy
+        )
 
     @property
     def agent_type(self) -> AiAgentType:
@@ -108,24 +170,9 @@ class CodexAdapter(AiAgentAdapter):
                 False, self.agent_type, checks_passed, checks_failed
             )
 
-        try:
-            blocked = self._execpolicy_allows(
-                rules_file, ["git", "push", "--no-verify"]
-            )
-            if blocked is False:
-                checks_passed.append("execpolicy_blocks:git push --no-verify")
-            else:
-                checks_failed.append("execpolicy_should_block:git push --no-verify")
-
-            allowed = self._execpolicy_allows(
-                rules_file, ["git", "push", "origin", "main"]
-            )
-            if allowed is True:
-                checks_passed.append("execpolicy_allows:git push origin main")
-            else:
-                checks_failed.append("execpolicy_wrongly_blocks:git push origin main")
-        except Exception as e:
-            checks_failed.append(f"execpolicy_check_failed:{str(e)[:40]}")
+        sample_passed, sample_failed = self._check_execpolicy_samples(rules_file)
+        checks_passed.extend(sample_passed)
+        checks_failed.extend(sample_failed)
 
         return VerificationResult(
             success=len(checks_failed) == 0,
@@ -139,43 +186,37 @@ class CodexAdapter(AiAgentAdapter):
         rules_file = self._get_rules_dir(project_root) / "orchestrator.rules"
         return rules_file.exists()
 
-    def _execpolicy_allows(self, rules_file: Path, command: list[str]) -> bool | None:
-        """Return True if execpolicy allows command, False if forbidden, None if unknown."""
-        result = subprocess.run(
-            [
-                "codex",
-                "execpolicy",
-                "check",
-                "--rules",
-                str(rules_file),
-                "--pretty",
-                "--",
-                *command,
-            ],
-            capture_output=True,
-            text=True,
-            timeout=120,
-        )
-        if result.returncode != 0:
-            raise RuntimeError(result.stderr.strip() or "execpolicy check failed")
+    def _check_execpolicy_samples(
+        self, rules_file: Path
+    ) -> tuple[list[str], list[str]]:
+        """Classify every sample, and report the checks that passed and failed.
 
-        data = json.loads(result.stdout)
-        decision = data.get("decision") or data.get("strictest_decision")
-        if decision is None:
-            # Fallback: search any decision-like field
-            serialized = json.dumps(data).lower()
-            if "forbidden" in serialized:
-                return False
-            if "allow" in serialized or "allowed" in serialized:
-                return True
-            return None
+        Each sample is asked and judged independently, so one unanswerable
+        check cannot hide the verdict on the other. Any failure to classify --
+        an unrecognized decision such as ``prompt``, malformed output, a CLI
+        that exited nonzero, a timeout, an absent binary -- is a verification
+        failure, never a silent pass.
 
-        decision = str(decision).lower()
-        if decision == "forbidden":
-            return False
-        if decision in ("allow", "allowed"):
-            return True
-        return None
+        Only ``ExecPolicyResultError`` is caught, because that is the failure
+        channel :class:`ExecPolicyChecker` declares and the whole channel: a
+        checker that raises anything else has a bug, and a bug reported as a
+        truncated policy-failure string is the same guess-at-an-unreadable-answer
+        this module exists to remove. It is left to crash where it happened.
+        """
+        passed: list[str] = []
+        failed: list[str] = []
+        for sample in _EXECPOLICY_SAMPLES:
+            try:
+                outcome = self._execpolicy.check(rules_file, sample.command)
+            except ExecPolicyResultError as exc:
+                failed.append(f"execpolicy_check_failed:{sample.label}:{str(exc)[:40]}")
+                continue
+            is_forbidden = outcome is ExecPolicyOutcome.FORBIDDEN
+            if is_forbidden == sample.expect_forbidden:
+                passed.append(sample.passed_check)
+            else:
+                failed.append(sample.failed_check)
+        return passed, failed
 
 
 __all__ = ["CodexAdapter"]

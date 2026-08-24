@@ -909,7 +909,11 @@ _NON_PROVIDER_TEXT_CLASSIFIERS = frozenset(
         "view_models/journey_projection.py::_coerce_non_review_latest_outcome",
         "view_models/journey_projection.py::_round_completed_outcome_label",
         # --- local tooling, configuration and filenames ---
-        "adapters/hooks/codex.py::CodexAdapter._execpolicy_allows",
+        # (#252 removed adapters/hooks/codex.py::CodexAdapter._execpolicy_allows,
+        # whose exemption this list used to carry: the substring search over
+        # execpolicy output it named is gone, and classification now reads the
+        # CLI's typed `decision` field. A re-introduced substring classifier
+        # there should have to argue for its own exemption.)
         "entrypoints/cli.py::cmd_default",
         "entrypoints/cli_tools/setup_wizard.py::_prompt_manual_existing_agent",
         "entrypoints/cli_tools/setup_wizard.py::wizard_existing_project",

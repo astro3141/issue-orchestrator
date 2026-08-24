@@ -228,6 +228,42 @@ If an agent is configured in YAML, missing its CLI or hook wiring is a **failure
 | Copilot | `.github/hooks` + `.github/hooks.json` + script tests | ✅ Supported (spawns Copilot CLI) |
 | Codex CLI | `.codex/rules/orchestrator.rules` + `codex execpolicy check` | ❌ Not supported |
 
+### Codex: no match is not a block
+
+`codex execpolicy check` answers two different questions with two different
+shapes, and Codex hook verification depends on telling them apart:
+
+| Result | Meaning | Verifier outcome |
+| --- | --- | --- |
+| `{"matchedRules": [...], "decision": "forbidden"}` | a rule matched and denied | `FORBIDDEN` |
+| `{"matchedRules": [...], "decision": "allow"}` | a rule matched and permitted | `ALLOWED` |
+| `{"matchedRules": []}` (no `decision`) | no rule matched at all | `NO_MATCH` |
+
+The shipped rules list `git push origin main` as `not_match` for the forbidden
+`git push --no-verify` rule, so Codex answers the verifier's safe sample with
+the no-match shape. Reading that absence as a block reported
+`execpolicy_wrongly_blocks` and failed every Codex hook gate (#252).
+
+The distinction is `NO_MATCH != FORBIDDEN`. It is **not** "anything other than
+forbidden is allowed": `prompt`, an unrecognized decision, a decision with no
+matched rule, output that is not the documented no-match shape, and a nonzero
+`codex execpolicy check` exit all fail the gate rather than passing it —
+`prompt` especially, since the CLI has flags that skip questions.
+`adapters/hooks/codex_execpolicy.py` owns the classification;
+`tests/integration/test_codex_execpolicy_live.py` re-measures it against the
+installed CLI.
+
+The verifier reports what it measured. The safe sample passes as
+`execpolicy_not_blocked:git push origin main` — not `execpolicy_allows`, which
+would say "allow" about a no-match — and fails as `execpolicy_wrongly_blocks`;
+the dangerous sample passes as `execpolicy_blocks` and fails as
+`execpolicy_should_block`. A policy that cannot answer at all — an absent or
+unrunnable CLI, a timeout, a nonzero exit, unclassifiable output — reaches the
+verifier as a single `ExecPolicyResultError` and is reported as
+`execpolicy_check_failed`, per sample. That is the only exception the verifier
+catches: any other error from a checker is a bug and is left to crash rather
+than being dressed up as a policy verdict.
+
 ### Hook Validation Config
 
 To exercise AI gate tests for all supported CLIs without changing your main config, use:
