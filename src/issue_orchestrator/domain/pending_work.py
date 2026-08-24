@@ -71,6 +71,25 @@ class PendingWorkClaim:
         """
         return f"{self.kind.value}:{_request_id(self.request)}"
 
+    @property
+    def flavor(self) -> str | None:
+        """The VARIANT this claim is, when its kind has variants (#245).
+
+        ``work_key`` deliberately does not carry it: two tech-lead investigations
+        of one issue are the same work by the queue's own dedupe rule, and the
+        ledger has to supersede rather than accumulate them. But an operator
+        naming a claim to act on is asking a different question, and
+        ``tech_lead:23`` alone does not distinguish the planning investigation
+        they mean from the failure investigation they do not.
+
+        ``None`` is a real answer, not a missing one: it says this kind has no
+        variants, so a caller expecting a flavor here is describing a different
+        claim.
+        """
+        if isinstance(self.request, PendingTechLeadReview):
+            return self.request.flavor.value
+        return None
+
 
 @dataclass(frozen=True, slots=True)
 class InFlightWork:

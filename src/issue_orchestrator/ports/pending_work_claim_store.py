@@ -11,6 +11,9 @@ Three durable states cover that whole span:
 * **parked** — a quarantine settled it (#210). The row stays as evidence and
   stops being work: nothing may schedule it, re-admit it, or re-derive fresh
   trouble from it, and a human decides what happens to it next.
+* **retired** — a human decided (#245). The row stays as evidence and stops
+  being work permanently, on a recorded authority, and no release path may
+  revoke it. See :mod:`.pending_work_claim_retirement`.
 * **gone** — the row is deleted, and only a true terminal work outcome does that.
 
 Parking is what makes the quarantine a *local* disposition. It commits with the
@@ -178,10 +181,17 @@ class UnresolvedClaim:
     #: escalation must keep seeing it, since it is the evidence the operator's
     #: block points at.
     parked: bool = False
+    #: Whether an OPERATOR has retired this row (#245). Separate from
+    #: :attr:`parked` because the two dispositions have different owners and
+    #: different lifetimes: parking is a quarantine's and ends when that
+    #: quarantine is released, while retirement is a human's and no release path
+    #: may revoke it. Carried for the same reason parking is — the row stays
+    #: enumerable as the evidence of what was abandoned.
+    retired: bool = False
 
     @property
     def re_admissible(self) -> bool:
-        """Whether recovery may hand this row's work back to a queue (#210).
+        """Whether recovery may hand this row's work back to a queue (#210, #245).
 
         The ONE place the re-admission rule is spelled, so a caller cannot
         inherit it by accident or lose it by asking a different question. A
@@ -191,8 +201,15 @@ class UnresolvedClaim:
         automatic double execution this boundary exists to prevent. The
         exclusion lasts exactly as long as the quarantine does — releasing one
         un-parks the row it settled, and ordinary recovery resumes.
+
+        A RETIRED row is excluded permanently. It is not waiting for anybody: an
+        operator has already decided, on a recorded authority, that this work is
+        abandoned, and the entire value of that decision is that no later sweep
+        quietly reverses it. Both exclusions are answered here rather than by
+        the enumeration, because the escalation sweep reads the same rows and
+        wants the opposite answer about them.
         """
-        return not self.parked
+        return not self.parked and not self.retired
 
     @property
     def quarantine_key(self) -> str:
@@ -499,6 +516,14 @@ class UnreadableClaim:
     #: predicate answering for two independent reasons is how the settlement
     #: stopped being provable in the first place.
     parked: bool = False
+    #: Whether an OPERATOR retired this row before it stopped being readable
+    #: (#245). A retirement is taken on a claim this build could read, and a
+    #: pinned runtime meeting a payload written in a larger vocabulary is #209's
+    #: ordinary operating condition — so "retired" and "unreadable" are not
+    #: exclusive, and the escalation sweep has to be able to tell that a
+    #: decision was already taken about this row rather than raise a fresh
+    #: ``needs-human`` block over it.
+    retired: bool = False
 
     @property
     def quarantine_key(self) -> str:

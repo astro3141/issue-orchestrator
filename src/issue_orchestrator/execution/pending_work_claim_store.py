@@ -59,6 +59,10 @@ from ..domain.pending_work import PendingWorkClaim, PendingWorkKind
 from ..domain.session_run import SessionRunAssets
 from ..infra.repo_identity import state_dir
 from ..infra.sqlite_connection import open_sqlite
+from ..ports.pending_work_claim_retirement import (
+    ClaimRetirementRequest,
+    RetiredClaimRecord,
+)
 from ..ports.pending_work_claim_store import (
     AnnouncedStory,
     ClaimLookup,
@@ -70,6 +74,10 @@ from ..ports.pending_work_claim_store import (
     UnreadableClaim,
     UnresolvedClaim,
     quarantine_key_for_run,
+)
+from .pending_work_claim_retirement import (
+    retire_claim as _retire_claim,
+    retired_claim_records,
 )
 from .pending_work_claim_schema import (
     STORE_FILENAME,
@@ -120,8 +128,11 @@ class SqlitePendingWorkClaimStore:
     def for_repo(cls, repo_root: Path) -> "SqlitePendingWorkClaimStore":
         """Store handle for a repository's orchestrator state directory.
 
-        Called only by the composition root (and adapter tests); control code
-        depends on the injected ports instead.
+        Called only by a composition root and by adapter tests; control code
+        depends on the injected ports instead. The operator retirement command
+        (#245) is a composition root of its own — a separate process with one
+        collaborator — and reaches this the same way ``trusted-runtime-promote``
+        reaches the live-assurance store.
         """
         return cls(state_dir(repo_root) / STORE_FILENAME)
 
@@ -146,8 +157,15 @@ class SqlitePendingWorkClaimStore:
             # the stale deferred row must not be mistaken for a rival claim.
             # Same transaction as the new hold, so the two can never both be
             # missing (#6999 F8).
+            #
+            # A RETIRED row is not one of these (#245). "Relaunching resolves
+            # the deferral" is a statement about work still waiting to be
+            # relaunched, which a retired row by definition is not: it is the
+            # evidence of a decision, and a fresh launch of unrelated work that
+            # happens to share this work key must not delete it.
             conn.execute(
-                "DELETE FROM pending_work_claim WHERE work_key = ? AND deferred = 1",
+                "DELETE FROM pending_work_claim "
+                "WHERE work_key = ? AND deferred = 1 AND retired = 0",
                 (work_key,),
             )
             row = conn.execute(
@@ -245,6 +263,10 @@ class SqlitePendingWorkClaimStore:
                     # the sweep that escalates live trouble asks the opposite one
                     # of the same rows.
                     parked=bool(row["parked"]),
+                    # Reported for the same reason and read by a different rule
+                    # (#245): recovery must skip it, and an operator asking what
+                    # became of the work must still find the row.
+                    retired=bool(row["retired"]),
                 )
             )
         return tuple(unresolved)
@@ -270,15 +292,28 @@ class SqlitePendingWorkClaimStore:
                         # is where a settlement on a row nothing can decode is
                         # observable at all.
                         parked=bool(row["parked"]),
+                        # A row can be retired while readable and become
+                        # unreadable afterwards - a pinned runtime meeting a
+                        # payload written in a larger vocabulary is #209's
+                        # ordinary operating condition (#245). The escalation
+                        # sweep has to be able to see that a decision was
+                        # already taken about it.
+                        retired=bool(row["retired"]),
                     )
                 )
         return tuple(unreadable)
 
     def retire_deferred_claim(self, work_key: str) -> None:
-        """Drop the deferred row for work a launch transaction gave up on."""
+        """Drop the deferred row for work a launch transaction gave up on.
+
+        An operator-retired row is excluded for the reason it is excluded from
+        the relaunch supersession above (#245): this deletes work that a launch
+        dropped, and a retired row is no longer work.
+        """
         with self._write_lock, self._transaction() as conn:
             conn.execute(
-                "DELETE FROM pending_work_claim WHERE work_key = ? AND deferred = 1",
+                "DELETE FROM pending_work_claim "
+                "WHERE work_key = ? AND deferred = 1 AND retired = 0",
                 (work_key,),
             )
 
@@ -291,12 +326,16 @@ class SqlitePendingWorkClaimStore:
         matches nothing is a successful statement and a failed commitment, and
         the caller spending a bounded retry budget has to be able to tell them
         apart.
+
+        A retired row is not rewritten and does not count as one (#245): its
+        payload is the preserved evidence of what was abandoned, and reporting
+        an overwrite of it as a commit would be false twice over.
         """
         payload = encode_claim_text(claim)
         with self._write_lock, self._transaction() as conn:
             cursor = conn.execute(
                 "UPDATE pending_work_claim SET payload = ? "
-                "WHERE work_key = ? AND deferred = 1",
+                "WHERE work_key = ? AND deferred = 1 AND retired = 0",
                 (payload, work_key),
             )
             return cursor.rowcount > 0
@@ -308,6 +347,44 @@ class SqlitePendingWorkClaimStore:
                 "UPDATE pending_work_claim SET deferred = 1 WHERE run_key = ?",
                 (run_key,),
             )
+
+    # -- operator retirement (#245) ----------------------------------------
+
+    def retire_claim(self, request: ClaimRetirementRequest) -> RetiredClaimRecord:
+        """Implement ``ports.pending_work_claim_retirement.retire_claim``.
+
+        The transaction and the write lock are the store's, because the claim
+        table is the store's; the checking and the two writes belong to the
+        operation and live beside each other in
+        :mod:`.pending_work_claim_retirement`. Nothing calls this on a schedule.
+        """
+        with self._write_lock, self._transaction() as conn:
+            return _retire_claim(conn, request)
+
+    def rehearse_claim_retirement(
+        self, request: ClaimRetirementRequest
+    ) -> RetiredClaimRecord:
+        """Implement ``...rehearse_claim_retirement``: everything, then undone.
+
+        The SAME call the real thing makes, rolled back rather than committed.
+        Re-implementing the checks for a rehearsal would give an operator
+        standing in front of an irreversible action a preview of a different
+        decision procedure, which is worse than no preview at all.
+        """
+        with self._write_lock:
+            conn = self._get_connection()
+            try:
+                return _retire_claim(conn, request)
+            finally:
+                # Unconditional: the refusal paths raise before writing and the
+                # success path has just written both rows, and neither may
+                # leave an open transaction behind for the next caller to
+                # commit by accident.
+                conn.rollback()
+
+    def list_retired_claims(self) -> tuple[RetiredClaimRecord, ...]:
+        """Implement ``ports.pending_work_claim_retirement.list_retired_claims``."""
+        return retired_claim_records(self._get_connection())
 
     def quarantine_key_for(self, run: SessionRunAssets) -> str:
         """Run root PLUS the start instant the ORCHESTRATOR recorded for it.
@@ -634,8 +711,8 @@ class SqlitePendingWorkClaimStore:
     def _all_rows(self) -> list[sqlite3.Row]:
         return list(
             self._get_connection().execute(
-                "SELECT run_key, session_name, deferred, parked, issue_number, "
-                "started_at, payload FROM pending_work_claim"
+                "SELECT run_key, session_name, deferred, parked, retired, "
+                "issue_number, started_at, payload FROM pending_work_claim"
             )
         )
 
