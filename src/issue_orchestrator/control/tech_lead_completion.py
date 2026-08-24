@@ -33,6 +33,13 @@ Policy summary:
   the session's history outcome is FAILED, not a quiet success; the action
   planner re-reads the same validation for its planning effects (#6761
   finding 3).
+* A completion that did NOT land has no decision pair to judge, and is never
+  asked to invent one — but the same pre-action seam still governs what it may
+  DO. ``settle_tech_lead_completion`` applies the zero-code publication lane
+  (#202) and the subject-recovery answer (#182/#136) to EVERY outcome, from the
+  trusted launch authority alone, because a BLOCKED planning run reaching the
+  generic action executor unshaped pushes a branch it never wrote and blocks
+  the very issue it was sent to prepare (#257).
 * What makes a decision ADMISSIBLE — role action-kind capability (#133),
   target scope (#6761 re-review F2, #6764 rr F1, #6780), the failure
   investigation's diagnosis duty (#6761 F2), and protected-label truth
@@ -55,7 +62,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable
 
-from ..domain.models import Session
+from ..domain.models import (
+    CompletionOutcome,
+    RequestedAction,
+    Session,
+    without_subject_recovery_intent,
+)
 from ..domain.board_snapshot import BOARD_SNAPSHOT_FILENAME, BoardSnapshot
 from ..domain.tech_lead_manifest import TechLeadManifest
 from ..domain.tech_lead_session import TechLeadLaunchAuthority, TechLeadSessionFlavor
@@ -80,10 +92,15 @@ from .tech_lead_decision_loader import (
     TechLeadDecisionLoadFailure,
     load_tech_lead_artifact_pair_for_run,
 )
+from .subject_recovery_authority import SubjectRecoveryAuthority
 from .tech_lead_case_files import build_pattern_ledger
 from .tech_lead_decision_contract import validate_decision_for_authority
 from .tech_lead_proposals import build_op_ledger
 from .tech_lead_session_policy import is_tech_lead_session, read_tech_lead_assignment
+from .tech_lead_zero_code import (
+    ZeroCodeWorktreeReader,
+    settle_zero_code_planning_completion,
+)
 
 if TYPE_CHECKING:
     from ..infra.config import Config
@@ -301,6 +318,147 @@ def admit_tech_lead_completion(
     return TechLeadCompletionAdmission(
         None, f"{ERROR_PREFIX_TECH_LEAD_DECISION}: {failure}: {result.detail}"
     )
+
+
+@dataclass(frozen=True, slots=True)
+class TechLeadCompletionLane:
+    """What ONE tech_lead completion may still ask the orchestrator to do.
+
+    ``rejection`` is the tagged error when the completion is refused outright;
+    the caller must then take zero action. Otherwise ``requested_actions`` is
+    what survives this run's own authority — the caller carries it forward in
+    place of the untrusted tuple the completion record arrived with — and
+    ``zero_code`` / ``detail`` record which lane it settled into, so an operator
+    reading the log of a run that kept the publication path sees which fact was
+    missing.
+    """
+
+    rejection: str | None
+    requested_actions: tuple[RequestedAction, ...]
+    zero_code: bool
+    detail: str
+
+
+def settle_tech_lead_completion(
+    config: "Config",
+    *,
+    tech_lead_authority: "TechLeadAuthorityStore",
+    run_dir: Path,
+    run_id: str,
+    session_name: str,
+    outcome: CompletionOutcome,
+    requested_actions: tuple[RequestedAction, ...],
+    worktree: Path,
+    worktree_reader: ZeroCodeWorktreeReader,
+) -> TechLeadCompletionLane:
+    """The PRE-ACTION policy for a tech_lead completion of ANY outcome (#257).
+
+    Called before the completion record is preserved and before a single
+    requested action executes, so what this returns is what the generic action
+    executor is allowed to see.
+
+    Two already-settled policies apply to what the run asked for, and this is
+    the one seam that applies them:
+
+    * publication intent — a planning run PROVEN to have changed no code offers
+      no code candidate, so :mod:`.tech_lead_zero_code` drops the
+      ``push_branch``/``create_pr`` the completion CLI hands every completion
+      (#202);
+    * recovery intent — a role that may not propose a recovery action on its
+      own subject may not achieve one by asking the completion path for the
+      label either, so the #182 answer removes those requests (#136).
+
+    Only :attr:`CompletionOutcome.COMPLETED` is held to the admission contract
+    — trusted launch authority plus a valid decision artifact pair. That gate is
+    unchanged and still runs first: suppressing intent for a completion whose
+    decision has not been judged would turn a rejection into a settlement.
+    Every other outcome reaches this seam with no decision pair to judge, and
+    must not be made to invent one merely to have its side effects governed
+    (#257): a BLOCKED run is a run that reported it could not proceed, and the
+    orchestrator-owned launch authority already says what role it was. Its
+    tamper detail is deliberately not fatal here, matching
+    :func:`~.tech_lead_terminal_effects.resolve_subject_recovery_authority` —
+    the flavor comes from the orchestrator's own record, never from the
+    worktree copies the agent could reach.
+
+    An unresolvable launch authority leaves the run ungoverned by both policies
+    — the conservative direction the same way round as everywhere else: zero
+    code is never assumed for a run whose base is unknown, and the generic
+    recovery behaviour stands for a role that cannot be proven bounded.
+    """
+    if outcome is CompletionOutcome.COMPLETED:
+        admission = admit_tech_lead_completion(
+            config,
+            tech_lead_authority=tech_lead_authority,
+            run_dir=run_dir,
+            run_id=run_id,
+            session_name=session_name,
+        )
+        if admission.error is not None:
+            return TechLeadCompletionLane(
+                rejection=admission.error,
+                requested_actions=requested_actions,
+                zero_code=False,
+                detail=admission.error,
+            )
+        authority = admission.authority
+    else:
+        authority, _tamper = resolve_tech_lead_launch_authority(
+            tech_lead_authority,
+            run_dir=run_dir,
+            run_id=run_id,
+            session_name=session_name,
+        )
+    if authority is None:
+        return TechLeadCompletionLane(
+            rejection=None,
+            requested_actions=requested_actions,
+            zero_code=False,
+            detail=(
+                "no orchestrator launch-authority record for run"
+                f" {run_id}/{session_name}; the run's role is unproven, so its"
+                " requested actions stand as the generic path would take them"
+            ),
+        )
+    settlement = settle_zero_code_planning_completion(
+        authority=authority,
+        requested_actions=requested_actions,
+        worktree=worktree,
+        worktree_reader=worktree_reader,
+    )
+    return TechLeadCompletionLane(
+        rejection=None,
+        requested_actions=_without_unauthorized_recovery_requests(
+            settlement.requested_actions, authority=authority
+        ),
+        zero_code=settlement.zero_code,
+        detail=settlement.detail,
+    )
+
+
+def _without_unauthorized_recovery_requests(
+    requested: tuple[RequestedAction, ...],
+    *,
+    authority: TechLeadLaunchAuthority,
+) -> tuple[RequestedAction, ...]:
+    """Drop the recovery requests this run's ROLE holds no authority to make.
+
+    The completion-record half of #182. The planned half already asks
+    :class:`~.subject_recovery_authority.SubjectRecoveryAuthority` — so a
+    ``planning_investigation`` that reports BLOCKED gets the operator note
+    saying no ``blocked`` label was added — while the agent's own
+    ``add_blocked_label`` request travelled a different road and added one
+    anyway, leaving the durable state contradicting the message (#257).
+
+    The SAME answer settles both, read from the capability table through the
+    same owner, so no second ``planning_investigation`` match exists to drift:
+    a role that later gains a recovery kind keeps its requests here in the very
+    edit that gives it the planned label back.
+    """
+    subject_recovery = SubjectRecoveryAuthority.for_flavor(authority.flavor)
+    if subject_recovery.may_leave_recovery_label:
+        return requested
+    return without_subject_recovery_intent(requested)
 
 
 _TECH_LEAD_ERROR_PREFIXES = (ERROR_PREFIX_TECH_LEAD_DECISION, ERROR_PREFIX_TECH_LEAD_AUTHORITY)

@@ -3462,17 +3462,13 @@ class TestTechLeadCompletionEffects:
         assert not result.errors
 
 
-class TestZeroCodePlanningLane:
-    """A planning run that changed no code settles without the publish gate (#202).
+class _PlanningLaneHarness:
+    """Arming shared by the tech_lead planning-completion lane suites.
 
-    ``coding-done completed`` hands EVERY completion ``push_branch`` +
-    ``create_pr``, so a planning run — launched into a disposable scratch
-    checkout and never asked to write code — was held to the code-candidate
-    publish contract and its already-authorized planning effects never settled.
-
-    These tests fix both halves of the boundary: the proven zero-code run must
-    reach none of the publication or review seams, and a run whose zero-code
-    status is anything less than proven must keep today's behaviour exactly.
+    One planning run, armed the way the orchestrator arms a real one — the
+    agent-visible assignment copy, the orchestrator-owned launch authority, and
+    a decision pair — so the suites below vary only what they are about: the
+    completion's outcome, the checkout's observed state, and the run's flavor.
     """
 
     LAUNCH_SHA = "c" * 40
@@ -3505,6 +3501,9 @@ class TestZeroCodePlanningLane:
             config.agents["agent:reviewer"] = AgentConfig(prompt_path=prompt)
             config.repo = "acme/widgets"
         mock_git_adapter.default_branch.return_value = "main"
+        # Kept so a test can reach the same wiring the processor was built
+        # with, rather than reading it back off the processor.
+        self.config = config
         return CompletionProcessor(
             agent_callback_endpoint=ready_callback_endpoint(),
             label_adapter=mock_label_adapter,
@@ -3634,6 +3633,20 @@ class TestZeroCodePlanningLane:
             agent_label="agent:tech-lead",
             issue_key=None,
         )
+
+
+class TestZeroCodePlanningLane(_PlanningLaneHarness):
+    """A planning run that changed no code settles without the publish gate (#202).
+
+    ``coding-done completed`` hands EVERY completion ``push_branch`` +
+    ``create_pr``, so a planning run — launched into a disposable scratch
+    checkout and never asked to write code — was held to the code-candidate
+    publish contract and its already-authorized planning effects never settled.
+
+    These tests fix both halves of the boundary: the proven zero-code run must
+    reach none of the publication or review seams, and a run whose zero-code
+    status is anything less than proven must keep today's behaviour exactly.
+    """
 
     # -- The proven zero-code run ---------------------------------------
 
@@ -3981,6 +3994,485 @@ class TestZeroCodePlanningLane:
         )
         mock_git_adapter.push.assert_not_called()
         mock_pr_adapter.create_pr.assert_not_called()
+
+
+class TestBlockedPlanningCompletionLane(_PlanningLaneHarness):
+    """A run that reports BLOCKED is governed before the generic executor (#257).
+
+    ``coding-done blocked`` hands every completion ``push_branch`` +
+    ``add_blocked_label``, and the pre-action policy phase used to return early
+    for anything that was not COMPLETED. So a planning run reporting it could
+    not proceed pushed a branch it never wrote (#202's lane never reached) and
+    blocked the very issue it was sent to prepare (#182's answer never asked) —
+    while the action planner, which DID ask, told the operator no label had been
+    added.
+
+    Both policies now apply to a BLOCKED completion, from the trusted launch
+    authority alone: a run that did not land has no decision pair, and must not
+    be made to invent one to have its side effects governed.
+    """
+
+    BLOCKED_REASON = "code validation could not reach the network"
+
+    @staticmethod
+    def _blocked_record() -> CompletionRecord:
+        """What ``coding-done blocked`` writes, planning runs included."""
+        return make_record(
+            outcome=CompletionOutcome.BLOCKED,
+            requested_actions=[
+                RequestedAction.PUSH_BRANCH,
+                RequestedAction.ADD_BLOCKED_LABEL,
+                RequestedAction.POST_COMMENT,
+            ],
+            summary="Could not prepare #123",
+            blocked_reason=TestBlockedPlanningCompletionLane.BLOCKED_REASON,
+        )
+
+    @staticmethod
+    def _added_labels(mock_label_adapter) -> list[str]:
+        return [
+            call_args.args[1]
+            for call_args in mock_label_adapter.add_label.call_args_list
+        ]
+
+    # -- Direction 1: the publication intent a blocked planning run never meant -
+
+    def test_a_blocked_zero_code_run_reaches_no_publication_or_review_seam(
+        self,
+        tmp_path,
+        mock_label_adapter,
+        mock_pr_adapter,
+        mock_git_adapter,
+        event_bus,
+        tech_lead_authority_store,
+        worktree_with_completion,
+    ):
+        """The live Pilot-4 shape: proven zero-code, and nothing publishes."""
+        gate = Mock()
+        gate.check = Mock(side_effect=publish_gate_outcome())
+        exchange_runner = _CapturingReviewExchangeRunner()
+        processor = self._make_processor(
+            tmp_path,
+            mock_label_adapter,
+            mock_pr_adapter,
+            mock_git_adapter,
+            event_bus,
+            tech_lead_authority_store,
+            publication_gate=gate,
+            review_exchange_runner=exchange_runner,
+        )
+        mock_git_adapter.get_head_sha.return_value = self.LAUNCH_SHA
+        worktree = worktree_with_completion(self._blocked_record())
+        run_assets = self._arm_planning_run(
+            tech_lead_authority_store, worktree, launch_base_sha=self.LAUNCH_SHA
+        )
+
+        result = self._process(processor, worktree, run_assets)
+
+        assert result.success is True
+        assert not result.errors
+        gate.check.assert_not_called()
+        assert exchange_runner.calls == []
+        mock_git_adapter.push.assert_not_called()
+        mock_pr_adapter.create_pr.assert_not_called()
+
+    # -- Direction 2: the recovery state the role holds no authority over ------
+
+    def test_a_blocked_planning_run_never_blocks_the_issue_it_prepared(
+        self,
+        tmp_path,
+        mock_label_adapter,
+        mock_pr_adapter,
+        mock_git_adapter,
+        event_bus,
+        tech_lead_authority_store,
+        worktree_with_completion,
+    ):
+        """The agent's own ``add_blocked_label`` request is not a second door."""
+        processor = self._make_processor(
+            tmp_path,
+            mock_label_adapter,
+            mock_pr_adapter,
+            mock_git_adapter,
+            event_bus,
+            tech_lead_authority_store,
+        )
+        mock_git_adapter.get_head_sha.return_value = self.LAUNCH_SHA
+        worktree = worktree_with_completion(self._blocked_record())
+        run_assets = self._arm_planning_run(
+            tech_lead_authority_store, worktree, launch_base_sha=self.LAUNCH_SHA
+        )
+
+        result = self._process(processor, worktree, run_assets)
+
+        assert result.success is True
+        assert self._added_labels(mock_label_adapter) == []
+
+    def test_the_absent_label_and_the_operator_message_agree(
+        self,
+        tmp_path,
+        mock_label_adapter,
+        mock_pr_adapter,
+        mock_git_adapter,
+        event_bus,
+        tech_lead_authority_store,
+        worktree_with_completion,
+    ):
+        """Durable state and the blocked-session explanation, from one answer.
+
+        The defect this pins was not a missing suppression but a DISAGREEMENT:
+        the planner asked the owner and said no ``blocked`` label was added,
+        while the completion path added one. Both halves are driven here from
+        the same launch-authority row, so a regression in either one shows up
+        as the contradiction it is.
+        """
+        processor = self._make_processor(
+            tmp_path,
+            mock_label_adapter,
+            mock_pr_adapter,
+            mock_git_adapter,
+            event_bus,
+            tech_lead_authority_store,
+        )
+        mock_git_adapter.get_head_sha.return_value = self.LAUNCH_SHA
+        worktree = worktree_with_completion(self._blocked_record())
+        run_assets = self._arm_planning_run(
+            tech_lead_authority_store, worktree, launch_base_sha=self.LAUNCH_SHA
+        )
+
+        self._process(processor, worktree, run_assets)
+        explanation = self._blocked_session_explanation(
+            worktree, run_assets, tech_lead_authority_store
+        )
+
+        assert self._added_labels(mock_label_adapter) == []
+        assert "no `blocked` label was added" in explanation
+        assert "will not be automatically retried" not in explanation
+
+    def _blocked_session_explanation(
+        self, worktree, run_assets, tech_lead_authority_store
+    ) -> str:
+        """The operator comment the outer planner generates for this same run."""
+        from issue_orchestrator.control.actions import AddCommentAction
+        from issue_orchestrator.control.agent_blocked_completion import (
+            agent_blocked_actions,
+        )
+        from issue_orchestrator.control.label_manager import LabelManager
+        from issue_orchestrator.control.reconciliation import (
+            build_expected_for_mutation,
+        )
+        from issue_orchestrator.control.tech_lead_terminal_effects import (
+            resolve_subject_recovery_authority,
+        )
+        from issue_orchestrator.domain.issue_key import FakeIssueKey
+        from issue_orchestrator.domain.models import Issue, Session
+        from issue_orchestrator.domain.session_key import SessionKey, TaskKind
+
+        config = self.config
+        issue = Issue(
+            number=123,
+            title="Planning Investigation",
+            labels=["agent:tech-lead"],
+            repo="acme/widgets",
+        )
+        session = Session(
+            key=SessionKey(issue=FakeIssueKey("123"), task=TaskKind.CODE),
+            issue=issue,
+            agent_config=config.agents["agent:tech-lead"],
+            terminal_id=run_assets.session_name,
+            worktree_path=worktree,
+            branch_name="tech-lead-planning-123-abc",
+            run_assets=run_assets,
+        )
+        actions = agent_blocked_actions(
+            session,
+            build_expected_for_mutation(),
+            label_manager=LabelManager(config),
+            blocked_label=None,
+            blocked_reason=self.BLOCKED_REASON,
+            subject_recovery=resolve_subject_recovery_authority(
+                config, session, tech_lead_authority=tech_lead_authority_store
+            ),
+        )
+        return "\n".join(
+            action.comment
+            for action in actions
+            if isinstance(action, AddCommentAction)
+        )
+
+    # -- No fake decision -----------------------------------------------------
+
+    def test_a_blocked_run_settles_with_no_decision_artifact_at_all(
+        self,
+        tmp_path,
+        mock_label_adapter,
+        mock_pr_adapter,
+        mock_git_adapter,
+        event_bus,
+        tech_lead_authority_store,
+        worktree_with_completion,
+    ):
+        """A run that did not land is not asked to invent the landing artifact.
+
+        The COMPLETED path REQUIRES the decision pair and rejects a completion
+        without one. A BLOCKED run legitimately has none — it is reporting that
+        it could not get that far — so demanding one to settle side-effect
+        policy would either reject every honest block or invite a fabricated
+        artifact. Neither is required: the launch authority alone says what role
+        this was.
+        """
+        processor = self._make_processor(
+            tmp_path,
+            mock_label_adapter,
+            mock_pr_adapter,
+            mock_git_adapter,
+            event_bus,
+            tech_lead_authority_store,
+        )
+        mock_git_adapter.get_head_sha.return_value = self.LAUNCH_SHA
+        worktree = worktree_with_completion(self._blocked_record())
+        run_assets = self._arm_planning_run(
+            tech_lead_authority_store, worktree, launch_base_sha=self.LAUNCH_SHA
+        )
+        data_dir = run_assets.run_dir / "tech-lead-data"
+        (data_dir / "tech-lead-decision.json").unlink()
+        (data_dir / "tech-lead-report.md").unlink()
+
+        result = self._process(processor, worktree, run_assets)
+
+        assert result.success is True
+        assert not result.errors
+        mock_git_adapter.push.assert_not_called()
+        assert self._added_labels(mock_label_adapter) == []
+
+    def test_a_needs_human_planning_run_does_not_escalate_its_subject(
+        self,
+        tmp_path,
+        mock_label_adapter,
+        mock_pr_adapter,
+        mock_git_adapter,
+        event_bus,
+        tech_lead_authority_store,
+        worktree_with_completion,
+    ):
+        """``needs-human`` retires the subject too, so the same answer governs it.
+
+        The rule is "may this run change its subject's RECOVERY state", not
+        "may it add one particular label" — the vocabulary of requests that
+        carry that change is owned once, so the escalation route closes with
+        the blocking one rather than a release later.
+        """
+        processor = self._make_processor(
+            tmp_path,
+            mock_label_adapter,
+            mock_pr_adapter,
+            mock_git_adapter,
+            event_bus,
+            tech_lead_authority_store,
+        )
+        mock_git_adapter.get_head_sha.return_value = self.LAUNCH_SHA
+        worktree = worktree_with_completion(
+            make_record(
+                outcome=CompletionOutcome.NEEDS_HUMAN,
+                requested_actions=[
+                    RequestedAction.PUSH_BRANCH,
+                    RequestedAction.ADD_NEEDS_HUMAN_LABEL,
+                    RequestedAction.POST_COMMENT,
+                ],
+                summary="Needs a decision on #123",
+            )
+        )
+        run_assets = self._arm_planning_run(
+            tech_lead_authority_store, worktree, launch_base_sha=self.LAUNCH_SHA
+        )
+
+        self._process(processor, worktree, run_assets)
+
+        assert self._added_labels(mock_label_adapter) == []
+
+    # -- The hard boundary: neither policy is assumed -------------------------
+
+    @pytest.mark.parametrize(
+        ("head_sha", "dirty_files", "why"),
+        [
+            ("d" * 40, [], "HEAD moved after launch"),
+            ("c" * 40, ["src/thing.py"], "blocking tracked dirt is present"),
+            (None, [], "HEAD is unreadable"),
+            ("c" * 40, None, "tracked dirt is unenumerable"),
+        ],
+    )
+    def test_an_unproven_blocked_run_keeps_its_push_and_still_loses_the_label(
+        self,
+        tmp_path,
+        mock_label_adapter,
+        mock_pr_adapter,
+        mock_git_adapter,
+        event_bus,
+        tech_lead_authority_store,
+        worktree_with_completion,
+        head_sha,
+        dirty_files,
+        why,
+    ):
+        """The two policies are independent, and zero-code is never assumed.
+
+        A blocked run whose checkout cannot be PROVEN unchanged keeps the push
+        that preserves its work — but its role's recovery authority does not
+        depend on what it wrote, so the label stays suppressed either way.
+        """
+        processor = self._make_processor(
+            tmp_path,
+            mock_label_adapter,
+            mock_pr_adapter,
+            mock_git_adapter,
+            event_bus,
+            tech_lead_authority_store,
+        )
+        mock_git_adapter.get_head_sha.return_value = head_sha
+        mock_git_adapter.list_dirty_files.return_value = dirty_files
+        worktree = worktree_with_completion(self._blocked_record())
+        run_assets = self._arm_planning_run(
+            tech_lead_authority_store, worktree, launch_base_sha=self.LAUNCH_SHA
+        )
+
+        self._process(processor, worktree, run_assets)
+
+        assert mock_git_adapter.push.called, why
+        assert self._added_labels(mock_label_adapter) == [], why
+
+    def test_a_legacy_authority_row_keeps_the_publication_path_when_blocked(
+        self,
+        tmp_path,
+        mock_label_adapter,
+        mock_pr_adapter,
+        mock_git_adapter,
+        event_bus,
+        tech_lead_authority_store,
+        worktree_with_completion,
+    ):
+        """No launch base recorded: the run's zero-code status is unknowable."""
+        processor = self._make_processor(
+            tmp_path,
+            mock_label_adapter,
+            mock_pr_adapter,
+            mock_git_adapter,
+            event_bus,
+            tech_lead_authority_store,
+        )
+        mock_git_adapter.get_head_sha.return_value = self.LAUNCH_SHA
+        worktree = worktree_with_completion(self._blocked_record())
+        run_assets = self._arm_planning_run(
+            tech_lead_authority_store, worktree, launch_base_sha=""
+        )
+
+        self._process(processor, worktree, run_assets)
+
+        mock_git_adapter.push.assert_called_once()
+
+    def test_an_unrecorded_run_keeps_the_generic_blocked_behaviour(
+        self,
+        tmp_path,
+        mock_label_adapter,
+        mock_pr_adapter,
+        mock_git_adapter,
+        event_bus,
+        tech_lead_authority_store,
+        worktree_with_completion,
+    ):
+        """No authority row at all: the role is unproven, so nothing is shaped.
+
+        The conservative direction the same way round as everywhere else — the
+        one :func:`resolve_subject_recovery_authority` already takes for a
+        tech_lead session whose launch authority cannot be resolved.
+        """
+        processor = self._make_processor(
+            tmp_path,
+            mock_label_adapter,
+            mock_pr_adapter,
+            mock_git_adapter,
+            event_bus,
+            tech_lead_authority_store,
+        )
+        mock_git_adapter.get_head_sha.return_value = self.LAUNCH_SHA
+        worktree = worktree_with_completion(self._blocked_record())
+
+        self._process(processor, worktree, make_session_run_assets(worktree))
+
+        mock_git_adapter.push.assert_called_once()
+        assert self._added_labels(mock_label_adapter) == ["blocked"]
+
+    # -- Other roles keep today's behaviour -----------------------------------
+
+    def test_a_blocked_failure_investigation_keeps_push_and_label(
+        self,
+        tmp_path,
+        mock_label_adapter,
+        mock_pr_adapter,
+        mock_git_adapter,
+        event_bus,
+        tech_lead_authority_store,
+        worktree_with_completion,
+    ):
+        """A role that HOLDS the recovery kinds is untouched by either policy."""
+        from issue_orchestrator.domain.tech_lead_session import TechLeadSessionFlavor
+
+        processor = self._make_processor(
+            tmp_path,
+            mock_label_adapter,
+            mock_pr_adapter,
+            mock_git_adapter,
+            event_bus,
+            tech_lead_authority_store,
+        )
+        mock_git_adapter.get_head_sha.return_value = self.LAUNCH_SHA
+        worktree = worktree_with_completion(self._blocked_record())
+        run_assets = self._arm_planning_run(
+            tech_lead_authority_store,
+            worktree,
+            launch_base_sha=self.LAUNCH_SHA,
+            flavor=TechLeadSessionFlavor.FAILURE_INVESTIGATION,
+        )
+
+        self._process(processor, worktree, run_assets)
+
+        mock_git_adapter.push.assert_called_once()
+        assert self._added_labels(mock_label_adapter) == ["blocked"]
+
+    def test_an_ordinary_coder_block_is_untouched(
+        self,
+        tmp_path,
+        mock_label_adapter,
+        mock_pr_adapter,
+        mock_git_adapter,
+        event_bus,
+        tech_lead_authority_store,
+        worktree_with_completion,
+    ):
+        """Control: nothing about an ordinary agent's block moved."""
+        processor = self._make_processor(
+            tmp_path,
+            mock_label_adapter,
+            mock_pr_adapter,
+            mock_git_adapter,
+            event_bus,
+            tech_lead_authority_store,
+        )
+        self.config.agents["agent:coder"] = self.config.agents["agent:tech-lead"]
+        mock_git_adapter.get_head_sha.return_value = self.LAUNCH_SHA
+        worktree = worktree_with_completion(self._blocked_record())
+
+        result = processor.process(
+            worktree,
+            run_assets=make_session_run_assets(worktree),
+            issue_number=123,
+            issue_title="Ordinary work",
+            agent_label="agent:coder",
+            issue_key=None,
+        )
+
+        assert result.success is True
+        mock_git_adapter.push.assert_called_once()
+        assert self._added_labels(mock_label_adapter) == ["blocked"]
 
 
 class TestCompletionProcessorGitActions:
