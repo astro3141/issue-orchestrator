@@ -158,6 +158,56 @@ def _connect(tmp_path: Path) -> sqlite3.Connection:
     )
 
 
+#: The claim table as a build BEFORE #245 wrote it, and the rewind onto it.
+#: Restated outright rather than reached with ``ALTER TABLE ... DROP COLUMN``:
+#: that edits the stored CREATE statement's text and re-parses the result, and
+#: every table in this schema carries the explanatory comments the module says
+#: it carries. SQLite 3.40 - what CI's interpreter bundles - rejects the edited
+#: text ("incomplete input"); 3.53, a current macOS build, accepts it. A proof
+#: about migrations must not be a proof about the developer's SQLite, so the
+#: earlier shape is written down here instead.
+_REWIND_PAST_RETIREMENT = """
+CREATE TABLE pending_work_claim_before_245 (
+    run_key TEXT PRIMARY KEY,
+    work_key TEXT NOT NULL,
+    deferred INTEGER NOT NULL DEFAULT 0,
+    session_name TEXT NOT NULL,
+    run_id TEXT NOT NULL,
+    started_at TEXT NOT NULL,
+    issue_number INTEGER NOT NULL,
+    payload TEXT NOT NULL,
+    parked INTEGER NOT NULL DEFAULT 0
+);
+INSERT INTO pending_work_claim_before_245
+SELECT run_key, work_key, deferred, session_name, run_id, started_at,
+       issue_number, payload, parked
+FROM pending_work_claim;
+DROP TABLE pending_work_claim;
+ALTER TABLE pending_work_claim_before_245 RENAME TO pending_work_claim;
+DROP TABLE pending_work_claim_retirement;
+"""
+
+
+def _rewind_past_retirement(tmp_path: Path) -> None:
+    """Leave the ledger in the shape a build before #245 wrote.
+
+    The ROWS carried across are the real ones this build placed - only the table
+    around them is rewound - so the reopened store migrates a genuine claim
+    rather than a hand-typed approximation of one.
+    """
+    conn = _connect(tmp_path)
+    conn.executescript(_REWIND_PAST_RETIREMENT)
+    conn.commit()
+    columns = {
+        str(column["name"])
+        for column in conn.execute("PRAGMA table_info(pending_work_claim)")
+    }
+    conn.close()
+    # Without this the test could go quietly vacuous: a rewind that left the
+    # column in place would assert "not retired" about a retirement nobody took.
+    assert "retired" not in columns
+
+
 def _park_under_quarantine(store: SqlitePendingWorkClaimStore, run) -> str:
     """Record a real #210 quarantine that PARKS the row, and hand back its key.
 
@@ -614,11 +664,7 @@ def test_a_ledger_written_before_this_build_reads_as_not_retired(
     """The additive direction: absent means permissive, so an upgrade alone
     never takes anybody's work away."""
     store, run = _ledger(tmp_path)
-    conn = _connect(tmp_path)
-    conn.execute("ALTER TABLE pending_work_claim DROP COLUMN retired")
-    conn.execute("DROP TABLE pending_work_claim_retirement")
-    conn.commit()
-    conn.close()
+    _rewind_past_retirement(tmp_path)
 
     reopened = SqlitePendingWorkClaimStore.for_repo(tmp_path)
 
