@@ -13,7 +13,10 @@ Two subcommands, and the split is the safety property:
 * ``record`` takes the decision. It is the only thing in this repository that
   sets the retired bit, it is never called by a scheduler, a startup path or a
   sweep, and it refuses — changing nothing — unless the row it finds is exactly
-  the claim the operator described.
+  the claim the operator described. The one precondition it cannot check for
+  itself is the run being over: liveness lives in the orchestrator's control
+  state, not in the ledger, so "this run has ended" stays the operator's
+  judgement and ``--dry-run`` is how they inspect the row before taking it.
 * ``evidence`` reads. It mutates nothing, and it is how the operator confirms
   afterwards that the payload and provenance survived the decision.
 
@@ -184,7 +187,16 @@ def build_parser() -> argparse.ArgumentParser:
     subcommands = parser.add_subparsers(dest="command", required=True)
     _add_record_arguments(
         subcommands.add_parser(
-            _RECORD, help="Record the retirement of one described claim"
+            _RECORD,
+            help="Record the retirement of one described claim",
+            description=(
+                "Record the retirement of one described claim. Retire only a "
+                "claim whose run has ENDED: the ledger cannot see liveness, so "
+                "it will not refuse on that ground, and retiring a live run's "
+                "claim leaves a decision recorded against work that may still "
+                "settle itself. Rehearse with --dry-run first - every check "
+                "runs against the real ledger and nothing is written."
+            ),
         )
     )
     subcommands.add_parser(

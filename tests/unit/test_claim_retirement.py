@@ -17,6 +17,8 @@ rather than a mechanism that could be reached by accident:
 * the payload survives, and so does a record of who decided and why;
 * no sweep, startup path or scheduler can re-admit, requeue or escalate it
   afterwards, across a restart and across the schema catching up;
+* no unrelated settlement path revokes it - in particular the quarantine
+  release whose whole job is to hand a row back to ordinary recovery;
 * nothing remote is touched on any path.
 
 Every fixture here is SYNTHESIZED. The preserved Pilot-3 database, its run
@@ -59,6 +61,12 @@ from issue_orchestrator.ports.pending_work_claim_retirement import (
     ClaimRetirementRefused,
     ClaimRetirementRequest,
     ClaimRetirementTarget,
+)
+from issue_orchestrator.ports.pending_work_claim_store import (
+    AnnouncedStory,
+    ClaimReadability,
+    ClaimSettlement,
+    QuarantineCause,
 )
 
 # ---------------------------------------------------------------------------
@@ -148,6 +156,29 @@ def _connect(tmp_path: Path) -> sqlite3.Connection:
     return open_sqlite(
         state_dir(tmp_path) / STORE_FILENAME, row_factory=sqlite3.Row
     )
+
+
+def _park_under_quarantine(store: SqlitePendingWorkClaimStore, run) -> str:
+    """Record a real #210 quarantine that PARKS the row, and hand back its key.
+
+    Built through the store's own API rather than by writing the parked bit, so
+    the release path under test is reached the way the orchestrator reaches it.
+    """
+    quarantine_key = store.quarantine_key_for(run)
+    store.record_quarantine(
+        quarantine_key,
+        run_key=store.run_key_for(run),
+        session_name="tech-lead-23",
+        issue_number=_ISSUE,
+        error="unreadable",
+        story=AnnouncedStory(
+            QuarantineCause.CLAIM_UNREADABLE_ENDED_RUN,
+            ClaimReadability.UNREADABLE_CORRUPT,
+        ),
+        work_kind=PendingWorkKind.TECH_LEAD,
+        settlement=ClaimSettlement.PARK,
+    )
+    return quarantine_key
 
 
 def _sweep(tmp_path: Path, quarantine: MagicMock) -> tuple[int, MagicMock]:
@@ -324,27 +355,8 @@ def test_a_quarantine_settled_claim_retires_nothing(tmp_path: Path) -> None:
     escalation that has since been repaired, and neither is a disposition
     anybody could reason about.
     """
-    from issue_orchestrator.ports.pending_work_claim_store import (
-        AnnouncedStory,
-        ClaimReadability,
-        ClaimSettlement,
-        QuarantineCause,
-    )
-
     store, run = _ledger(tmp_path)
-    store.record_quarantine(
-        store.quarantine_key_for(run),
-        run_key=store.run_key_for(run),
-        session_name="tech-lead-23",
-        issue_number=_ISSUE,
-        error="unreadable",
-        story=AnnouncedStory(
-            QuarantineCause.CLAIM_UNREADABLE_ENDED_RUN,
-            ClaimReadability.UNREADABLE_CORRUPT,
-        ),
-        work_kind=PendingWorkKind.TECH_LEAD,
-        settlement=ClaimSettlement.PARK,
-    )
+    _park_under_quarantine(store, run)
 
     with pytest.raises(ClaimRetirementRefused) as refused:
         store.retire_claim(_request())
@@ -427,6 +439,40 @@ def test_a_retired_row_is_not_dropped_by_a_deferred_retirement(
     store.retire_deferred_claim(_WORK_KEY)
 
     assert len(store.list_unresolved_claims()) == 1
+
+
+def test_a_quarantine_release_does_not_revoke_a_retirement(tmp_path: Path) -> None:
+    """The reason ``retired`` is a column and not a second reading of ``parked``.
+
+    A quarantine's release is the exact undo of that quarantine's settlement
+    (#210), and it is the one write in this store whose whole purpose is to hand
+    a row back to ordinary recovery. A retirement is a HUMAN's decision with no
+    such expiry, so the release must un-park the row and leave the retirement
+    exactly where it was.
+
+    Ordering matters here: the retirement is taken first, because a row already
+    parked refuses one. A quarantine can still be recorded over it afterwards -
+    ``record_quarantine`` does not consult the retirement - which is precisely
+    how a release comes to run across a retired row in the field.
+    """
+    store, run = _ledger(tmp_path)
+    store.retire_claim(_request())
+    quarantine_key = _park_under_quarantine(store, run)
+
+    store.release_quarantine(quarantine_key)
+
+    (row,) = store.list_unresolved_claims()
+    # The release did its own job: the parking it recorded is gone...
+    assert not row.parked
+    # ...and it took nothing else with it.
+    assert row.retired
+    assert not row.re_admissible
+    (record,) = store.list_retired_claims()
+    assert record.authority == _AUTHORITY
+    # And the sweep that release exists to re-enable still refuses this row.
+    readmitted, state = _sweep(tmp_path, MagicMock())
+    assert readmitted == 0
+    assert state.pending_tech_lead_reviews == []
 
 
 # ---------------------------------------------------------------------------
@@ -695,6 +741,32 @@ def test_the_operator_command_rehearses_without_writing(
     (row,) = reopened.list_unresolved_claims()
     assert not row.retired
     assert row.re_admissible
+
+
+def test_a_rehearsal_is_rolled_back_on_the_connection_that_ran_it(
+    tmp_path: Path,
+) -> None:
+    """Asked through the SAME store, so this pins the rollback and not the commit.
+
+    The test above reopens the ledger, which a transaction that was merely left
+    open on a discarded connection would also survive. Here the writes are still
+    within reach of the connection that made them: if the rehearsal had only
+    failed to commit rather than actually rolled back, the retirement would be
+    visible right here - and the next ordinary write on this store would carry
+    it into the database as a side effect.
+    """
+    store, _ = _ledger(tmp_path)
+
+    store.rehearse_claim_retirement(_request())
+
+    assert store.list_retired_claims() == ()
+    (row,) = store.list_unresolved_claims()
+    assert not row.retired
+    assert row.re_admissible
+    # The real thing still works afterwards: the rehearsal left no half-open
+    # transaction for it to inherit.
+    store.retire_claim(_request())
+    assert len(store.list_retired_claims()) == 1
 
 
 def test_the_operator_command_rehearses_a_refusal_too(
