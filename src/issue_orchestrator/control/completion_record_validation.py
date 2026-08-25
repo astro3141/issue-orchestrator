@@ -8,8 +8,16 @@ from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol
 
-from ..domain.models import COMPLETION_RECORD_PATH, CompletionRecord, RequestedAction, sanitize_agent_label
+from ..domain.models import (
+    COMPLETION_STRING_MAX_BYTES,
+    CompletionRecord,
+    RequestedAction,
+    completion_record_path,
+    fits_record_string_bound,
+    sanitize_agent_label,
+)
 from ..infra.runtime_artifacts import filter_runtime_managed_dirty_paths
+from ..infra.validation_state import truncate_with_tail
 
 if TYPE_CHECKING:
     from ..infra.config import Config
@@ -29,6 +37,27 @@ _DIRTY_FILES_REASON_LIMIT = 8
 # completion we have seen; tighten further if we ever shrink per-field
 # caps.
 _MAX_COMPLETION_FILE_BYTES = 2 * 1024 * 1024
+
+# The producer's own retry naming. ``write_completion_record`` appends
+# ``-2``, ``-3``, ... to the stem when the canonical path is already
+# occupied (``agent_done.py``), so those names — and only those names —
+# can hold a retry of this run's completion. An arbitrary neighbouring
+# file is not a candidate.
+_PRODUCER_RETRY_MIN_INDEX = 2
+
+# Both of the placeholder's fields are untrusted agent output bounded
+# only by the file-size gate above, and both travel into logs and event
+# payloads. Bound them here rather than at every consumer.
+#
+# ``error`` is truncated because a long one is still evidence worth
+# keeping. ``session_id`` is not truncated but REJECTED past the record
+# parser's own field cap: it is matched, not read, and a value the parser
+# would refuse cannot be the session_id of any valid retry, so a
+# placeholder carrying one can never hand authority to anything. Keeping
+# a mangled copy of it would only put unbounded agent text on the
+# per-sibling log lines below.
+_PRODUCER_ERROR_MAX_CHARS = 2000
+_PRODUCER_ERROR_TAIL_CHARS = 500
 
 
 class WorktreeValidationFailure(Enum):
@@ -50,6 +79,31 @@ class CompletionRecordLoadFailure(str, Enum):
 
 
 @dataclass(frozen=True)
+class ProducerErrorPlaceholder:
+    """What ``write_error_completion`` leaves where a record belongs.
+
+    Not a completion: it is the record of a ``coding-done`` that crashed
+    while *building* one. It parses, and it carries the session it was
+    writing for plus the error that stopped it, but by construction it
+    has no ``summary`` and no action payload — so it can never satisfy
+    the :class:`CompletionRecord` contract.
+
+    Typed rather than a raw dict because exactly two fields of the
+    placeholder are load-bearing, and both are untrusted agent output:
+    ``session_id`` is what a retry must match to be considered the same
+    run's, and ``error`` is the evidence a repaired retry must never
+    silently erase (#264).
+
+    Both are bounded before they get here — see
+    ``_producer_error_placeholder`` — so holding one of these cannot put
+    unbounded agent text on a per-tick log line or in an event payload.
+    """
+
+    session_id: str
+    error: str
+
+
+@dataclass(frozen=True)
 class CompletionRecordLoadResult:
     """Result of parsing an untrusted completion record file."""
 
@@ -59,6 +113,16 @@ class CompletionRecordLoadResult:
     error: str | None = None
     exists: bool = False
     size: int | None = None
+    producer_error: ProducerErrorPlaceholder | None = None
+
+    @classmethod
+    def missing(cls, record_path: Path) -> "CompletionRecordLoadResult":
+        """The one shape for "there is nothing at this path to parse"."""
+        return cls(
+            path=record_path,
+            failure=CompletionRecordLoadFailure.MISSING,
+            error="Completion record not found",
+        )
 
     @property
     def ok(self) -> bool:
@@ -131,19 +195,31 @@ def load_completion_record_result(record_path: Path) -> CompletionRecordLoadResu
     duplicate reader — that was the bug flagged in #6017 re-review-2
     P3. Returns a typed result so callers can distinguish a genuinely
     missing completion record from one that was present but rejected.
+
+    Every branch here logs at DEBUG, rejections included. This function
+    is polled on the hot path — the observer calls it through
+    ``select_completion_record`` on every ``observe_session`` for every
+    live session — and a record that is unreadable, oversized, or
+    malformed keeps being unreadable, oversized, or malformed on every
+    subsequent tick until the session ends. Logging that at ERROR turns
+    one torn write into an ERROR line per tick for the whole window,
+    which is exactly the signal a real fault would produce.
+
+    Nothing is lost by the demotion: a rejection only becomes a fault
+    once a decision has to be made on it, and the decision site says so
+    loudly. ``SessionController`` routes an invalid record to
+    ``report_invalid_completion_record``, which logs the failure and its
+    error at ERROR, emits ``SESSION_INVALID_COMPLETION_RECORD``, and
+    writes a diagnostic file — once, when the session terminates.
     """
     if not record_path.exists():
-        logger.info("No completion record found at %s", record_path)
-        return CompletionRecordLoadResult(
-            path=record_path,
-            failure=CompletionRecordLoadFailure.MISSING,
-            error="Completion record not found",
-        )
+        logger.debug("No completion record found at %s", record_path)
+        return CompletionRecordLoadResult.missing(record_path)
 
     try:
         size = record_path.stat().st_size
     except OSError as exc:
-        logger.error("Could not stat completion record %s: %s", record_path, exc)
+        logger.debug("Could not stat completion record %s: %s", record_path, exc)
         return CompletionRecordLoadResult(
             path=record_path,
             failure=CompletionRecordLoadFailure.UNREADABLE,
@@ -155,7 +231,7 @@ def load_completion_record_result(record_path: Path) -> CompletionRecordLoadResu
             f"Completion record is {size} bytes, exceeds max "
             f"{_MAX_COMPLETION_FILE_BYTES}"
         )
-        logger.error("%s: %s", record_path, error)
+        logger.debug("%s: %s", record_path, error)
         return CompletionRecordLoadResult(
             path=record_path,
             failure=CompletionRecordLoadFailure.OVERSIZED,
@@ -164,11 +240,21 @@ def load_completion_record_result(record_path: Path) -> CompletionRecordLoadResu
             size=size,
         )
 
+    # Bound before the parse so the rejection branch can inspect what
+    # was actually on disk even when ``json.load`` itself raised.
+    raw: object = None
     try:
         with open(record_path) as f:
             data = json.load(f)
+        raw = data
         record = CompletionRecord.from_dict(data)
-        logger.info(
+        # DEBUG, not INFO: the observer polls this every tick for every
+        # live session, and a session parked in a deferred state (a
+        # background review exchange) polls for a long time. The one
+        # place a successful read is worth an INFO line is the decision
+        # that acts on it, and the controller's completion lookup
+        # already logs exactly that — with the chosen path and why.
+        logger.debug(
             "Read completion record: outcome=%s session=%s path=%s",
             record.outcome.value,
             record.session_id,
@@ -181,7 +267,7 @@ def load_completion_record_result(record_path: Path) -> CompletionRecordLoadResu
             size=size,
         )
     except json.JSONDecodeError as exc:
-        logger.error("Invalid JSON in completion record %s: %s", record_path, exc)
+        logger.debug("Invalid JSON in completion record %s: %s", record_path, exc)
         return CompletionRecordLoadResult(
             path=record_path,
             failure=CompletionRecordLoadFailure.INVALID_JSON,
@@ -189,15 +275,305 @@ def load_completion_record_result(record_path: Path) -> CompletionRecordLoadResu
             exists=True,
             size=size,
         )
+    except OSError as exc:
+        # The file was there a moment ago. It can stop being readable
+        # between the existence check and the read — post-processing
+        # cleanup removes it — and this function is polled every tick
+        # for every live session, so that race is a load failure to
+        # report, never an exception to raise at the caller.
+        logger.debug("Could not read completion record %s: %s", record_path, exc)
+        return CompletionRecordLoadResult(
+            path=record_path,
+            failure=CompletionRecordLoadFailure.UNREADABLE,
+            error=f"Could not read completion record: {exc}",
+            exists=True,
+            size=size,
+        )
     except ValueError as exc:
-        logger.error("Invalid completion record %s: %s", record_path, exc)
+        logger.debug("Invalid completion record %s: %s", record_path, exc)
         return CompletionRecordLoadResult(
             path=record_path,
             failure=CompletionRecordLoadFailure.INVALID_SCHEMA,
             error=str(exc),
             exists=True,
             size=size,
+            producer_error=_producer_error_placeholder(raw),
         )
+
+
+def _producer_error_placeholder(raw: object) -> ProducerErrorPlaceholder | None:
+    """Classify rejected JSON as a producer-error placeholder, or not.
+
+    Only reached for a file that PARSED and then failed the record
+    contract, which is the only shape ``write_error_completion`` can
+    leave behind. Both fields are required: without ``agent_done_error``
+    the file is some other broken record, and without a ``session_id``
+    that a valid record could also carry, nothing can be matched against
+    it — either way this is not a placeholder and the caller must leave
+    the canonical path in charge.
+    """
+    if not isinstance(raw, dict):
+        return None
+    error = raw.get("agent_done_error")
+    written_for = raw.get("session_id")
+    if not isinstance(error, str) or not error.strip():
+        return None
+    if not isinstance(written_for, str) or not written_for.strip():
+        return None
+    if not fits_record_string_bound(written_for):
+        # DEBUG for the same reason the other rejection branches are:
+        # this is polled every tick for every live session.
+        logger.debug(
+            "Not a producer-error placeholder: session_id is %d bytes, "
+            "past the %d a valid record may carry, so no retry can match it",
+            len(written_for.encode("utf-8")),
+            COMPLETION_STRING_MAX_BYTES,
+        )
+        return None
+    return ProducerErrorPlaceholder(
+        session_id=written_for,
+        error=truncate_with_tail(
+            error,
+            _PRODUCER_ERROR_MAX_CHARS,
+            _PRODUCER_ERROR_TAIL_CHARS,
+        ),
+    )
+
+
+class CompletionPathChoice(str, Enum):
+    """Which file the selection owner made authoritative, and why."""
+
+    CANONICAL = "canonical"
+    PRODUCER_ERROR_RETRY = "producer_error_retry"
+    AMBIGUOUS_PRODUCER_ERROR_RETRY = "ambiguous_producer_error_retry"
+
+
+@dataclass(frozen=True)
+class CompletionRecordSelection:
+    """The authoritative record for a run, plus why that file won."""
+
+    canonical_path: Path
+    path: Path
+    load_result: CompletionRecordLoadResult
+    choice: CompletionPathChoice
+    producer_error: str | None = None
+    unresolved_candidates: tuple[Path, ...] = ()
+
+    @property
+    def record(self) -> CompletionRecord | None:
+        return self.load_result.record
+
+    @property
+    def superseded_path(self) -> Path | None:
+        """The placeholder the selected retry took over from, if any.
+
+        Descriptive only. This owner answers WHICH file speaks for the run;
+        it does not decide which files may be removed, and #264 removes
+        nothing it did not already remove — both records stay on disk except
+        for the canonical file the pre-existing cleanup has always unlinked.
+        Cleanup reads this to say in its log which record it deliberately
+        LEFT behind, never to widen what it deletes.
+        """
+        if self.path == self.canonical_path:
+            return None
+        return self.canonical_path
+
+    def lookup_fields(self) -> dict[str, object]:
+        """Explain the choice to a log line or a trace event payload.
+
+        Carries ``completion_producer_error`` whenever a placeholder was
+        found, including when nothing replaced it: a repaired retry must
+        not erase the fact that the first ``coding-done`` failed (#264).
+
+        Every path in the payload is resolved, so a consumer comparing
+        two of these fields — or one of them against the
+        ``full_path``/``worktree_path`` the lookup event already resolves
+        — is comparing the same form on both sides.
+        """
+        return {
+            "completion_selected_path": str(self.path.resolve()),
+            "completion_path_choice": self.choice.value,
+            "completion_producer_error": self.producer_error,
+            "completion_unresolved_candidates": [
+                str(path.resolve()) for path in self.unresolved_candidates
+            ],
+        }
+
+
+def select_completion_record(
+    worktree: Path, completion_path: str | None
+) -> CompletionRecordSelection:
+    """Choose WHICH completion record file speaks for a run.
+
+    The ONE owner of that question. The observer that watches sessions,
+    the controller that decides their outcome, and the run-scoped audit
+    copy all route here, so a record one of them acts on can never be a
+    record another cannot see — the split that left a valid completion
+    invisible on disk while its session ran to timeout (#264).
+
+    It decides authority, not lifetime. Nothing here moves, renames,
+    overwrites, or deletes any file, and #264 leaves record cleanup
+    exactly as it found it: the pre-existing cleanup unlinks the
+    canonical path and no other. Cleanup consults this only to report
+    which record it left behind.
+
+    Takes ``(worktree, completion_path)`` rather than a resolved file so
+    that callers cannot re-derive the join themselves and drift; it asks
+    ``completion_record_path`` for the canonical location and returns
+    both that and its verdict.
+
+    The rule is deliberately narrow:
+
+    * Canonical missing, or canonical valid -> canonical. A VALID
+      canonical record wins even with suffixed siblings present, because
+      the suffix has a legitimate second meaning (a second review after
+      rework, ``agent_done.py``). Re-assigning authority between two
+      valid completions would change which intent governs, and this
+      owner does not make that decision.
+    * Canonical is a producer-error placeholder -> the placeholder is
+      not a completion at all, so a successful retry may take over. It
+      must be exactly one valid sibling, named the way the producer
+      names retries, in the same run directory, carrying the same
+      ``session_id`` the placeholder was written for.
+    * Anything else -> canonical, unchanged. No valid sibling leaves the
+      placeholder in charge; more than one is ambiguity this owner
+      refuses to resolve — there is no newest-wins, lowest-suffix-wins,
+      or mtime rule anywhere in it — so it fails closed onto the
+      placeholder and the existing rejected-record path it already
+      travels.
+
+    Every file this function reads goes through
+    ``load_completion_record_result``, so the size gate and field bounds
+    apply to siblings exactly as they apply to the canonical record.
+
+    Like the loader it calls, this function explains itself at DEBUG.
+    It runs on every ``observe_session`` for every live session, so a
+    placeholder that sits there unresolved would otherwise re-log the
+    same explanation — once per non-matching sibling — on every tick
+    until the session ends. The verdict is reported once, where it is
+    acted on: ``SessionController._log_completion_lookup`` logs the
+    chosen path, the choice, the preserved producer error, and any
+    unresolved candidates, and puts the same fields on the
+    ``COMPLETION_LOOKUP`` event.
+    """
+    canonical_path = completion_record_path(worktree, completion_path)
+    if not canonical_path.exists():
+        # Polled every tick for every live session, so the nothing-there
+        # case must not pay for a stat and an open it does not need.
+        return _canonical_selection(
+            canonical_path, CompletionRecordLoadResult.missing(canonical_path)
+        )
+
+    canonical_result = load_completion_record_result(canonical_path)
+    placeholder = canonical_result.producer_error
+    if canonical_result.ok or placeholder is None:
+        return _canonical_selection(canonical_path, canonical_result)
+
+    candidates = _valid_producer_retries(canonical_path, placeholder.session_id)
+    if not candidates:
+        logger.debug(
+            "Completion producer error at %s with no valid retry beside it: %s",
+            canonical_path,
+            placeholder.error,
+        )
+        return _canonical_selection(
+            canonical_path, canonical_result, producer_error=placeholder.error
+        )
+
+    if len(candidates) > 1:
+        logger.debug(
+            "Ambiguous completion retry beside %s: %d valid records for "
+            "session %s (%s); refusing to choose. Producer error was: %s",
+            canonical_path,
+            len(candidates),
+            placeholder.session_id,
+            ", ".join(str(candidate.path) for candidate in candidates),
+            placeholder.error,
+        )
+        return CompletionRecordSelection(
+            canonical_path=canonical_path,
+            path=canonical_path,
+            load_result=canonical_result,
+            choice=CompletionPathChoice.AMBIGUOUS_PRODUCER_ERROR_RETRY,
+            producer_error=placeholder.error,
+            unresolved_candidates=tuple(
+                candidate.path for candidate in candidates
+            ),
+        )
+
+    chosen = candidates[0]
+    logger.debug(
+        "Completion retry at %s takes over from the producer error at %s. "
+        "The first completion command failed with: %s",
+        chosen.path,
+        canonical_path,
+        placeholder.error,
+    )
+    return CompletionRecordSelection(
+        canonical_path=canonical_path,
+        path=chosen.path,
+        load_result=chosen,
+        choice=CompletionPathChoice.PRODUCER_ERROR_RETRY,
+        producer_error=placeholder.error,
+    )
+
+
+def _canonical_selection(
+    canonical_path: Path,
+    load_result: CompletionRecordLoadResult,
+    *,
+    producer_error: str | None = None,
+) -> CompletionRecordSelection:
+    return CompletionRecordSelection(
+        canonical_path=canonical_path,
+        path=canonical_path,
+        load_result=load_result,
+        choice=CompletionPathChoice.CANONICAL,
+        producer_error=producer_error,
+    )
+
+
+def _valid_producer_retries(
+    canonical_path: Path, written_for: str
+) -> list[CompletionRecordLoadResult]:
+    """Load every valid same-session retry beside the canonical path.
+
+    Returns them in a stable order for reporting only. Order never
+    decides anything: one candidate is selected, several are ambiguity.
+    """
+    parent = canonical_path.parent
+    stem = canonical_path.stem
+    suffix = canonical_path.suffix
+    found: list[CompletionRecordLoadResult] = []
+    for sibling in sorted(parent.glob(f"*{suffix}")):
+        if not _has_producer_suffix(sibling, stem, suffix):
+            continue
+        loaded = load_completion_record_result(sibling)
+        if loaded.record is None:
+            continue
+        if loaded.record.session_id != written_for:
+            logger.debug(
+                "Ignoring %s beside %s: written for session %s, not %s",
+                sibling,
+                canonical_path,
+                loaded.record.session_id,
+                written_for,
+            )
+            continue
+        found.append(loaded)
+    return found
+
+
+def _has_producer_suffix(sibling: Path, stem: str, suffix: str) -> bool:
+    """Whether ``sibling`` carries the producer's own numeric suffix."""
+    if sibling.suffix != suffix or not sibling.is_file():
+        return False
+    if not sibling.stem.startswith(f"{stem}-"):
+        return False
+    index = sibling.stem[len(stem) + 1:]
+    if not index.isdigit():
+        return False
+    return int(index) >= _PRODUCER_RETRY_MIN_INDEX
 
 
 class CompletionValidationGitAdapter(Protocol):
@@ -244,8 +620,19 @@ class CompletionRecordValidator:
         self, worktree: Path, completion_path: str | None = None
     ) -> CompletionRecordLoadResult:
         """Read and validate a completion record from a worktree."""
-        record_path = worktree / (completion_path or COMPLETION_RECORD_PATH)
-        return load_completion_record_result(record_path)
+        return self.select_completion_record(worktree, completion_path).load_result
+
+    def select_completion_record(
+        self, worktree: Path, completion_path: str | None = None
+    ) -> CompletionRecordSelection:
+        """Resolve a worktree-relative hint to the run's authoritative record.
+
+        The instance-level door onto the module owner, for the consumers
+        that hold a validator — the controller's lookup, the processor's
+        re-read on the publish path — so every one of them acts on the
+        same file (#264).
+        """
+        return select_completion_record(worktree, completion_path)
 
     def resolve_agent_label_from_completion_path(
         self, completion_path: str | None

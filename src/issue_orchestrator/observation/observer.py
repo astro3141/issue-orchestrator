@@ -22,7 +22,9 @@ if TYPE_CHECKING:
     from ..ports.fresh_issue_reader import FreshIssueReader
     from ..ports.issue import Issue
 
+from ..control.completion_record_validation import select_completion_record
 from ..domain import ProcessState
+from ..domain.models import completion_record_path
 from ..domain.process_state import ProcessExitInfo
 from ..infra.config import Config
 from ..infra.logging_config import issue_log
@@ -221,59 +223,57 @@ class SessionObserver:
     ) -> SessionObservationResult | None:
         """Check for valid completion.json and return result if found.
 
+        Routes through ``select_completion_record``, the one owner of
+        which file speaks for a run, rather than reading the canonical
+        path itself. Two consequences, both deliberate (#264): a valid
+        retry written beside a producer-error placeholder is visible
+        here exactly as it is to the controller, and every file this
+        observer causes to be read passes the shared size gate and
+        field bounds instead of an ad-hoc required-fields check.
+
         Returns:
             SessionObservationResult for a valid completion, None otherwise.
         """
-        import json
-
-        completion_path = session.worktree_path / session.completion_path
-        if not completion_path.exists():
+        selection = select_completion_record(
+            session.worktree_path, session.completion_path
+        )
+        record = selection.record
+        if record is None:
             return None
 
-        try:
-            with open(completion_path) as f:
-                data = json.load(f)
-            required_fields = ["session_id", "timestamp", "outcome", "summary"]
-            if all(k in data for k in required_fields):
-                # Detection is observed every tick while the session waits in
-                # deferred states (e.g. background review exchange). Emit the
-                # event and info log only once per session — the controller
-                # still re-evaluates on every terminated() return.
-                if session.completion_detected_at is None:
-                    logger.info(
-                        issue_log(
-                            session.issue.number,
-                            "Valid completion.json detected: outcome=%s",
-                        ),
-                        data.get("outcome"),
-                    )
-                    self.events.publish(
-                        TraceEvent(
-                            EventName.OBSERVATION_COMPLETION_DETECTED,
-                            {
-                                "issue_number": session.issue.number,
-                                "session_name": session.terminal_id,
-                                "outcome": data.get("outcome"),
-                                "session_exists": exists,
-                            },
-                        )
-                    )
-                    session.completion_detected_at = datetime.now()
-                if timeout_exceeded:
-                    return SessionObservationResult.timed_out(
-                        runtime_minutes=runtime,
-                        timeout_minutes=timeout,
-                        session_exists=exists,
-                    )
-                return SessionObservationResult.terminated(runtime_minutes=runtime)
-            else:
-                logger.debug(
-                    "completion.json missing required fields, treating as incomplete"
+        # Detection is observed every tick while the session waits in
+        # deferred states (e.g. background review exchange). Emit the
+        # event and info log only once per session — the controller
+        # still re-evaluates on every terminated() return.
+        if session.completion_detected_at is None:
+            logger.info(
+                issue_log(
+                    session.issue.number,
+                    "Valid completion.json detected: outcome=%s path=%s",
+                ),
+                record.outcome.value,
+                selection.path,
+            )
+            self.events.publish(
+                TraceEvent(
+                    EventName.OBSERVATION_COMPLETION_DETECTED,
+                    {
+                        "issue_number": session.issue.number,
+                        "session_name": session.terminal_id,
+                        "outcome": record.outcome.value,
+                        "session_exists": exists,
+                        **selection.lookup_fields(),
+                    },
                 )
-        except (json.JSONDecodeError, OSError) as e:
-            logger.debug(f"completion.json not yet valid (partial write?): {e}")
-
-        return None
+            )
+            session.completion_detected_at = datetime.now()
+        if timeout_exceeded:
+            return SessionObservationResult.timed_out(
+                runtime_minutes=runtime,
+                timeout_minutes=timeout,
+                session_exists=exists,
+            )
+        return SessionObservationResult.terminated(runtime_minutes=runtime)
 
     def _try_send_exit_if_has_pr(self, session: Session) -> None:
         """Send /exit to session if it has an open PR but is still running."""
@@ -360,7 +360,9 @@ class SessionObserver:
 
     def _capture_terminal_output_on_termination(self, session: Session) -> None:
         """Capture terminal output when session terminates without completion."""
-        completion_path = session.worktree_path / session.completion_path
+        completion_path = completion_record_path(
+            session.worktree_path, session.completion_path
+        )
         if completion_path.exists() or not self._session_runner:
             return
 
@@ -399,7 +401,17 @@ class SessionObserver:
         if result.observation == SessionObservation.RUNNING:
             return
 
-        completion_path = session.worktree_path / session.completion_path
+        # ``completion_json_exists`` reports the canonical path only, and that
+        # stays consistent with the ``completion_selected_path`` the detection
+        # events carry: this event is only ever emitted on a result the
+        # completion check did NOT produce, and the selection can name a file
+        # other than the canonical one only when it found a valid record there
+        # — in which case ``observe_session`` has already returned (#264
+        # review round 1, N3). Routed through the same path owner so the two
+        # cannot drift apart on WHERE, either.
+        completion_path = completion_record_path(
+            session.worktree_path, session.completion_path
+        )
         event_data = {
             "issue_number": session.issue.number,
             "session_name": session.terminal_id,

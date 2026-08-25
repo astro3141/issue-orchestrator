@@ -18,6 +18,8 @@ import shutil
 from pathlib import Path
 from typing import TYPE_CHECKING, Iterable, Sequence
 
+from ..domain.models import completion_record_path
+
 if TYPE_CHECKING:
     from ..domain.models import OrchestratorState
     from ..domain.publish_retry import PublishRetryLocators
@@ -53,7 +55,7 @@ def locator_block_reason(locators: "PublishRetryLocators") -> str | None:
     # The live completion path preserves a run-scoped copy and then deletes the
     # agent's original completion file, so a real publish failure leaves only
     # the durable copy. Either source is a valid retry input.
-    completion_path = worktree / locators.completion_path
+    completion_path = completion_record_path(worktree, locators.completion_path)
     durable_copy = locators.run_assets.completion_record_copy.path
     if not completion_path.exists() and not durable_copy.exists():
         return "Completion record for retry is missing"
@@ -70,7 +72,9 @@ def restore_completion_record(locators: "PublishRetryLocators") -> None:
     durable copy is gone (the processor then fails loudly on a genuinely missing
     record, keeping the issue retryable).
     """
-    target = Path(locators.worktree_path) / locators.completion_path
+    target = completion_record_path(
+        Path(locators.worktree_path), locators.completion_path
+    )
     if target.exists():
         return
     durable_copy = locators.run_assets.completion_record_copy.path

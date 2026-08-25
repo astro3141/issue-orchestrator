@@ -7243,6 +7243,88 @@ class TestRunScopedArtifacts:
         assert not completion_path.exists()
         assert manifest["completion_record_path"] == str(preserved_path)
 
+    def test_process_preserves_the_retry_and_leaves_it_on_disk(
+        self,
+        tmp_path,
+        mock_label_adapter,
+        mock_pr_adapter,
+        mock_git_adapter,
+        event_bus,
+    ) -> None:
+        """The audit copy is the retry; cleanup stays what it always was (#264).
+
+        A crashed ``coding-done`` leaves a placeholder on the canonical
+        path and the retry lands on a numbered sibling. The run-scoped
+        copy must be the retry — that is the record the orchestrator acted
+        on, and the one a publish retry restores. Selecting it must not
+        make #264 delete the sibling: the issue keeps both files on disk
+        and reserves record lifetime for a decision of its own.
+        """
+        worktree = tmp_path / "worktree"
+        worktree.mkdir()
+        session_output = FileSystemSessionOutput()
+        run = session_output.start_run(
+            worktree,
+            "coding-1",
+            issue_number=123,
+            agent_label="agent:web",
+            completion_path=".issue-orchestrator/sessions/20260201-000000Z__coding-1/completion-agent_web.json",
+        )
+        completion_rel = (
+            f".issue-orchestrator/sessions/{run.run_dir.name}/completion-agent_web.json"
+        )
+        canonical = worktree / completion_rel
+        record = make_record(
+            outcome=CompletionOutcome.COMPLETED,
+            requested_actions=[],
+            implementation="Implemented the issue on the retry",
+            problems="None",
+        )
+        canonical.write_text(
+            json.dumps(
+                {
+                    "outcome": "completed",
+                    "agent_done_error": "follow_up evidence validation exploded",
+                    "session_id": record.session_id,
+                    "timestamp": datetime.now().isoformat(),
+                }
+            )
+        )
+        retry = canonical.parent / "completion-agent_web-2.json"
+        retry.write_text(json.dumps(record.to_dict()))
+
+        processor = CompletionProcessor(
+            agent_callback_endpoint=ready_callback_endpoint(),
+            label_adapter=mock_label_adapter,
+            pr_adapter=mock_pr_adapter,
+            git_adapter=mock_git_adapter,
+            session_output=session_output,
+            event_bus=event_bus,
+            label_config={},
+        )
+
+        result = processor.process(
+            worktree,
+            run_assets=run,
+            issue_number=123,
+            issue_title="Test Issue",
+            completion_path=completion_rel,
+            agent_label="agent:web",
+            issue_key=None,
+        )
+
+        preserved_path = run.run_dir / "completion-record.json"
+        assert result.success is True
+        assert result.completion_record_path == str(preserved_path)
+        preserved = json.loads(preserved_path.read_text())
+        assert preserved["implementation"] == "Implemented the issue on the retry"
+        assert "agent_done_error" not in preserved
+        # Cleanup removed the canonical placeholder, exactly as it did
+        # before #264. The retry it superseded is left where the producer
+        # wrote it — selecting a record does not license deleting one.
+        assert retry.exists()
+        assert not canonical.exists()
+
     def test_review_exchange_summary_is_stored_in_review_run_dir(
         self,
         tmp_path,

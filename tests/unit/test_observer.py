@@ -502,6 +502,64 @@ class TestObserveSession:
         assert result.observation == SessionObservation.TERMINATED
         assert result.session_exists is False  # terminated() sets session_exists=False
 
+    def test_observe_session_sees_retry_written_beside_producer_error(
+        self, monitor, sample_session, mock_session_runner, tmp_path
+    ):
+        """A valid retry is visible here exactly as it is to the controller (#264)."""
+        import json
+        from issue_orchestrator.observation.observation import SessionObservation
+
+        worktree = tmp_path / "worktree"
+        worktree.mkdir(parents=True)
+        set_session_worktree(sample_session, worktree)
+        completion_dir = worktree / ".issue-orchestrator"
+        completion_dir.mkdir(parents=True, exist_ok=True)
+        # What coding-done leaves behind when it crashes mid-record.
+        (completion_dir / "completion.json").write_text(json.dumps({
+            "outcome": "completed",
+            "agent_done_error": "evidence validation exploded",
+            "session_id": "any-session-id",
+            "timestamp": "2026-08-25T10:55:25",
+        }))
+        # ...and where its successful retry lands.
+        (completion_dir / "completion-2.json").write_text(json.dumps({
+            "session_id": "any-session-id",
+            "timestamp": "2026-08-25T11:02:00",
+            "outcome": "completed",
+            "summary": "Work done",
+        }))
+
+        mock_session_runner.session_exists_by_name.return_value = True
+
+        result = monitor.observe_session(sample_session)
+
+        assert result.observation == SessionObservation.TERMINATED
+
+    def test_observe_session_ignores_producer_error_without_retry(
+        self, monitor, sample_session, mock_session_runner, tmp_path
+    ):
+        """A placeholder alone is not a completion - behaviour is unchanged."""
+        import json
+        from issue_orchestrator.observation.observation import SessionObservation
+
+        worktree = tmp_path / "worktree"
+        worktree.mkdir(parents=True)
+        set_session_worktree(sample_session, worktree)
+        completion_dir = worktree / ".issue-orchestrator"
+        completion_dir.mkdir(parents=True, exist_ok=True)
+        (completion_dir / "completion.json").write_text(json.dumps({
+            "outcome": "completed",
+            "agent_done_error": "evidence validation exploded",
+            "session_id": "any-session-id",
+            "timestamp": "2026-08-25T10:55:25",
+        }))
+
+        mock_session_runner.session_exists_by_name.return_value = True
+
+        result = monitor.observe_session(sample_session)
+
+        assert result.observation == SessionObservation.RUNNING
+
     def test_observe_session_ignores_incomplete_completion_json(
         self, monitor, sample_session, mock_session_runner, tmp_path
     ):

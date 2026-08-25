@@ -47,7 +47,7 @@ from ..domain.completion_finalization import (
     CompletionFinalizationDecision,
     CompletionRuntimeState,
 )
-from ..domain.models import SessionStatus, CompletionOutcome
+from ..domain.models import COMPLETION_RECORD_PATH, SessionStatus, CompletionOutcome
 from ..domain.session_run import SessionRunAssets
 from ..ports.provider_resilience import ProviderErrorType
 from ..infra.provider_resilience import ProviderStatus, read_provider_status
@@ -62,7 +62,7 @@ from ..infra.validation_profiles import (
 )
 from ..infra.validation_state import (
     DEFAULT_RETRY_TEMPLATE,
-    _truncate_with_tail,
+    truncate_with_tail,
 )
 from ..observation.observation import SessionObservation, SessionObservationResult
 from ..ports import EventSink, make_trace_event
@@ -72,6 +72,7 @@ from ..ports.run_evidence import (
 )
 from ..ports.session_output import SessionOutput, ValidationRecord, ValidationState
 from .completion_types import REVIEW_EXCHANGE_ERROR_PREFIX
+from .completion_lookup_report import report_completion_lookup
 from .completion_record_validation import CompletionRecordLoadResult
 from .absent_completion_record import (
     collect_completion_debug_context,
@@ -286,12 +287,19 @@ class SessionController:
         provider_success = provider_success_from_status(provider_status)
 
         # Log and look up completion record
-        self._log_completion_lookup(
-            worktree_path, issue_number, session_name, completion_path
-        )
-        load_result = self.completion_processor.read_completion_record_result(
+        selection = self.completion_processor.select_completion_record(
             worktree_path, completion_path
         )
+        report_completion_lookup(
+            worktree_path=worktree_path,
+            issue_number=issue_number,
+            session_name=session_name,
+            completion_path=completion_path,
+            default_completion_path=COMPLETION_RECORD_PATH,
+            selection=selection,
+            events=self.events,
+        )
+        load_result = selection.load_result
         record = load_result.record
 
         if record is None:
@@ -835,46 +843,6 @@ class SessionController:
                 "validation_reason": validation_reason,
                 "artifacts": self._validation_record_artifacts(run_dir),
             },
-        )
-
-    def _log_completion_lookup(
-        self,
-        worktree_path: Path,
-        issue_number: int,
-        session_name: str,
-        completion_path: str | None,
-    ) -> None:
-        """Log completion record lookup details."""
-        full_path = (
-            (worktree_path / completion_path).resolve()
-            if completion_path
-            else (worktree_path / ".issue-orchestrator/completion.json").resolve()
-        )
-        logger.info(
-            issue_log(
-                issue_number, "Session not running: session=%s checking_completion=%s"
-            ),
-            session_name,
-            completion_path or ".issue-orchestrator/completion.json",
-        )
-        self._emit_event(
-            EventName.COMPLETION_LOOKUP,
-            {
-                "issue_number": issue_number,
-                "session_name": session_name,
-                "worktree_path": str(worktree_path.resolve()),
-                "completion_path": completion_path,
-                "full_path": str(full_path),
-                "file_exists": full_path.exists(),
-            },
-        )
-        exists = full_path.exists()
-        size = full_path.stat().st_size if exists else None
-        logger.info(
-            issue_log(issue_number, "Completion lookup: exists=%s size=%s path=%s"),
-            exists,
-            size,
-            full_path,
         )
 
     def _handle_no_completion_record(
@@ -1781,7 +1749,7 @@ class SessionController:
             error_file=str(validation_error_file)
             if validation_error_file
             else "unknown",
-            error_summary=_truncate_with_tail(validation_error),
+            error_summary=truncate_with_tail(validation_error),
             retry_count=display_count,
             max_retries=display_max,
             retries_remaining=display_max - display_count,
@@ -1840,7 +1808,7 @@ Runtime note: orchestrator-managed metadata under `.issue-orchestrator/` and `.c
 ## Worktree Blocker
 
 ```
-{_truncate_with_tail(validation_error)}
+{truncate_with_tail(validation_error)}
 ```
 """
 

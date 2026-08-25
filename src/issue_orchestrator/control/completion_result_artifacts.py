@@ -9,7 +9,11 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from ..domain.events import SessionEvent
-from ..domain.models import COMPLETION_RECORD_PATH, CompletionRecord, RequestedAction
+from ..domain.models import (
+    CompletionRecord,
+    RequestedAction,
+    completion_record_path,
+)
 from ..domain.review_exchange_run import ReviewExchangeRunAssets
 from ..domain.runtime_identity import RuntimeIdentity
 from ..domain.session_run import SessionRunAssets
@@ -19,6 +23,7 @@ from .completion_failure_reporting import (
     build_processing_failure_comment,
     write_failure_diagnostic,
 )
+from .completion_record_validation import CompletionRecordSelection
 from .completion_types import (
     ERROR_PREFIX_CREATE_PR,
     ERROR_PREFIX_GOVERNED_LABEL,
@@ -31,6 +36,9 @@ logger = logging.getLogger(__name__)
 
 EmitCompletionEvent = Callable[[SessionEvent, int, dict[str, Any]], None]
 CleanupRecord = Callable[[Path, str | None], bool]
+CleanupCompletionRecord = Callable[
+    [Path, str | None, CompletionRecordSelection, int], None
+]
 
 
 class PostIssueComment(Protocol):
@@ -54,11 +62,12 @@ def build_processing_result(
     error_details: list[dict[str, Any]],
     total_duration: float,
     completion_path: str | None,
+    selection: CompletionRecordSelection,
     preserved_completion_path: str | None,
     run_assets: SessionRunAssets,
     emit_completion_event: EmitCompletionEvent,
     post_issue_comment: PostIssueComment,
-    cleanup_completion_record_fn: Callable[[Path, str | None, int], None],
+    cleanup_completion_record_fn: CleanupCompletionRecord,
 ) -> ProcessingResult:
     """Build final processing result and handle completion diagnostics."""
     has_publish_error = any(
@@ -138,7 +147,7 @@ def build_processing_result(
         )
         post_issue_comment(issue_number, comment, context="processing failure")
 
-    cleanup_completion_record_fn(worktree, completion_path, issue_number)
+    cleanup_completion_record_fn(worktree, completion_path, selection, issue_number)
 
     review_exchange_halted = any(
         error.startswith(REVIEW_EXCHANGE_ERROR_PREFIX) for error in errors
@@ -161,12 +170,22 @@ def build_processing_result(
 def preserve_completion_record(
     *,
     session_output: SessionOutput,
-    worktree: Path,
-    completion_path: str | None,
+    selection: CompletionRecordSelection,
     run_assets: SessionRunAssets,
 ) -> str | None:
-    """Persist a run-scoped completion copy before cleanup for timeline/audit use."""
-    source_path = worktree / (completion_path or COMPLETION_RECORD_PATH)
+    """Persist a run-scoped completion copy before cleanup for timeline/audit use.
+
+    Takes the selection the caller already made rather than re-deriving a
+    path, so the audit copy is the record the orchestrator actually acted
+    on — not a producer-error placeholder a valid retry already superseded
+    (#264).
+
+    This runs before cleanup deliberately: cleanup removes the canonical
+    file, so the durable copy is what a later publish retry restores, and
+    it has to be the selected record for that retry to republish the work
+    that was actually approved.
+    """
+    source_path = selection.path
     if not source_path.exists():
         return None
 
@@ -187,25 +206,66 @@ def preserve_completion_record(
         return None
 
 
+def remove_completion_record(worktree: Path, completion_path: str | None) -> bool:
+    """Delete the run's canonical completion record.
+
+    The canonical path and nothing else, as it has always been. #264 gave
+    completion-record *selection* one owner; record lifetime was explicitly
+    outside it ("both files stay on disk"), so a numbered sibling — a retry
+    that superseded a producer error, a legitimate second review, or a
+    candidate the owner refused to choose between — is left where the
+    producer wrote it.
+
+    Returns:
+        True if the record is gone, False if the removal failed.
+    """
+    record_path = completion_record_path(worktree, completion_path)
+    try:
+        if record_path.exists():
+            record_path.unlink()
+            logger.debug("Removed completion record: %s", record_path)
+        return True
+    except Exception as exc:
+        logger.warning("Failed to remove completion record: %s", exc)
+        return False
+
+
 def cleanup_completion_record(
     *,
     worktree: Path,
     completion_path: str | None,
+    selection: CompletionRecordSelection,
     issue_number: int,
     cleanup_record: CleanupRecord,
     post_issue_comment: PostIssueComment,
 ) -> None:
-    """Clean up the completion record after processing."""
-    record_path = worktree / (completion_path or COMPLETION_RECORD_PATH)
+    """Clean up the completion record after processing.
+
+    Removes the canonical record and nothing else, exactly as it did before
+    #264. That leaf gave completion-record *selection* one owner; it does
+    not own record lifetime, and inventing a deletion policy for the files
+    selection now looks at is a separate decision nobody has made.
+
+    ``selection`` is here for the log, not for the removal: when a retry
+    superseded a producer-error placeholder, the file this function unlinks
+    is the placeholder while the record the orchestrator actually acted on
+    stays on disk. Saying only ``path=<canonical> exists_after=False`` would
+    read as "the completion was cleaned up" — the same file-the-decision-did-
+    not-read gap that made #264 invisible — so the line names the retained
+    record explicitly.
+    """
+    record_path = selection.canonical_path
+    retained = selection.path if selection.superseded_path is not None else None
     existed_before = record_path.exists()
     cleanup_ok = cleanup_record(worktree, completion_path)
     exists_after = record_path.exists()
     logger.warning(
-        "CLEANUP: issue=%d path=%s existed_before=%s exists_after=%s",
+        "CLEANUP: issue=%d path=%s existed_before=%s exists_after=%s retained=%s",
         issue_number,
         record_path,
         existed_before,
         exists_after,
+        retained,
     )
     if existed_before and exists_after and not cleanup_ok:
         comment = build_cleanup_failure_comment(

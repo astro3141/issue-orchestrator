@@ -55,6 +55,14 @@ def isolate_git_env(monkeypatch):
     - This causes pollution like user.name="Test User" in the real repo
 
     This fixture runs for EVERY test (autouse=True) and strips these vars.
+
+    It also pins the locale git speaks. Tests assert on git's own
+    diagnostics (``"would be overwritten" in stderr``), and git
+    translates those messages, so on an operator whose shell is not
+    English the same command produces a different string and the
+    assertion fails for a reason that has nothing to do with the code
+    under test. Determinism is required of tests here, and the locale
+    is part of the environment a test cannot be allowed to inherit.
     """
     git_env_vars = [
         "GIT_DIR",
@@ -66,6 +74,8 @@ def isolate_git_env(monkeypatch):
     ]
     for var in git_env_vars:
         monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("LC_ALL", "C")
+    monkeypatch.setenv("LANG", "C")
 
 
 @pytest.fixture(autouse=True)

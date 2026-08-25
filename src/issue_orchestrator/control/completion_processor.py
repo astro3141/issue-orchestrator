@@ -47,7 +47,6 @@ from ..domain.models import (
     CompletionRecord,
     PUBLICATION_ACTIONS,
     RequestedAction,
-    COMPLETION_RECORD_PATH,
 )
 from ..domain.events import EventBus, SessionEvent
 from ..domain.review_artifacts import review_artifacts_from_exchange_result
@@ -90,6 +89,7 @@ from .completion_failure_reporting import (
 )
 from .completion_record_validation import (
     CompletionRecordLoadResult,
+    CompletionRecordSelection,
     CompletionRecordValidator,
     WorktreeValidationFailure,
     WorktreeValidationResult,
@@ -99,6 +99,7 @@ from .completion_result_artifacts import (
     build_processing_result,
     cleanup_completion_record,
     preserve_completion_record,
+    remove_completion_record,
     write_reviewer_feedback_file,
 )
 from .completion_review_exchange import CompletionReviewExchange
@@ -378,6 +379,13 @@ class CompletionProcessor:
         self, worktree: Path, completion_path: str | None = None
     ) -> CompletionRecordLoadResult:
         return self._record_validator.read_completion_record_result(
+            worktree, completion_path
+        )
+
+    def select_completion_record(
+        self, worktree: Path, completion_path: str | None = None
+    ) -> CompletionRecordSelection:
+        return self._record_validator.select_completion_record(
             worktree, completion_path
         )
 
@@ -710,14 +718,18 @@ class CompletionProcessor:
         errors: list[str] = []
         error_details: list[dict[str, Any]] = []  # Full diagnostic info per error
 
-        # Read and validate completion record
-        record, session_name, error_result = self._read_and_validate_record(
+        # Read and validate completion record. The selection is made ONCE here
+        # and travels to the audit copy and to the cleanup log, so the record
+        # this run acted on and the record it reports are the same file (#264).
+        selection, session_name, error_result = self._read_and_validate_record(
             worktree,
             completion_path,
             run_assets,
         )
         if error_result:
             return error_result
+        assert selection is not None  # Guaranteed if error_result is None
+        record = selection.record
         assert record is not None  # Guaranteed if error_result is None
 
         if agent_label is None:
@@ -784,8 +796,7 @@ class CompletionProcessor:
 
         preserved_completion_path = preserve_completion_record(
             session_output=self.session_output,
-            worktree=worktree,
-            completion_path=completion_path,
+            selection=selection,
             run_assets=run_assets,
         )
 
@@ -847,6 +858,7 @@ class CompletionProcessor:
             error_details=error_details,
             total_duration=total_duration,
             completion_path=completion_path,
+            selection=selection,
             preserved_completion_path=preserved_completion_path,
             run_assets=run_assets,
             emit_completion_event=self._emit,
@@ -1018,14 +1030,18 @@ class CompletionProcessor:
         worktree: Path,
         completion_path: str | None,
         run_assets: SessionRunAssets,
-    ) -> tuple[CompletionRecord | None, str | None, ProcessingResult | None]:
+    ) -> tuple[CompletionRecordSelection | None, str | None, ProcessingResult | None]:
         """Read completion record and attach validation artifacts.
 
+        Returns the whole selection, not just the record: the caller has to
+        hand the SAME choice of file to the audit copy and to cleanup (#264).
+
         Returns:
-            Tuple of (record, session_name, error_result).
+            Tuple of (selection, session_name, error_result).
             If error_result is not None, caller should return it immediately.
         """
-        record = self.read_completion_record(worktree, completion_path)
+        selection = self.select_completion_record(worktree, completion_path)
+        record = selection.record
         if not record:
             return None, None, ProcessingResult(
                 success=False,
@@ -1058,7 +1074,7 @@ class CompletionProcessor:
                 )
         self.session_output.attach_claude_log(run_assets.run_dir)
 
-        return record, session_name, None
+        return selection, session_name, None
 
     def _handle_invalid_worktree_state(
         self,
@@ -2658,11 +2674,13 @@ class CompletionProcessor:
         self,
         worktree: Path,
         completion_path: str | None,
+        selection: CompletionRecordSelection,
         issue_number: int,
     ) -> None:
         cleanup_completion_record(
             worktree=worktree,
             completion_path=completion_path,
+            selection=selection,
             issue_number=issue_number,
             cleanup_record=self.cleanup_record,
             post_issue_comment=self._add_issue_comment,
@@ -2683,19 +2701,7 @@ class CompletionProcessor:
     def cleanup_record(self, worktree: Path, completion_path: str | None = None) -> bool:
         """Remove the completion record after processing.
 
-        Args:
-            worktree: Path to the worktree.
-            completion_path: Agent-specific path to completion.json (optional).
-
-        Returns:
-            True if successfully removed, False otherwise.
+        The canonical record and nothing else, unchanged by #264. See
+        ``remove_completion_record`` for why siblings are left alone.
         """
-        record_path = worktree / (completion_path or COMPLETION_RECORD_PATH)
-        try:
-            if record_path.exists():
-                record_path.unlink()
-                logger.debug(f"Removed completion record: {record_path}")
-            return True
-        except Exception as e:
-            logger.warning(f"Failed to remove completion record: {e}")
-            return False
+        return remove_completion_record(worktree, completion_path)

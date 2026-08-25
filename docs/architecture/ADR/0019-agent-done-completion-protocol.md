@@ -124,6 +124,78 @@ Planner decides actions based on outcome
 ActionApplier executes (push, create PR, labels)
 ```
 
+### Which File the Orchestrator Reads
+
+`agent-done` writes to the run's canonical completion path. Two things can
+put a second file beside it: a legitimate second review after rework, and a
+crash inside `agent-done` itself, which leaves an **error placeholder** at
+the canonical path (it carries `agent_done_error` and by construction no
+`summary`) and sends the successful retry to a `-2`, `-3`, ... sibling.
+
+Two questions, two owners, one chain. `completion_record_path` in
+`domain/models.py` owns **where** a run's completion lives — the single join
+of a worktree and the stored relative hint, so no caller re-derives it.
+`select_completion_record` in `control/completion_record_validation.py`
+starts from that answer and owns **which** file is authoritative. The
+observer, the session controller, and the run-scoped audit copy all ask, so
+none of them can act on — or report — a record another cannot see:
+
+- canonical missing or **valid** → canonical, always. Siblings are ignored;
+  authority is never re-assigned between two valid completions.
+- canonical is an error placeholder → exactly one valid sibling, named with
+  the producer's own numeric suffix, in the same run directory, carrying the
+  same `session_id`, may take over. The placeholder's `agent_done_error`
+  travels on the selection and onto the lookup event either way — a repaired
+  retry must not erase the fact that the first `agent-done` failed. A
+  `session_id` longer than a valid record's own field cap is rejected rather
+  than truncated: nothing that long can be matched, so it is not a
+  placeholder.
+- anything else → canonical, unchanged. Several valid siblings is ambiguity,
+  not a race to resolve: there is no newest-wins or suffix-order rule, so the
+  placeholder stays authoritative and fails closed onto the existing
+  rejected-record diagnostic path.
+
+Every candidate is read through `load_completion_record_result`, so the
+file-size gate and field bounds apply to siblings exactly as they do to the
+canonical record. Selection itself moves, renames, and deletes nothing.
+
+**The poll explains, the decision reports.** Loading and selection run on a
+hot loop — the observer asks on every `observe_session` for every live
+session — and the conditions they encounter persist: a malformed record is
+malformed on the next tick too, and a placeholder no retry resolves stays
+unresolved until the session ends. So both explain themselves at DEBUG only.
+The levels an operator watches belong to the sites that run once per
+decision: `SessionController._log_completion_lookup` logs the chosen path,
+the choice, any preserved producer error, and warns with the candidate files
+named when the owner refused to choose; `report_invalid_completion_record`
+logs the rejection at ERROR, emits `session.invalid_completion_record`, and
+writes a diagnostic. Levelling the polled path the same way would spend a
+real fault's signal on a transient one.
+
+**Selection decides authority, not lifetime.** Record cleanup is exactly
+what it was before this rule existed: it unlinks the canonical path and no
+other file. Every sibling — a retry that superseded a placeholder, a second
+review after rework, candidates the owner refused to choose between — stays
+where the producer wrote it. Giving selection a say in what may be deleted
+would be a new retention policy, and that is a decision of its own, not a
+consequence of teaching two readers to agree.
+
+The one thing cleanup owes the reader is an honest account. When a retry
+superseded a placeholder, the file cleanup removes is the placeholder, so
+its log names that path *and* the retained record beside it. Reporting only
+`path=<canonical> exists_after=False` would read as "the completion was
+cleaned up" while the record the orchestrator acted on sat on disk — the
+same naming-a-file-the-decision-did-not-read gap that made the original
+defect invisible.
+
+Processing therefore resolves the selection **once** and hands that same
+object to the audit copy and to the cleanup log. The ordering matters for
+the publish-retry path: `preserve_completion_record` copies the *selected*
+record to the run-scoped copy before cleanup frees the canonical path, so
+`restore_completion_record` — which no-ops only while that path is occupied
+— restores the record that was actually acted on, and the next selection
+sees a valid canonical file and takes it.
+
 ## Consequences
 
 ### Positive

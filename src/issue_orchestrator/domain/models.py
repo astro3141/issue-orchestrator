@@ -111,6 +111,24 @@ def get_completion_path(
     return f"{COMPLETION_DIR}/completion-{safe_name}.json"
 
 
+def completion_record_path(worktree: Path, completion_path: str | None = None) -> Path:
+    """Resolve a worktree plus a stored relative hint to the record's file.
+
+    The ONE owner of that join. ``get_completion_path`` above decides what a
+    run's completion record is called; this decides where that name lives on
+    disk. Both halves belong to one owner because the alternative is what
+    #264 was: every reader, the audit copy, and cleanup each re-deriving
+    ``worktree / (completion_path or COMPLETION_RECORD_PATH)``, free to drift
+    apart and mean different files on the same path.
+
+    Note this answers *where a run's completion is written*, not *which file
+    speaks for the run* — a crashed producer can leave a placeholder here and
+    its retry beside it. ``select_completion_record`` owns that second
+    question and starts from this answer.
+    """
+    return worktree / (completion_path or COMPLETION_RECORD_PATH)
+
+
 def sanitize_agent_label(agent_name: str) -> str:
     return agent_name.replace(":", "_").replace("/", "_").replace(" ", "_")
 
@@ -214,7 +232,13 @@ def without_subject_recovery_intent(
 
 # Default cap for any agent-supplied free-form string. Matches GitHub's max
 # comment length so we do not reject a legitimate comment body.
-_COMPLETION_STRING_MAX_BYTES = 64 * 1024
+#
+# Public because it is also the ceiling on what a VALID record's fields can
+# hold, which readers of rejected records need: a ``session_id`` longer than
+# this cannot belong to any record ``CompletionRecord.from_dict`` would accept,
+# so nothing may be matched against it. Import this rather than restating the
+# number, so the two gates cannot drift apart.
+COMPLETION_STRING_MAX_BYTES = 64 * 1024
 
 # Tighter caps for specific fields.
 _COMPLETION_RISK_LEVEL_MAX = 32
@@ -245,11 +269,23 @@ _FOLLOW_UP_EVIDENCE_MAX_BYTES = 4 * 1024
 _FOLLOW_UP_SUGGESTED_LABELS_MAX = 10
 
 
+def fits_record_string_bound(value: str) -> bool:
+    """Whether a valid completion record could carry ``value`` in a field.
+
+    The same question ``from_dict`` asks, exported for readers that hold a
+    string from a REJECTED record and need to know whether any accepted
+    record could match it — a longer one could not, so nothing may be
+    matched against it. Asking here keeps the bound in one place instead
+    of re-implementing the byte comparison at each such reader.
+    """
+    return len(value.encode("utf-8")) <= COMPLETION_STRING_MAX_BYTES
+
+
 def _check_optional_string(
     name: str,
     value: Any,
     *,
-    max_bytes: int = _COMPLETION_STRING_MAX_BYTES,
+    max_bytes: int = COMPLETION_STRING_MAX_BYTES,
     allow_empty: bool = True,
 ) -> str | None:
     """Validate an optional agent-supplied string field.
@@ -315,7 +351,7 @@ def _check_validation_record_path(value: Any) -> str | None:
         raise ValueError("validation_record_path must be a non-empty string")
     if "\x00" in value:
         raise ValueError("validation_record_path must not contain null bytes")
-    if len(value.encode("utf-8")) > _COMPLETION_STRING_MAX_BYTES:
+    if len(value.encode("utf-8")) > COMPLETION_STRING_MAX_BYTES:
         raise ValueError("validation_record_path is too long")
     normalized = PurePosixPath(value.replace("\\", "/"))
     if any(part == ".." for part in normalized.parts):
@@ -353,7 +389,7 @@ def _check_list_of_strings(
     value: Any,
     *,
     max_items: int = _COMPLETION_LIST_OF_STRINGS_MAX_ITEMS,
-    max_bytes_per_item: int = _COMPLETION_STRING_MAX_BYTES,
+    max_bytes_per_item: int = COMPLETION_STRING_MAX_BYTES,
 ) -> list[str] | None:
     if value is None:
         return None
@@ -618,13 +654,13 @@ class CompletionRecord:
                 raise ValueError(f"Invalid requested action: {action}")
 
         session_id = _check_required_string(
-            "session_id", data["session_id"], max_bytes=_COMPLETION_STRING_MAX_BYTES
+            "session_id", data["session_id"], max_bytes=COMPLETION_STRING_MAX_BYTES
         )
         timestamp = _check_required_string(
             "timestamp", data["timestamp"], max_bytes=_COMPLETION_TIMESTAMP_MAX
         )
         summary = _check_required_string(
-            "summary", data["summary"], max_bytes=_COMPLETION_STRING_MAX_BYTES
+            "summary", data["summary"], max_bytes=COMPLETION_STRING_MAX_BYTES
         )
 
         follow_up_raw = data.get("follow_up_issues")

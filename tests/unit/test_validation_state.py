@@ -197,7 +197,7 @@ class TestWriteRetryPrompt:
         )
 
         content = path.read_text()
-        # Error (5000 chars) is truncated by _truncate_with_tail to ~4000 chars,
+        # Error (5000 chars) is truncated by truncate_with_tail to ~4000 chars,
         # so total content must be well under 5000 + template chrome.
         assert len(content) < len(long_error) + 2000
         assert "truncated" in content
