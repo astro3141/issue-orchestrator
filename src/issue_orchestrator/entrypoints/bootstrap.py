@@ -55,6 +55,7 @@ from .bootstrap_continuation import (
 from ..infra.config import Config
 from ..infra.env import ENV_PREFIX
 from ..adapters.github.repo import get_repo_from_git, GitRepoError
+from ..adapters.worktree.api import CodexPlanningCommandGuardInstaller
 from ..ports.event_sink import EventSink, NullEventSink
 from ..ports.issue_tracker import IssueTracker
 from ..ports.session_runner import SessionRunner, NullSessionRunner
@@ -101,10 +102,7 @@ from ..ports.verification import VerificationBudget
 from ..execution.worktree_adapter import GitWorktreeManager
 from ..execution.git_working_copy import GitWorkingCopy
 from ..execution.command_runner import LocalCommandRunner
-from ..ports.provider_readiness import (
-    NO_PROVIDER_READINESS_PROBE,
-    ProviderReadinessProbe,
-)
+from ..ports.provider_readiness import NO_PROVIDER_READINESS_PROBE, ProviderReadinessProbe
 from ..execution.session_output_adapter import FileSystemSessionOutput
 from ..execution.review_artifact_reader import ManifestReviewArtifactReader
 from ..execution.internal_review_prompt import build_coder_prompt_addendum_provider
@@ -839,6 +837,7 @@ def build_orchestrator(
         needs_human_block=pending_work.needs_human_block,
         publication_verdict=publication_verdict,
         coder_prompt_addendum=coder_prompt_addendum,
+        planning_command_guard=CodexPlanningCommandGuardInstaller(),
     )
     deps = OrchestratorDeps(
         events=events,
@@ -1258,6 +1257,7 @@ def build_orchestrator_for_testing(
         needs_human_block=pending_work.needs_human_block,
         publication_verdict=publication_verdict,
         coder_prompt_addendum=coder_prompt_addendum,
+        planning_command_guard=CodexPlanningCommandGuardInstaller(),
     )
     completion_handler_factory = build_completion_handler_factory(
         config,

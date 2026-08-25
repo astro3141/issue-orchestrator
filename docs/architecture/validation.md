@@ -1131,7 +1131,10 @@ rather than Claude Code's:
 - **Composed, not substituted.** The installer places the shipped
   `orchestrator.rules` beside the planning policy, and Codex loads every
   `.rules` file in that directory, so `git push --no-verify`, commit-hook
-  bypass, `gh pr merge` and `gh api` stay denied.
+  bypass, `gh pr merge` and `gh api` stay denied. The copy is not taken on
+  trust: `git push --no-verify` and `gh pr merge` are put to the checker
+  against that file too, in the same pass, so a safety policy that arrived
+  empty or superseded fails the launch.
 - **Established, not assumed.** Before the session spawns, the installer asks
   `codex execpolicy check` to classify pinned samples — `make validate-pr-raw`
   and a pytest-shaped command must come back `forbidden`; `git log`, `rg` and
@@ -1144,6 +1147,32 @@ rather than Claude Code's:
   provider — or on an agent configured with a raw `command` and no provider at
   all — gets no policy file and a WARNING naming the gap, rather than a
   decorative one.
+
+**What a guarded planning launch leaves on your machine.** The policy files
+themselves go away with the disposable worktree. One thing does not: to keep
+them out of `git status`, the launch adds two lines to the repository's
+**shared** `.git/info/exclude` in the product checkout —
+
+```
+.codex/rules/planning-gate.rules
+.codex/rules/orchestrator.rules
+```
+
+`info/` is a common-dir path in git, so a linked worktree's own
+`.git/worktrees/<name>/info/exclude` is never read and the shared file is the
+only one that takes effect. The write is idempotent, so this is two lines once,
+not two per launch, and both name orchestrator-owned untracked files the
+repository does not track (`orchestrator.rules` is what `io hooks install`
+already writes at the product root; `planning-gate.rules` never exists there).
+
+They are **not removed** at teardown, deliberately: the file is shared, so
+dropping the entries when one scratch worktree is deleted would unhide a
+concurrently running planning launch's policy files, and would still leave them
+behind whenever a run dies before teardown. If you want them gone, delete the
+two lines by hand — nothing depends on them once no planning run is live.
+Nothing else outside the worktree changes: no tracked file, no
+`.codex/rules` in the product checkout, no `~/.codex`, no trust, sandbox,
+approval or credential state.
 
 ## Configuration (YAML)
 

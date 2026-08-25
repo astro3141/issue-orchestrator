@@ -12,10 +12,6 @@ layer_boundaries:
     allow:
       # bootstrap.py is the composition root - it wires adapters to protocols
       - src/issue_orchestrator/entrypoints/bootstrap.py
-      # #6924 A3-R2 split the session launcher's assembly out of bootstrap.py
-      # into this module; it is the same composition root, so it wires the
-      # launcher's adapters to its protocols for the same reason bootstrap does.
-      - src/issue_orchestrator/entrypoints/bootstrap_session_launcher.py
       # provider factory (when introduced) is part of composition wiring
       - src/issue_orchestrator/entrypoints/repository_host_factory.py
   - name: core_no_github_adapter_imports

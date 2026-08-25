@@ -613,7 +613,10 @@ class LauncherTestBundle:
         default_factory=RecordingBoardSnapshotProvider
     )
     claim_manager: MagicMock | None = None
-    planning_command_guard: RecordingPlanningCommandGuard = field(
+    # The installer the launcher was wired with. Typed as the port, not the
+    # recording double, because a caller may inject its own (a failing one, for
+    # the fail-closed tests) and the bundle must report THAT object.
+    planning_command_guard: PlanningCommandGuardInstaller = field(
         default_factory=RecordingPlanningCommandGuard
     )
 
@@ -649,7 +652,15 @@ def _build_launcher_bundle(
     """
     if board_snapshot_provider is None:
         board_snapshot_provider = RecordingBoardSnapshotProvider()
-    planning_guard = RecordingPlanningCommandGuard()
+    # The installer the launcher is actually wired with — the caller's when one
+    # was injected. Reporting a fresh double on the bundle instead would hand a
+    # test an object nothing ever called, and its ``calls`` assertions would
+    # pass or fail for reasons unrelated to the launch.
+    planning_guard: PlanningCommandGuardInstaller = (
+        RecordingPlanningCommandGuard()
+        if planning_command_guard is None
+        else planning_command_guard
+    )
     session_exists_calls = []
     create_session_calls = []
     session_exists_override = [None]  # List so tests can replace the callable
@@ -724,11 +735,7 @@ def _build_launcher_bundle(
             if publication_verdict is not None
             else verdict_with_no_evidence(unrecorded=unrecorded_refusals)
         ),
-        planning_command_guard=(
-            planning_command_guard
-            if planning_command_guard is not None
-            else planning_guard
-        ),
+        planning_command_guard=planning_guard,
         **launcher_kwargs,
     )
 
