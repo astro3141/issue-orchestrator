@@ -18,34 +18,42 @@ import os
 import pytest
 from fastapi.testclient import TestClient
 
-from issue_orchestrator.entrypoints.web import (
-    app,
-    configure_dashboard_admin_token,
-    get_configured_dashboard_admin_token,
+from issue_orchestrator.entrypoints.control_api import (
+    configure_api_token,
+    get_configured_agent_callback_token,
+    get_configured_api_token,
 )
+from issue_orchestrator.entrypoints.web import app
 from issue_orchestrator.infra import browser_session
 
 
 @pytest.fixture
 def authed_client():
-    """TestClient with dashboard auth turned on."""
-    prev = get_configured_dashboard_admin_token()
-    configure_dashboard_admin_token("test-admin-token")
+    """TestClient with dashboard auth turned on.
+
+    ``configure_api_token`` is the process-wide switch: the dashboard
+    reads the same bearer-token owner the Control API does, so there is
+    no separate dashboard call to make (#269).
+    """
+    prev_admin = get_configured_api_token()
+    prev_agent = get_configured_agent_callback_token()
+    configure_api_token("test-admin-token", agent_callback=None)
     try:
         yield TestClient(app)
     finally:
-        configure_dashboard_admin_token(prev)
+        configure_api_token(prev_admin, agent_callback=prev_agent)
 
 
 @pytest.fixture
 def open_client():
     """TestClient with dashboard auth disabled (test default)."""
-    prev = get_configured_dashboard_admin_token()
-    configure_dashboard_admin_token(None)
+    prev_admin = get_configured_api_token()
+    prev_agent = get_configured_agent_callback_token()
+    configure_api_token(None, agent_callback=None)
     try:
         yield TestClient(app)
     finally:
-        configure_dashboard_admin_token(prev)
+        configure_api_token(prev_admin, agent_callback=prev_agent)
 
 
 # ---------------------------------------------------------------------------
@@ -397,28 +405,16 @@ def test_mounted_control_route_accepts_dashboard_bearer(
     authed_client: TestClient,
 ) -> None:
     """A caller with a valid dashboard bearer must also pass the
-    mounted Control API middleware. Both surfaces use the same
-    shared-secret so the same token works on both.
+    mounted Control API middleware. Both surfaces read the same
+    bearer-token owner, so the same token works on both.
     """
-    from issue_orchestrator.entrypoints.control_api import (
-        configure_api_token,
-        get_configured_agent_callback_token,
-        get_configured_api_token,
+    resp = authed_client.get(
+        "/control/orchestrator/status",
+        headers={"Authorization": "Bearer test-admin-token"},
     )
-
-    prev_admin = get_configured_api_token()
-    prev_agent = get_configured_agent_callback_token()
-    configure_api_token("test-admin-token", agent_callback=None)
-    try:
-        resp = authed_client.get(
-            "/control/orchestrator/status",
-            headers={"Authorization": "Bearer test-admin-token"},
-        )
-        # 200 or 5xx both prove we passed both middlewares; the only
-        # failure we care about is 401/403 from auth.
-        assert resp.status_code not in (401, 403), resp.text
-    finally:
-        configure_api_token(prev_admin, agent_callback=prev_agent)
+    # 200 or 5xx both prove we passed both middlewares; the only
+    # failure we care about is 401/403 from auth.
+    assert resp.status_code not in (401, 403), resp.text
 
 
 # ---------------------------------------------------------------------------
@@ -435,13 +431,7 @@ def test_mounted_control_route_accepts_dashboard_bearer(
 
 @pytest.fixture
 def agent_callback_tokens():
-    """Configure both surfaces with a real agent-callback token."""
-    from issue_orchestrator.entrypoints.control_api import (
-        configure_api_token,
-        get_configured_agent_callback_token,
-        get_configured_api_token,
-    )
-
+    """Configure the process with a real agent-callback token."""
     prev_admin = get_configured_api_token()
     prev_agent = get_configured_agent_callback_token()
     configure_api_token("test-admin-token", agent_callback="test-agent-token")
@@ -566,30 +556,23 @@ def test_cookie_minted_via_cc_login_works_on_dashboard() -> None:
     the same admin token.
 
     Simulates the two-process operator flow without spawning a real
-    second process: configure CC + dashboard with the shared admin
-    token, log in once via CC's ``/login``, then attach the resulting
-    cookie to a dashboard request and assert it passes auth. Before
-    the stateless-cookie change this would 401 because each process
-    held its own random secret and its own ``_SESSIONS`` dict.
+    second process: configure the shared admin token, log in once via
+    CC's ``/login``, then attach the resulting cookie to a dashboard
+    request and assert it passes auth. Before the stateless-cookie
+    change this would 401 because each process held its own random
+    secret and its own ``_SESSIONS`` dict.
     """
-    from issue_orchestrator.entrypoints.control_api import (
-        configure_api_token,
-        control_app,
-        get_configured_agent_callback_token,
-        get_configured_api_token,
-    )
+    from issue_orchestrator.entrypoints.control_api import control_app
     from issue_orchestrator.infra import browser_session as bs_module
 
     shared_admin = "shared-admin-cross-process-token"
 
     prev_admin = get_configured_api_token()
     prev_agent = get_configured_agent_callback_token()
-    prev_dashboard = get_configured_dashboard_admin_token()
 
     bs_module.shutdown()
     bs_module.initialize(admin_token=shared_admin)
     configure_api_token(shared_admin, agent_callback=None)
-    configure_dashboard_admin_token(shared_admin)
     try:
         cc_client = TestClient(control_app)
         login = cc_client.post("/login", json={"token": shared_admin})
@@ -609,7 +592,6 @@ def test_cookie_minted_via_cc_login_works_on_dashboard() -> None:
     finally:
         bs_module.shutdown()
         configure_api_token(prev_admin, agent_callback=prev_agent)
-        configure_dashboard_admin_token(prev_dashboard)
 
 
 # ---------------------------------------------------------------------------

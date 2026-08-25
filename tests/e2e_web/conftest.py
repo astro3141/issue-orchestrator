@@ -21,6 +21,11 @@ from issue_orchestrator.execution.session_output_adapter import FileSystemSessio
 from issue_orchestrator.execution.timeline_reader import DefaultTimelineReader
 from issue_orchestrator.execution.timeline_store import SqliteTimelineStore
 import issue_orchestrator.entrypoints.web as web_module
+from issue_orchestrator.entrypoints.control_api import (
+    configure_api_token,
+    get_configured_agent_callback_token,
+    get_configured_api_token,
+)
 from issue_orchestrator.entrypoints.web import app
 from issue_orchestrator.ports.timeline_store import TimelineRecord
 from tests.fixtures.web_contract_mocks import MockOrchestratorForWeb
@@ -365,7 +370,7 @@ def web_server(tmp_path_factory: pytest.TempPathFactory) -> dict[str, object]:
     # leak into this run — the dashboard auth fixture below enables
     # the gate, and without this reset a module teardown race could
     # leave it on for the wider smoke suite.
-    web_module.configure_dashboard_admin_token(None)
+    configure_api_token(None, agent_callback=None)
 
     original = web_module.get_orchestrator()
     web_module.set_orchestrator(orchestrator)
@@ -404,8 +409,9 @@ def cc_admin_token() -> str:
 def authed_web_server(tmp_path_factory: pytest.TempPathFactory) -> dict[str, object]:
     """Run the dashboard with auth turned on.
 
-    Mirrors ``web_server`` but calls ``configure_dashboard_admin_token``
-    + ``browser_session.initialize`` before binding. Used by tests that
+    Mirrors ``web_server`` but calls ``configure_api_token`` — the one
+    process-wide bearer owner both surfaces read (#269) — plus
+    ``browser_session.initialize`` before binding. Used by tests that
     need to exercise the login flow end-to-end; keeps the default
     ``web_server`` fixture auth-off so the wider smoke suite isn't
     forced to log in for every scenario.
@@ -418,9 +424,10 @@ def authed_web_server(tmp_path_factory: pytest.TempPathFactory) -> dict[str, obj
     orchestrator.add_queue_issue(408, "Flow smoke item")
     port = find_free_port()
 
-    previous_token = web_module.get_configured_dashboard_admin_token()
+    previous_token = get_configured_api_token()
+    previous_agent = get_configured_agent_callback_token()
     browser_session.initialize()
-    web_module.configure_dashboard_admin_token(TEST_ADMIN_TOKEN)
+    configure_api_token(TEST_ADMIN_TOKEN, agent_callback=None)
 
     original = web_module.get_orchestrator()
     web_module.set_orchestrator(orchestrator)
@@ -435,7 +442,7 @@ def authed_web_server(tmp_path_factory: pytest.TempPathFactory) -> dict[str, obj
     finally:
         server.stop()
         web_module.set_orchestrator(original)
-        web_module.configure_dashboard_admin_token(previous_token)
+        configure_api_token(previous_token, agent_callback=previous_agent)
 
 
 def login_via_form(page: Page, base_url: str, token: str) -> None:

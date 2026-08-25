@@ -38,6 +38,7 @@ from issue_orchestrator.domain.tech_lead_session import (
     TechLeadSessionFlavor,
 )
 from issue_orchestrator.entrypoints import web as web_module
+from issue_orchestrator.entrypoints.control_api import configure_api_token
 from issue_orchestrator.execution.session_output_adapter import (
     FileSystemSessionOutput,
 )
@@ -154,7 +155,7 @@ def tech_lead_server(tmp_path_factory: pytest.TempPathFactory):
         labels=["agent:web", "blocked-needs-human"],
     )
     port = find_free_port()
-    web_module.configure_dashboard_admin_token(None)
+    configure_api_token(None, agent_callback=None)
     original = web_module.get_orchestrator()
     web_module.set_orchestrator(orchestrator)
     server = UvicornTestServer("127.0.0.1", port)
