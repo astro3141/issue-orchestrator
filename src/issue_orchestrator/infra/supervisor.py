@@ -11,6 +11,7 @@ Multi-instance mode: Multiple orchestrators per repo (when instances > 1)
 The supervisor itself does NOT run orchestration logic - it only manages processes.
 """
 
+import json
 import logging
 import os
 import signal
@@ -18,9 +19,12 @@ import socket
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 from typing import Any, Callable
 
+from .api_token import read_existing_admin_token
 from .config_identity import (
     EXPECTED_CONFIG_FINGERPRINT_ENV,
     assert_expected_config_fingerprint,
@@ -325,6 +329,43 @@ def _is_port_in_use(port: int) -> bool:
         return False
 
 
+def _shutdown_request(
+    port: int,
+    *,
+    reason: str,
+    actor: str,
+) -> urllib.request.Request:
+    """Build the one authenticated ``/api/shutdown`` POST the supervisor sends.
+
+    The dashboard route is admin-gated, and after #269 both HTTP
+    surfaces agree on that. A POST with no ``Authorization`` header is
+    therefore refused with 401, and the caller degrades to signals — the
+    live #267 B2 failure, where an ordinary stop never got its graceful
+    phase even though the engine was healthy and the operator held the
+    credential.
+
+    The credential is that same existing one: ``read_existing_admin_token``
+    prefers ``ISSUE_ORCHESTRATOR_API_TOKEN`` and otherwise reads an
+    already-written ``~/.issue-orchestrator/api-token``. It never mints
+    one, so an engine started with ``--dev-no-auth`` (no token anywhere)
+    still receives exactly the unauthenticated request its open gate
+    accepts.
+
+    Both stop paths build their request here so neither can drift into
+    its own header or credential rule.
+    """
+    headers = {"Content-Type": "application/json"}
+    token = read_existing_admin_token()
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    return urllib.request.Request(
+        f"http://127.0.0.1:{port}/api/shutdown",
+        method="POST",
+        data=json.dumps({"reason": reason, "actor": actor}).encode("utf-8"),
+        headers=headers,
+    )
+
+
 def _request_graceful_shutdown(
     port: int,
     *,
@@ -332,10 +373,6 @@ def _request_graceful_shutdown(
     actor: str = "supervisor",
 ) -> bool:
     """Request HTTP shutdown once; the shared stop budget owns all waiting."""
-    import json as _json
-    import urllib.request
-    import urllib.error
-
     if not reason or not reason.strip():
         # Fail-fast: the HTTP endpoint will 400 on empty reason
         # anyway, so there's no point making the round-trip and
@@ -345,7 +382,6 @@ def _request_graceful_shutdown(
             "_request_graceful_shutdown requires a non-empty reason; "
             "the /api/shutdown contract rejects unreasoned shutdowns",
         )
-    body = _json.dumps({"reason": reason, "actor": actor}).encode("utf-8")
 
     try:
         logger.info(
@@ -354,12 +390,7 @@ def _request_graceful_shutdown(
             reason,
             actor,
         )
-        req = urllib.request.Request(
-            f"http://127.0.0.1:{port}/api/shutdown",
-            method="POST",
-            data=body,
-            headers={"Content-Type": "application/json"},
-        )
+        req = _shutdown_request(port, reason=reason, actor=actor)
         with urllib.request.urlopen(req, timeout=2.0) as resp:
             return resp.status == 200
     except (urllib.error.URLError, OSError) as e:
@@ -392,18 +423,9 @@ def stop_by_port(
         )
 
     if not force:
-        import json as _json
-        import urllib.request
-
         try:
             logger.info("Requesting shutdown on port %d (reason=%r)", port, reason)
-            body = _json.dumps({"reason": reason, "actor": actor}).encode("utf-8")
-            req = urllib.request.Request(
-                f"http://127.0.0.1:{port}/api/shutdown",
-                method="POST",
-                data=body,
-                headers={"Content-Type": "application/json"},
-            )
+            req = _shutdown_request(port, reason=reason, actor=actor)
             with urllib.request.urlopen(req, timeout=2.0):
                 pass
         except Exception as e:  # noqa: BLE001 — fall through to port kill
