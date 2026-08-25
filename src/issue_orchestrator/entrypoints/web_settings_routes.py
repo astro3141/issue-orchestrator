@@ -40,10 +40,10 @@ async def settings_page(
     root handler in ``web_read_model_routes.py``.
     """
     from ._auth_middleware import resolve_browser_page_auth
-    from .web import get_configured_dashboard_admin_token
+    from ._auth_tokens import PROCESS_BEARER_TOKENS
 
     page_auth = resolve_browser_page_auth(
-        request, auth_enabled=get_configured_dashboard_admin_token() is not None
+        request, auth_enabled=PROCESS_BEARER_TOKENS.gate_enabled
     )
     if isinstance(page_auth, HTMLResponse):
         return page_auth

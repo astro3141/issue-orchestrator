@@ -72,6 +72,7 @@ from ._auth_middleware import (
     issue_sse_token_response,
     resolve_browser_page_auth,
 )
+from ._auth_tokens import PROCESS_BEARER_TOKENS
 from .brand_assets import read_logo_svg
 from .bootstrap_repository_setup import build_repository_setup_owner
 from .control_api_goal_pilot_routes import control_goal_pilot_router
@@ -197,25 +198,23 @@ if STATIC_DIR.exists():
 
 # Bearer-token enforcement (security issue #5987, F3 + #6017 review).
 #
-# Two tokens gate the Control API:
+# Two tokens gate every HTTP surface in this process:
 #
-# - ``_admin_token`` authorizes every route. Held by the orchestrator,
-#   the operator CLI, the Control Center, and MCP clients driven by the
-#   operator.
-# - ``_agent_callback_token`` authorizes an allowlist of routes only
-#   (see ``_auth_middleware.is_agent_callback_route``). Issued to agent
-#   subprocesses so they can call preflight-push / exchange-respond /
-#   issue-resume without holding the admin credential (#6017 P2 review).
+# - the **admin** bearer authorizes every route. Held by the
+#   orchestrator, the operator CLI, the Control Center, and MCP clients.
+# - the **agent-callback** bearer authorizes an allowlist of routes only
+#   (see ``_auth_middleware.is_agent_callback_route``). Issued to agents
+#   for preflight-push / exchange-respond / issue-resume, so they need
+#   not hold the admin credential (#6017 P2 review).
 #
-# Both are ``None`` by default so unit tests using ``TestClient`` keep
-# working. Every production entrypoint that serves these routes must
-# call ``configure_api_token`` to turn enforcement on:
-# ``ControlAPIServer.start``, ``control_center.main``, and
-# ``EngineStartup.configure_auth`` — the last of these serves
-# ``control_app`` mounted under the dashboard app, and omitting it
-# left the engine with no callback token at all (#6924).
-_admin_token: str | None = None
-_agent_callback_token: str | None = None
+# Neither is stored here: both live in ``PROCESS_BEARER_TOKENS``, the one
+# owner the dashboard app reads too — its former private copy of the
+# admin bearer diverged inside a running engine (#268/#269). Both are
+# ``None`` by default so ``TestClient`` tests keep working; every
+# production entrypoint serving these routes calls ``configure_api_token``
+# (``ControlAPIServer.start``, ``control_center.main``, and
+# ``EngineStartup.configure_auth``, which serves ``control_app`` under
+# the dashboard app — omitting it left the engine tokenless, #6924).
 
 # Paths that must remain accessible without any authentication —
 # browser chrome, static assets, the login form, and favicon. The
@@ -253,11 +252,12 @@ async def _require_api_token_middleware(  # pyright: ignore[reportUnusedFunction
     """Enforce Control API auth via the shared three-path gate.
 
     See ``_auth_middleware.evaluate_request`` for the bearer /
-    session-cookie / SSE-token logic; this wrapper just binds the
-    module-level admin + agent-callback tokens.
+    session-cookie / SSE-token logic; this wrapper reads the process's
+    one bearer-token owner, one snapshot per request.
     """
+    tokens = PROCESS_BEARER_TOKENS.current()
     gate_response = evaluate_request(
-        request, _admin_token, _agent_callback_token, _CONTROL_API_SURFACE
+        request, tokens.admin, tokens.agent_callback, _CONTROL_API_SURFACE
     )
     if gate_response is not None:
         return gate_response
@@ -269,7 +269,10 @@ def configure_api_token(
     *,
     agent_callback: str | None = None,
 ) -> None:
-    """Enable (or disable) bearer-token enforcement on the Control API.
+    """Enable (or disable) bearer-token enforcement on every surface here.
+
+    Writes the one owner, so the dashboard app that mounts ``control_app``
+    is configured by this same call — nothing to keep in step.
 
     ``admin`` — required for anything other than the agent-callback
     allowlist. Pass ``None`` to disable enforcement entirely (test
@@ -279,19 +282,17 @@ def configure_api_token(
     ``Authorization: Bearer <agent_callback>`` is accepted on the
     allowlisted routes.
     """
-    global _admin_token, _agent_callback_token
-    _admin_token = admin
-    _agent_callback_token = agent_callback
+    PROCESS_BEARER_TOKENS.configure(admin, agent_callback=agent_callback)
 
 
 def get_configured_api_token() -> str | None:
     """Return the currently configured admin token."""
-    return _admin_token
+    return PROCESS_BEARER_TOKENS.admin
 
 
 def get_configured_agent_callback_token() -> str | None:
     """Return the currently configured agent-callback token."""
-    return _agent_callback_token
+    return PROCESS_BEARER_TOKENS.agent_callback
 
 
 # Global reference to orchestrator (set at startup)
@@ -959,7 +960,7 @@ async def control_center_ui(request: Request) -> HTMLResponse:
     mint a valid session for anyone who hit ``/``, letting any local
     process turn an anonymous visit into admin-equivalent API access.
     """
-    auth_enabled = not (_admin_token is None and _agent_callback_token is None)
+    auth_enabled = PROCESS_BEARER_TOKENS.gate_enabled
     page_auth = resolve_browser_page_auth(request, auth_enabled=auth_enabled)
     if isinstance(page_auth, HTMLResponse):
         # No valid session and auth is active — show login form.
@@ -1027,9 +1028,10 @@ async def control_center_login(request: Request) -> Response:
 
     Delegates to the shared ``handle_login_post`` helper; see that
     function for the accept-both-content-types / constant-time verify
-    / cookie-mint semantics.
+    / cookie-mint semantics. The token comes from the same owner the
+    gate reads, so login and enforcement cannot disagree.
     """
-    return await handle_login_post(request, _admin_token)
+    return await handle_login_post(request, PROCESS_BEARER_TOKENS.admin)
 
 
 @control_app.get("/api/sse-token")

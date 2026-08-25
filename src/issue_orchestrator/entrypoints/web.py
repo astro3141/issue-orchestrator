@@ -28,6 +28,7 @@ from ._auth_middleware import (
     is_agent_callback_route,
     issue_sse_token_response,
 )
+from ._auth_tokens import PROCESS_BEARER_TOKENS
 from .brand_assets import read_logo_svg
 from .timeline_presentation import (
     _decorate_timeline_events,
@@ -100,9 +101,15 @@ if STATIC_DIR.exists():
 # admin secret is shared with the CC on purpose — the dashboard
 # surface is a strict superset in sensitivity, so one login covers
 # both.
+#
+# "Shared" is now literal. This module used to keep its own mutable
+# ``_dashboard_admin_token``, seeded from the same startup value as the
+# Control API's; the two then diverged inside a live engine, so one
+# unrotated token file authenticated ``control_api`` and 401'd here in
+# the same process (#268), which broke the supported graceful stop that
+# goes through the dashboard ``/api/shutdown`` (#267). The mirror is
+# gone: every gate below reads ``PROCESS_BEARER_TOKENS``, the one owner.
 # ---------------------------------------------------------------------------
-
-_dashboard_admin_token: str | None = None
 
 # ``/`` and ``/settings`` (top-level HTML pages) are public so that
 # anonymous visitors can be shown the login form — each page handler
@@ -130,22 +137,6 @@ _DASHBOARD_SURFACE = AuthSurfaceConfig(
 )
 
 
-def configure_dashboard_admin_token(admin: str | None) -> None:
-    """Enable (or disable) dashboard auth.
-
-    ``admin`` — the shared admin bearer token (same one used for the
-    Control API). Pass ``None`` to disable enforcement entirely;
-    ``TestClient`` defaults to this.
-    """
-    global _dashboard_admin_token
-    _dashboard_admin_token = admin
-
-
-def get_configured_dashboard_admin_token() -> str | None:
-    """Return the admin token currently enforced on the dashboard."""
-    return _dashboard_admin_token
-
-
 @app.middleware("http")
 async def _dashboard_auth_middleware(  # pyright: ignore[reportUnusedFunction]
     request: Request, call_next: Any
@@ -157,15 +148,15 @@ async def _dashboard_auth_middleware(  # pyright: ignore[reportUnusedFunction]
     defense in depth. That also means agent-callback requests reach
     *this* gate first, so it must know the agent-callback token; passing
     ``None`` here rejected every valid agent callback before the inner
-    gate ever ran (#6913). The token is read from the Control API rather
-    than mirrored, so the two surfaces cannot drift apart.
+    gate ever ran (#6913). Both tokens are read from the one process
+    owner rather than mirrored, so the two surfaces cannot drift apart
+    (#269).
     """
-    from .control_api import get_configured_agent_callback_token
-
+    tokens = PROCESS_BEARER_TOKENS.current()
     gate_response = evaluate_request(
         request,
-        _dashboard_admin_token,
-        get_configured_agent_callback_token(),
+        tokens.admin,
+        tokens.agent_callback,
         _DASHBOARD_SURFACE,
     )
     if gate_response is not None:
@@ -194,9 +185,12 @@ async def dashboard_login(request: Request) -> Response:
     """Exchange the admin bearer token for a dashboard session cookie.
 
     Delegates to the shared helper; accepts both form-urlencoded (HTML
-    form) and JSON (programmatic) bodies.
+    form) and JSON (programmatic) bodies. It verifies against the same
+    owner the middleware enforces, so a token that opens the Control API
+    also completes a dashboard login — fixing the gate alone would have
+    left login bound to a second value (#269).
     """
-    return await handle_login_post(request, _dashboard_admin_token)
+    return await handle_login_post(request, PROCESS_BEARER_TOKENS.admin)
 
 
 @app.get("/api/sse-token")

@@ -139,27 +139,24 @@ def reset_control_api_token():
     """Reset process-wide browser auth and bearer-token enforcement.
 
     ``ControlAPIServer.start`` (and tests that explicitly call
-    ``configure_api_token``) install process-wide tokens on the
-    ``control_app`` module. Dashboard auth has a separate process-wide
-    token. Without an autouse reset, leftover tokens from an earlier
-    test cause unrelated TestClient calls to return 401 instead of the
-    expected status. See security issue #5987 (F3) + #6017 P3.
+    ``configure_api_token``) install process-wide tokens that gate every
+    HTTP surface, dashboard included — one owner, one call. Without an
+    autouse reset, leftover tokens from an earlier test cause unrelated
+    TestClient calls to return 401 instead of the expected status. See
+    security issue #5987 (F3) + #6017 P3.
     """
     try:
         from issue_orchestrator.entrypoints.control_api import configure_api_token
-        from issue_orchestrator.entrypoints.web import configure_dashboard_admin_token
         from issue_orchestrator.infra import browser_session
     except Exception:
         yield
         return
     configure_api_token(None, agent_callback=None)
-    configure_dashboard_admin_token(None)
     browser_session.shutdown()
     try:
         yield
     finally:
         configure_api_token(None, agent_callback=None)
-        configure_dashboard_admin_token(None)
         browser_session.shutdown()
 
 
@@ -209,13 +206,11 @@ def fake_browser_auth() -> FakeBrowserAuth:
     depending on ``~/.issue-orchestrator/api-token``.
     """
     from issue_orchestrator.entrypoints.control_api import configure_api_token
-    from issue_orchestrator.entrypoints.web import configure_dashboard_admin_token
     from issue_orchestrator.infra import browser_session
 
     browser_session.shutdown()
     browser_session.initialize(admin_token=TEST_ADMIN_TOKEN)
     configure_api_token(TEST_ADMIN_TOKEN, agent_callback=TEST_AGENT_CALLBACK_TOKEN)
-    configure_dashboard_admin_token(TEST_ADMIN_TOKEN)
     return FakeBrowserAuth()
 
 

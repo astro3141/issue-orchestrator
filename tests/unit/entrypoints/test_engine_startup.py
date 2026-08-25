@@ -24,10 +24,6 @@ from issue_orchestrator.entrypoints.control_api import (
     get_configured_api_token,
 )
 from issue_orchestrator.entrypoints.engine_startup import EngineStartup
-from issue_orchestrator.entrypoints.web import (
-    configure_dashboard_admin_token,
-    get_configured_dashboard_admin_token,
-)
 from issue_orchestrator.infra import browser_session as bs_module
 from issue_orchestrator.infra.agent_callback_endpoint import (
     RuntimeAgentCallbackEndpoint,
@@ -56,14 +52,12 @@ def startup(endpoint: RuntimeAgentCallbackEndpoint) -> EngineStartup:
 
 @pytest.fixture(autouse=True)
 def _restore_auth_state():
-    prev_dashboard = get_configured_dashboard_admin_token()
     prev_admin = get_configured_api_token()
     prev_agent = get_configured_agent_callback_token()
     prev_ttl = bs_module.SESSION_TTL_SECONDS
     prev_sse = bs_module.SSE_TOKEN_TTL_SECONDS
     prev_max = bs_module.MAX_SESSIONS
     yield
-    configure_dashboard_admin_token(prev_dashboard)
     configure_api_token(prev_admin, agent_callback=prev_agent)
     bs_module.initialize(
         session_ttl_seconds=prev_ttl,
@@ -97,10 +91,27 @@ class TestConfigureAuth:
     def test_configures_the_shared_admin_token(
         self, startup: EngineStartup, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        """One startup call must arm every surface this engine serves.
+
+        Asserting the configured value alone is what let #268 through:
+        startup did write the same token twice, and the dashboard's own
+        copy still ended up rejecting it. So this also drives the real
+        dashboard gate with that token (#269).
+        """
+        from fastapi.testclient import TestClient
+
+        from issue_orchestrator.entrypoints.web import app
+
         monkeypatch.setenv("ISSUE_ORCHESTRATOR_API_TOKEN", ADMIN_TOKEN)
         startup.configure_auth(dev_no_auth=False, config=_FakeConfig())
+
         assert get_configured_api_token() == ADMIN_TOKEN
-        assert get_configured_dashboard_admin_token() == ADMIN_TOKEN
+        dashboard = TestClient(app)
+        accepted = dashboard.get(
+            "/api/status", headers={"Authorization": f"Bearer {ADMIN_TOKEN}"}
+        )
+        assert accepted.status_code != 401, accepted.text
+        assert dashboard.get("/api/status").status_code == 401
 
     def test_honours_operator_browser_session_config(
         self, startup: EngineStartup, monkeypatch: pytest.MonkeyPatch

@@ -30,11 +30,12 @@ that actually served the route (#6913) — a delivery failure the round
 runner then misread as an unresponsive agent, destroying validated
 work. One owner, one answer.
 
-It does NOT own the admin / agent-callback token state. Each app
-configures its own tokens via ``configure_api_token`` (Control API)
-or ``configure_dashboard_admin_token`` (Web Dashboard); they typically
-point at the same shared secret loaded from
-``~/.issue-orchestrator/api-token``.
+It does NOT own the admin / agent-callback token *values*: those live
+in ``_auth_tokens.PROCESS_BEARER_TOKENS``, the single process-local
+owner both surfaces read live, loaded from
+``~/.issue-orchestrator/api-token`` at startup. This module owns the
+rules; that module owns the secrets. Per-surface copies of a shared
+credential are exactly what #268/#269 removed.
 """
 
 from __future__ import annotations
