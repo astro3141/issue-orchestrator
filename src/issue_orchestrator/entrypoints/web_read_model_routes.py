@@ -165,15 +165,17 @@ async def dashboard(request: Request, orchestrator: WebOrchestratorDependency) -
     Auth model: ``/`` is marked public in the middleware (otherwise an
     anonymous browser would hit a raw 401 JSON), so this handler has
     to decide for itself whether to serve the dashboard or the login
-    form. When auth is disabled entirely (``configure_dashboard_admin_token(None)``
+    form. "Is auth on?" is answered by the same owner the middleware
+    reads, so the page and the gate cannot disagree; when auth is
+    disabled entirely (``configure_api_token(None, agent_callback=None)``
     — the TestClient default) we render the dashboard directly, which
     keeps every non-auth unit test working.
     """
     from ._auth_middleware import resolve_browser_page_auth
-    from .web import get_configured_dashboard_admin_token
+    from ._auth_tokens import PROCESS_BEARER_TOKENS
 
     page_auth = resolve_browser_page_auth(
-        request, auth_enabled=get_configured_dashboard_admin_token() is not None
+        request, auth_enabled=PROCESS_BEARER_TOKENS.gate_enabled
     )
     if isinstance(page_auth, HTMLResponse):
         return page_auth

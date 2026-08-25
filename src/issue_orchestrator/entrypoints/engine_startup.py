@@ -56,11 +56,14 @@ class EngineStartup:
         the same rule enforced differently by path.
 
         This process serves ``control_app`` mounted under the dashboard
-        app, so it configures the Control API tokens too. The
-        agent-callback token is resolved once and published to the
-        process environment, which ``agent_runner_env`` passes through to
-        agent subprocesses: configuring the server without exporting
-        would make the API demand a secret its agents never receive.
+        app, and both surfaces read one bearer-token owner, so a single
+        ``configure_api_token`` call activates both — there is no
+        dashboard-side token to set separately, and therefore none to
+        drift (#269). The agent-callback token is resolved once and
+        published to the process environment, which ``agent_runner_env``
+        passes through to agent subprocesses: configuring the server
+        without exporting would make the API demand a secret its agents
+        never receive.
         """
         from ..infra import browser_session
         from ..infra.api_token import (
@@ -69,7 +72,6 @@ class EngineStartup:
             resolve_api_token,
         )
         from .control_api import configure_api_token
-        from .web import configure_dashboard_admin_token
 
         session_ttl = getattr(config, "browser_session_ttl_seconds", None)
         sse_ttl = getattr(config, "sse_token_ttl_seconds", None)
@@ -88,7 +90,9 @@ class EngineStartup:
                 "\033[0m\n",
                 flush=True,
             )
-            configure_dashboard_admin_token(None)
+            # One clear covers both surfaces: ``--dev-no-auth`` must be
+            # an authoritative OFF everywhere, never one surface open
+            # while the other still enforces stale state.
             configure_api_token(None, agent_callback=None)
             os.environ.pop("ISSUE_ORCHESTRATOR_API_TOKEN", None)
             # Clear the callback token too: agents must not carry a
@@ -102,7 +106,6 @@ class EngineStartup:
             return
 
         admin_token = resolve_api_token()
-        configure_dashboard_admin_token(admin_token)
         agent_callback_token = resolve_agent_callback_token()
         configure_api_token(admin_token, agent_callback=agent_callback_token)
         os.environ[AGENT_CALLBACK_TOKEN_ENV_VAR] = agent_callback_token
