@@ -13,6 +13,11 @@ from ._worktree import (
     next_branch_name,
     find_worktree_for_branch,
 )
+from ._planning_command_guard import (
+    PLANNING_GUARD_RULES,
+    CodexPlanningCommandGuardInstaller,
+    render_planning_rules,
+)
 from ._review_command_guard import (
     GUARDABLE_PROVIDERS,
     REVIEW_COMMAND_GUARD_SETTINGS,
@@ -33,8 +38,11 @@ from ._worktree_runtime_setup import WorktreeRuntimeSetup, WorktreeRuntimeState
 
 __all__ = [
     "GUARDABLE_PROVIDERS",
+    "PLANNING_GUARD_RULES",
+    "CodexPlanningCommandGuardInstaller",
     "REVIEW_COMMAND_GUARD_SETTINGS",
     "ReviewCommandGuardOutcome",
+    "render_planning_rules",
     "WorktreeError",
     "WorktreeRuntimeSetup",
     "WorktreeRuntimeState",

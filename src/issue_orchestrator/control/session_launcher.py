@@ -78,6 +78,7 @@ from ..ports.coder_prompt import (
     CoderPromptAddendumProvider,
     NO_CODER_PROMPT_ADDENDUM,
 )
+from ..ports.planning_command_guard import PlanningCommandGuardInstaller
 from ..ports.session_output import SessionOutput
 from ..ports.event_sink import SessionStartedEventPayload, make_session_started_event
 from ..ports.worktree_manager import WorktreeManager, WorktreeReuseOptions
@@ -195,6 +196,8 @@ class SessionLauncher:
         # re-reads all of it; a launcher built without one would trust the
         # queue, which is what the ordering defect did.
         publication_verdict: "PublicationVerdictReader",
+        # The launch-scoped planning barrier (#289): required, never defaulted.
+        planning_command_guard: PlanningCommandGuardInstaller,
     ):
         self.config = config
         self.events = events
@@ -253,6 +256,7 @@ class SessionLauncher:
             read_labels=repository_host.get_issue_labels_fresh,
         )
         self._publication_verdict = publication_verdict
+        self._planning_command_guard = planning_command_guard
         self._tech_lead_needs_human = TechLeadNeedsHumanLifecycle(
             labels=label_manager,
             events=events,
@@ -641,6 +645,7 @@ class SessionLauncher:
             tech_lead_authority=self._tech_lead_authority,
             board_snapshot_provider=self._board_snapshot_provider,
             working_copy=self._working_copy,
+            planning_command_guard=self._planning_command_guard,
             issue=issue,
             ctx=ctx,
             tech_lead_scope=tech_lead_scope,

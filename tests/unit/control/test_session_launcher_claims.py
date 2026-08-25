@@ -6,6 +6,9 @@ from unittest.mock import MagicMock, patch, PropertyMock
 
 import pytest
 
+from issue_orchestrator.ports.planning_command_guard import (
+    UNGUARDED_PLANNING_COMMAND_GUARD,
+)
 from issue_orchestrator.control.completion_handler import CleanupDecision
 from issue_orchestrator.domain.claim import ClaimResult, ClaimState
 from issue_orchestrator.domain.coder_prompt import PreparedCoderPromptAddendum
@@ -122,6 +125,7 @@ class TestSessionLauncherClaimAcquisition:
             board_snapshot_provider=NullBoardSnapshotProvider(),
             agent_callback_endpoint=ready_callback_endpoint(),
             publication_verdict=verdict_with_no_evidence(),
+            planning_command_guard=UNGUARDED_PLANNING_COMMAND_GUARD,
         )
 
         claim = launcher._acquire_issue_claim(MockIssue())  # noqa: SLF001
@@ -241,6 +245,7 @@ class TestSessionLauncherClaimAcquisition:
                     agent_callback_endpoint=ready_callback_endpoint(),
                     coder_prompt_addendum=prompt_provider,
                     publication_verdict=verdict_with_no_evidence(),
+                    planning_command_guard=UNGUARDED_PLANNING_COMMAND_GUARD,
                 )
 
                 issue = MockIssue()
@@ -303,6 +308,7 @@ class TestSessionLauncherClaimAcquisition:
             board_snapshot_provider=NullBoardSnapshotProvider(),
             agent_callback_endpoint=ready_callback_endpoint(),
             publication_verdict=verdict_with_no_evidence(),
+            planning_command_guard=UNGUARDED_PLANNING_COMMAND_GUARD,
         )
 
         issue = MockIssue()
@@ -354,6 +360,7 @@ class TestSessionLauncherClaimAcquisition:
             board_snapshot_provider=NullBoardSnapshotProvider(),
             agent_callback_endpoint=ready_callback_endpoint(),
             publication_verdict=verdict_with_no_evidence(),
+            planning_command_guard=UNGUARDED_PLANNING_COMMAND_GUARD,
         )
 
         issue = MockIssue()

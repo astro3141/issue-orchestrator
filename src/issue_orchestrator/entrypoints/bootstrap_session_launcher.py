@@ -18,6 +18,8 @@ from ..ports.coder_prompt import (
     CoderPromptAddendumProvider,
     NO_CODER_PROMPT_ADDENDUM,
 )
+from ..adapters.worktree.api import CodexPlanningCommandGuardInstaller
+from ..ports.planning_command_guard import PlanningCommandGuardInstaller
 from ..ports.provider_readiness import ProviderReadinessProbe
 
 if TYPE_CHECKING:
@@ -55,8 +57,16 @@ def build_session_launcher_factory(
     needs_human_block: SharedNeedsHumanBlock,
     publication_verdict: "PublicationVerdictReader",
     coder_prompt_addendum: CoderPromptAddendumProvider = NO_CODER_PROMPT_ADDENDUM,
+    planning_command_guard: PlanningCommandGuardInstaller | None = None,
 ) -> "SessionLauncherFactory":
-    """Bind the application dependencies; return the facade-facing factory."""
+    """Bind the application dependencies; return the facade-facing factory.
+
+    ``planning_command_guard`` resolves to the real Codex installer (#289):
+    this module is the composition boundary that owns which adapter a launcher
+    gets, and a planning_investigation must not reach a launch without one. A
+    test composition passes its own double instead.
+    """
+    planning_guard = planning_command_guard or CodexPlanningCommandGuardInstaller()
 
     def _factory(
         *,
@@ -93,6 +103,7 @@ def build_session_launcher_factory(
             needs_human_block=needs_human_block,
             coder_prompt_addendum=coder_prompt_addendum,
             publication_verdict=publication_verdict,
+            planning_command_guard=planning_guard,
         )
 
     return _factory

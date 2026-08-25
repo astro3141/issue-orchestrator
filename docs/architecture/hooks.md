@@ -77,14 +77,30 @@ These are installed and refreshed in the target project by `issue-orchestrator s
 | Execpolicy rules (Codex) | Codex CLI | `.codex/rules/orchestrator.rules` | Blocks dangerous commands outside sandbox | **YES** |
 | AGENTS.md / CLAUDE.md | Policy | `AGENTS.md` (`CLAUDE.md` symlink for compatibility) | Documents prohibited actions | Advisory |
 
-One more `PreToolUse` guard is installed per *worktree* rather than per project:
-the review-exchange reviewer worktree gets `.claude/settings.local.json`
-registering `infra/hooks/review_command_guard.py`, which refuses build, test
-and validation commands there. That worktree is deliberately created without
-the repository's runtime prerequisites, so a gate command run in it reports on
-the environment while the record says it reports on the candidate. The reviewer
-prompt explains why the refusal happens; per this document, the prompt is not
-what prevents it. See `docs/architecture/validation.md`.
+Two more guards are installed per *worktree* rather than per project, and both
+refuse the same thing — the build/test/validation entry points listed once in
+`infra/hooks/gate_commands.py` — through whichever mechanism the provider in
+that worktree actually reads:
+
+| Worktree | Provider | Registration | Why the gate must not run |
+|----------|----------|--------------|---------------------------|
+| Review-exchange reviewer worktree | `claude-code` | `.claude/settings.local.json` → `infra/hooks/review_command_guard.py` | The worktree is deliberately created without the repository's runtime prerequisites, so a gate command reports on the environment while the record says it reports on the candidate |
+| `planning_investigation` scratch worktree | `codex` | `.codex/rules/planning-gate.rules` → `adapters/worktree/_planning_command_guard.py` | The run prepares a bounded issue; the code-candidate publication gate produces no planning verdict, and R22 Pilot 4 spent a whole round inside one its sandbox could not satisfy (#289) |
+
+Neither is a claim: each installer returns whether a guard was *established*,
+and refuses to write a policy file for a provider that would never read it. The
+planning guard goes further and asks the enforcing mechanism itself — `codex
+execpolicy check` — to classify pinned gate and inspection commands before the
+session is allowed to spawn; a policy that does not verify as refusing fails
+the launch closed rather than launching an apparently-guarded session. Because
+Codex resolves a linked worktree as its own project root, that policy is scoped
+to the one disposable run worktree: the product checkout's `.codex/rules`, the
+repository's shared Codex policy and the operator's `~/.codex` are untouched,
+and it composes with (rather than replaces) `orchestrator.rules`, which the
+installer places beside it.
+
+Both prompts still explain why the refusal happens; per this document, the
+prompt is not what prevents it. See `docs/architecture/validation.md`.
 
 Managed pre-push guardrails also support an optional
 `repo-specific/hooks/post-verify` extension point. When that hook exists during

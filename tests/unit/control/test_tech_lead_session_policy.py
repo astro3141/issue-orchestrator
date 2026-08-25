@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from tests.planning_command_guard_fakes import RecordingPlanningCommandGuard
 from issue_orchestrator.control import tech_lead_session_policy
 from issue_orchestrator.control.completion_pr_collision import NoCommitsBetweenError
 from issue_orchestrator.control.tech_lead_evidence import EVIDENCE_MAP_FILENAME
@@ -462,6 +463,7 @@ class TestLaunchBaseSha:
             tech_lead_authority=store,
             board_snapshot_provider=self._board_provider(),
             working_copy=working_copy,
+            planning_command_guard=RecordingPlanningCommandGuard(),
             issue=SimpleNamespace(
                 number=109, title="Investigate", agent_type="agent:tech-lead", labels=[]
             ),

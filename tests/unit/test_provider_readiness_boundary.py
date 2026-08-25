@@ -25,6 +25,9 @@ from pathlib import Path
 
 import pytest
 
+from issue_orchestrator.ports.planning_command_guard import (
+    UNGUARDED_PLANNING_COMMAND_GUARD,
+)
 from issue_orchestrator.control.actions import (
     AddCommentAction,
     AddLabelAction,
@@ -584,6 +587,7 @@ class _LauncherHarness:
             agent_callback_endpoint=ready_callback_endpoint(),
             provider_readiness_probe=probe,
             publication_verdict=verdict_with_no_evidence(),
+            planning_command_guard=UNGUARDED_PLANNING_COMMAND_GUARD,
         )
 
     def launch(self):

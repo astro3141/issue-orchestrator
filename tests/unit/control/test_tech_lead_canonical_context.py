@@ -16,6 +16,7 @@ from typing import Any, cast
 
 import pytest
 
+from tests.planning_command_guard_fakes import RecordingPlanningCommandGuard
 from issue_orchestrator.control.tech_lead_canonical_context import (
     stage_canonical_context,
 )
@@ -846,10 +847,17 @@ class TestOrdinaryLaneThroughThePolicyOwner:
     def _config(tmp_path: Path):
         from issue_orchestrator.infra.config import Config
 
+        from issue_orchestrator.domain.models import AgentConfig
+
         config = Config(repo="test/repo")
         config.tech_lead_review_agent = "agent:tech-lead"
         config.repo_root = tmp_path / "repo"
         config.repo_root.mkdir(parents=True, exist_ok=True)
+        # A planning launch resolves its provider from the agent block; a
+        # tech-lead agent with none is a launch nothing can be bound to (#289).
+        config.agents["agent:tech-lead"] = AgentConfig(
+            prompt_path=tmp_path / "prompt.md", provider="codex"
+        )
         return config
 
     @staticmethod
@@ -899,6 +907,7 @@ class TestOrdinaryLaneThroughThePolicyOwner:
             tech_lead_authority=store,
             board_snapshot_provider=self._board_provider(),
             working_copy=cast("WorkingCopy", self._working_copy()),
+            planning_command_guard=RecordingPlanningCommandGuard(),
             issue=subject,
             ctx=ctx,
             tech_lead_scope=TechLeadLaunchScope(

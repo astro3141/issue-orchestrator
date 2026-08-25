@@ -28,6 +28,9 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from issue_orchestrator.ports.planning_command_guard import (
+    UNGUARDED_PLANNING_COMMAND_GUARD,
+)
 from issue_orchestrator.control.session_launcher import SessionLauncher
 from issue_orchestrator.domain.issue_key import FakeIssueKey
 from issue_orchestrator.domain.models import (
@@ -66,6 +69,7 @@ def _launcher(endpoint) -> SessionLauncher:
         board_snapshot_provider=NullBoardSnapshotProvider(),
         agent_callback_endpoint=endpoint,
         publication_verdict=verdict_with_no_evidence(),
+        planning_command_guard=UNGUARDED_PLANNING_COMMAND_GUARD,
     )
 
 
@@ -251,6 +255,7 @@ class _RealLauncher:
             board_snapshot_provider=NullBoardSnapshotProvider(),
             agent_callback_endpoint=endpoint,
             publication_verdict=verdict_with_no_evidence(),
+            planning_command_guard=UNGUARDED_PLANNING_COMMAND_GUARD,
         )
 
 

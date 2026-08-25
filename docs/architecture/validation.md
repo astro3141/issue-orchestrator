@@ -1102,6 +1102,49 @@ where it is not (see the gap above) the note is all there is. A change that
 lets the reviewer run gates must remove the guard *and* route this worktree
 through `WorktreeProvisioner`.
 
+### The other principal that must not run the gate
+
+A `planning_investigation` Tech Lead is refused the same commands, for an
+unrelated reason. Its scratch worktree *is* fully provisioned — the gate would
+run — but the run's job is to prepare one bounded issue from source and staged
+governing evidence, and the code-candidate publication gate produces no
+planning verdict. R22 Pilot 4 was told that in its prompt, ran
+`make validate-pr-raw` anyway, spent about seventeen minutes inside a gate its
+sandbox could not satisfy, and returned BLOCKED without the bounded
+`create_issue` it was launched to produce (#289).
+
+The barrier is the same shape as the reviewer's, through Codex's mechanism
+rather than Claude Code's:
+
+- **One classifier.** Which entry points count as a gate is declared once, in
+  `infra/hooks/gate_commands.py`. The reviewer's hook renders it as command
+  regexes; the planning installer renders it as Codex `prefix_rule` argv
+  patterns. Adding a gate entry point teaches both; removing one breaks both,
+  which is how the shared link is testable.
+- **Launch-scoped.** Codex resolves a linked worktree as its own project root,
+  so `.codex/rules/planning-gate.rules` inside the run's *disposable* scratch
+  worktree is read by that run and by nothing else. The product checkout's
+  rules, the repository's shared Codex policy, and the operator's `~/.codex`
+  are all untouched, so an ordinary Codex Actor's validation still runs. No new
+  repository root is trusted: the policy loads under the existing #215 grant,
+  which names the common repository root.
+- **Composed, not substituted.** The installer places the shipped
+  `orchestrator.rules` beside the planning policy, and Codex loads every
+  `.rules` file in that directory, so `git push --no-verify`, commit-hook
+  bypass, `gh pr merge` and `gh api` stay denied.
+- **Established, not assumed.** Before the session spawns, the installer asks
+  `codex execpolicy check` to classify pinned samples — `make validate-pr-raw`
+  and a pytest-shaped command must come back `forbidden`; `git log`, `rg` and
+  `cat` must not. A policy that does not verify, or a checker that cannot
+  answer, raises `PlanningCommandGuardError`, and the ADR-0031 launch owner
+  (`control/tech_lead_session_policy.py`) turns that into a failed launch. A
+  Codex planning session never spawns unguarded.
+- **Codex only, and it says so.** `GUARDABLE_PLANNING_PROVIDERS` is the one
+  place both the installer and the launch owner read. A planning run on another
+  provider — or on an agent configured with a raw `command` and no provider at
+  all — gets no policy file and a WARNING naming the gap, rather than a
+  decorative one.
+
 ## Configuration (YAML)
 
 ```yaml

@@ -18,6 +18,14 @@ entry points that start a build/test/validation run at a command position and
 leaves reading the code — ``git``, ``rg``, ``cat``, ``ls``, ``find`` — and the
 reviewer's own completion command untouched.
 
+*Which* entry points those are is no longer decided here. It moved to
+:mod:`issue_orchestrator.infra.hooks.gate_commands` when a second principal —
+a ``planning_investigation`` Tech Lead under Codex — needed the same
+classification through a mechanism that matches argv tokens instead of command
+text (#289). This module still owns the shell dialect: command-position
+anchoring, the prefixes a reviewer types by habit, and the refusal prose. It
+owns no part of the vocabulary.
+
 **Threat model: forgetfulness, not evasion.** The reviewer is a cooperating
 agent that has been told in its prompt why gates cannot run here; the guard
 exists so the instruction cannot be quietly ignored, not so a determined
@@ -42,6 +50,7 @@ from .block_no_verify import (
     format_copilot_response,
     format_cursor_response,
 )
+from .gate_commands import shell_gate_patterns
 
 __all__ = [
     "GUARD_MODULE",
@@ -74,47 +83,9 @@ _COMMAND_START = r"(?:^|[\n;&|(`]|\$\()\s*(?:\w+=\S*\s+)*(?:(?:command|exec|time
 # `packages/vscode/node_modules/.bin/vitest`).
 _PATH_PREFIX = r"(?:[\w.~/-]*/)?"
 
-_GATE_COMMANDS: tuple[str, ...] = (
-    # Build-system entry points.
-    r"gradlew(?:\.bat)?\b",
-    r"gradle\b",
-    r"make\b",
-    r"ninja\b",
-    r"cmake\b",
-    r"bazel\s+(?:test|build|run|coverage)\b",
-    r"mvn\b",
-    r"sbt\b",
-    r"rake\b",
-    r"cargo\s+(?:test|build|check|bench|run|clippy)\b",
-    r"go\s+(?:test|build|vet|run)\b",
-    r"dotnet\s+(?:test|build|run)\b",
-    r"tox\b",
-    # Node package managers: only the verbs that install or run something.
-    r"(?:npm|pnpm|yarn|bun)\s+(?:ci|install|i|test|run|exec|build|start|dlx)\b",
-    # Ad-hoc package runners exist to execute a tool; nothing they can run here
-    # is a read of the candidate's source.
-    r"(?:npx|bunx)\b",
-    # A nested shell would otherwise carry a gate command past this policy,
-    # because the inner command is an argument rather than a command position.
-    r"(?:ba|z|k|da)?sh\s+(?:-\S+\s+)*-c\b",
-    # Python test/gate runners, direct and via a launcher.
-    r"pytest\b",
-    r"(?:python[\d.]*|uv\s+run|uvx|poetry\s+run|pipenv\s+run|hatch\s+run)"
-    r"\s+(?:-\S+\s+)*(?:-m\s+)?(?:pytest|tox|unittest|nox)\b",
-    r"nox\b",
-    r"bundle\s+exec\b",
-    # Static-analysis and browser-test tooling the gates drive.
-    r"(?:ruff|pyright|mypy|semgrep|eslint|tsc|vitest|jest|playwright)\b",
-    r"lint-imports\b",
-    # This repository's own gate entry points.
-    r"validate(?:-\S+)?\b",
-    r"prepush-check\b",
-    r"verify-pr(?:\.sh)?\b",
-    r"quality_guardrails\.py\b",
-)
-
 _GATE_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
-    re.compile(_COMMAND_START + _PATH_PREFIX + entry) for entry in _GATE_COMMANDS
+    re.compile(_COMMAND_START + _PATH_PREFIX + fragment)
+    for fragment in shell_gate_patterns()
 )
 
 
