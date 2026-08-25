@@ -1339,6 +1339,12 @@ completions only. Its shape matters as much as its existence:
 - **The pre-completion dirty-tree check still runs, before this question is
   even asked.** Planning is zero-code, so a dirty planning worktree is still
   refused rather than quietly completed.
+- **The routing decision comes before the candidate gate's configuration is
+  read.** A planning completion calls neither `load_validation_cmd` nor
+  `run_validation` for the candidate quick gate, so the lane cannot be made to
+  depend on — or die on — configuration describing a candidate it does not
+  have. Deciding late would leave the completion record hostage to a config
+  read the planning run has no use for.
 - **The signal is a routing hint, never authority.** It reads the launch-time
   `tech-lead-assignment.json`, which lives in the run directory *inside the
   agent-writable worktree*. A session that writes itself a planning assignment

@@ -43,6 +43,8 @@ from issue_orchestrator.domain.tech_lead_session import (
     TechLeadLaunchAuthority,
     TechLeadSessionFlavor,
 )
+from issue_orchestrator.entrypoints.cli_tools import agent_done, coding_done
+from issue_orchestrator.entrypoints.cli_tools.agent_done import QuickValidationSelection
 from issue_orchestrator.entrypoints.cli_tools.coding_done import main as coding_done_main
 from issue_orchestrator.execution.session_output_adapter import FileSystemSessionOutput
 from issue_orchestrator.infra.env import ENV_PREFIX
@@ -158,6 +160,101 @@ def completing(repo: Repo, *, status: str = "completed") -> Iterator[None]:
     finally:
         os.chdir(original_cwd)
         os.environ.pop("ORCHESTRATOR_SESSION_ID", None)
+
+
+@contextmanager
+def candidate_config_refused() -> Iterator[None]:
+    """Fail the test if the candidate quick-validation configuration is read.
+
+    Both module bindings of the loader are covered. ``coding_done`` imported it
+    by value, and ``run_validation`` reaches it through ``agent_done``, so
+    patching only one would leave the other route open and the tripwire would
+    prove nothing.
+    """
+
+    def refuse(worktree: Path) -> QuickValidationSelection:
+        raise AssertionError(
+            "the candidate quick-validation configuration was read for a "
+            f"completion that offers no candidate ({worktree})"
+        )
+
+    with (
+        patch.object(coding_done, "load_validation_cmd", refuse),
+        patch.object(agent_done, "load_validation_cmd", refuse),
+    ):
+        yield
+
+
+@contextmanager
+def candidate_config_reads() -> Iterator[list[Path]]:
+    """Record every read of the candidate quick-validation configuration."""
+    reads: list[Path] = []
+    real = agent_done.load_validation_cmd
+
+    def counting(worktree: Path) -> QuickValidationSelection:
+        reads.append(worktree)
+        return real(worktree)
+
+    with (
+        patch.object(coding_done, "load_validation_cmd", counting),
+        patch.object(agent_done, "load_validation_cmd", counting),
+    ):
+        yield reads
+
+
+class TestRoutingIsDecidedBeforeTheCandidateConfigIsRead:
+    """A1. The planning lane does not depend on candidate gate configuration.
+
+    Dropping the gate late — after reading the config the gate would have
+    used — would still leave a planning completion answerable to a candidate
+    contract it has no candidate for: a config read that dies (`die` on a
+    missing config file) takes the completion record with it. So the ordering
+    is the behaviour, and it is proven by refusing the read outright rather
+    than by asserting on how the function is written.
+    """
+
+    def test_a_planning_completion_never_reads_the_candidate_config(
+        self, repo: Repo
+    ) -> None:
+        repo.assign(PLANNING)
+
+        with completing(repo), candidate_config_refused():
+            coding_done_main()
+
+        assert repo.completion_record().outcome is CompletionOutcome.COMPLETED
+        assert repo.gate_ran is False
+
+    def test_an_ordinary_actor_completion_still_reads_it(self, repo: Repo) -> None:
+        """The same tripwire in the other direction: here the read must happen.
+
+        Without this, a change that stopped reading the config for *every*
+        completion would satisfy the planning test above while silently
+        removing the gate from the lane that needs it.
+        """
+        with completing(repo), candidate_config_reads() as reads:
+            with pytest.raises(SystemExit) as exit_info:
+                coding_done_main()
+
+        assert reads == [repo.root]
+        assert repo.gate_ran is True
+        assert exit_info.value.code == 1
+
+    @pytest.mark.parametrize(
+        "flavor",
+        [flavor for flavor in TechLeadSessionFlavor if flavor is not PLANNING],
+        ids=lambda flavor: flavor.value,
+    )
+    def test_every_non_planning_flavor_still_reads_it(
+        self, repo: Repo, flavor: TechLeadSessionFlavor
+    ) -> None:
+        repo.assign(flavor)
+
+        with completing(repo), candidate_config_reads() as reads:
+            with pytest.raises(SystemExit):
+                coding_done_main()
+
+        assert reads == [repo.root]
+        assert repo.gate_ran is True
 
 
 class TestTheExactPlanningCompletion:

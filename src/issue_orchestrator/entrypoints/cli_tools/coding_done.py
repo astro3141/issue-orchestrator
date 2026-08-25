@@ -300,21 +300,23 @@ def _run_quick_validation_gate(
     is a separate gate the orchestrator runs later, and nothing here stands in
     for it.
 
-    Returns ``None`` when no gate ran — either because the repository configures
-    none, or because :func:`route_completion_quick_gate` found this completion
-    has no code candidate for the gate to judge (#293). A gate that does not run
-    leaves no trace at all: no process starts, no run assets are opened for it,
-    and the caller therefore records no validation evidence. The absence is
+    Returns ``None`` when no gate ran — either because :func:`route_completion_quick_gate`
+    found this completion has no code candidate for the gate to judge (#293), or
+    because the repository configures no quick gate at all. A gate that does not
+    run leaves no trace at all: no process starts, no run assets are opened for
+    it, and the caller therefore records no validation evidence. The absence is
     visible rather than papered over with a manufactured PASS.
 
-    The routing question is asked only of an orchestrator-MANAGED session,
-    because it is answered from the run contract the orchestrator injected. A
-    standalone developer invocation has no such contract and keeps the gate
+    **Routing is decided before the candidate gate's configuration is read.** A
+    completion with no code candidate never touches
+    :func:`load_validation_cmd` or :func:`run_validation` for the candidate
+    quick gate, so the planning lane cannot be made to depend on — or fail
+    on — configuration that describes a candidate it does not have (#293). The
+    routing question is asked only of an orchestrator-MANAGED session, because
+    it is answered from the run contract the orchestrator injected. A standalone
+    developer invocation has no such contract and keeps the gate
     unconditionally.
     """
-    selection = load_validation_cmd(worktree_root)
-    if not selection.cmd:
-        return None
     if not session_id:
         logger.error("[coding-done] Validation requires session_id but none found")
         sys.exit(1)
@@ -325,7 +327,13 @@ def _run_quick_validation_gate(
             print(f"Note: no quick validation for this completion — {routing.detail}")
             logger.info("[coding-done] quick gate not run: %s", routing.detail)
             return None
+        # The managed run's assets are already allocated by the orchestrator, so
+        # nothing here needs the selection up front: ``run_validation`` reads it
+        # and answers None when the repository configures no quick gate.
     else:
+        selection = load_validation_cmd(worktree_root)
+        if not selection.cmd:
+            return None
         assets = FileSystemSessionOutput().start_run(
             worktree_root,
             session_id,
@@ -340,11 +348,10 @@ def _run_quick_validation_gate(
         verbose=verbose,
     )
     if result is None:
-        # ``run_validation`` re-reads the repository's validation config and
-        # answers None when there is none. This function already checked that
-        # above against the same worktree, so reaching here means the config
-        # changed underfoot mid-call. Either way no process ran and there is no
-        # verdict to carry — same answer as every other did-not-run path.
+        # No quick gate is configured for this worktree, so no process ran and
+        # there is no verdict to carry — the same answer as every other
+        # did-not-run path. (The standalone branch above has already ruled this
+        # out for itself, because it needs the selection to freeze a profile.)
         return None
     return QuickGateRun(result=result, assets=assets)
 
