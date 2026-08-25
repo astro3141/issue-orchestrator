@@ -758,12 +758,26 @@ def _remove_exclude_entries(exclude_path: Path, prefix: str) -> int:
 
 
 def _worktree_exclude_files(worktree_path: Path) -> list[Path]:
-    """Return every exclude file git reads for this worktree.
+    """Return the exclude files an entry must be written to — and removed from.
 
-    A linked worktree has its own ``info/exclude`` *and* reads the common git
-    dir's. Both are returned so an entry is written — and removed — everywhere
-    git would honour it; a stale entry left in the common dir would leak across
-    every other worktree of the same repository.
+    Measured, not assumed (git 2.55): ``info/`` is a **common-dir** path, so
+    ``git rev-parse --git-path info/exclude`` inside a linked worktree resolves
+    to the *shared* ``.git/info/exclude``. The per-worktree
+    ``.git/worktrees/<name>/info/exclude`` exists on disk but git never reads
+    it. Only the common-dir file is enforcing.
+
+    Both are still returned, for two different reasons:
+
+    * the common-dir file is the one that takes effect, and it is repo-wide —
+      an entry written here is honoured in every worktree of the repository
+      until something removes it, which is why the drop half must reach it;
+    * the per-worktree file is written for symmetry with the drop half, which
+      must clear entries an older orchestrator left there before this was
+      measured.
+
+    A caller that needs launch-scoped invisibility must therefore treat the
+    write as *shared repository state* and say so, not as something the
+    worktree carries away when it is deleted.
     """
     git_dir = _worktree_git_dir(worktree_path)
     if git_dir is None:

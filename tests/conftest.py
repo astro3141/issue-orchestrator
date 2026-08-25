@@ -927,6 +927,7 @@ def build_test_orchestrator_deps(
         build_session_launcher_factory,
     )
     from tests.callback_endpoint_helpers import ready_callback_endpoint
+    from tests.planning_command_guard_fakes import RecordingPlanningCommandGuard
     from issue_orchestrator.events import EventHub
     from issue_orchestrator.execution.git_working_copy import GitWorkingCopy
     from issue_orchestrator.execution.command_runner import LocalCommandRunner
@@ -1222,6 +1223,7 @@ def build_test_orchestrator_deps(
             provider_readiness_probe=readiness_probe,
             needs_human_block=needs_human_block,
             publication_verdict=publication_verdict,
+            planning_command_guard=RecordingPlanningCommandGuard(),
         ),
         # Same shape again for the completion handler (#6999 A4).
         completion_handler_factory=build_completion_handler_factory(

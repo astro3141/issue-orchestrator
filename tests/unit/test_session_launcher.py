@@ -148,6 +148,14 @@ from issue_orchestrator.ports.provider_readiness import (
     ProviderReadinessProbe,
 )
 from issue_orchestrator.ports.board_snapshot_provider import BoardSnapshotProvider
+from issue_orchestrator.ports.planning_command_guard import (
+    UNGUARDED_PLANNING_COMMAND_GUARD,
+    PlanningCommandGuardInstaller,
+)
+from tests.planning_command_guard_fakes import (
+    FailingPlanningCommandGuard,
+    RecordingPlanningCommandGuard,
+)
 from issue_orchestrator.control.board_snapshot_builder import (
     BoardSnapshotBuilder,
     StateBoardSnapshotProvider,
@@ -605,6 +613,12 @@ class LauncherTestBundle:
         default_factory=RecordingBoardSnapshotProvider
     )
     claim_manager: MagicMock | None = None
+    # The installer the launcher was wired with. Typed as the port, not the
+    # recording double, because a caller may inject its own (a failing one, for
+    # the fail-closed tests) and the bundle must report THAT object.
+    planning_command_guard: PlanningCommandGuardInstaller = field(
+        default_factory=RecordingPlanningCommandGuard
+    )
 
 
 def _build_launcher_bundle(
@@ -623,6 +637,7 @@ def _build_launcher_bundle(
     unrecorded_refusals: UnrecordedRefusals | None = None,
     publication_verdict: PublicationVerdictReader | None = None,
     action_applier: object | None = None,
+    planning_command_guard: PlanningCommandGuardInstaller | None = None,
 ) -> LauncherTestBundle:
     """Create a SessionLauncher with mock dependencies and tracking.
 
@@ -637,6 +652,15 @@ def _build_launcher_bundle(
     """
     if board_snapshot_provider is None:
         board_snapshot_provider = RecordingBoardSnapshotProvider()
+    # The installer the launcher is actually wired with — the caller's when one
+    # was injected. Reporting a fresh double on the bundle instead would hand a
+    # test an object nothing ever called, and its ``calls`` assertions would
+    # pass or fail for reasons unrelated to the launch.
+    planning_guard: PlanningCommandGuardInstaller = (
+        RecordingPlanningCommandGuard()
+        if planning_command_guard is None
+        else planning_command_guard
+    )
     session_exists_calls = []
     create_session_calls = []
     session_exists_override = [None]  # List so tests can replace the callable
@@ -711,6 +735,7 @@ def _build_launcher_bundle(
             if publication_verdict is not None
             else verdict_with_no_evidence(unrecorded=unrecorded_refusals)
         ),
+        planning_command_guard=planning_guard,
         **launcher_kwargs,
     )
 
@@ -726,6 +751,7 @@ def _build_launcher_bundle(
         action_applier=mock_action_applier,
         board_snapshot_provider=board_snapshot_provider,
         claim_manager=claim_manager,
+        planning_command_guard=planning_guard,
     )
     return bundle
 
@@ -1589,6 +1615,7 @@ class TestLaunchIssueSession:
             board_snapshot_provider=NullBoardSnapshotProvider(),
             agent_callback_endpoint=ready_callback_endpoint(),
             publication_verdict=verdict_with_no_evidence(),
+            planning_command_guard=UNGUARDED_PLANNING_COMMAND_GUARD,
         )
 
         result = launcher.launch_issue_session(sample_issue, active_sessions=[])
@@ -2625,6 +2652,7 @@ class TestLaunchReviewSession:
             mock_working_copy,
             mock_command_runner,
             publication_verdict=verdict_with_no_evidence(),
+            planning_command_guard=UNGUARDED_PLANNING_COMMAND_GUARD,
         )
         review = PendingReview(
             issue_key=GitHubIssueKey(repo="test/repo", external_id="123"),
@@ -5355,6 +5383,43 @@ class TestLaunchTechLeadIssueSessionFlavors:
         PendingSessionQueues(state).queue_planning_investigation(
             903, "Prepare the thing"
         )
+
+    def test_a_codex_planning_launch_does_not_spawn_without_a_verified_guard(
+        self, sample_config, mock_events, mock_repo_host, mock_worktree_manager,
+        mock_working_copy, mock_command_runner, tmp_path
+    ):
+        """#289: guard-setup failure is a failed launch, before any session.
+
+        The R22 Pilot 4 direction, inverted: rather than an unguarded planning
+        principal spending its round inside a gate, nothing spawns at all and
+        the failure names the guard.
+        """
+        bundle = _build_launcher_bundle(
+            sample_config, mock_events, mock_repo_host, mock_worktree_manager,
+            mock_working_copy, mock_command_runner,
+            planning_command_guard=FailingPlanningCommandGuard(),
+        )
+        config = bundle.launcher.config
+        self._enable_tech_lead_agent(config, tmp_path)
+        config.agents["agent:tech-lead"].provider = "codex"
+        state = OrchestratorState()
+        self._queue_planning(state, mock_repo_host, "Plan this.\n")
+
+        session = orchestrator_launch_tech_lead_session(
+            state.pending_tech_lead_reviews[0],
+            state,
+            config,
+            bundle.launcher,
+            MagicMock(),
+            _claims_store(),
+        )
+
+        assert session is None
+        assert bundle.create_session_calls == []
+        failed = mock_events.get_events_by_name("session.start_failed")
+        assert failed, "a guard that did not take must be an observable failure"
+        # Typed enough to tell guard setup from a model or task failure.
+        assert "execpolicy did not refuse" in failed[-1].data["error"]
 
     def test_planning_launch_stages_the_declared_canonical_context(
         self, launcher_bundle, mock_repo_host, mock_events, tmp_path
@@ -8412,6 +8477,7 @@ class TestStackRelaunchGate:
             board_snapshot_provider=NullBoardSnapshotProvider(),
             agent_callback_endpoint=ready_callback_endpoint(),
             publication_verdict=verdict_with_no_evidence(),
+            planning_command_guard=UNGUARDED_PLANNING_COMMAND_GUARD,
         )
 
     @pytest.fixture

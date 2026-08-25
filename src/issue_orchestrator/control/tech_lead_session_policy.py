@@ -12,7 +12,9 @@ session's name distinguishes them. This module is the single owner for:
 - **launch preparation**: per-flavor session inputs (PR manifest download,
   the agent-visible assignment copy) plus the orchestrator-owned
   :class:`TechLeadLaunchAuthority` record that completion later trusts
-  (#6761 re-review F1);
+  (#6761 re-review F1), and — for a planning run — the launch-scoped command
+  guard that technically refuses the code-candidate validation gate before it
+  can execute (#289);
 - **completion effects**: shaping the requested actions a tech_lead completion
   may execute and classifying the benign "clean audit, nothing to publish"
   outcome so it is treated as success rather than a publish failure.
@@ -23,6 +25,7 @@ import uuid
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from ..domain.artifact_contracts import AgentProvider
 from ..domain.models import RequestedAction
 from ..domain.tech_lead_manifest import TechLeadManifest
 from ..domain.board_snapshot import BOARD_SNAPSHOT_FILENAME, BoardSnapshot
@@ -33,6 +36,11 @@ from ..domain.tech_lead_session import (
     TechLeadLaunchAuthority,
     TechLeadLaunchScope,
     TechLeadSessionFlavor,
+)
+from ..ports.planning_command_guard import (
+    GUARDABLE_PLANNING_PROVIDERS,
+    PlanningCommandGuard,
+    PlanningCommandGuardError,
 )
 from .completion_pr_collision import NoCommitsBetweenError
 from .tech_lead_canonical_context import stage_canonical_context
@@ -45,6 +53,7 @@ if TYPE_CHECKING:
     from ..infra.config import Config
     from ..ports import ManifestDownloader, RepositoryHost
     from ..ports.issue import Issue
+    from ..ports.planning_command_guard import PlanningCommandGuardInstaller
     from ..ports.working_copy import WorkingCopy
     from ..ports.tech_lead_authority import TechLeadAuthorityStore
     from .worktree_context import ScratchWorktreeIdentity, WorktreeContext
@@ -294,6 +303,104 @@ def _resolve_health_review_cohort(
     return tuple(sorted({problem.issue_number for problem in cohort or ()}))
 
 
+def resolve_tech_lead_provider(
+    config: "Config", issue: "Issue"
+) -> AgentProvider | None:
+    """The provider that will execute this Tech Lead principal, if it is named.
+
+    Read from the loaded agent block, which is where provider inheritance from
+    ``default_agent`` has already been resolved — never from the session name,
+    the issue's labels, or the command string.
+
+    ``None`` is a real answer, not a lookup miss: an agent configured with a
+    raw ``command`` template instead of a provider is a configuration this
+    repository accepts (``infra/validators/agent``), and the orchestrator then
+    genuinely does not know which CLI will run. It is reported as unresolved so
+    the caller can say the launch is unguarded, rather than being guessed into
+    a provider whose registration would not be read.
+    """
+    agent_config = config.agents.get(issue.agent_type or "")
+    provider = agent_config.provider if agent_config is not None else None
+    return AgentProvider(provider) if provider else None
+
+
+def establish_planning_command_guard(
+    *,
+    config: "Config",
+    issue: "Issue",
+    ctx: "WorktreeContext",
+    flavor: TechLeadSessionFlavor,
+    planning_command_guard: "PlanningCommandGuardInstaller",
+) -> PlanningCommandGuard | None:
+    """Bind the launch-scoped gate-command refusal to a planning run (#289).
+
+    Runs for exactly one flavor. ``PLANNING_INVESTIGATION`` prepares a bounded
+    issue from source and staged governing evidence; the repository's
+    code-candidate validation gate is not a verdict it can produce, and R22
+    Pilot 4 proved a prompt saying so is not what makes that hold. Every other
+    flavor is untouched — a failure investigation and a batch review are not
+    given a barrier this leaf did not measure for them.
+
+    The pair of facts this owner is the smallest place to hold together is
+    (flavor, provider): the flavor comes from the launch authority resolved
+    above, never from a label or a session name, and the provider from the
+    loaded agent block. Only a Codex planning launch gets a Codex
+    registration.
+
+    **Fail closed.** For a provider in :data:`GUARDABLE_PLANNING_PROVIDERS`, an
+    outcome that is not ``enforced`` raises, and the launcher turns that into a
+    failed launch before any session spawns — the guard-setup failure is
+    distinguishable from a model or task failure by its own exception type. A
+    provider outside that set gets no registration and a WARNING that says so,
+    because the alternative is a launch that is reported as guarded and is not.
+
+    Returns ``None`` for every non-planning flavor.
+    """
+    if flavor is not TechLeadSessionFlavor.PLANNING_INVESTIGATION:
+        return None
+    provider = resolve_tech_lead_provider(config, issue)
+    if provider is None:
+        logger.warning(
+            "[tech_lead] planning_investigation is UNGUARDED: agent %s names no "
+            "provider (custom command), so no launch-scoped gate-command guard "
+            "can be bound to it; only the planning prompt stops a validation "
+            "gate in %s",
+            issue.agent_type,
+            ctx.worktree_path,
+        )
+        return None
+    guard = planning_command_guard.establish(ctx.worktree_path, provider=provider)
+    if provider.value in GUARDABLE_PLANNING_PROVIDERS and not guard.enforced:
+        raise PlanningCommandGuardError(
+            "Refusing to spawn an unguarded planning_investigation session in "
+            f"{ctx.worktree_path}: provider {provider.value} must launch behind "
+            "a verified launch-scoped gate-command guard and none was "
+            "established"
+        )
+    if not guard.enforced:
+        logger.warning(
+            "[tech_lead] planning_investigation is UNGUARDED: provider %s has "
+            "no launch-scoped gate-command guard (guardable: %s); only the "
+            "planning prompt stops a validation gate in %s",
+            provider.value,
+            ", ".join(sorted(GUARDABLE_PLANNING_PROVIDERS)),
+            ctx.worktree_path,
+        )
+        return guard
+    ctx.update_manifest({
+        "planning_command_guard": str(guard.policy_file),
+        "planning_command_guard_provider": provider.value,
+        "planning_command_guard_refuses": list(guard.refusals()),
+        "planning_command_guard_allows": list(guard.allowances()),
+    })
+    logger.info(
+        "[tech_lead] planning command guard established: policy=%s refuses=%s",
+        guard.policy_file,
+        ", ".join(guard.refusals()),
+    )
+    return guard
+
+
 def _launch_base_sha(working_copy: "WorkingCopy", worktree_path: Path) -> str:
     """The commit this run's checkout stands at, right now, before the spawn.
 
@@ -327,6 +434,7 @@ def prepare_tech_lead_session_data(
     tech_lead_authority: "TechLeadAuthorityStore",
     board_snapshot_provider: "BoardSnapshotProvider",
     working_copy: "WorkingCopy",
+    planning_command_guard: "PlanningCommandGuardInstaller",
     issue: "Issue",
     ctx: "WorktreeContext",
     tech_lead_scope: "TechLeadLaunchScope | None",
@@ -351,7 +459,11 @@ def prepare_tech_lead_session_data(
     context of its subject (#183) — the exact sources the subject declares,
     staged with their revision identity and digests so no Human has to carry
     that text across the boundary. Its owner is
-    :mod:`.tech_lead_canonical_context`.
+    :mod:`.tech_lead_canonical_context`. It is also the only flavor that
+    launches behind a *launch-scoped command guard* (#289): the code-candidate
+    validation gate is technically refused before it can execute, and a Codex
+    planning launch whose guard cannot be established and verified raises here
+    so the launcher fails it closed rather than spawning unguarded.
 
     Flavor resolution: an explicit ``tech_lead_scope`` wins (the pending-queue
     launch path forwards the producer-declared grant); otherwise the
@@ -431,6 +543,16 @@ def prepare_tech_lead_session_data(
         run_dir=run_dir,
         flavor=flavor,
         subject_issue=issue,
+    )
+    # The planning barrier (#289): established before the launcher spawns
+    # anything, and raising here is what makes an unguarded Codex planning
+    # session impossible rather than merely discouraged.
+    establish_planning_command_guard(
+        config=config,
+        issue=issue,
+        ctx=ctx,
+        flavor=flavor,
+        planning_command_guard=planning_command_guard,
     )
     return _stage_evidence_map(
         config=config,

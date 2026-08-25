@@ -17,6 +17,9 @@ from issue_orchestrator.ports.repository_host import DependencyIssueSnapshot
 from issue_orchestrator.entrypoints.bootstrap_session_launcher import (
     build_session_launcher_factory,
 )
+from issue_orchestrator.ports.planning_command_guard import (
+    UNGUARDED_PLANNING_COMMAND_GUARD,
+)
 from tests.callback_endpoint_helpers import ready_callback_endpoint
 
 
@@ -1462,6 +1465,7 @@ class TestLaunchSessionDependencyCAS:
                 provider_readiness_probe=orch.deps.provider_readiness_probe,
                 needs_human_block=NO_OTHER_NEEDS_HUMAN_CAUSES,
                 publication_verdict=orch.deps.publication_verdict,
+                planning_command_guard=UNGUARDED_PLANNING_COMMAND_GUARD,
             )
 
         # Original issue had no dependencies
@@ -1556,6 +1560,7 @@ class TestLaunchSessionDependencyCAS:
                 provider_readiness_probe=orch.deps.provider_readiness_probe,
                 needs_human_block=NO_OTHER_NEEDS_HUMAN_CAUSES,
                 publication_verdict=orch.deps.publication_verdict,
+                planning_command_guard=UNGUARDED_PLANNING_COMMAND_GUARD,
             )
 
         issue = Issue(

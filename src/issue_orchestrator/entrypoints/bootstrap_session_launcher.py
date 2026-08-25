@@ -18,6 +18,7 @@ from ..ports.coder_prompt import (
     CoderPromptAddendumProvider,
     NO_CODER_PROMPT_ADDENDUM,
 )
+from ..ports.planning_command_guard import PlanningCommandGuardInstaller
 from ..ports.provider_readiness import ProviderReadinessProbe
 
 if TYPE_CHECKING:
@@ -55,8 +56,18 @@ def build_session_launcher_factory(
     needs_human_block: SharedNeedsHumanBlock,
     publication_verdict: "PublicationVerdictReader",
     coder_prompt_addendum: CoderPromptAddendumProvider = NO_CODER_PROMPT_ADDENDUM,
+    planning_command_guard: PlanningCommandGuardInstaller,
 ) -> "SessionLauncherFactory":
-    """Bind the application dependencies; return the facade-facing factory."""
+    """Bind the application dependencies; return the facade-facing factory.
+
+    ``planning_command_guard`` is REQUIRED and never defaulted, for the reason
+    ``SessionLauncher.__init__`` states about the same value (#289): a default
+    here would let a caller that forgot the installer still produce a launcher,
+    and a planning_investigation must not reach a launch without one. The
+    adapter is constructed where every other adapter this module wires is
+    constructed — ``bootstrap.py``, the composition root — so this module keeps
+    depending only on the port. A test composition passes its own double.
+    """
 
     def _factory(
         *,
@@ -93,6 +104,7 @@ def build_session_launcher_factory(
             needs_human_block=needs_human_block,
             coder_prompt_addendum=coder_prompt_addendum,
             publication_verdict=publication_verdict,
+            planning_command_guard=planning_command_guard,
         )
 
     return _factory
