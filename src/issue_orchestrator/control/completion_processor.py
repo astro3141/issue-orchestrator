@@ -90,6 +90,7 @@ from .completion_failure_reporting import (
 )
 from .completion_record_validation import (
     CompletionRecordLoadResult,
+    CompletionRecordSelection,
     CompletionRecordValidator,
     WorktreeValidationFailure,
     WorktreeValidationResult,
@@ -378,6 +379,13 @@ class CompletionProcessor:
         self, worktree: Path, completion_path: str | None = None
     ) -> CompletionRecordLoadResult:
         return self._record_validator.read_completion_record_result(
+            worktree, completion_path
+        )
+
+    def select_completion_record(
+        self, worktree: Path, completion_path: str | None = None
+    ) -> CompletionRecordSelection:
+        return self._record_validator.select_completion_record(
             worktree, completion_path
         )
 

@@ -47,7 +47,7 @@ from ..domain.completion_finalization import (
     CompletionFinalizationDecision,
     CompletionRuntimeState,
 )
-from ..domain.models import SessionStatus, CompletionOutcome
+from ..domain.models import COMPLETION_RECORD_PATH, SessionStatus, CompletionOutcome
 from ..domain.session_run import SessionRunAssets
 from ..ports.provider_resilience import ProviderErrorType
 from ..infra.provider_resilience import ProviderStatus, read_provider_status
@@ -72,7 +72,10 @@ from ..ports.run_evidence import (
 )
 from ..ports.session_output import SessionOutput, ValidationRecord, ValidationState
 from .completion_types import REVIEW_EXCHANGE_ERROR_PREFIX
-from .completion_record_validation import CompletionRecordLoadResult
+from .completion_record_validation import (
+    CompletionRecordLoadResult,
+    CompletionRecordSelection,
+)
 from .absent_completion_record import (
     collect_completion_debug_context,
     log_completion_debug_context,
@@ -286,12 +289,13 @@ class SessionController:
         provider_success = provider_success_from_status(provider_status)
 
         # Log and look up completion record
-        self._log_completion_lookup(
-            worktree_path, issue_number, session_name, completion_path
-        )
-        load_result = self.completion_processor.read_completion_record_result(
+        selection = self.completion_processor.select_completion_record(
             worktree_path, completion_path
         )
+        self._log_completion_lookup(
+            worktree_path, issue_number, session_name, completion_path, selection
+        )
+        load_result = selection.load_result
         record = load_result.record
 
         if record is None:
@@ -843,39 +847,55 @@ class SessionController:
         issue_number: int,
         session_name: str,
         completion_path: str | None,
+        selection: CompletionRecordSelection,
     ) -> None:
-        """Log completion record lookup details."""
-        full_path = (
-            (worktree_path / completion_path).resolve()
-            if completion_path
-            else (worktree_path / ".issue-orchestrator/completion.json").resolve()
-        )
+        """Log which completion record was looked up, and why that one.
+
+        Reports the path the selection owner made authoritative rather
+        than re-deriving the canonical one: a lookup line naming a file
+        the decision did not read is exactly what made #264 invisible.
+        """
+        full_path = selection.path.resolve()
         logger.info(
             issue_log(
                 issue_number, "Session not running: session=%s checking_completion=%s"
             ),
             session_name,
-            completion_path or ".issue-orchestrator/completion.json",
+            completion_path or COMPLETION_RECORD_PATH,
         )
-        self._emit_event(
-            EventName.COMPLETION_LOOKUP,
-            {
-                "issue_number": issue_number,
-                "session_name": session_name,
-                "worktree_path": str(worktree_path.resolve()),
-                "completion_path": completion_path,
-                "full_path": str(full_path),
-                "file_exists": full_path.exists(),
-            },
-        )
+        payload: dict[str, Any] = {
+            "issue_number": issue_number,
+            "session_name": session_name,
+            "worktree_path": str(worktree_path.resolve()),
+            "completion_path": completion_path,
+            "full_path": str(full_path),
+            "file_exists": full_path.exists(),
+        }
+        payload.update(selection.lookup_fields())
+        self._emit_event(EventName.COMPLETION_LOOKUP, payload)
         exists = full_path.exists()
         size = full_path.stat().st_size if exists else None
         logger.info(
-            issue_log(issue_number, "Completion lookup: exists=%s size=%s path=%s"),
+            issue_log(
+                issue_number,
+                "Completion lookup: exists=%s size=%s path=%s choice=%s",
+            ),
             exists,
             size,
             full_path,
+            selection.choice.value,
         )
+        producer_error = selection.producer_error
+        if producer_error:
+            logger.info(
+                issue_log(
+                    issue_number,
+                    "Completion producer error preserved for session=%s at %s: %s",
+                ),
+                session_name,
+                selection.canonical_path,
+                producer_error,
+            )
 
     def _handle_no_completion_record(
         self,

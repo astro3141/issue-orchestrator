@@ -14,6 +14,7 @@ from ..domain.review_exchange_run import ReviewExchangeRunAssets
 from ..domain.runtime_identity import RuntimeIdentity
 from ..domain.session_run import SessionRunAssets
 from ..ports.session_output import SessionOutput
+from .completion_record_validation import select_completion_record
 from .completion_failure_reporting import (
     build_cleanup_failure_comment,
     build_processing_failure_comment,
@@ -165,8 +166,16 @@ def preserve_completion_record(
     completion_path: str | None,
     run_assets: SessionRunAssets,
 ) -> str | None:
-    """Persist a run-scoped completion copy before cleanup for timeline/audit use."""
-    source_path = worktree / (completion_path or COMPLETION_RECORD_PATH)
+    """Persist a run-scoped completion copy before cleanup for timeline/audit use.
+
+    Asks the selection owner which file speaks for this run rather than
+    re-deriving the canonical path, so the audit copy is the record the
+    orchestrator actually acted on — not a producer-error placeholder a
+    valid retry already superseded (#264).
+    """
+    source_path = select_completion_record(
+        worktree / (completion_path or COMPLETION_RECORD_PATH)
+    ).path
     if not source_path.exists():
         return None
 

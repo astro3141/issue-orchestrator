@@ -124,6 +124,34 @@ Planner decides actions based on outcome
 ActionApplier executes (push, create PR, labels)
 ```
 
+### Which File the Orchestrator Reads
+
+`agent-done` writes to the run's canonical completion path. Two things can
+put a second file beside it: a legitimate second review after rework, and a
+crash inside `agent-done` itself, which leaves an **error placeholder** at
+the canonical path (it carries `agent_done_error` and by construction no
+`summary`) and sends the successful retry to a `-2`, `-3`, ... sibling.
+
+`select_completion_record` in `control/completion_record_validation.py` is
+the single owner of which of those files is authoritative — both the
+observer and the session controller ask it, so neither can act on a record
+the other cannot see:
+
+- canonical missing or **valid** → canonical, always. Siblings are ignored;
+  authority is never re-assigned between two valid completions.
+- canonical is an error placeholder → exactly one valid sibling, named with
+  the producer's own numeric suffix, in the same run directory, carrying the
+  same `session_id`, may take over. The placeholder's `agent_done_error` is
+  logged at INFO and travels on the lookup event either way.
+- anything else → canonical, unchanged. Several valid siblings is ambiguity,
+  not a race to resolve: there is no newest-wins or suffix-order rule, so the
+  placeholder stays authoritative and fails closed onto the existing
+  rejected-record diagnostic path.
+
+Every candidate is read through `load_completion_record_result`, so the
+file-size gate and field bounds apply to siblings exactly as they do to the
+canonical record. Nothing here moves, renames, or deletes either file.
+
 ## Consequences
 
 ### Positive

@@ -20,10 +20,13 @@ from issue_orchestrator.control.session_controller import (
 from issue_orchestrator.control.completion_processor import CompletionProcessor
 from issue_orchestrator.control.completion_types import ProcessingResult
 from issue_orchestrator.control.completion_record_validation import (
+    CompletionPathChoice,
     CompletionRecordLoadFailure,
     CompletionRecordLoadResult,
+    CompletionRecordSelection,
     WorktreeValidationFailure,
     WorktreeValidationResult,
+    select_completion_record,
 )
 from issue_orchestrator.domain.completion_finalization import (
     CompletionFinalizationCommand,
@@ -141,6 +144,7 @@ class MockCompletionProcessor:
     def __init__(self):
         self.completion_record: CompletionRecord | None = None
         self.completion_load_result: CompletionRecordLoadResult | None = None
+        self.completion_selection: CompletionRecordSelection | None = None
         self.process_calls: list[dict] = []
         self.worktree_state_valid = True
         self.worktree_state_reason = ""
@@ -175,6 +179,24 @@ class MockCompletionProcessor:
             path=path,
             record=self.completion_record,
             exists=True,
+        )
+
+    def select_completion_record(
+        self, worktree_path: Path, completion_path: str | None = None
+    ) -> CompletionRecordSelection:
+        if self.completion_selection is not None:
+            return self.completion_selection
+        load_result = self.read_completion_record_result(
+            worktree_path, completion_path
+        )
+        canonical_path = worktree_path / (
+            completion_path or ".issue-orchestrator/completion.json"
+        )
+        return CompletionRecordSelection(
+            canonical_path=canonical_path,
+            path=load_result.path,
+            load_result=load_result,
+            choice=CompletionPathChoice.CANONICAL,
         )
 
     def process(
@@ -553,6 +575,81 @@ class TestSessionControllerTerminated:
         assert "follow_up_issues exceeds" in payload["completion_parse_error"]
         assert payload["completion_path_absolute"] == str(completion_path.resolve())
         assert payload["diagnostic_path"] == str(diagnostic_path)
+
+    def test_completion_lookup_names_the_record_the_decision_read(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """A retry beside a producer error is decided on, and says so (#264)."""
+        worktree = tmp_path / "worktree"
+        completion_rel = (
+            ".issue-orchestrator/sessions/run-1/completion-agent_backend.json"
+        )
+        canonical = worktree / completion_rel
+        canonical.parent.mkdir(parents=True, exist_ok=True)
+        canonical.write_text(
+            json.dumps(
+                {
+                    "outcome": "completed",
+                    "agent_done_error": "evidence validation exploded",
+                    "session_id": "issue-264-run-1",
+                    "timestamp": "2026-08-25T10:55:25",
+                }
+            ),
+            encoding="utf-8",
+        )
+        retry = canonical.parent / "completion-agent_backend-2.json"
+        retry.write_text(
+            json.dumps(
+                {
+                    "session_id": "issue-264-run-1",
+                    "timestamp": "2026-08-25T11:02:00",
+                    "outcome": "completed",
+                    "summary": "Done on the retry",
+                    "requested_actions": ["push_branch"],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        processor = MockCompletionProcessor()
+        processor.completion_selection = select_completion_record(canonical)
+        event_sink = RecordingEventSink()
+        controller = SessionController(
+            completion_processor=processor,
+            events=event_sink,
+            session_output=FileSystemSessionOutput(),
+            working_copy=StubWorkingCopy(),
+        )
+
+        decision = decide_with_run_assets(
+            controller,
+            observation=SessionObservationResult.terminated(runtime_minutes=10.0),
+            worktree_path=worktree,
+            issue_number=123,
+            issue_title="Test Issue",
+            session_name="issue-123",
+            completion_path=completion_rel,
+        )
+
+        assert decision.status == SessionStatus.COMPLETED
+        assert decision.completion_processed
+
+        lookups = [
+            event
+            for event in event_sink.events
+            if event.name == EventName.COMPLETION_LOOKUP
+        ]
+        assert len(lookups) == 1
+        payload = lookups[0].data
+        assert payload["full_path"] == str(retry.resolve())
+        assert payload["completion_selected_path"] == str(retry.resolve())
+        assert payload["completion_path_choice"] == "producer_error_retry"
+        assert payload["completion_producer_error"] == "evidence validation exploded"
+        assert payload["completion_unresolved_candidates"] == []
+        # Neither record is moved, renamed, or removed by the lookup.
+        assert canonical.exists()
+        assert retry.exists()
 
     def test_terminated_with_completed_record_is_completed(self):
         """Session that exits with completed outcome = COMPLETED."""
