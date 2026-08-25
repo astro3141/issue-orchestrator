@@ -116,6 +116,25 @@ class TestUnreadableIsNeverPlanning:
         assert routing.runs_quick_gate is True
         assert "could not be read" in routing.detail
 
+    @pytest.mark.parametrize("payload", ["3", "[]", "null", '"planning_investigation"'])
+    def test_json_that_is_not_an_object_keeps_the_gate(
+        self, assets: SessionRunAssets, payload: str
+    ) -> None:
+        """Parsable-but-not-an-object is malformed too, and must not escape.
+
+        The assignment lives in agent-writable space, so this content is
+        reachable without any orchestrator bug. It has to come back as a routing
+        answer, not as an exception that costs the run its completion record.
+        """
+        path = assignment_path(assets)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(payload, encoding="utf-8")
+
+        routing = route_completion_quick_gate(assets)
+
+        assert routing.runs_quick_gate is True
+        assert "could not be read" in routing.detail
+
     def test_an_unknown_flavor_keeps_the_gate(self, assets: SessionRunAssets) -> None:
         path = assignment_path(assets)
         path.parent.mkdir(parents=True, exist_ok=True)

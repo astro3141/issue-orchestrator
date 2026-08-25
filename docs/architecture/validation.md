@@ -1352,6 +1352,13 @@ completions only. Its shape matters as much as its existence:
   that parses cleanly *and* names `planning_investigation`. Missing, malformed,
   unknown-flavor, or any other Tech Lead flavor keeps the existing behaviour,
   and there is no `--skip-validation` flag for an ordinary Actor to reach for.
+  The fail-safe is only as good as the reader's error contract, so
+  `TechLeadAssignment.read` raises `ValueError` for *every* malformed payload,
+  including valid JSON that is not an object (`3`, `[]`, `null`) — content the
+  agent-writable run directory can hold. Without that, such a file would leave
+  the reader as an `AttributeError`, past both this router and
+  `resolve_tech_lead_launch_authority`, and cost the run the completion record
+  #293 exists to guarantee.
 
 ## Configuration (YAML)
 

@@ -14,6 +14,7 @@ import os
 import subprocess
 import sys
 import traceback
+from dataclasses import dataclass
 from pathlib import Path
 
 from .agent_done import (
@@ -271,26 +272,40 @@ def _handle_dirty_files_rejection(
     sys.exit(1)
 
 
+@dataclass(frozen=True, slots=True)
+class QuickGateRun:
+    """A quick gate that actually ran, with the run assets holding its evidence.
+
+    The verdict and the artifacts it must be written into are one fact, so they
+    travel as one value: there is no way to hold a result whose evidence has
+    nowhere to go, and no way to open run assets for a gate that never started.
+    A gate that did not run is the absence of this value, not a pair of
+    ``None``\\ s the caller has to re-correlate.
+    """
+
+    result: AgentGateResult
+    assets: SessionRunAssets
+
+
 def _run_quick_validation_gate(
     *,
     worktree_root: Path,
     session_id: str,
     managed: bool,
     verbose: bool,
-) -> tuple[AgentGateResult | None, SessionRunAssets | None]:
+) -> QuickGateRun | None:
     """Run the local immediate-feedback quick gate, when this completion has one.
 
     This is the agent's own fast feedback; the canonical publication validation
     is a separate gate the orchestrator runs later, and nothing here stands in
     for it.
 
-    Returns ``(result, assets)``, and ``(None, None)`` when no gate ran — either
-    because the repository configures none, or because
-    :func:`route_completion_quick_gate` found this completion has no code
-    candidate for the gate to judge (#293). A gate that does not run leaves no
-    trace at all: no process starts, no run assets are opened for it, and the
-    caller therefore records no validation evidence. The absence is visible
-    rather than papered over with a manufactured PASS.
+    Returns ``None`` when no gate ran — either because the repository configures
+    none, or because :func:`route_completion_quick_gate` found this completion
+    has no code candidate for the gate to judge (#293). A gate that does not run
+    leaves no trace at all: no process starts, no run assets are opened for it,
+    and the caller therefore records no validation evidence. The absence is
+    visible rather than papered over with a manufactured PASS.
 
     The routing question is asked only of an orchestrator-MANAGED session,
     because it is answered from the run contract the orchestrator injected. A
@@ -299,7 +314,7 @@ def _run_quick_validation_gate(
     """
     selection = load_validation_cmd(worktree_root)
     if not selection.cmd:
-        return None, None
+        return None
     if not session_id:
         logger.error("[coding-done] Validation requires session_id but none found")
         sys.exit(1)
@@ -309,7 +324,7 @@ def _run_quick_validation_gate(
         if not routing.runs_quick_gate:
             print(f"Note: no quick validation for this completion — {routing.detail}")
             logger.info("[coding-done] quick gate not run: %s", routing.detail)
-            return None, None
+            return None
     else:
         assets = FileSystemSessionOutput().start_run(
             worktree_root,
@@ -319,14 +334,19 @@ def _run_quick_validation_gate(
             # to freeze onto it (#7059).
             validation_profile=selection.profile,
         )
-    return (
-        run_validation(
-            worktree_root,
-            session_output_dir=assets.run_dir,
-            verbose=verbose,
-        ),
-        assets,
+    result = run_validation(
+        worktree_root,
+        session_output_dir=assets.run_dir,
+        verbose=verbose,
     )
+    if result is None:
+        # ``run_validation`` re-reads the repository's validation config and
+        # answers None when there is none. This function already checked that
+        # above against the same worktree, so reaching here means the config
+        # changed underfoot mid-call. Either way no process ran and there is no
+        # verdict to carry — same answer as every other did-not-run path.
+        return None
+    return QuickGateRun(result=result, assets=assets)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -476,10 +496,9 @@ def main() -> None:  # noqa: C901, PLR0912
     # 3. Run quick validation if configured. This is the immediate feedback
     #    path for coding agents; deeper publish validation runs later through
     #    the orchestrator-controlled pre-push/pre-publish gate.
-    validation_result = None
-    assets = None
+    quick_gate = None
     if status in STATUSES_REQUIRING_VALIDATION:
-        validation_result, assets = _run_quick_validation_gate(
+        quick_gate = _run_quick_validation_gate(
             worktree_root=worktree_root,
             session_id=record.session_id,
             managed=managed,
@@ -488,11 +507,13 @@ def main() -> None:  # noqa: C901, PLR0912
     elif status in {AgentStatus.BLOCKED, AgentStatus.NEEDS_HUMAN}:
         print(f"Note: Skipping validation for '{status}' status (agent is reporting a problem)")
 
-    if validation_result and assets is not None:
+    validation_result = quick_gate.result if quick_gate is not None else None
+
+    if quick_gate is not None:
         validation_record_path = record_validation_artifacts(
             worktree_root,
-            assets.validation_artifacts,
-            validation_result,
+            quick_gate.assets.validation_artifacts,
+            quick_gate.result,
         )
         if validation_record_path is not None:
             record.validation_record_path = str(validation_record_path)

@@ -336,8 +336,21 @@ class TechLeadAssignment:
 
     @classmethod
     def read(cls, path: Path) -> "TechLeadAssignment":
-        """Read assignment from file; malformed content raises ValueError."""
-        return cls.from_dict(json.loads(path.read_text()))
+        """Read assignment from file; malformed content raises ValueError.
+
+        The file lives in agent-writable space, so its bytes are untrusted: it
+        may hold valid JSON that is not an object at all (``3``, ``[]``,
+        ``null``). ``from_dict`` is typed for a mapping and would raise
+        ``AttributeError`` on those, which no caller catches — callers fail
+        safe on ``ValueError``, so this boundary converts every malformed
+        payload into the error the docstring promises.
+        """
+        payload = json.loads(path.read_text())
+        if not isinstance(payload, dict):
+            raise ValueError(
+                f"tech_lead assignment must be a JSON object, got {payload!r}"
+            )
+        return cls.from_dict(payload)
 
 
 @dataclass(frozen=True, slots=True)
