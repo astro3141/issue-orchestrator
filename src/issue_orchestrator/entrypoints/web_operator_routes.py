@@ -20,9 +20,15 @@ from ..control.shutdown_manager import shutdown_manager
 from ..execution.client_host import ClientHost
 from ..execution.label_ops import LabelOperation, apply_label_operations
 from .shutdown_reason_support import parse_shutdown_reason
+from .web_after_response import defer_until_response_sent
 from .web_session_context import WebOrchestratorDependency
 
 logger = logging.getLogger(__name__)
+
+# How long the process waits after the dashboard server is told to stop
+# before exiting outright. Unchanged from when this timer was armed
+# inline; only *when* it is armed moved (#277).
+_PROCESS_EXIT_DELAY_SECONDS = 0.2
 
 web_operator_router = APIRouter()
 
@@ -419,6 +425,27 @@ async def open_agent_prompt(
     return JSONResponse({"status": result.action, **result.to_dict()}, status_code=status_code)
 
 
+def _tear_down_dashboard_server(
+    operator_deps: WebOperatorDependencies,
+) -> Callable[[], None]:
+    """Build the destructive half of a shutdown, to run after the ACK.
+
+    ``trigger_server_shutdown`` sets ``should_exit`` *and* ``force_exit``
+    on a server configured with ``timeout_graceful_shutdown=0``, and the
+    timer then exits the process. Neither is survivable by a response
+    that has not been written yet, which is why both live behind the
+    after-response boundary rather than inside the handler body (#277).
+    """
+
+    def tear_down() -> None:
+        operator_deps.trigger_server_shutdown()
+        timer = threading.Timer(_PROCESS_EXIT_DELAY_SECONDS, shutdown_manager.exit)
+        timer.daemon = False
+        timer.start()
+
+    return tear_down
+
+
 @web_operator_router.post("/api/shutdown")
 async def shutdown(
     request: Request,
@@ -440,6 +467,15 @@ async def shutdown(
     ``actor`` is optional and carries a stable identifier for the
     caller (cc, browser, cli, test-harness) so aggregated logs can
     group shutdowns by source.
+
+    Everything the request is accountable for — reason/actor parsing,
+    the orchestrator's own ``request_shutdown``, the shutdown-manager
+    state transition, the active-session count and the
+    ``shutdown_requested`` broadcast — happens here, inline. Only the
+    destructive teardown of the dashboard server is deferred: it would
+    otherwise kill the connection this acknowledgment travels on, which
+    is what made an authenticated supervisor stop time out and fall back
+    to SIGTERM (#277).
     """
     if orchestrator is None:
         return JSONResponse({"error": "Orchestrator not running"}, status_code=503)
@@ -476,11 +512,7 @@ async def shutdown(
             "actor": actor_str or None,
         },
     )
-    operator_deps.trigger_server_shutdown()
-
-    timer = threading.Timer(0.2, shutdown_manager.exit)
-    timer.daemon = False
-    timer.start()
+    defer_until_response_sent(request.scope, _tear_down_dashboard_server(operator_deps))
 
     return JSONResponse({
         "status": "force_shutdown" if force else "shutdown_requested",
