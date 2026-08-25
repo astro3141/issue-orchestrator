@@ -9,17 +9,17 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from ..domain.events import SessionEvent
-from ..domain.models import COMPLETION_RECORD_PATH, CompletionRecord, RequestedAction
+from ..domain.models import CompletionRecord, RequestedAction
 from ..domain.review_exchange_run import ReviewExchangeRunAssets
 from ..domain.runtime_identity import RuntimeIdentity
 from ..domain.session_run import SessionRunAssets
 from ..ports.session_output import SessionOutput
-from .completion_record_validation import select_completion_record
 from .completion_failure_reporting import (
     build_cleanup_failure_comment,
     build_processing_failure_comment,
     write_failure_diagnostic,
 )
+from .completion_record_validation import CompletionRecordSelection
 from .completion_types import (
     ERROR_PREFIX_CREATE_PR,
     ERROR_PREFIX_GOVERNED_LABEL,
@@ -31,7 +31,8 @@ from .completion_types import (
 logger = logging.getLogger(__name__)
 
 EmitCompletionEvent = Callable[[SessionEvent, int, dict[str, Any]], None]
-CleanupRecord = Callable[[Path, str | None], bool]
+CleanupRecord = Callable[[CompletionRecordSelection], bool]
+CleanupCompletionRecord = Callable[[Path, CompletionRecordSelection, int], None]
 
 
 class PostIssueComment(Protocol):
@@ -54,12 +55,12 @@ def build_processing_result(
     errors: list[str],
     error_details: list[dict[str, Any]],
     total_duration: float,
-    completion_path: str | None,
+    selection: CompletionRecordSelection,
     preserved_completion_path: str | None,
     run_assets: SessionRunAssets,
     emit_completion_event: EmitCompletionEvent,
     post_issue_comment: PostIssueComment,
-    cleanup_completion_record_fn: Callable[[Path, str | None, int], None],
+    cleanup_completion_record_fn: CleanupCompletionRecord,
 ) -> ProcessingResult:
     """Build final processing result and handle completion diagnostics."""
     has_publish_error = any(
@@ -139,7 +140,7 @@ def build_processing_result(
         )
         post_issue_comment(issue_number, comment, context="processing failure")
 
-    cleanup_completion_record_fn(worktree, completion_path, issue_number)
+    cleanup_completion_record_fn(worktree, selection, issue_number)
 
     review_exchange_halted = any(
         error.startswith(REVIEW_EXCHANGE_ERROR_PREFIX) for error in errors
@@ -162,20 +163,17 @@ def build_processing_result(
 def preserve_completion_record(
     *,
     session_output: SessionOutput,
-    worktree: Path,
-    completion_path: str | None,
+    selection: CompletionRecordSelection,
     run_assets: SessionRunAssets,
 ) -> str | None:
     """Persist a run-scoped completion copy before cleanup for timeline/audit use.
 
-    Asks the selection owner which file speaks for this run rather than
-    re-deriving the canonical path, so the audit copy is the record the
-    orchestrator actually acted on — not a producer-error placeholder a
-    valid retry already superseded (#264).
+    Takes the selection the caller already made rather than re-deriving a
+    path, so the audit copy is the record the orchestrator actually acted
+    on — not a producer-error placeholder a valid retry already superseded
+    (#264) — and cannot disagree with the cleanup that follows it.
     """
-    source_path = select_completion_record(
-        worktree / (completion_path or COMPLETION_RECORD_PATH)
-    ).path
+    source_path = selection.path
     if not source_path.exists():
         return None
 
@@ -196,31 +194,69 @@ def preserve_completion_record(
         return None
 
 
+def clear_completion_records(selection: CompletionRecordSelection) -> bool:
+    """Remove every file this run's completion occupies.
+
+    Both halves are load-bearing. Leaving the record that was ACTED on
+    behind would report a completion as cleaned while it survived on disk —
+    the same file-the-decision-did-not-read split that made #264 invisible,
+    on the cleanup side of the preserve/cleanup pair. Leaving the superseded
+    placeholder behind would strand the publish-retry path, whose
+    ``restore_completion_record`` no-ops when the canonical path is occupied.
+
+    Returns:
+        True if every occupied path is gone, False if any removal failed.
+    """
+    removed = True
+    for record_path in selection.occupied_paths():
+        try:
+            if record_path.exists():
+                record_path.unlink()
+                logger.debug("Removed completion record: %s", record_path)
+        except Exception as exc:
+            logger.warning(
+                "Failed to remove completion record %s: %s", record_path, exc
+            )
+            removed = False
+    return removed
+
+
 def cleanup_completion_record(
     *,
     worktree: Path,
-    completion_path: str | None,
+    selection: CompletionRecordSelection,
     issue_number: int,
     cleanup_record: CleanupRecord,
     post_issue_comment: PostIssueComment,
 ) -> None:
-    """Clean up the completion record after processing."""
-    record_path = worktree / (completion_path or COMPLETION_RECORD_PATH)
-    existed_before = record_path.exists()
-    cleanup_ok = cleanup_record(worktree, completion_path)
-    exists_after = record_path.exists()
+    """Clean up the completion record files after processing.
+
+    Clears every path the selection says this run's completion occupies —
+    the record that was acted on AND any placeholder it superseded — and
+    names the acted-on one in the log. Reporting the canonical path as
+    cleaned while the record the orchestrator actually read survived beside
+    it is the same lie, on the cleanup side, that #264 was on the lookup
+    side (#264 review round 1, F1).
+    """
+    record_paths = selection.occupied_paths()
+    existed_before = [path for path in record_paths if path.exists()]
+    cleanup_ok = cleanup_record(selection)
+    remaining = [path for path in record_paths if path.exists()]
     logger.warning(
-        "CLEANUP: issue=%d path=%s existed_before=%s exists_after=%s",
+        "CLEANUP: issue=%d path=%s choice=%s superseded=%s "
+        "existed_before=%s exists_after=%s",
         issue_number,
-        record_path,
-        existed_before,
-        exists_after,
+        selection.path,
+        selection.choice.value,
+        selection.superseded_path,
+        bool(existed_before),
+        [str(path) for path in remaining],
     )
-    if existed_before and exists_after and not cleanup_ok:
+    if existed_before and remaining and not cleanup_ok:
         comment = build_cleanup_failure_comment(
             issue_number=issue_number,
             worktree=worktree,
-            record_path=record_path,
+            record_path=remaining[0],
         )
         post_issue_comment(issue_number, comment, context="cleanup warning")
 

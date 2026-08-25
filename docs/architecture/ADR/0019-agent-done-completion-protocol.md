@@ -132,10 +132,13 @@ crash inside `agent-done` itself, which leaves an **error placeholder** at
 the canonical path (it carries `agent_done_error` and by construction no
 `summary`) and sends the successful retry to a `-2`, `-3`, ... sibling.
 
-`select_completion_record` in `control/completion_record_validation.py` is
-the single owner of which of those files is authoritative — both the
-observer and the session controller ask it, so neither can act on a record
-the other cannot see:
+Two questions, two owners, one chain. `completion_record_path` in
+`domain/models.py` owns **where** a run's completion lives — the single join
+of a worktree and the stored relative hint, so no caller re-derives it.
+`select_completion_record` in `control/completion_record_validation.py`
+starts from that answer and owns **which** file is authoritative. The
+observer, the session controller, the run-scoped audit copy, and cleanup all
+ask, so none of them can act on — or report — a record another cannot see:
 
 - canonical missing or **valid** → canonical, always. Siblings are ignored;
   authority is never re-assigned between two valid completions.
@@ -150,7 +153,18 @@ the other cannot see:
 
 Every candidate is read through `load_completion_record_result`, so the
 file-size gate and field bounds apply to siblings exactly as they do to the
-canonical record. Nothing here moves, renames, or deletes either file.
+canonical record. Selection itself moves, renames, and deletes nothing.
+
+Processing resolves the selection **once**, then hands that same object to
+the run-scoped audit copy and to cleanup. Cleanup clears every path the
+selection says the run occupies — the record that was acted on and any
+placeholder it superseded — and names the acted-on one in its log. Both
+halves matter: leaving the acted-on record behind would report a completion
+as cleaned while it survived on disk, and leaving the placeholder behind
+would block `restore_completion_record` on the publish-retry path, which
+no-ops when something already occupies the canonical path. Siblings the
+owner refused to choose between are left alone; unresolved evidence is not
+cleanup's to delete.
 
 ## Consequences
 

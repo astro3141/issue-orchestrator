@@ -7243,6 +7243,85 @@ class TestRunScopedArtifacts:
         assert not completion_path.exists()
         assert manifest["completion_record_path"] == str(preserved_path)
 
+    def test_process_preserves_and_clears_the_retry_that_superseded_a_placeholder(
+        self,
+        tmp_path,
+        mock_label_adapter,
+        mock_pr_adapter,
+        mock_git_adapter,
+        event_bus,
+    ) -> None:
+        """The audit copy and cleanup must mean the SAME file (#264 F1).
+
+        A crashed ``coding-done`` leaves a placeholder on the canonical
+        path and the retry lands on a numbered sibling. Preserving the
+        retry while cleanup removed only the placeholder would leave the
+        record the orchestrator acted on sitting on disk, unreported.
+        """
+        worktree = tmp_path / "worktree"
+        worktree.mkdir()
+        session_output = FileSystemSessionOutput()
+        run = session_output.start_run(
+            worktree,
+            "coding-1",
+            issue_number=123,
+            agent_label="agent:web",
+            completion_path=".issue-orchestrator/sessions/20260201-000000Z__coding-1/completion-agent_web.json",
+        )
+        completion_rel = (
+            f".issue-orchestrator/sessions/{run.run_dir.name}/completion-agent_web.json"
+        )
+        canonical = worktree / completion_rel
+        record = make_record(
+            outcome=CompletionOutcome.COMPLETED,
+            requested_actions=[],
+            implementation="Implemented the issue on the retry",
+            problems="None",
+        )
+        canonical.write_text(
+            json.dumps(
+                {
+                    "outcome": "completed",
+                    "agent_done_error": "follow_up evidence validation exploded",
+                    "session_id": record.session_id,
+                    "timestamp": datetime.now().isoformat(),
+                }
+            )
+        )
+        retry = canonical.parent / "completion-agent_web-2.json"
+        retry.write_text(json.dumps(record.to_dict()))
+
+        processor = CompletionProcessor(
+            agent_callback_endpoint=ready_callback_endpoint(),
+            label_adapter=mock_label_adapter,
+            pr_adapter=mock_pr_adapter,
+            git_adapter=mock_git_adapter,
+            session_output=session_output,
+            event_bus=event_bus,
+            label_config={},
+        )
+
+        result = processor.process(
+            worktree,
+            run_assets=run,
+            issue_number=123,
+            issue_title="Test Issue",
+            completion_path=completion_rel,
+            agent_label="agent:web",
+            issue_key=None,
+        )
+
+        preserved_path = run.run_dir / "completion-record.json"
+        assert result.success is True
+        assert result.completion_record_path == str(preserved_path)
+        preserved = json.loads(preserved_path.read_text())
+        assert preserved["implementation"] == "Implemented the issue on the retry"
+        assert "agent_done_error" not in preserved
+        # Both files this run's completion occupied are gone: the record
+        # that was acted on, and the placeholder it superseded.
+        assert not retry.exists()
+        assert not canonical.exists()
+
     def test_review_exchange_summary_is_stored_in_review_run_dir(
         self,
         tmp_path,

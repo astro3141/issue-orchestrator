@@ -49,6 +49,7 @@ from issue_orchestrator.domain.models import (
     CompletionRecord,
     CompletionOutcome,
     RequestedAction,
+    completion_record_path,
 )
 from issue_orchestrator.domain.issue_key import IssueKey
 from issue_orchestrator.domain.session_run import SessionRunAssets
@@ -168,7 +169,7 @@ class MockCompletionProcessor:
     ) -> CompletionRecordLoadResult:
         if self.completion_load_result is not None:
             return self.completion_load_result
-        path = worktree_path / (completion_path or ".issue-orchestrator/completion.json")
+        path = completion_record_path(worktree_path, completion_path)
         if self.completion_record is None:
             return CompletionRecordLoadResult(
                 path=path,
@@ -189,9 +190,7 @@ class MockCompletionProcessor:
         load_result = self.read_completion_record_result(
             worktree_path, completion_path
         )
-        canonical_path = worktree_path / (
-            completion_path or ".issue-orchestrator/completion.json"
-        )
+        canonical_path = completion_record_path(worktree_path, completion_path)
         return CompletionRecordSelection(
             canonical_path=canonical_path,
             path=load_result.path,
@@ -613,7 +612,9 @@ class TestSessionControllerTerminated:
         )
 
         processor = MockCompletionProcessor()
-        processor.completion_selection = select_completion_record(canonical)
+        processor.completion_selection = select_completion_record(
+            worktree, completion_rel
+        )
         event_sink = RecordingEventSink()
         controller = SessionController(
             completion_processor=processor,

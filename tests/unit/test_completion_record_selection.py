@@ -16,10 +16,13 @@ from issue_orchestrator.control.completion_record_validation import (
     _MAX_COMPLETION_FILE_BYTES,
     CompletionPathChoice,
     CompletionRecordLoadFailure,
+    CompletionRecordSelection,
     CompletionRecordValidator,
     select_completion_record,
 )
 from issue_orchestrator.control.completion_result_artifacts import (
+    cleanup_completion_record,
+    clear_completion_records,
     preserve_completion_record,
 )
 from issue_orchestrator.execution.session_output_adapter import FileSystemSessionOutput
@@ -27,6 +30,7 @@ from issue_orchestrator.execution.session_output_adapter import FileSystemSessio
 from tests.unit.session_run_helpers import make_session_run_assets
 
 CANONICAL_NAME = "completion-agent_backend.json"
+COMPLETION_REL = f".issue-orchestrator/sessions/run-1/{CANONICAL_NAME}"
 SESSION_ID = "issue-264-run-1"
 
 
@@ -51,6 +55,14 @@ def run_dir(tmp_path: Path) -> Path:
     directory = tmp_path / "worktree" / ".issue-orchestrator" / "sessions" / "run-1"
     directory.mkdir(parents=True)
     return directory
+
+
+def _select(run_dir: Path) -> CompletionRecordSelection:
+    """Ask the owner the way production does: a worktree and a relative hint.
+
+    Nothing hands it a resolved file, so the join has one owner too.
+    """
+    return select_completion_record(run_dir.parents[2], COMPLETION_REL)
 
 
 def _write_record(
@@ -96,7 +108,7 @@ def _write_placeholder(
 
 
 def test_missing_canonical_reports_nothing_to_parse(run_dir: Path) -> None:
-    selection = select_completion_record(run_dir / CANONICAL_NAME)
+    selection = _select(run_dir)
 
     assert selection.choice is CompletionPathChoice.CANONICAL
     assert selection.path == run_dir / CANONICAL_NAME
@@ -110,7 +122,7 @@ def test_valid_canonical_wins_and_siblings_are_ignored(run_dir: Path) -> None:
     canonical = _write_record(run_dir / CANONICAL_NAME, summary="first")
     _write_record(run_dir / "completion-agent_backend-2.json", summary="second")
 
-    selection = select_completion_record(canonical)
+    selection = _select(run_dir)
 
     assert selection.choice is CompletionPathChoice.CANONICAL
     assert selection.path == canonical
@@ -126,7 +138,7 @@ def test_placeholder_hands_over_to_the_one_matching_retry(run_dir: Path) -> None
         run_dir / "completion-agent_backend-2.json", summary="retried cleanly"
     )
 
-    selection = select_completion_record(canonical)
+    selection = _select(run_dir)
 
     assert selection.choice is CompletionPathChoice.PRODUCER_ERROR_RETRY
     assert selection.path == retry
@@ -145,7 +157,7 @@ def test_placeholder_evidence_reaches_the_log_at_info(
     _write_record(run_dir / "completion-agent_backend-2.json")
 
     with caplog.at_level("INFO"):
-        select_completion_record(canonical)
+        _select(run_dir)
 
     assert any(
         "boom in evidence" in record.getMessage()
@@ -160,7 +172,7 @@ def test_retry_for_a_different_session_is_not_selected(run_dir: Path) -> None:
         run_dir / "completion-agent_backend-2.json", session_id="issue-999-run-7"
     )
 
-    selection = select_completion_record(canonical)
+    selection = _select(run_dir)
 
     assert selection.choice is CompletionPathChoice.CANONICAL
     assert selection.path == canonical
@@ -173,7 +185,7 @@ def test_placeholder_without_any_retry_stays_on_the_canonical_path(
 ) -> None:
     canonical = _write_placeholder(run_dir / CANONICAL_NAME)
 
-    selection = select_completion_record(canonical)
+    selection = _select(run_dir)
 
     assert selection.choice is CompletionPathChoice.CANONICAL
     assert selection.path == canonical
@@ -191,7 +203,7 @@ def test_two_valid_retries_are_ambiguity_and_fail_closed(
     third = _write_record(run_dir / "completion-agent_backend-3.json", summary="b")
 
     with caplog.at_level("ERROR"):
-        selection = select_completion_record(canonical)
+        selection = _select(run_dir)
 
     assert selection.choice is CompletionPathChoice.AMBIGUOUS_PRODUCER_ERROR_RETRY
     assert selection.path == canonical
@@ -212,7 +224,7 @@ def test_oversized_retry_is_rejected_by_the_shared_gate(run_dir: Path) -> None:
     oversized = run_dir / "completion-agent_backend-2.json"
     oversized.write_text("x" * (_MAX_COMPLETION_FILE_BYTES + 1), encoding="utf-8")
 
-    selection = select_completion_record(canonical)
+    selection = _select(run_dir)
 
     assert selection.choice is CompletionPathChoice.CANONICAL
     assert selection.path == canonical
@@ -225,7 +237,7 @@ def test_unparseable_retry_is_rejected(run_dir: Path) -> None:
         "{ not valid json", encoding="utf-8"
     )
 
-    selection = select_completion_record(canonical)
+    selection = _select(run_dir)
 
     assert selection.choice is CompletionPathChoice.CANONICAL
     assert selection.record is None
@@ -241,7 +253,7 @@ def test_an_unreadable_record_is_a_load_failure_not_a_crash(run_dir: Path) -> No
     canonical = run_dir / CANONICAL_NAME
     canonical.mkdir()
 
-    selection = select_completion_record(canonical)
+    selection = _select(run_dir)
 
     assert selection.record is None
     assert selection.load_result.failure is CompletionRecordLoadFailure.UNREADABLE
@@ -253,7 +265,7 @@ def test_only_the_producers_own_suffix_names_are_candidates(run_dir: Path) -> No
     _write_record(run_dir / "completion-agent_reviewer.json")
     _write_record(run_dir / "completion-agent_backend-2.txt")
 
-    selection = select_completion_record(canonical)
+    selection = _select(run_dir)
 
     assert selection.choice is CompletionPathChoice.CANONICAL
     assert selection.record is None
@@ -265,7 +277,7 @@ def test_rejected_canonical_without_producer_error_is_unchanged(run_dir: Path) -
     canonical.write_text(json.dumps({"outcome": "completed"}), encoding="utf-8")
     _write_record(run_dir / "completion-agent_backend-2.json")
 
-    selection = select_completion_record(canonical)
+    selection = _select(run_dir)
 
     assert selection.choice is CompletionPathChoice.CANONICAL
     assert selection.path == canonical
@@ -283,7 +295,7 @@ def test_placeholder_missing_its_session_id_is_not_a_placeholder(
     )
     _write_record(run_dir / "completion-agent_backend-2.json")
 
-    selection = select_completion_record(canonical)
+    selection = _select(run_dir)
 
     assert selection.choice is CompletionPathChoice.CANONICAL
     assert selection.record is None
@@ -293,7 +305,7 @@ def test_placeholder_missing_its_session_id_is_not_a_placeholder(
 def test_producer_error_text_is_bounded_before_it_travels(run_dir: Path) -> None:
     canonical = _write_placeholder(run_dir / CANONICAL_NAME, error="E" * 50_000)
 
-    selection = select_completion_record(canonical)
+    selection = _select(run_dir)
 
     assert selection.producer_error is not None
     assert len(selection.producer_error) < 5_000
@@ -304,7 +316,7 @@ def test_lookup_fields_explain_the_choice(run_dir: Path) -> None:
     canonical = _write_placeholder(run_dir / CANONICAL_NAME)
     retry = _write_record(run_dir / "completion-agent_backend-2.json")
 
-    fields = select_completion_record(canonical).lookup_fields()
+    fields = _select(run_dir).lookup_fields()
 
     assert fields["completion_selected_path"] == str(retry.resolve())
     assert fields["completion_path_choice"] == "producer_error_retry"
@@ -312,6 +324,138 @@ def test_lookup_fields_explain_the_choice(run_dir: Path) -> None:
         "follow_up evidence validation exploded"
     )
     assert fields["completion_unresolved_candidates"] == []
+
+
+class TestOccupiedPaths:
+    """What cleanup must clear: the acted-on record, and only what it replaced."""
+
+    def test_canonical_only_when_nothing_was_superseded(self, run_dir: Path) -> None:
+        canonical = _write_record(run_dir / CANONICAL_NAME)
+        _write_record(run_dir / "completion-agent_backend-2.json", summary="second")
+
+        selection = _select(run_dir)
+
+        assert selection.superseded_path is None
+        # The sibling is a legitimate second review, not this run's leftover.
+        assert selection.occupied_paths() == (canonical,)
+
+    def test_retry_and_the_placeholder_it_took_over_from(self, run_dir: Path) -> None:
+        canonical = _write_placeholder(run_dir / CANONICAL_NAME)
+        retry = _write_record(run_dir / "completion-agent_backend-2.json")
+
+        selection = _select(run_dir)
+
+        assert selection.superseded_path == canonical
+        assert selection.occupied_paths() == (retry, canonical)
+
+    def test_unresolved_candidates_are_evidence_not_cleanup(
+        self, run_dir: Path
+    ) -> None:
+        canonical = _write_placeholder(run_dir / CANONICAL_NAME)
+        _write_record(run_dir / "completion-agent_backend-2.json", summary="a")
+        _write_record(run_dir / "completion-agent_backend-3.json", summary="b")
+
+        selection = _select(run_dir)
+
+        assert selection.choice is CompletionPathChoice.AMBIGUOUS_PRODUCER_ERROR_RETRY
+        assert selection.occupied_paths() == (canonical,)
+
+    def test_missing_canonical_has_nothing_beyond_itself(self, run_dir: Path) -> None:
+        selection = _select(run_dir)
+
+        assert selection.occupied_paths() == (run_dir / CANONICAL_NAME,)
+
+
+class TestCleanupClearsWhatWasActedOn:
+    """The other half of the preserve/cleanup pair (#264 review round 1, F1)."""
+
+    def _cleanup(
+        self, run_dir: Path, caplog: pytest.LogCaptureFixture
+    ) -> CompletionRecordSelection:
+        selection = _select(run_dir)
+
+        def refuse_comment(issue_number: int, comment: str, *, context: str) -> None:
+            raise AssertionError("a clean removal must not comment on the issue")
+
+        with caplog.at_level("WARNING"):
+            cleanup_completion_record(
+                worktree=run_dir.parents[2],
+                selection=selection,
+                issue_number=264,
+                cleanup_record=clear_completion_records,
+                post_issue_comment=refuse_comment,
+            )
+        assert not any(path.exists() for path in selection.occupied_paths())
+        return selection
+
+    def test_the_retry_is_removed_not_only_the_placeholder(
+        self, run_dir: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        canonical = _write_placeholder(run_dir / CANONICAL_NAME)
+        retry = _write_record(run_dir / "completion-agent_backend-2.json")
+
+        self._cleanup(run_dir, caplog)
+
+        assert not retry.exists()
+        assert not canonical.exists()
+
+    def test_the_log_names_the_record_the_decision_read(
+        self, run_dir: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        canonical = _write_placeholder(run_dir / CANONICAL_NAME)
+        retry = _write_record(run_dir / "completion-agent_backend-2.json")
+
+        self._cleanup(run_dir, caplog)
+
+        cleanup_lines = [
+            record.getMessage()
+            for record in caplog.records
+            if record.getMessage().startswith("CLEANUP:")
+        ]
+        assert len(cleanup_lines) == 1
+        assert str(retry) in cleanup_lines[0]
+        assert f"superseded={canonical}" in cleanup_lines[0]
+        assert "exists_after=[]" in cleanup_lines[0]
+
+    def test_a_second_review_sibling_survives_cleanup(
+        self, run_dir: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        canonical = _write_record(run_dir / CANONICAL_NAME, summary="first")
+        sibling = _write_record(
+            run_dir / "completion-agent_backend-2.json", summary="second"
+        )
+
+        self._cleanup(run_dir, caplog)
+
+        assert not canonical.exists()
+        assert sibling.exists()
+
+    def test_a_refused_removal_is_reported_against_what_remains(
+        self, run_dir: Path
+    ) -> None:
+        _write_placeholder(run_dir / CANONICAL_NAME)
+        retry = _write_record(run_dir / "completion-agent_backend-2.json")
+        comments: list[str] = []
+
+        def record_comment(issue_number: int, comment: str, *, context: str) -> None:
+            comments.append(comment)
+
+        cleanup_completion_record(
+            worktree=run_dir.parents[2],
+            selection=_select(run_dir),
+            issue_number=264,
+            cleanup_record=lambda _selection: False,
+            post_issue_comment=record_comment,
+        )
+
+        assert len(comments) == 1
+        diagnostics = list(
+            (run_dir.parents[2] / ".issue-orchestrator" / "diagnostics").glob("*.json")
+        )
+        assert len(diagnostics) == 1
+        details = json.loads(diagnostics[0].read_text(encoding="utf-8"))
+        # The record that survived is the one an operator has to go delete.
+        assert details["details"]["record_path"] == str(retry)
 
 
 def test_preserved_audit_copy_is_the_record_that_was_acted_on(
@@ -331,8 +475,7 @@ def test_preserved_audit_copy_is_the_record_that_was_acted_on(
 
     preserved = preserve_completion_record(
         session_output=FileSystemSessionOutput(),
-        worktree=worktree,
-        completion_path=completion_rel,
+        selection=select_completion_record(worktree, completion_rel),
         run_assets=run_assets,
     )
 
@@ -356,8 +499,7 @@ def test_preserved_audit_copy_is_canonical_when_nothing_supersedes_it(
 
     preserved = preserve_completion_record(
         session_output=FileSystemSessionOutput(),
-        worktree=worktree,
-        completion_path=completion_rel,
+        selection=select_completion_record(worktree, completion_rel),
         run_assets=run_assets,
     )
 

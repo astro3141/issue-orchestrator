@@ -24,6 +24,7 @@ if TYPE_CHECKING:
 
 from ..control.completion_record_validation import select_completion_record
 from ..domain import ProcessState
+from ..domain.models import completion_record_path
 from ..domain.process_state import ProcessExitInfo
 from ..infra.config import Config
 from ..infra.logging_config import issue_log
@@ -234,7 +235,7 @@ class SessionObserver:
             SessionObservationResult for a valid completion, None otherwise.
         """
         selection = select_completion_record(
-            session.worktree_path / session.completion_path
+            session.worktree_path, session.completion_path
         )
         record = selection.record
         if record is None:
@@ -359,7 +360,9 @@ class SessionObserver:
 
     def _capture_terminal_output_on_termination(self, session: Session) -> None:
         """Capture terminal output when session terminates without completion."""
-        completion_path = session.worktree_path / session.completion_path
+        completion_path = completion_record_path(
+            session.worktree_path, session.completion_path
+        )
         if completion_path.exists() or not self._session_runner:
             return
 
@@ -398,7 +401,17 @@ class SessionObserver:
         if result.observation == SessionObservation.RUNNING:
             return
 
-        completion_path = session.worktree_path / session.completion_path
+        # ``completion_json_exists`` reports the canonical path only, and that
+        # stays consistent with the ``completion_selected_path`` the detection
+        # events carry: this event is only ever emitted on a result the
+        # completion check did NOT produce, and the selection can name a file
+        # other than the canonical one only when it found a valid record there
+        # — in which case ``observe_session`` has already returned (#264
+        # review round 1, N3). Routed through the same path owner so the two
+        # cannot drift apart on WHERE, either.
+        completion_path = completion_record_path(
+            session.worktree_path, session.completion_path
+        )
         event_data = {
             "issue_number": session.issue.number,
             "session_name": session.terminal_id,

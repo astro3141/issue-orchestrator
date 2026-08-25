@@ -8,9 +8,14 @@ from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol
 
-from ..domain.models import COMPLETION_RECORD_PATH, CompletionRecord, RequestedAction, sanitize_agent_label
+from ..domain.models import (
+    CompletionRecord,
+    RequestedAction,
+    completion_record_path,
+    sanitize_agent_label,
+)
 from ..infra.runtime_artifacts import filter_runtime_managed_dirty_paths
-from ..infra.validation_state import _truncate_with_tail
+from ..infra.validation_state import truncate_with_tail
 
 if TYPE_CHECKING:
     from ..infra.config import Config
@@ -213,7 +218,13 @@ def load_completion_record_result(record_path: Path) -> CompletionRecordLoadResu
             data = json.load(f)
         raw = data
         record = CompletionRecord.from_dict(data)
-        logger.info(
+        # DEBUG, not INFO: the observer polls this every tick for every
+        # live session, and a session parked in a deferred state (a
+        # background review exchange) polls for a long time. The one
+        # place a successful read is worth an INFO line is the decision
+        # that acts on it, and the controller's completion lookup
+        # already logs exactly that — with the chosen path and why.
+        logger.debug(
             "Read completion record: outcome=%s session=%s path=%s",
             record.outcome.value,
             record.session_id,
@@ -280,7 +291,7 @@ def _producer_error_placeholder(raw: object) -> ProducerErrorPlaceholder | None:
         return None
     return ProducerErrorPlaceholder(
         session_id=written_for,
-        error=_truncate_with_tail(
+        error=truncate_with_tail(
             error,
             _PRODUCER_ERROR_MAX_CHARS,
             _PRODUCER_ERROR_TAIL_CHARS,
@@ -311,6 +322,31 @@ class CompletionRecordSelection:
     def record(self) -> CompletionRecord | None:
         return self.load_result.record
 
+    @property
+    def superseded_path(self) -> Path | None:
+        """The placeholder the selected retry took over from, if any."""
+        if self.path == self.canonical_path:
+            return None
+        return self.canonical_path
+
+    def occupied_paths(self) -> tuple[Path, ...]:
+        """Every file this run's completion occupies, authoritative first.
+
+        What cleanup has to remove. Removing only the canonical path would
+        leave the record the orchestrator ACTED on sitting beside it while
+        reporting the completion as cleaned — the same file-the-decision-did-
+        not-read split that made #264 invisible, on the other half of the
+        preserve/cleanup pair.
+
+        Deliberately excludes ``unresolved_candidates``: those exist only
+        where this owner refused to choose, and unresolved evidence is not
+        this function's to delete.
+        """
+        superseded = self.superseded_path
+        if superseded is None:
+            return (self.path,)
+        return (self.path, superseded)
+
     def lookup_fields(self) -> dict[str, object]:
         """Explain the choice to a log line or a trace event payload.
 
@@ -328,14 +364,21 @@ class CompletionRecordSelection:
         }
 
 
-def select_completion_record(canonical_path: Path) -> CompletionRecordSelection:
+def select_completion_record(
+    worktree: Path, completion_path: str | None
+) -> CompletionRecordSelection:
     """Choose WHICH completion record file speaks for a run.
 
-    The ONE owner of that question. The observer that watches sessions
-    and the controller that decides their outcome both route here, so a
-    record one of them acts on can never be a record the other cannot
-    see — the split that left a valid completion invisible on disk while
-    its session ran to timeout (#264).
+    The ONE owner of that question. The observer that watches sessions,
+    the controller that decides their outcome, the audit copy, and
+    cleanup all route here, so a record one of them acts on can never be
+    a record another cannot see — the split that left a valid completion
+    invisible on disk while its session ran to timeout (#264).
+
+    Takes ``(worktree, completion_path)`` rather than a resolved file so
+    that callers cannot re-derive the join themselves and drift; it asks
+    ``completion_record_path`` for the canonical location and returns
+    both that and its verdict.
 
     The rule is deliberately narrow:
 
@@ -361,6 +404,7 @@ def select_completion_record(canonical_path: Path) -> CompletionRecordSelection:
     ``load_completion_record_result``, so the size gate and field bounds
     apply to siblings exactly as they apply to the canonical record.
     """
+    canonical_path = completion_record_path(worktree, completion_path)
     if not canonical_path.exists():
         # Polled every tick for every live session, so the nothing-there
         # case must not pay for the loader's per-read logging.
@@ -531,13 +575,12 @@ class CompletionRecordValidator:
     ) -> CompletionRecordSelection:
         """Resolve a worktree-relative hint to the run's authoritative record.
 
-        The single place that turns ``(worktree, completion_path)`` into
-        a file, so every consumer of the record — the controller's
-        lookup, the processor's re-read on the publish path — acts on
-        the same one (#264).
+        The instance-level door onto the module owner, for the consumers
+        that hold a validator — the controller's lookup, the processor's
+        re-read on the publish path — so every one of them acts on the
+        same file (#264).
         """
-        canonical_path = worktree / (completion_path or COMPLETION_RECORD_PATH)
-        return select_completion_record(canonical_path)
+        return select_completion_record(worktree, completion_path)
 
     def resolve_agent_label_from_completion_path(
         self, completion_path: str | None

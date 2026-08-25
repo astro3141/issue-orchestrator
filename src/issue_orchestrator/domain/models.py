@@ -111,6 +111,24 @@ def get_completion_path(
     return f"{COMPLETION_DIR}/completion-{safe_name}.json"
 
 
+def completion_record_path(worktree: Path, completion_path: str | None = None) -> Path:
+    """Resolve a worktree plus a stored relative hint to the record's file.
+
+    The ONE owner of that join. ``get_completion_path`` above decides what a
+    run's completion record is called; this decides where that name lives on
+    disk. Both halves belong to one owner because the alternative is what
+    #264 was: every reader, the audit copy, and cleanup each re-deriving
+    ``worktree / (completion_path or COMPLETION_RECORD_PATH)``, free to drift
+    apart and mean different files on the same path.
+
+    Note this answers *where a run's completion is written*, not *which file
+    speaks for the run* — a crashed producer can leave a placeholder here and
+    its retry beside it. ``select_completion_record`` owns that second
+    question and starts from this answer.
+    """
+    return worktree / (completion_path or COMPLETION_RECORD_PATH)
+
+
 def sanitize_agent_label(agent_name: str) -> str:
     return agent_name.replace(":", "_").replace("/", "_").replace(" ", "_")
 

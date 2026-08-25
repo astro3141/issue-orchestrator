@@ -440,11 +440,17 @@ Timestamp: {_now_iso()}
     return errors_file
 
 
-def _truncate_with_tail(text: str, max_length: int = 4000, tail_length: int = 2000) -> str:
+def truncate_with_tail(text: str, max_length: int = 4000, tail_length: int = 2000) -> str:
     """Truncate text keeping both head and tail.
 
     For test output, the summary (pass/fail counts, failure details) is at the end.
     This function keeps the last `tail_length` chars which contain the important info.
+
+    Shared, and public for that reason: the same "bound untrusted text before it
+    travels into a log, a comment, or an event payload" need shows up wherever
+    agent output crosses a boundary, and every caller wants the tail for the
+    same reason. Callers outside this module import it by this name rather than
+    reaching for a module-private one.
 
     Args:
         text: The text to truncate
@@ -516,14 +522,14 @@ def write_retry_prompt(
 
     # Render template with variables
     # Note: retry_count is 0-based internally, display as 1-based
-    # Use _truncate_with_tail to preserve the end (pytest summary is at the end)
+    # Use truncate_with_tail to preserve the end (pytest summary is at the end)
     display_count = retry_count + 1
     display_max = max_retries + 1
     content = template.format(
         original_task=original_prompt,
         validation_cmd=validation_cmd,
         error_file=str(errors_file),
-        error_summary=_truncate_with_tail(validation_error),
+        error_summary=truncate_with_tail(validation_error),
         retry_count=display_count,
         max_retries=display_max,
         retries_remaining=display_max - display_count,

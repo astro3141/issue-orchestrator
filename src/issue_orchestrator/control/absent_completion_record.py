@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any
 
 from ..infra.logging_config import issue_log
-from ..infra.validation_state import _truncate_with_tail
+from ..infra.validation_state import truncate_with_tail
 from ..observation.observation import SessionObservationResult
 from ..ports.session_output import SessionOutput
 
@@ -119,7 +119,7 @@ def collect_completion_debug_context(
     marker_preview: str | None = None
     if marker_exists:
         try:
-            marker_preview = _truncate_with_tail(
+            marker_preview = truncate_with_tail(
                 marker_path.read_text(encoding="utf-8"), 200
             )
         except OSError:

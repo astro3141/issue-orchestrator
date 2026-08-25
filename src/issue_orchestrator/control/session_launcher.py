@@ -54,7 +54,7 @@ from ..domain.coder_prompt import (
 from ..domain.session_run import SessionRunAssets
 from .worktree_context import WorktreeContext
 from .worktree_provisioning import build_launch_provisioner, provision_launch_worktree, provisioning_failure_facts
-from ..infra.validation_state import DEFAULT_RETRY_TEMPLATE, _truncate_with_tail
+from ..infra.validation_state import DEFAULT_RETRY_TEMPLATE, truncate_with_tail
 from ..domain.tech_lead_session import TechLeadLaunchScope
 from .session_identity_metadata import session_identity_launch_metadata
 from .tech_lead_session_policy import (
@@ -1508,7 +1508,7 @@ class SessionLauncher:
             original_task=original_task,
             validation_cmd=validation_cmd,
             error_file=retry.validation_error_file or "unknown",
-            error_summary=_truncate_with_tail(retry.validation_error or "Unknown validation error"),
+            error_summary=truncate_with_tail(retry.validation_error or "Unknown validation error"),
             retry_count=display_count,
             max_retries=display_max,
             retries_remaining=max(0, display_max - display_count),

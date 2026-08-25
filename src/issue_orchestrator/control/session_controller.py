@@ -62,7 +62,7 @@ from ..infra.validation_profiles import (
 )
 from ..infra.validation_state import (
     DEFAULT_RETRY_TEMPLATE,
-    _truncate_with_tail,
+    truncate_with_tail,
 )
 from ..observation.observation import SessionObservation, SessionObservationResult
 from ..ports import EventSink, make_trace_event
@@ -1801,7 +1801,7 @@ class SessionController:
             error_file=str(validation_error_file)
             if validation_error_file
             else "unknown",
-            error_summary=_truncate_with_tail(validation_error),
+            error_summary=truncate_with_tail(validation_error),
             retry_count=display_count,
             max_retries=display_max,
             retries_remaining=display_max - display_count,
@@ -1860,7 +1860,7 @@ Runtime note: orchestrator-managed metadata under `.issue-orchestrator/` and `.c
 ## Worktree Blocker
 
 ```
-{_truncate_with_tail(validation_error)}
+{truncate_with_tail(validation_error)}
 ```
 """
 
