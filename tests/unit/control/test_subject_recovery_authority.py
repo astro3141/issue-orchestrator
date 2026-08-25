@@ -14,6 +14,10 @@ from issue_orchestrator.control.subject_recovery_authority import (
     SUBJECT_RECOVERY_UNBOUNDED,
     SubjectRecoveryAuthority,
 )
+from issue_orchestrator.domain.models import (
+    SUBJECT_RECOVERY_ACTIONS,
+    RequestedAction,
+)
 from issue_orchestrator.domain.tech_lead_capabilities import (
     TECH_LEAD_ACTION_CAPABILITIES,
 )
@@ -116,3 +120,75 @@ def test_a_bounded_run_loses_the_label_and_the_note_explains_that() -> None:
     assert outcome.label_actions == ()
     assert "`blocked-failed` label was added" in outcome.note
     assert "marked and parked" not in outcome.note
+
+
+# -- The seventh door: the agent's own completion record (#257) --------------
+
+_BLOCKED_REQUEST_TUPLE = (
+    RequestedAction.PUSH_BRANCH,
+    RequestedAction.ADD_BLOCKED_LABEL,
+    RequestedAction.POST_COMMENT,
+)
+
+
+def test_an_authorized_run_keeps_every_request_it_made() -> None:
+    """The permitted branch leaves the untrusted tuple exactly as it arrived."""
+    outcome = SUBJECT_RECOVERY_UNBOUNDED.completion_request_outcome(
+        _BLOCKED_REQUEST_TUPLE
+    )
+
+    assert outcome.requested_actions == _BLOCKED_REQUEST_TUPLE
+    assert outcome.suppressed == ()
+    assert outcome.detail == ""
+
+
+def test_a_bounded_run_loses_the_request_and_is_handed_what_it_lost() -> None:
+    """Survivors and refusals travel together, so a drop cannot go untraced.
+
+    Handing back only the survivors is what let the completion-record seam
+    suppress an escalation and record nothing about it (#257 round 1 F1/A1):
+    the caller had no value it was obliged to place anywhere.
+    """
+    outcome = SubjectRecoveryAuthority(
+        may_leave_recovery_label=False
+    ).completion_request_outcome(_BLOCKED_REQUEST_TUPLE)
+
+    assert outcome.requested_actions == (
+        RequestedAction.PUSH_BRANCH,
+        RequestedAction.POST_COMMENT,
+    )
+    assert outcome.suppressed == (RequestedAction.ADD_BLOCKED_LABEL,)
+    assert "add_blocked_label" in outcome.detail
+    assert "holds no recovery authority" in outcome.detail
+
+
+@pytest.mark.parametrize("action", sorted(SUBJECT_RECOVERY_ACTIONS, key=str))
+def test_every_recovery_request_in_the_vocabulary_is_refused(
+    action: RequestedAction,
+) -> None:
+    """Derived from the domain's set, so a recovery action joins in one edit.
+
+    ``add_needs_human_label`` retires the subject exactly as ``add_blocked``
+    does; the rule is "may this run change its subject's RECOVERY state", not
+    "may it add one particular label".
+    """
+    outcome = SubjectRecoveryAuthority(
+        may_leave_recovery_label=False
+    ).completion_request_outcome((action,))
+
+    assert outcome.requested_actions == ()
+    assert outcome.suppressed == (action,)
+
+
+def test_a_request_outside_the_vocabulary_is_never_touched() -> None:
+    """The door refuses recovery intent, not everything a bounded run asks."""
+    ordinary = tuple(
+        action for action in RequestedAction if action not in SUBJECT_RECOVERY_ACTIONS
+    )
+
+    outcome = SubjectRecoveryAuthority(
+        may_leave_recovery_label=False
+    ).completion_request_outcome(ordinary)
+
+    assert outcome.requested_actions == ordinary
+    assert outcome.suppressed == ()

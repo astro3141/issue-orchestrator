@@ -32,7 +32,14 @@ from issue_orchestrator.control.label_manager import LabelManager
 from tests.conftest import make_provider_availability
 from issue_orchestrator.domain.board_snapshot import BoardFailure, BoardSnapshot
 from issue_orchestrator.domain.issue_key import FakeIssueKey
-from issue_orchestrator.domain.models import AgentConfig, Issue, Session, SessionStatus
+from issue_orchestrator.domain.models import (
+    SUBJECT_RECOVERY_ACTIONS,
+    AgentConfig,
+    Issue,
+    RequestedAction,
+    Session,
+    SessionStatus,
+)
 from issue_orchestrator.domain.session_key import SessionKey, TaskKind
 from issue_orchestrator.domain.tech_lead_manifest import PRToReview, TechLeadManifest
 from issue_orchestrator.domain.tech_lead_session import (
@@ -1209,6 +1216,175 @@ def test_a_provider_blocked_planning_run_records_the_outage(tmp_path: Path) -> N
     )
 
     assert labels.blocked not in added_labels(actions)
+    assert labels.in_progress in removed_labels(actions)
+
+
+# -- Door 7's planned twin: a suppressed escalation still reaches a human -----
+
+_PLANNING_QUESTION = "which milestone should this target?"
+
+# The completion outcome that carries each recovery REQUEST, and what that
+# outcome needs to be planned. The completion-record seam refuses these
+# requests for a bounded role (#257), so each one MUST have a planned path that
+# tells the operator what happened — otherwise the escalation vanishes.
+_RECOVERY_REQUEST_PLANNED_TWIN: dict[RequestedAction, tuple[SessionStatus, dict]] = {
+    RequestedAction.ADD_BLOCKED_LABEL: (
+        SessionStatus.BLOCKED,
+        {"blocked_reason": "tech-lead-data directory missing"},
+    ),
+    RequestedAction.ADD_NEEDS_HUMAN_LABEL: (
+        SessionStatus.NEEDS_HUMAN,
+        {"completion_detail": {"question": _PLANNING_QUESTION}},
+    ),
+}
+
+
+def test_every_refused_recovery_request_is_covered_by_a_planned_twin() -> None:
+    """Derived from the domain's vocabulary, so the pairing cannot drift.
+
+    A recovery action added to ``SUBJECT_RECOVERY_ACTIONS`` is refused at the
+    completion-record seam the moment it joins the set. This assertion is what
+    stops it from being refused SILENTLY: the edit that adds it must also name
+    the outcome whose planned path speaks for it, or this fails.
+    """
+    assert set(_RECOVERY_REQUEST_PLANNED_TWIN) == set(SUBJECT_RECOVERY_ACTIONS)
+
+
+@pytest.mark.parametrize(
+    "requested_action", sorted(_RECOVERY_REQUEST_PLANNED_TWIN, key=str)
+)
+def test_a_suppressed_recovery_request_still_reaches_a_human(
+    requested_action: RequestedAction, tmp_path: Path
+) -> None:
+    """Suppression is not silence: no label, but a comment and a released claim.
+
+    The round-1 defect (#257 F1) was a green suite proving only the absence of
+    a label. A bounded planning run that asked for one gets the same three
+    things whichever request was refused — nothing added to the subject, the
+    one voice explaining why, and the ``in-progress`` claim released so the
+    issue is not held by a marker nothing is holding.
+    """
+    status, extra = _RECOVERY_REQUEST_PLANNED_TWIN[requested_action]
+    config = make_tech_lead_config(tmp_path)
+    session = make_tech_lead_session(tmp_path)
+    arm_planning_session(config, session)
+    labels = LabelManager(config)
+
+    actions = make_planner(config).generate_completion_actions(
+        session, status, **extra
+    )
+
+    assert added_labels(actions) == set()
+    assert labels.in_progress in removed_labels(actions)
+    (comment,) = comments(actions)
+    assert _NO_RECOVERY_AUTHORITY_PHRASE in comment
+
+
+def test_a_needs_human_planning_run_surfaces_the_question_it_asked(
+    tmp_path: Path,
+) -> None:
+    """The escalation's whole content is the question; it must be readable.
+
+    ``shape_requested_actions_for_tech_lead`` drops the agent's own
+    ``post_comment``, so for a tech_lead run this comment is the ONLY place the
+    question is ever written where an operator looks.
+    """
+    config = make_tech_lead_config(tmp_path)
+    session = make_tech_lead_session(tmp_path)
+    arm_planning_session(config, session)
+
+    actions = make_planner(config).generate_completion_actions(
+        session,
+        SessionStatus.NEEDS_HUMAN,
+        completion_detail={"question": _PLANNING_QUESTION},
+    )
+
+    (comment,) = comments(actions)
+    assert "Human Input Requested" in comment
+    assert _PLANNING_QUESTION in comment
+    assert f"`{LabelManager(config).needs_human}` label was added" in comment
+
+
+def test_a_needs_human_run_that_may_escalate_keeps_the_generic_policy(
+    tmp_path: Path,
+) -> None:
+    """Nothing changes for a role whose requested label lands (#257 scope).
+
+    A run that MAY leave the label is already visible on the board through it,
+    and the label is what holds the issue — so the claim stays, and the agent's
+    own comment carries the question. Planning a second comment here, or
+    releasing a claim the label is holding, would be a different decision than
+    the one #257 asked for.
+    """
+    config = make_tech_lead_config(tmp_path)
+    session = make_tech_lead_session(tmp_path)
+    arm_investigation_session(config, session)
+
+    actions = make_planner(config).generate_completion_actions(
+        session,
+        SessionStatus.NEEDS_HUMAN,
+        completion_detail={"question": _PLANNING_QUESTION},
+    )
+
+    assert actions == ()
+
+
+def test_an_ordinary_needs_human_session_keeps_the_generic_policy(
+    tmp_path: Path,
+) -> None:
+    """The unbounded default: a non-tech_lead escalation is untouched."""
+    actions = make_planner(Config()).generate_completion_actions(
+        make_session(tmp_path),
+        SessionStatus.NEEDS_HUMAN,
+        completion_detail={"question": _PLANNING_QUESTION},
+    )
+
+    assert actions == ()
+
+
+def test_a_needs_human_planning_run_outside_an_issue_terminal_plans_nothing(
+    tmp_path: Path,
+) -> None:
+    """A review terminal's escalation does not map onto issue state.
+
+    Same boundary ``agent_blocked_actions`` draws: the parent workflow owns
+    whatever happens to that PR, so this path stays out of it.
+    """
+    config = make_tech_lead_config(tmp_path)
+    session = make_tech_lead_session(tmp_path, terminal_id="review-1")
+    arm_planning_session(config, session)
+
+    actions = make_planner(config).generate_completion_actions(
+        session,
+        SessionStatus.NEEDS_HUMAN,
+        completion_detail={"question": _PLANNING_QUESTION},
+    )
+
+    assert actions == ()
+
+
+def test_a_needs_human_planning_run_without_a_question_still_speaks(
+    tmp_path: Path,
+) -> None:
+    """A record whose question did not survive is still not silence.
+
+    ``question`` is required by ``coding-done needs_human``, but the planner
+    reads it from curated completion detail rather than from the record, so a
+    missing one must degrade to a comment an operator can act on — not to the
+    empty plan this issue is about.
+    """
+    config = make_tech_lead_config(tmp_path)
+    session = make_tech_lead_session(tmp_path)
+    arm_planning_session(config, session)
+    labels = LabelManager(config)
+
+    actions = make_planner(config).generate_completion_actions(
+        session, SessionStatus.NEEDS_HUMAN
+    )
+
+    (comment,) = comments(actions)
+    assert "No question provided." in comment
+    assert _NO_RECOVERY_AUTHORITY_PHRASE in comment
     assert labels.in_progress in removed_labels(actions)
 
 

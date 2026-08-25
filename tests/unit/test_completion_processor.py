@@ -4164,26 +4164,9 @@ class TestBlockedPlanningCompletionLane(_PlanningLaneHarness):
         from issue_orchestrator.control.tech_lead_terminal_effects import (
             resolve_subject_recovery_authority,
         )
-        from issue_orchestrator.domain.issue_key import FakeIssueKey
-        from issue_orchestrator.domain.models import Issue, Session
-        from issue_orchestrator.domain.session_key import SessionKey, TaskKind
 
         config = self.config
-        issue = Issue(
-            number=123,
-            title="Planning Investigation",
-            labels=["agent:tech-lead"],
-            repo="acme/widgets",
-        )
-        session = Session(
-            key=SessionKey(issue=FakeIssueKey("123"), task=TaskKind.CODE),
-            issue=issue,
-            agent_config=config.agents["agent:tech-lead"],
-            terminal_id=run_assets.session_name,
-            worktree_path=worktree,
-            branch_name="tech-lead-planning-123-abc",
-            run_assets=run_assets,
-        )
+        session = self._planning_session(worktree, run_assets)
         actions = agent_blocked_actions(
             session,
             build_expected_for_mutation(),
@@ -4198,6 +4181,33 @@ class TestBlockedPlanningCompletionLane(_PlanningLaneHarness):
             action.comment
             for action in actions
             if isinstance(action, AddCommentAction)
+        )
+
+    def _planning_session(self, worktree, run_assets):
+        """The session the outer planner sees for this same planning run.
+
+        Shared by both suppression halves — the blocked one and the needs-human
+        one — so neither can be shown agreeing with the completion seam on a
+        session the other would not have built.
+        """
+        from issue_orchestrator.domain.issue_key import FakeIssueKey
+        from issue_orchestrator.domain.models import Issue, Session
+        from issue_orchestrator.domain.session_key import SessionKey, TaskKind
+
+        issue = Issue(
+            number=123,
+            title="Planning Investigation",
+            labels=["agent:tech-lead"],
+            repo="acme/widgets",
+        )
+        return Session(
+            key=SessionKey(issue=FakeIssueKey("123"), task=TaskKind.CODE),
+            issue=issue,
+            agent_config=self.config.agents["agent:tech-lead"],
+            terminal_id=run_assets.session_name,
+            worktree_path=worktree,
+            branch_name="tech-lead-planning-123-abc",
+            run_assets=run_assets,
         )
 
     # -- No fake decision -----------------------------------------------------
@@ -4271,17 +4281,7 @@ class TestBlockedPlanningCompletionLane(_PlanningLaneHarness):
             tech_lead_authority_store,
         )
         mock_git_adapter.get_head_sha.return_value = self.LAUNCH_SHA
-        worktree = worktree_with_completion(
-            make_record(
-                outcome=CompletionOutcome.NEEDS_HUMAN,
-                requested_actions=[
-                    RequestedAction.PUSH_BRANCH,
-                    RequestedAction.ADD_NEEDS_HUMAN_LABEL,
-                    RequestedAction.POST_COMMENT,
-                ],
-                summary="Needs a decision on #123",
-            )
-        )
+        worktree = worktree_with_completion(self._needs_human_record())
         run_assets = self._arm_planning_run(
             tech_lead_authority_store, worktree, launch_base_sha=self.LAUNCH_SHA
         )
@@ -4289,6 +4289,108 @@ class TestBlockedPlanningCompletionLane(_PlanningLaneHarness):
         self._process(processor, worktree, run_assets)
 
         assert self._added_labels(mock_label_adapter) == []
+        mock_git_adapter.push.assert_not_called()
+
+    def test_a_suppressed_escalation_still_reaches_the_operator(
+        self,
+        tmp_path,
+        mock_label_adapter,
+        mock_pr_adapter,
+        mock_git_adapter,
+        event_bus,
+        tech_lead_authority_store,
+        worktree_with_completion,
+    ):
+        """The other half of the suppression: what the human is LEFT with (#257).
+
+        Proving only the absent label was how the round-1 hole stayed invisible
+        in a green suite. Every request this run made is refused — the push by
+        the zero-code lane, ``add_needs_human_label`` by the recovery door, and
+        the comment by ``shape_requested_actions_for_tech_lead`` — so if the
+        planned path said nothing, the question would exist nowhere an operator
+        looks and the reaped ``in-progress`` label would quietly requeue the
+        issue. Both halves are driven from the same launch-authority row.
+        """
+        processor = self._make_processor(
+            tmp_path,
+            mock_label_adapter,
+            mock_pr_adapter,
+            mock_git_adapter,
+            event_bus,
+            tech_lead_authority_store,
+        )
+        mock_git_adapter.get_head_sha.return_value = self.LAUNCH_SHA
+        worktree = worktree_with_completion(self._needs_human_record())
+        run_assets = self._arm_planning_run(
+            tech_lead_authority_store, worktree, launch_base_sha=self.LAUNCH_SHA
+        )
+
+        from issue_orchestrator.control.actions import (
+            AddCommentAction,
+            RemoveLabelAction,
+        )
+
+        self._process(processor, worktree, run_assets)
+        planned = self._planned_needs_human_actions(
+            worktree, run_assets, tech_lead_authority_store
+        )
+
+        assert self._added_labels(mock_label_adapter) == []
+        assert mock_pr_adapter.add_comment.call_args_list == []
+        explanation = "\n".join(
+            action.comment
+            for action in planned
+            if isinstance(action, AddCommentAction)
+        )
+        assert self.NEEDS_HUMAN_QUESTION in explanation
+        assert "no `needs-human` label was added" in explanation
+        assert [
+            action.label
+            for action in planned
+            if isinstance(action, RemoveLabelAction)
+        ] == ["in-progress"]
+
+    NEEDS_HUMAN_QUESTION = "which milestone should #123 target?"
+
+    @staticmethod
+    def _needs_human_record() -> CompletionRecord:
+        """What ``coding-done needs_human`` writes, planning runs included."""
+        return make_record(
+            outcome=CompletionOutcome.NEEDS_HUMAN,
+            requested_actions=[
+                RequestedAction.PUSH_BRANCH,
+                RequestedAction.ADD_NEEDS_HUMAN_LABEL,
+                RequestedAction.POST_COMMENT,
+            ],
+            summary="Needs a decision on #123",
+            question=TestBlockedPlanningCompletionLane.NEEDS_HUMAN_QUESTION,
+        )
+
+    def _planned_needs_human_actions(
+        self, worktree, run_assets, tech_lead_authority_store
+    ) -> list:
+        """What the outer planner plans for this same run's escalation."""
+        from issue_orchestrator.control.agent_needs_human_completion import (
+            agent_needs_human_actions,
+        )
+        from issue_orchestrator.control.label_manager import LabelManager
+        from issue_orchestrator.control.reconciliation import (
+            build_expected_for_mutation,
+        )
+        from issue_orchestrator.control.tech_lead_terminal_effects import (
+            resolve_subject_recovery_authority,
+        )
+
+        session = self._planning_session(worktree, run_assets)
+        return agent_needs_human_actions(
+            session,
+            build_expected_for_mutation(),
+            label_manager=LabelManager(self.config),
+            question=self.NEEDS_HUMAN_QUESTION,
+            subject_recovery=resolve_subject_recovery_authority(
+                self.config, session, tech_lead_authority=tech_lead_authority_store
+            ),
+        )
 
     # -- The hard boundary: neither policy is assumed -------------------------
 

@@ -66,7 +66,6 @@ from ..domain.models import (
     CompletionOutcome,
     RequestedAction,
     Session,
-    without_subject_recovery_intent,
 )
 from ..domain.board_snapshot import BOARD_SNAPSHOT_FILENAME, BoardSnapshot
 from ..domain.tech_lead_manifest import TechLeadManifest
@@ -331,6 +330,13 @@ class TechLeadCompletionLane:
     ``zero_code`` / ``detail`` record which lane it settled into, so an operator
     reading the log of a run that kept the publication path sees which fact was
     missing.
+
+    ``detail`` covers BOTH policies, not just publication: a run whose recovery
+    requests were refused says so there, because the whole point of #257 is that
+    a suppressed request must not be invisible (round 1 review N1). The
+    operator-facing sentence for the same suppression is the planned path's job
+    — the trace records the decision, the comment explains it — and both come
+    from :class:`~.subject_recovery_authority.SubjectRecoveryAuthority`.
     """
 
     rejection: str | None
@@ -366,7 +372,15 @@ def settle_tech_lead_completion(
       (#202);
     * recovery intent — a role that may not propose a recovery action on its
       own subject may not achieve one by asking the completion path for the
-      label either, so the #182 answer removes those requests (#136).
+      label either, so the #182 answer removes those requests (#136). The
+      completion record is the SEVENTH door onto a subject's recovery state,
+      and it goes through
+      :meth:`~.subject_recovery_authority.SubjectRecoveryAuthority.completion_request_outcome`
+      rather than reading the answer and deciding for itself what a suppression
+      means: the owner hands back what was refused alongside what survives, so
+      the refusal cannot leave this seam untraced, and every outcome whose
+      requests it refuses has a planned twin that says the same thing in the
+      operator's comment.
 
     Only :attr:`CompletionOutcome.COMPLETED` is held to the admission contract
     — trusted launch authority plus a valid decision artifact pair. That gate is
@@ -426,39 +440,28 @@ def settle_tech_lead_completion(
         worktree=worktree,
         worktree_reader=worktree_reader,
     )
+    recovery = SubjectRecoveryAuthority.for_flavor(
+        authority.flavor
+    ).completion_request_outcome(settlement.requested_actions)
     return TechLeadCompletionLane(
         rejection=None,
-        requested_actions=_without_unauthorized_recovery_requests(
-            settlement.requested_actions, authority=authority
-        ),
+        requested_actions=recovery.requested_actions,
         zero_code=settlement.zero_code,
-        detail=settlement.detail,
+        detail=_lane_detail(settlement.detail, recovery.detail),
     )
 
 
-def _without_unauthorized_recovery_requests(
-    requested: tuple[RequestedAction, ...],
-    *,
-    authority: TechLeadLaunchAuthority,
-) -> tuple[RequestedAction, ...]:
-    """Drop the recovery requests this run's ROLE holds no authority to make.
+def _lane_detail(zero_code_detail: str, recovery_detail: str) -> str:
+    """The trace an operator reads, covering BOTH policies this seam applied.
 
-    The completion-record half of #182. The planned half already asks
-    :class:`~.subject_recovery_authority.SubjectRecoveryAuthority` — so a
-    ``planning_investigation`` that reports BLOCKED gets the operator note
-    saying no ``blocked`` label was added — while the agent's own
-    ``add_blocked_label`` request travelled a different road and added one
-    anyway, leaving the durable state contradicting the message (#257).
-
-    The SAME answer settles both, read from the capability table through the
-    same owner, so no second ``planning_investigation`` match exists to drift:
-    a role that later gains a recovery kind keeps its requests here in the very
-    edit that gives it the planned label back.
+    ``detail`` used to explain only the publication lane, so a blocked planning
+    run whose ``add_blocked_label`` had just been dropped logged nothing about
+    the one thing #257 is for (round 1 review N1). Empty when nothing was
+    refused, so a run that kept its requests reads exactly as it did before.
     """
-    subject_recovery = SubjectRecoveryAuthority.for_flavor(authority.flavor)
-    if subject_recovery.may_leave_recovery_label:
-        return requested
-    return without_subject_recovery_intent(requested)
+    if not recovery_detail:
+        return zero_code_detail
+    return f"{zero_code_detail}; {recovery_detail}"
 
 
 _TECH_LEAD_ERROR_PREFIXES = (ERROR_PREFIX_TECH_LEAD_DECISION, ERROR_PREFIX_TECH_LEAD_AUTHORITY)

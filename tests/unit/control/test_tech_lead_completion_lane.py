@@ -197,6 +197,42 @@ class TestTheRecoveryAnswerHasOneOwner:
             PUBLICATION_ACTIONS | SUBJECT_RECOVERY_ACTIONS
         )
 
+    def test_the_trace_names_the_recovery_requests_it_dropped(
+        self, tmp_path: Path
+    ) -> None:
+        """``detail`` is the operator's trace, so a drop must be visible in it.
+
+        It used to explain only the publication lane, so a blocked planning run
+        whose ``add_blocked_label`` had just been refused logged nothing about
+        the one thing #257 is for (round 1 review N1).
+        """
+        run = arm(tmp_path, TechLeadSessionFlavor.PLANNING_INVESTIGATION)
+
+        lane = run.settle(
+            requested_actions=(
+                RequestedAction.PUSH_BRANCH,
+                RequestedAction.ADD_BLOCKED_LABEL,
+            )
+        )
+
+        assert "add_blocked_label" in lane.detail
+        assert "holds no recovery authority" in lane.detail
+
+    def test_the_trace_is_unchanged_for_a_run_that_kept_its_requests(
+        self, tmp_path: Path
+    ) -> None:
+        """Nothing refused, nothing appended — the publication lane reads as before."""
+        run = arm(tmp_path, TechLeadSessionFlavor.FAILURE_INVESTIGATION)
+
+        lane = run.settle(
+            requested_actions=(
+                RequestedAction.PUSH_BRANCH,
+                RequestedAction.ADD_BLOCKED_LABEL,
+            )
+        )
+
+        assert "recovery requests dropped" not in lane.detail
+
 
 class TestWhatABlockedRunIsAndIsNotAskedFor:
     """A run that did not land is governed, but never asked to have landed."""

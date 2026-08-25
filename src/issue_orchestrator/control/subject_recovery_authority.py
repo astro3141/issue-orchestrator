@@ -7,7 +7,7 @@ on. #136 gave ``planning_investigation`` a capability row that omits every
 recovery kind, so the role may not propose a recovery action on its subject —
 and therefore must not achieve one by malfunctioning either.
 
-Six completion paths would each answer that question for themselves, which is
+Seven completion paths would each answer that question for themselves, which is
 how the boundary ended up half-enforced the first time (#136 review A1/A2):
 
 1. the crash path — the session died;
@@ -17,7 +17,11 @@ how the boundary ended up half-enforced the first time (#136 review A1/A2):
 5. the publish-failure path — the run COMPLETED and the push or PR creation
    failed, leaving ``publish-failed`` and eventually ``needs-human``;
 6. the review-exchange-halt path — the exchange around that publish stopped
-   without an outcome, leaving ``blocked-failed``.
+   without an outcome, leaving ``blocked-failed``;
+7. the COMPLETION RECORD itself — ``coding-done blocked`` and ``coding-done
+   needs_human`` each write a request that would retire the issue, and those
+   requests reach the generic action executor without passing any of the six
+   (#257).
 
 Paths 1 and 2 are planned by :mod:`.tech_lead_terminal_effects`, which knows
 the run's flavor. Paths 3 through 6 are GENERIC session machinery that never
@@ -26,6 +30,15 @@ instead — :class:`SubjectRecoveryAuthority`, resolved once by the tech_lead
 owner and passed in. What travels is the ANSWER, never the flavor: a generic
 path that received a flavor would be one flavor comparison away from owning
 this rule too.
+
+Path 7 is the tech_lead completion seam, which holds the run's launch authority
+already; it asks :meth:`SubjectRecoveryAuthority.completion_request_outcome`
+and is handed back what it must carry as well as what survives, so a refused
+request cannot leave the seam without something recording that it was refused.
+Every outcome whose requests this door refuses has a planned twin — path 4 for
+BLOCKED, :mod:`.agent_needs_human_completion` for NEEDS_HUMAN — that speaks the
+same suppression in the operator's comment, which is what keeps the durable
+state and the message one answer rather than two that happen to agree.
 
 Paths 5 and 6 are the ones a run reaches by SUCCEEDING at its own job: a
 focused tech_lead run publishes onto its disposable branch
@@ -37,18 +50,46 @@ RELAUNCH rather than retiring the issue, and the provider-blocked path, where a
 dead credential is an outage record rather than a verdict on the issue.
 
 The answer is read from the capability table rather than matched by flavor, so
-a future bounded role inherits every one of these six suppressions the moment
+a future bounded role inherits every one of these seven suppressions the moment
 it declares its row, and a role that later GAINS a recovery kind loses them in
 the same edit.
 """
 
 from __future__ import annotations
 
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 
+from ..domain.models import (
+    RequestedAction,
+    without_subject_recovery_intent,
+)
 from ..domain.tech_lead_capabilities import TECH_LEAD_ACTION_CAPABILITIES
 from ..domain.tech_lead_session import TechLeadSessionFlavor
 from .actions import Action, AddLabelAction
+
+
+def _every_request_stands(
+    actions: Iterable[RequestedAction],
+) -> tuple[RequestedAction, ...]:
+    """The permitted answer: nothing about the requested tuple changes."""
+    return tuple(actions)
+
+
+_SURVIVING_RECOVERY_REQUESTS: Mapping[
+    bool, Callable[[Iterable[RequestedAction]], tuple[RequestedAction, ...]]
+] = {
+    True: _every_request_stands,
+    False: without_subject_recovery_intent,
+}
+"""What each answer does to a completion record's requests — a table, not a branch.
+
+Keyed by :attr:`SubjectRecoveryAuthority.may_leave_recovery_label` so the
+refusal is stated once and reads as the domain's own command form
+(:func:`~...domain.models.without_subject_recovery_intent`), rather than as one
+more site that decides for itself what "may not leave the label" implies for a
+request that asks for it.
+"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,6 +106,43 @@ class SubjectRecoveryOutcome:
 
     label_actions: tuple[Action, ...]
     note: str
+
+
+@dataclass(frozen=True, slots=True)
+class SubjectRecoveryRequestOutcome:
+    """What a COMPLETION RECORD's recovery requests come to, in one value.
+
+    The seventh door onto a subject's recovery state is the agent's own
+    completion record: ``coding-done blocked`` and ``coding-done needs_human``
+    each hand the orchestrator a request that would retire the issue (#257).
+    Refusing those is the same decision the six planned paths make, so it is
+    made here rather than by whichever seam happens to hold the tuple.
+
+    ``suppressed`` travels beside ``requested_actions`` for the reason
+    :class:`SubjectRecoveryOutcome` pairs its label with its note: a caller
+    handed only the survivors could drop an escalation and leave nothing
+    recording that anything was dropped — the drift #136 was filed for, in the
+    shape the completion-record seam takes. A caller that must carry
+    ``suppressed`` has to say so, in its trace and in the operator's comment.
+    """
+
+    requested_actions: tuple[RequestedAction, ...]
+    suppressed: tuple[RequestedAction, ...]
+
+    @property
+    def detail(self) -> str:
+        """One clause naming what was refused, for the operator-facing trace.
+
+        Empty when nothing was refused, so a caller can append it unguarded and
+        a run that kept its requests reads exactly as it did before.
+        """
+        if not self.suppressed:
+            return ""
+        names = ", ".join(action.value for action in self.suppressed)
+        return (
+            f"recovery requests dropped ({names}): this role holds no recovery"
+            " authority over the issue it was sent to work on"
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -123,6 +201,31 @@ class SubjectRecoveryAuthority:
         if self.may_leave_recovery_label:
             return SubjectRecoveryOutcome((add_label,), note_when_added)
         return SubjectRecoveryOutcome((), self.suppression_note(add_label.label))
+
+    def completion_request_outcome(
+        self, requested: tuple[RequestedAction, ...]
+    ) -> SubjectRecoveryRequestOutcome:
+        """Which of an agent's own requests survive, and which were refused.
+
+        The completion-record twin of :meth:`recovery_label_outcome`, for the
+        seam that holds untrusted REQUESTS rather than planned actions (#257).
+        The two shapes cannot share one method — a planned path hands in the
+        ``AddLabelAction`` it would have taken, while this one is handed the
+        whole requested tuple and must return the whole survivor — but they must
+        share the ANSWER, and now they read it from the same object rather than
+        each consulting :attr:`may_leave_recovery_label` and deciding for itself
+        what a suppression means.
+
+        Which requests carry a recovery change is the domain's one vocabulary
+        (:data:`~...domain.models.SUBJECT_RECOVERY_ACTIONS`), so a recovery
+        action added to :class:`~...domain.models.RequestedAction` is refused
+        here the moment it joins that set.
+        """
+        kept = _SURVIVING_RECOVERY_REQUESTS[self.may_leave_recovery_label](requested)
+        return SubjectRecoveryRequestOutcome(
+            kept,
+            tuple(action for action in requested if action not in kept),
+        )
 
     def suppression_note(self, *suppressed: str) -> str:
         """Why the subject carries no blocking label, in ONE voice for all paths.

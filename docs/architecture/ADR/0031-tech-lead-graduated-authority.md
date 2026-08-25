@@ -486,10 +486,32 @@ pre-action seam for a tech_lead completion of ANY outcome:
   (`add_blocked_label`, `add_needs_human_label`) are removed exactly when
   `SubjectRecoveryAuthority` says this run's role may not change its subject's
   recovery state, so the completion-record seam and the planned seam give one
-  answer and cannot disagree in a comment.
+  answer.
+- **A refused request is never a silent one.** The completion record is the
+  SEVENTH door onto a subject's recovery state, and it goes through the same
+  owner as the other six: `completion_request_outcome` hands the seam what it
+  refused alongside what survived, so the refusal reaches the lane's `detail`
+  trace, and every outcome whose requests it refuses has a planned twin that
+  says the same thing in the operator's comment — `agent_blocked_actions` for
+  `BLOCKED`, `agent_needs_human_completion` for `NEEDS_HUMAN`. That pairing is
+  the property, not a coincidence of which modules happen to exist: the
+  vocabulary lives in `SUBJECT_RECOVERY_ACTIONS`, and a recovery action added
+  to it fails the planner suite until it is given a twin.
 - **An unresolvable launch authority governs nothing.** The role is unproven, so
   the generic behaviour stands — the same conservative direction the planned
   half already takes.
+
+The `NEEDS_HUMAN` twin was the gap this amendment's first round left open. A
+tech_lead escalation loses all three of its requests — the push to the zero-code
+lane, the comment to `shape_requested_actions_for_tech_lead`, the label to the
+recovery door — and `NEEDS_HUMAN` deliberately plans nothing, because for an
+ordinary session the requested `needs-human` label is what holds the issue.
+With no label there is no holder: the `in-progress` claim is reaped, the issue
+returns to the queue, and the question the agent asked was never written
+anywhere an operator looks. `agent_needs_human_completion` speaks exactly where
+that happens — when the role may NOT leave the label — reporting the question,
+the reason the subject carries no label, and releasing the claim. A role that
+MAY leave the label keeps the generic policy untouched.
 
 ### 5. Sequencing and scope boundaries
 

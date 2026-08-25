@@ -11,6 +11,7 @@ from ..ports import RepositoryHost
 from ..ports.tech_lead_authority import TechLeadAuthorityStore
 from .actions import Action, AddCommentAction, AddLabelAction, RemoveLabelAction
 from .agent_blocked_completion import agent_blocked_actions
+from .agent_needs_human_completion import agent_needs_human_actions
 from .open_issue_corpus import OpenIssueCorpusManager
 from .tech_lead_completion import (
     generate_tech_lead_completion_actions,
@@ -374,51 +375,25 @@ class CompletionActionPlanner:
             context="actions",
         )
 
-        # If agent said "completed" but critical processing failed, treat as blocked-failed.
-        if status == SessionStatus.COMPLETED and critical_errors:
-            return self._generate_completed_with_critical_actions(
-                session, critical_errors, diagnostic_path, expected
-            )
-
-        if status == SessionStatus.COMPLETED and review_exchange_halted:
-            logger.info(
-                "[COMPLETION] Review exchange halted - generating blocked-failed actions: issue=%d",
-                session.issue.number,
-            )
-            return tuple(
-                self._generate_review_exchange_halted_actions(
-                    session,
-                    expected,
-                    subject_recovery=self._subject_recovery(session),
-                )
+        if status == SessionStatus.COMPLETED:
+            return self._generate_completed_status_actions(
+                session,
+                expected,
+                critical_errors=critical_errors,
+                diagnostic_path=diagnostic_path,
+                review_exchange_halted=review_exchange_halted,
             )
 
         if status == SessionStatus.TIMED_OUT:
             return tuple(self._plan_terminal_actions(session, expected, status))
 
         if status == SessionStatus.FAILED:
-            detail = completion_detail
-            if malformed_actions := self._maybe_malformed_record_relaunch_actions(
+            return self._generate_failed_status_actions(
                 session,
                 expected,
-                detail,
-            ):
-                return tuple(malformed_actions)
-            invalid_actions = invalid_record_actions(
-                session=session,
-                expected=expected,
-                labels=self._lm,
                 detail=completion_detail,
                 diagnostic_path=diagnostic_path,
-                subject_recovery=self._subject_recovery(session),
             )
-            if invalid_actions is not None:
-                return tuple(invalid_actions)
-            # Interrupted auto-retry relaunches the session: not terminal, so
-            # no tech_lead failure effects (the retry re-audits the same PRs).
-            if retry_actions := self._generate_interrupted_retry_actions(session, expected):
-                return tuple(retry_actions)
-            return tuple(self._plan_terminal_actions(session, expected, status))
 
         if status == SessionStatus.BLOCKED:
             return tuple(
@@ -431,21 +406,109 @@ class CompletionActionPlanner:
                 )
             )
 
-        if status == SessionStatus.COMPLETED:
-            # POLICY: Completion -> release in-progress (claim maintained via pr-pending).
-            actions: list[Action] = [
-                RemoveLabelAction(
-                    issue_number=session.issue.number,
-                    label=self._lm.in_progress,
-                    reason="Session completed successfully",
-                    expected=expected,
+        if status == SessionStatus.NEEDS_HUMAN:
+            # NEEDS_HUMAN keeps in-progress to maintain the ownership claim —
+            # the `needs-human` label the completion record asked for is what
+            # holds the issue. A run whose role may not leave that label has no
+            # holder, so planning nothing drops the escalation entirely (#257).
+            return tuple(
+                agent_needs_human_actions(
+                    session,
+                    expected,
+                    label_manager=self._lm,
+                    question=(completion_detail or {}).get("question"),
+                    subject_recovery=self._subject_recovery(session),
                 )
-            ]
-            actions.extend(self._generate_tech_lead_actions(session, expected))
-            return tuple(actions)
+            )
 
-        # NEEDS_HUMAN keeps in-progress to maintain the ownership claim.
         return ()
+
+    def _generate_completed_status_actions(
+        self,
+        session: Session,
+        expected: ExpectedState,
+        *,
+        critical_errors: list[str],
+        diagnostic_path: Optional[str],
+        review_exchange_halted: bool,
+    ) -> tuple[Action, ...]:
+        """What a self-reported COMPLETED session actually comes to.
+
+        "Completed" is the agent's claim, not the outcome: a push or PR creation
+        that failed makes it blocked-failed, and a review exchange that stopped
+        without progress puts the issue on hold. Only a claim nothing
+        contradicted releases the claim label. All three read as one list here
+        rather than as three ``status == COMPLETED`` tests differing by a second
+        condition.
+        """
+        if critical_errors:
+            return self._generate_completed_with_critical_actions(
+                session, critical_errors, diagnostic_path, expected
+            )
+        if review_exchange_halted:
+            logger.info(
+                "[COMPLETION] Review exchange halted - generating blocked-failed actions: issue=%d",
+                session.issue.number,
+            )
+            return tuple(
+                self._generate_review_exchange_halted_actions(
+                    session,
+                    expected,
+                    subject_recovery=self._subject_recovery(session),
+                )
+            )
+        # POLICY: Completion -> release in-progress (claim maintained via pr-pending).
+        actions: list[Action] = [
+            RemoveLabelAction(
+                issue_number=session.issue.number,
+                label=self._lm.in_progress,
+                reason="Session completed successfully",
+                expected=expected,
+            )
+        ]
+        actions.extend(self._generate_tech_lead_actions(session, expected))
+        return tuple(actions)
+
+    def _generate_failed_status_actions(
+        self,
+        session: Session,
+        expected: ExpectedState,
+        *,
+        detail: Optional[dict[str, Any]],
+        diagnostic_path: Optional[str],
+    ) -> tuple[Action, ...]:
+        """What a FAILED session comes to, in the order the four kinds rank.
+
+        FAILED is the one status that is not a single verdict: a malformed
+        record that looks like an interruption relaunches, a record that could
+        not be accepted takes the rejected-record path, an interrupted session
+        auto-retries, and only what is left is terminal. The ordering is the
+        policy, which is why it reads as one list here rather than as four
+        branches inside the status dispatch above.
+        """
+        if malformed_actions := self._maybe_malformed_record_relaunch_actions(
+            session,
+            expected,
+            detail,
+        ):
+            return tuple(malformed_actions)
+        invalid_actions = invalid_record_actions(
+            session=session,
+            expected=expected,
+            labels=self._lm,
+            detail=detail,
+            diagnostic_path=diagnostic_path,
+            subject_recovery=self._subject_recovery(session),
+        )
+        if invalid_actions is not None:
+            return tuple(invalid_actions)
+        # Interrupted auto-retry relaunches the session: not terminal, so
+        # no tech_lead failure effects (the retry re-audits the same PRs).
+        if retry_actions := self._generate_interrupted_retry_actions(session, expected):
+            return tuple(retry_actions)
+        return tuple(
+            self._plan_terminal_actions(session, expected, SessionStatus.FAILED)
+        )
 
     def _generate_timeout_actions(
         self,
