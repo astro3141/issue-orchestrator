@@ -9,9 +9,11 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Protocol
 
 from ..domain.models import (
+    COMPLETION_STRING_MAX_BYTES,
     CompletionRecord,
     RequestedAction,
     completion_record_path,
+    fits_record_string_bound,
     sanitize_agent_label,
 )
 from ..infra.runtime_artifacts import filter_runtime_managed_dirty_paths
@@ -43,9 +45,17 @@ _MAX_COMPLETION_FILE_BYTES = 2 * 1024 * 1024
 # file is not a candidate.
 _PRODUCER_RETRY_MIN_INDEX = 2
 
-# The placeholder's error text is untrusted agent output bounded only by
-# the file-size gate above, and it travels into logs and event payloads.
-# Bound it there rather than at every consumer.
+# Both of the placeholder's fields are untrusted agent output bounded
+# only by the file-size gate above, and both travel into logs and event
+# payloads. Bound them here rather than at every consumer.
+#
+# ``error`` is truncated because a long one is still evidence worth
+# keeping. ``session_id`` is not truncated but REJECTED past the record
+# parser's own field cap: it is matched, not read, and a value the parser
+# would refuse cannot be the session_id of any valid retry, so a
+# placeholder carrying one can never hand authority to anything. Keeping
+# a mangled copy of it would only put unbounded agent text on the
+# per-sibling log lines below.
 _PRODUCER_ERROR_MAX_CHARS = 2000
 _PRODUCER_ERROR_TAIL_CHARS = 500
 
@@ -83,6 +93,10 @@ class ProducerErrorPlaceholder:
     ``session_id`` is what a retry must match to be considered the same
     run's, and ``error`` is the evidence a repaired retry must never
     silently erase (#264).
+
+    Both are bounded before they get here — see
+    ``_producer_error_placeholder`` — so holding one of these cannot put
+    unbounded agent text on a per-tick log line or in an event payload.
     """
 
     session_id: str
@@ -181,15 +195,31 @@ def load_completion_record_result(record_path: Path) -> CompletionRecordLoadResu
     duplicate reader — that was the bug flagged in #6017 re-review-2
     P3. Returns a typed result so callers can distinguish a genuinely
     missing completion record from one that was present but rejected.
+
+    Every branch here logs at DEBUG, rejections included. This function
+    is polled on the hot path — the observer calls it through
+    ``select_completion_record`` on every ``observe_session`` for every
+    live session — and a record that is unreadable, oversized, or
+    malformed keeps being unreadable, oversized, or malformed on every
+    subsequent tick until the session ends. Logging that at ERROR turns
+    one torn write into an ERROR line per tick for the whole window,
+    which is exactly the signal a real fault would produce.
+
+    Nothing is lost by the demotion: a rejection only becomes a fault
+    once a decision has to be made on it, and the decision site says so
+    loudly. ``SessionController`` routes an invalid record to
+    ``report_invalid_completion_record``, which logs the failure and its
+    error at ERROR, emits ``SESSION_INVALID_COMPLETION_RECORD``, and
+    writes a diagnostic file — once, when the session terminates.
     """
     if not record_path.exists():
-        logger.info("No completion record found at %s", record_path)
+        logger.debug("No completion record found at %s", record_path)
         return CompletionRecordLoadResult.missing(record_path)
 
     try:
         size = record_path.stat().st_size
     except OSError as exc:
-        logger.error("Could not stat completion record %s: %s", record_path, exc)
+        logger.debug("Could not stat completion record %s: %s", record_path, exc)
         return CompletionRecordLoadResult(
             path=record_path,
             failure=CompletionRecordLoadFailure.UNREADABLE,
@@ -201,7 +231,7 @@ def load_completion_record_result(record_path: Path) -> CompletionRecordLoadResu
             f"Completion record is {size} bytes, exceeds max "
             f"{_MAX_COMPLETION_FILE_BYTES}"
         )
-        logger.error("%s: %s", record_path, error)
+        logger.debug("%s: %s", record_path, error)
         return CompletionRecordLoadResult(
             path=record_path,
             failure=CompletionRecordLoadFailure.OVERSIZED,
@@ -237,7 +267,7 @@ def load_completion_record_result(record_path: Path) -> CompletionRecordLoadResu
             size=size,
         )
     except json.JSONDecodeError as exc:
-        logger.error("Invalid JSON in completion record %s: %s", record_path, exc)
+        logger.debug("Invalid JSON in completion record %s: %s", record_path, exc)
         return CompletionRecordLoadResult(
             path=record_path,
             failure=CompletionRecordLoadFailure.INVALID_JSON,
@@ -251,7 +281,7 @@ def load_completion_record_result(record_path: Path) -> CompletionRecordLoadResu
         # cleanup removes it — and this function is polled every tick
         # for every live session, so that race is a load failure to
         # report, never an exception to raise at the caller.
-        logger.error("Could not read completion record %s: %s", record_path, exc)
+        logger.debug("Could not read completion record %s: %s", record_path, exc)
         return CompletionRecordLoadResult(
             path=record_path,
             failure=CompletionRecordLoadFailure.UNREADABLE,
@@ -260,7 +290,7 @@ def load_completion_record_result(record_path: Path) -> CompletionRecordLoadResu
             size=size,
         )
     except ValueError as exc:
-        logger.error("Invalid completion record %s: %s", record_path, exc)
+        logger.debug("Invalid completion record %s: %s", record_path, exc)
         return CompletionRecordLoadResult(
             path=record_path,
             failure=CompletionRecordLoadFailure.INVALID_SCHEMA,
@@ -277,9 +307,10 @@ def _producer_error_placeholder(raw: object) -> ProducerErrorPlaceholder | None:
     Only reached for a file that PARSED and then failed the record
     contract, which is the only shape ``write_error_completion`` can
     leave behind. Both fields are required: without ``agent_done_error``
-    the file is some other broken record, and without ``session_id``
-    nothing can be matched against it — either way this is not a
-    placeholder and the caller must leave the canonical path in charge.
+    the file is some other broken record, and without a ``session_id``
+    that a valid record could also carry, nothing can be matched against
+    it — either way this is not a placeholder and the caller must leave
+    the canonical path in charge.
     """
     if not isinstance(raw, dict):
         return None
@@ -288,6 +319,16 @@ def _producer_error_placeholder(raw: object) -> ProducerErrorPlaceholder | None:
     if not isinstance(error, str) or not error.strip():
         return None
     if not isinstance(written_for, str) or not written_for.strip():
+        return None
+    if not fits_record_string_bound(written_for):
+        # DEBUG for the same reason the other rejection branches are:
+        # this is polled every tick for every live session.
+        logger.debug(
+            "Not a producer-error placeholder: session_id is %d bytes, "
+            "past the %d a valid record may carry, so no retry can match it",
+            len(written_for.encode("utf-8")),
+            COMPLETION_STRING_MAX_BYTES,
+        )
         return None
     return ProducerErrorPlaceholder(
         session_id=written_for,
@@ -343,13 +384,18 @@ class CompletionRecordSelection:
         Carries ``completion_producer_error`` whenever a placeholder was
         found, including when nothing replaced it: a repaired retry must
         not erase the fact that the first ``coding-done`` failed (#264).
+
+        Every path in the payload is resolved, so a consumer comparing
+        two of these fields — or one of them against the
+        ``full_path``/``worktree_path`` the lookup event already resolves
+        — is comparing the same form on both sides.
         """
         return {
             "completion_selected_path": str(self.path.resolve()),
             "completion_path_choice": self.choice.value,
             "completion_producer_error": self.producer_error,
             "completion_unresolved_candidates": [
-                str(path) for path in self.unresolved_candidates
+                str(path.resolve()) for path in self.unresolved_candidates
             ],
         }
 
@@ -399,11 +445,21 @@ def select_completion_record(
     Every file this function reads goes through
     ``load_completion_record_result``, so the size gate and field bounds
     apply to siblings exactly as they apply to the canonical record.
+
+    Like the loader it calls, this function explains itself at DEBUG.
+    It runs on every ``observe_session`` for every live session, so a
+    placeholder that sits there unresolved would otherwise re-log the
+    same explanation — once per non-matching sibling — on every tick
+    until the session ends. The verdict is reported once, where it is
+    acted on: ``SessionController._log_completion_lookup`` logs the
+    chosen path, the choice, the preserved producer error, and any
+    unresolved candidates, and puts the same fields on the
+    ``COMPLETION_LOOKUP`` event.
     """
     canonical_path = completion_record_path(worktree, completion_path)
     if not canonical_path.exists():
         # Polled every tick for every live session, so the nothing-there
-        # case must not pay for the loader's per-read logging.
+        # case must not pay for a stat and an open it does not need.
         return _canonical_selection(
             canonical_path, CompletionRecordLoadResult.missing(canonical_path)
         )
@@ -415,7 +471,7 @@ def select_completion_record(
 
     candidates = _valid_producer_retries(canonical_path, placeholder.session_id)
     if not candidates:
-        logger.info(
+        logger.debug(
             "Completion producer error at %s with no valid retry beside it: %s",
             canonical_path,
             placeholder.error,
@@ -425,7 +481,7 @@ def select_completion_record(
         )
 
     if len(candidates) > 1:
-        logger.error(
+        logger.debug(
             "Ambiguous completion retry beside %s: %d valid records for "
             "session %s (%s); refusing to choose. Producer error was: %s",
             canonical_path,
@@ -446,7 +502,7 @@ def select_completion_record(
         )
 
     chosen = candidates[0]
-    logger.info(
+    logger.debug(
         "Completion retry at %s takes over from the producer error at %s. "
         "The first completion command failed with: %s",
         chosen.path,
@@ -496,7 +552,7 @@ def _valid_producer_retries(
         if loaded.record is None:
             continue
         if loaded.record.session_id != written_for:
-            logger.info(
+            logger.debug(
                 "Ignoring %s beside %s: written for session %s, not %s",
                 sibling,
                 canonical_path,

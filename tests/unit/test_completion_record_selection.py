@@ -8,6 +8,7 @@ prove both readers ask it rather than resolving the path themselves.
 """
 
 import json
+import logging
 from pathlib import Path
 
 import pytest
@@ -20,6 +21,7 @@ from issue_orchestrator.control.completion_record_validation import (
     CompletionRecordValidator,
     select_completion_record,
 )
+from issue_orchestrator.domain.models import COMPLETION_STRING_MAX_BYTES
 from issue_orchestrator.control.completion_result_artifacts import (
     cleanup_completion_record,
     preserve_completion_record,
@@ -67,6 +69,27 @@ def _select(run_dir: Path) -> CompletionRecordSelection:
     Nothing hands it a resolved file, so the join has one owner too.
     """
     return select_completion_record(run_dir.parents[2], COMPLETION_REL)
+
+
+def _above_debug(caplog: pytest.LogCaptureFixture) -> list[str]:
+    """Everything the selection said louder than DEBUG.
+
+    The observer runs selection on every ``observe_session`` for every
+    live session, and a record that is malformed — or a placeholder no
+    retry resolves — stays that way for every tick until the session
+    ends. Anything above DEBUG here is therefore a line an operator gets
+    once per tick for the whole window, which is why these tests assert
+    the list is empty rather than trusting a level in the source.
+    """
+    return [
+        record.getMessage()
+        for record in caplog.records
+        if record.levelno > logging.DEBUG
+    ]
+
+
+def _all_messages(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [record.getMessage() for record in caplog.records]
 
 
 def _write_record(
@@ -154,20 +177,29 @@ def test_placeholder_hands_over_to_the_one_matching_retry(run_dir: Path) -> None
     assert canonical.exists() and retry.exists()
 
 
-def test_placeholder_evidence_reaches_the_log_at_info(
+def test_placeholder_evidence_reaches_the_selection_without_shouting(
     run_dir: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    canonical = _write_placeholder(run_dir / CANONICAL_NAME, error="boom in evidence")
+    """The owner is polled every tick, so it explains itself at DEBUG.
+
+    The evidence is not lost by that: it rides on the selection to the
+    decision site, which logs it once — see the controller test
+    ``test_ambiguous_retry_is_reported_where_the_decision_is_made`` and
+    the ``completion_producer_error`` field on ``COMPLETION_LOOKUP``.
+    """
+    _write_placeholder(run_dir / CANONICAL_NAME, error="boom in evidence")
     _write_record(run_dir / "completion-agent_backend-2.json")
 
-    with caplog.at_level("INFO"):
-        _select(run_dir)
+    with caplog.at_level(logging.DEBUG):
+        selection = _select(run_dir)
 
+    assert selection.producer_error == "boom in evidence"
     assert any(
         "boom in evidence" in record.getMessage()
         for record in caplog.records
-        if record.levelname == "INFO"
+        if record.levelno == logging.DEBUG
     )
+    assert _above_debug(caplog) == []
 
 
 def test_retry_for_a_different_session_is_not_selected(run_dir: Path) -> None:
@@ -206,7 +238,7 @@ def test_two_valid_retries_are_ambiguity_and_fail_closed(
     second = _write_record(run_dir / "completion-agent_backend-2.json", summary="a")
     third = _write_record(run_dir / "completion-agent_backend-3.json", summary="b")
 
-    with caplog.at_level("ERROR"):
+    with caplog.at_level(logging.DEBUG):
         selection = _select(run_dir)
 
     assert selection.choice is CompletionPathChoice.AMBIGUOUS_PRODUCER_ERROR_RETRY
@@ -219,8 +251,11 @@ def test_two_valid_retries_are_ambiguity_and_fail_closed(
     assert any(
         "Ambiguous completion retry" in record.getMessage()
         for record in caplog.records
-        if record.levelname == "ERROR"
+        if record.levelno == logging.DEBUG
     )
+    # An unresolved ambiguity persists across ticks, so the poll must not
+    # be the thing that reports it. The decision site does.
+    assert _above_debug(caplog) == []
 
 
 def test_oversized_retry_is_rejected_by_the_shared_gate(run_dir: Path) -> None:
@@ -304,6 +339,67 @@ def test_placeholder_missing_its_session_id_is_not_a_placeholder(
     assert selection.choice is CompletionPathChoice.CANONICAL
     assert selection.record is None
     assert selection.producer_error is None
+
+
+def test_a_session_id_no_valid_record_could_carry_is_not_a_placeholder(
+    run_dir: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The placeholder's session_id is matched, not read.
+
+    ``CompletionRecord.from_dict`` refuses a session_id past
+    ``COMPLETION_STRING_MAX_BYTES``, so no valid retry can ever carry one
+    that long — a placeholder holding it could never hand over authority.
+    Rejecting it at the boundary keeps unbounded agent text, which only
+    the 2 MiB file gate otherwise caps, off the per-sibling log lines.
+    """
+    oversized = "S" * (COMPLETION_STRING_MAX_BYTES + 1)
+    _write_placeholder(run_dir / CANONICAL_NAME, session_id=oversized)
+    _write_record(run_dir / "completion-agent_backend-2.json")
+
+    with caplog.at_level(logging.DEBUG):
+        selection = _select(run_dir)
+
+    assert selection.choice is CompletionPathChoice.CANONICAL
+    assert selection.record is None
+    assert selection.producer_error is None
+    assert selection.unresolved_candidates == ()
+    assert not any(oversized in message for message in _all_messages(caplog))
+
+
+def test_a_session_id_at_the_limit_still_matches(run_dir: Path) -> None:
+    """The rejection is exactly the record parser's own cap, not tighter."""
+    at_limit = "S" * COMPLETION_STRING_MAX_BYTES
+    _write_placeholder(run_dir / CANONICAL_NAME, session_id=at_limit)
+    retry = _write_record(
+        run_dir / "completion-agent_backend-2.json", session_id=at_limit
+    )
+
+    selection = _select(run_dir)
+
+    assert selection.choice is CompletionPathChoice.PRODUCER_ERROR_RETRY
+    assert selection.path == retry
+
+
+def test_a_malformed_record_does_not_shout_once_per_tick(
+    run_dir: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A torn or broken write is a fact to report, not a fault to raise.
+
+    The observer polls the same file every tick until the session ends,
+    so the rejection is explained at DEBUG here; the ERROR belongs to the
+    controller, which reports it once, when it has to decide on it.
+    """
+    (run_dir / CANONICAL_NAME).write_text("{ not valid json", encoding="utf-8")
+
+    with caplog.at_level(logging.DEBUG):
+        for _ in range(3):
+            _select(run_dir)
+
+    assert _above_debug(caplog) == []
+    assert any(
+        "Invalid JSON in completion record" in message
+        for message in _all_messages(caplog)
+    )
 
 
 def test_producer_error_text_is_bounded_before_it_travels(run_dir: Path) -> None:

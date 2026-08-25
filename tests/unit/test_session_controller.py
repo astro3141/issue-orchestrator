@@ -652,6 +652,102 @@ class TestSessionControllerTerminated:
         assert canonical.exists()
         assert retry.exists()
 
+    def test_ambiguous_retry_is_reported_where_the_decision_is_made(
+        self,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Two valid retries need a human, and the decision says so once.
+
+        The selection owner is polled every tick by the observer, so it
+        explains the ambiguity at DEBUG. This is the site that runs once
+        per decision, so this is where the operator gets told — with the
+        candidate files named, so they do not have to go find them.
+        """
+        worktree = tmp_path / "worktree"
+        completion_rel = (
+            ".issue-orchestrator/sessions/run-1/completion-agent_backend.json"
+        )
+        canonical = worktree / completion_rel
+        canonical.parent.mkdir(parents=True, exist_ok=True)
+        canonical.write_text(
+            json.dumps(
+                {
+                    "outcome": "completed",
+                    "agent_done_error": "evidence validation exploded",
+                    "session_id": "issue-264-run-1",
+                    "timestamp": "2026-08-25T10:55:25",
+                }
+            ),
+            encoding="utf-8",
+        )
+        candidates = []
+        for index, summary in ((2, "first retry"), (3, "second retry")):
+            retry = canonical.parent / f"completion-agent_backend-{index}.json"
+            retry.write_text(
+                json.dumps(
+                    {
+                        "session_id": "issue-264-run-1",
+                        "timestamp": "2026-08-25T11:02:00",
+                        "outcome": "completed",
+                        "summary": summary,
+                        "requested_actions": ["push_branch"],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            candidates.append(retry)
+
+        processor = MockCompletionProcessor()
+        processor.completion_selection = select_completion_record(
+            worktree, completion_rel
+        )
+        event_sink = RecordingEventSink()
+        controller = SessionController(
+            completion_processor=processor,
+            events=event_sink,
+            session_output=FileSystemSessionOutput(),
+            working_copy=StubWorkingCopy(),
+        )
+
+        with caplog.at_level("WARNING"):
+            decision = decide_with_run_assets(
+                controller,
+                observation=SessionObservationResult.terminated(runtime_minutes=10.0),
+                worktree_path=worktree,
+                issue_number=123,
+                issue_title="Test Issue",
+                session_name="issue-123",
+                completion_path=completion_rel,
+            )
+
+        # Fails closed onto the placeholder rather than picking a retry.
+        assert decision.status == SessionStatus.FAILED
+        warnings = [
+            record.getMessage()
+            for record in caplog.records
+            if record.levelname == "WARNING"
+            and "Ambiguous completion retry" in record.getMessage()
+        ]
+        assert len(warnings) == 1
+        for candidate in candidates:
+            assert str(candidate) in warnings[0]
+
+        lookups = [
+            event
+            for event in event_sink.events
+            if event.name == EventName.COMPLETION_LOOKUP
+        ]
+        assert len(lookups) == 1
+        payload = lookups[0].data
+        assert payload["completion_path_choice"] == "ambiguous_producer_error_retry"
+        assert payload["completion_unresolved_candidates"] == [
+            str(candidate.resolve()) for candidate in candidates
+        ]
+        # Neither candidate is moved, renamed, or removed by the decision.
+        assert all(candidate.exists() for candidate in candidates)
+        assert canonical.exists()
+
     def test_terminated_with_completed_record_is_completed(self):
         """Session that exits with completed outcome = COMPLETED."""
         processor = MockCompletionProcessor()

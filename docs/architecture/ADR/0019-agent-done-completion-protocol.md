@@ -144,8 +144,12 @@ none of them can act on — or report — a record another cannot see:
   authority is never re-assigned between two valid completions.
 - canonical is an error placeholder → exactly one valid sibling, named with
   the producer's own numeric suffix, in the same run directory, carrying the
-  same `session_id`, may take over. The placeholder's `agent_done_error` is
-  logged at INFO and travels on the lookup event either way.
+  same `session_id`, may take over. The placeholder's `agent_done_error`
+  travels on the selection and onto the lookup event either way — a repaired
+  retry must not erase the fact that the first `agent-done` failed. A
+  `session_id` longer than a valid record's own field cap is rejected rather
+  than truncated: nothing that long can be matched, so it is not a
+  placeholder.
 - anything else → canonical, unchanged. Several valid siblings is ambiguity,
   not a race to resolve: there is no newest-wins or suffix-order rule, so the
   placeholder stays authoritative and fails closed onto the existing
@@ -154,6 +158,19 @@ none of them can act on — or report — a record another cannot see:
 Every candidate is read through `load_completion_record_result`, so the
 file-size gate and field bounds apply to siblings exactly as they do to the
 canonical record. Selection itself moves, renames, and deletes nothing.
+
+**The poll explains, the decision reports.** Loading and selection run on a
+hot loop — the observer asks on every `observe_session` for every live
+session — and the conditions they encounter persist: a malformed record is
+malformed on the next tick too, and a placeholder no retry resolves stays
+unresolved until the session ends. So both explain themselves at DEBUG only.
+The levels an operator watches belong to the sites that run once per
+decision: `SessionController._log_completion_lookup` logs the chosen path,
+the choice, any preserved producer error, and warns with the candidate files
+named when the owner refused to choose; `report_invalid_completion_record`
+logs the rejection at ERROR, emits `session.invalid_completion_record`, and
+writes a diagnostic. Levelling the polled path the same way would spend a
+real fault's signal on a transient one.
 
 **Selection decides authority, not lifetime.** Record cleanup is exactly
 what it was before this rule existed: it unlinks the canonical path and no
