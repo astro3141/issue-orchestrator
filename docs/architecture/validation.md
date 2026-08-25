@@ -1315,6 +1315,44 @@ Nothing else outside the worktree changes: no tracked file, no
 `.codex/rules` in the product checkout, no `~/.codex`, no trust, sandbox,
 approval or credential state.
 
+#### …and the gate its own completion command used to run anyway
+
+The barrier above stops the *session* from running the gate. It does not stop
+`coding-done`, which is the planning run's only way out and which, for every
+`completed`, ran the configured quick contract itself before writing a
+completion record. The first guarded live planning run proved the point: the
+guard refused `make validate-pr-raw` at `CreateProcess`, the run then called
+`coding-done completed`, and the completion command ran the same gate from
+inside the same sandbox and failed on the same class. No completion record was
+written at all, so a planning lane whose agent had followed its contract
+perfectly still could not finish (#293).
+
+`control/completion_quick_gate.py` is the single owner of the question that
+fixes this — *does this completion's local quick gate have a verdict to
+contribute?* — and `coding-done` asks it once, for orchestrator-managed
+completions only. Its shape matters as much as its existence:
+
+- **It removes a local feedback gate; it grants nothing.** The canonical
+  publication validation the orchestrator runs later is untouched, and a
+  planning completion writes no validation record, no artifact, and no
+  fabricated PASS. A gate that did not run is visibly absent.
+- **The pre-completion dirty-tree check still runs, before this question is
+  even asked.** Planning is zero-code, so a dirty planning worktree is still
+  refused rather than quietly completed.
+- **The signal is a routing hint, never authority.** It reads the launch-time
+  `tech-lead-assignment.json`, which lives in the run directory *inside the
+  agent-writable worktree*. A session that writes itself a planning assignment
+  therefore loses its own quick feedback and gains nothing else: publication,
+  zero-code settlement, issue creation and recovery are all decided from the
+  orchestrator-owned `TechLeadLaunchAuthority` and the orchestrator's own read
+  of HEAD (#202/#257), which never consult this answer — and
+  `resolve_tech_lead_launch_authority` reports a worktree assignment that
+  diverges from the recorded authority as tamper evidence.
+- **Unreadable is never planning.** The gate is dropped only for an assignment
+  that parses cleanly *and* names `planning_investigation`. Missing, malformed,
+  unknown-flavor, or any other Tech Lead flavor keeps the existing behaviour,
+  and there is no `--skip-validation` flag for an ordinary Actor to reach for.
+
 ## Configuration (YAML)
 
 ```yaml

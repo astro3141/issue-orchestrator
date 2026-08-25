@@ -45,6 +45,9 @@ from .dirty_retry_budget import (
 from .orchestrator_resume import trigger_orchestrator_resume
 from .orchestrator_run_assets import require_orchestrator_run_assets_for_session
 
+from ...control.agent_gate import AgentGateResult
+from ...control.completion_quick_gate import route_completion_quick_gate
+from ...domain.session_run import SessionRunAssets
 from ...execution.git_planted_paths import local_repo_owns_planted_cli_tools
 from ...infra.env import get_env
 from ...infra.logging_config import issue_log
@@ -75,6 +78,10 @@ CODING_STATUSES = [
     AgentStatus.BLOCKED,
     AgentStatus.NEEDS_HUMAN,
 ]
+
+# Only a completion offers a candidate for the quick gate to judge; BLOCKED and
+# NEEDS_HUMAN are reports of a problem and have always skipped it.
+STATUSES_REQUIRING_VALIDATION = {AgentStatus.COMPLETED}
 
 
 def _is_managed_session() -> bool:
@@ -264,6 +271,64 @@ def _handle_dirty_files_rejection(
     sys.exit(1)
 
 
+def _run_quick_validation_gate(
+    *,
+    worktree_root: Path,
+    session_id: str,
+    managed: bool,
+    verbose: bool,
+) -> tuple[AgentGateResult | None, SessionRunAssets | None]:
+    """Run the local immediate-feedback quick gate, when this completion has one.
+
+    This is the agent's own fast feedback; the canonical publication validation
+    is a separate gate the orchestrator runs later, and nothing here stands in
+    for it.
+
+    Returns ``(result, assets)``, and ``(None, None)`` when no gate ran — either
+    because the repository configures none, or because
+    :func:`route_completion_quick_gate` found this completion has no code
+    candidate for the gate to judge (#293). A gate that does not run leaves no
+    trace at all: no process starts, no run assets are opened for it, and the
+    caller therefore records no validation evidence. The absence is visible
+    rather than papered over with a manufactured PASS.
+
+    The routing question is asked only of an orchestrator-MANAGED session,
+    because it is answered from the run contract the orchestrator injected. A
+    standalone developer invocation has no such contract and keeps the gate
+    unconditionally.
+    """
+    selection = load_validation_cmd(worktree_root)
+    if not selection.cmd:
+        return None, None
+    if not session_id:
+        logger.error("[coding-done] Validation requires session_id but none found")
+        sys.exit(1)
+    if managed:
+        assets = require_orchestrator_run_assets_for_session(worktree_root, session_id)
+        routing = route_completion_quick_gate(assets)
+        if not routing.runs_quick_gate:
+            print(f"Note: no quick validation for this completion — {routing.detail}")
+            logger.info("[coding-done] quick gate not run: %s", routing.detail)
+            return None, None
+    else:
+        assets = FileSystemSessionOutput().start_run(
+            worktree_root,
+            session_id,
+            # Unmanaged run: the orchestrator never allocated one, so the
+            # profile this session actually resolved is the only honest thing
+            # to freeze onto it (#7059).
+            validation_profile=selection.profile,
+        )
+    return (
+        run_validation(
+            worktree_root,
+            session_output_dir=assets.run_dir,
+            verbose=verbose,
+        ),
+        assets,
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Build argument parser for coding-done."""
     parser = argparse.ArgumentParser(
@@ -412,33 +477,14 @@ def main() -> None:  # noqa: C901, PLR0912
     #    path for coding agents; deeper publish validation runs later through
     #    the orchestrator-controlled pre-push/pre-publish gate.
     validation_result = None
-    statuses_requiring_validation = {AgentStatus.COMPLETED}
     assets = None
-    if status in statuses_requiring_validation:
-        selection = load_validation_cmd(worktree_root)
-        if selection.cmd:
-            if not record.session_id:
-                logger.error("[coding-done] Validation requires session_id but none found")
-                sys.exit(1)
-            if managed:
-                assets = require_orchestrator_run_assets_for_session(
-                    worktree_root,
-                    record.session_id,
-                )
-            else:
-                assets = FileSystemSessionOutput().start_run(
-                    worktree_root,
-                    record.session_id,
-                    # Unmanaged run: the orchestrator never allocated one, so
-                    # the profile this session actually resolved is the only
-                    # honest thing to freeze onto it (#7059).
-                    validation_profile=selection.profile,
-                )
-            validation_result = run_validation(
-                worktree_root,
-                session_output_dir=assets.run_dir,
-                verbose=args.verbose,
-            )
+    if status in STATUSES_REQUIRING_VALIDATION:
+        validation_result, assets = _run_quick_validation_gate(
+            worktree_root=worktree_root,
+            session_id=record.session_id,
+            managed=managed,
+            verbose=args.verbose,
+        )
     elif status in {AgentStatus.BLOCKED, AgentStatus.NEEDS_HUMAN}:
         print(f"Note: Skipping validation for '{status}' status (agent is reporting a problem)")
 
