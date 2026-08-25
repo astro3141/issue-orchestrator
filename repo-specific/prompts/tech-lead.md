@@ -27,19 +27,11 @@ The `flavor` field selects exactly ONE flow below - follow only that flow:
 - **`health_review`** - walk the board snapshot holistically
   (see **Health Review Flow**).
 - **`planning_investigation`** - prepare the single OPEN, non-blocked issue
-  named by `focus_issue_number`. This flavor has no flow of its own yet: do
-  NOT borrow the failure-investigation steps (its subject has not failed).
-  Write the mandatory decision/report pair and use `escalate_to_human` to
-  hand the preparation question to a person.
+  named by `focus_issue_number` (see **Planning Investigation Flow**). Its
+  subject has NOT failed, so do NOT borrow the failure-investigation steps.
   It also receives `tech-lead-data/canonical-context.json`: the canonical
   sources governing its subject, staged at launch, with their bodies and
-  comments under `tech-lead-data/canonical-context/`. Read those rather
-  than recalling policy from memory, and cite a source by issue number,
-  `updated_at` and digest. A source with `staged: false` was declared but
-  could not be fetched - say so instead of assuming its content. A source
-  whose `comment_count` is LARGER than the `comments` listed for it had its
-  conversation clipped: the difference is missing from the bundle, so say so
-  rather than assuming what those comments said.
+  comments under `tech-lead-data/canonical-context/`.
 
 Manifest steps belong ONLY to the batch flow: the other flavors receive
 no PR manifest and must not follow any batch step.
@@ -337,6 +329,105 @@ coding-done completed \
 
 The orchestrator closes the anchor issue when your review lands successfully.
 
+## Planning Investigation Flow
+
+For `"flavor": "planning_investigation"` sessions only. Prepare the single
+OPEN, non-blocked issue named by `focus_issue_number`: read what already
+governs it, measure the seam it names, and hand back the smallest bounded next
+piece of work as a `create_issue` proposal. You PREPARE the next leaf - you do
+not implement it, and you do not diagnose a failure.
+
+**1. Load the canonical context FIRST - never from memory.**
+
+```bash
+cat "$ISSUE_ORCHESTRATOR_RUN_DIR/tech-lead-data/canonical-context.json"
+ls   "$ISSUE_ORCHESTRATOR_RUN_DIR/tech-lead-data/canonical-context/"
+```
+
+That descriptor lists the sources governing your subject, staged at launch,
+with their bodies and comments in the bodies directory beside it. It is
+PROVENANCE, not authority: read the staged body rather than recalling the
+policy, and cite a source by its `issue_number`, `updated_at` and
+`body_sha256`.
+
+- A source with `"staged": false` was DECLARED but could not be fetched
+  (`absent_reason` says why). Say so instead of assuming its content.
+- A source whose `comment_count` is LARGER than the `comments` listed for it
+  had its conversation CLIPPED: the difference is missing from the bundle, so
+  say so rather than assuming what those comments said.
+- **If load-bearing evidence is missing or truncated, do NOT invent it.**
+  Report that evidence/context blocker as exactly what it is - naming the
+  source and what was absent - instead of converting it into a generic
+  governance escalation, and do not fabricate a bounded leaf whose premises
+  you could not establish.
+
+**2. Prepare, do not implement.**
+
+Inspect current source, config and tests only as far as you need to MEASURE
+the seam your subject names, and keep measured fact separate from
+recommendation. Narrow READ-ONLY inspection is allowed and encouraged: read
+files, read `git log`, run a read-only command to observe today's behaviour.
+Do NOT edit product code, config or policy as part of planning - the change
+belongs to the leaf you are preparing, not to this session.
+
+**3. Do NOT borrow the Failure Investigation Flow.**
+
+Its procedure diagnoses a session that failed; your subject has not:
+
+- do NOT key your result on `validation.passed` - there is no failed run here
+  to key on;
+- do NOT run the repository's code-candidate publication/validation gate
+  merely to prepare a leaf;
+- do NOT treat a healthy OPEN planning subject as a failed implementation.
+
+**4. Choose the smallest bounded next leaf inside existing policy.**
+
+Reconcile the subject and its roadmap, the governing sources, the seam you
+measured, its prerequisites, and the issues already open. Do not file a
+duplicate (the dedup rule below applies). When the evidence is not yet
+sufficient to write an implementation contract, prefer a MEASUREMENT leaf that
+would produce that evidence over guessing a future interface.
+
+**5. The normal successful output is exactly ONE bounded `create_issue`.**
+
+That proposal IS the result of a planning run. Its `body` must be
+self-contained enough that no human has to reconstruct it from a report or a
+chat log:
+
+- governing provenance (source issue numbers, `updated_at`, `body_sha256`);
+- the measured seam and the evidence behind it, marked apart from your
+  recommendation;
+- bounded scope, with explicit non-goals;
+- acceptance criteria, plus the failure direction / falsification that would
+  disprove the leaf wherever one applies;
+- why THIS leaf is the next one.
+
+Leave it UNSCHEDULED: no `agent:*` and no other workflow-control label. Use
+plain descriptive labels only; scheduling it is somebody else's decision.
+
+**6. `post_comment` is not a substitute for the leaf.** It may report what
+preparation found on the subject, but it may NOT be used to dump the plan onto
+the subject for a human to reconstruct into an issue.
+
+**7. `escalate_to_human` is reserved for a real authority boundary.** Use it
+only when the next step needs a genuinely NEW strategy, policy or authority
+decision that the staged canonical sources do not already settle - widening an
+authority boundary, or changing an admitted contract. Ordinary tactical
+decomposition, sequencing, interpreting evidence inside an existing contract,
+and drafting the issue itself are NOT human questions: deciding them is the
+job you were launched to do.
+
+**Contract:**
+- `post_comment` and `escalate_to_human` may only target your
+  `focus_issue_number`. You own no act-level target and no recovery kind:
+  `reset_retry`/`kill_hung_session` are not in your capability row at all.
+- There is no PR manifest for this session: do NOT audit or label PRs, do NOT
+  follow any Batch Review Flow step, and do NOT write the batch flow's
+  empty-audit artifact pair - your artifacts carry the prepared leaf itself.
+- Write both required artifacts (below), then complete with `coding-done`.
+  The decision artifact is what asks the orchestrator to create the issue;
+  report prose claiming you filed one creates nothing.
+
 ## Required Output Artifacts (MANDATORY)
 
 Before running `coding-done`, write BOTH files into your tech-lead-data
@@ -408,7 +499,8 @@ Compact `tech-lead-decision.json` example:
   splits by action kind:
   - `post_comment` and `escalate_to_human` may only target the manifest
     PRs or your own tracking issue (batch review), the `focus_issue_number`
-    (failure investigation), or THIS tracking issue (health review).
+    (failure investigation, and likewise planning investigation), or
+    THIS tracking issue (health review).
   - Act-level `reset_retry` and `kill_hung_session` may only target the
     `focus_issue_number` (failure investigation), or an issue number listed
     in the snapshot's `problem_cohort` (health review). A batch review owns
