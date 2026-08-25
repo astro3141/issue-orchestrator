@@ -171,6 +171,37 @@ def without_publication_intent(
     )
 
 
+SUBJECT_RECOVERY_ACTIONS: frozenset[RequestedAction] = frozenset({
+    RequestedAction.ADD_BLOCKED_LABEL,
+    RequestedAction.ADD_NEEDS_HUMAN_LABEL,
+})
+"""The requested actions that change an ISSUE's recovery state — one vocabulary.
+
+The completion-record twin of the labels the planned recovery paths stamp: both
+retire the issue from ordinary work until a human takes it off. Whether a given
+run's ROLE may make that change is not decided here — that is the one answer
+``SubjectRecoveryAuthority`` owns (#182) — but *which requested actions ask for
+it* is stated once, here, so a recovery action added to
+:class:`RequestedAction` joins the family in a single edit rather than leaving
+the agent-requested seam permitting what the planned seam refuses.
+"""
+
+
+def without_subject_recovery_intent(
+    actions: Iterable[RequestedAction],
+) -> tuple[RequestedAction, ...]:
+    """``actions`` minus everything that retires the issue, order preserved.
+
+    The command form of :data:`SUBJECT_RECOVERY_ACTIONS`, in the shape
+    :func:`without_publication_intent` already gives the publication family: a
+    caller that has been told its run holds no recovery authority over its
+    subject states that intent, instead of restating which actions carry it.
+    """
+    return tuple(
+        action for action in actions if action not in SUBJECT_RECOVERY_ACTIONS
+    )
+
+
 # ---------------------------------------------------------------------------
 # CompletionRecord untrusted-input bounds
 #

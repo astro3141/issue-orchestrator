@@ -455,6 +455,64 @@ publication and review path, as does every other flavor and every ordinary
 coder, rework, and review completion. What "validated" means for a code
 candidate is untouched.
 
+### 4c. The lane is decided for every outcome, not only COMPLETED (#257 amendment)
+
+A live planning pilot reported `BLOCKED` — the outcome `coding-done blocked`
+writes when an agent says it cannot proceed — and the pre-action policy phase
+returned early for anything that was not `COMPLETED`. Two already-settled
+policies were therefore skipped, and the generic action executor ran the
+completion record's untrusted requests as written: the run pushed a branch it
+had not written, and `add_blocked_label` blocked the very issue it had been
+sent to prepare, while the action planner (which does ask) told the operator
+that no `blocked` label had been added. Durable state and the operator message
+contradicted each other.
+
+`control/tech_lead_completion.py::settle_tech_lead_completion` is now the one
+pre-action seam for a tech_lead completion of ANY outcome:
+
+- **COMPLETED is unchanged.** It is still held to the admission contract —
+  trusted launch authority plus a valid decision artifact pair — and that gate
+  still runs before any shaping, for the ordering reason above.
+- **Any other outcome is governed without being asked to have landed.** A run
+  that did not land has no decision pair, and demanding one to settle
+  side-effect policy would either reject every honest block or invite a
+  fabricated artifact. The orchestrator-owned launch authority already records
+  what role the run was, which is all either policy needs. Its worktree-copy
+  tamper detail is deliberately not fatal here, matching how
+  `resolve_subject_recovery_authority` reads the same row for the planned half.
+- **Both policies apply to the surviving requests.** Zero code is still PROVEN
+  by the six facts above, never assumed — a blocked run whose checkout cannot be
+  proven unchanged keeps the push that preserves its work. Recovery requests
+  (`add_blocked_label`, `add_needs_human_label`) are removed exactly when
+  `SubjectRecoveryAuthority` says this run's role may not change its subject's
+  recovery state, so the completion-record seam and the planned seam give one
+  answer.
+- **A refused request is never a silent one.** The completion record is the
+  SEVENTH door onto a subject's recovery state, and it goes through the same
+  owner as the other six: `completion_request_outcome` hands the seam what it
+  refused alongside what survived, so the refusal reaches the lane's `detail`
+  trace, and every outcome whose requests it refuses has a planned twin that
+  says the same thing in the operator's comment — `agent_blocked_actions` for
+  `BLOCKED`, `agent_needs_human_completion` for `NEEDS_HUMAN`. That pairing is
+  the property, not a coincidence of which modules happen to exist: the
+  vocabulary lives in `SUBJECT_RECOVERY_ACTIONS`, and a recovery action added
+  to it fails the planner suite until it is given a twin.
+- **An unresolvable launch authority governs nothing.** The role is unproven, so
+  the generic behaviour stands — the same conservative direction the planned
+  half already takes.
+
+The `NEEDS_HUMAN` twin was the gap this amendment's first round left open. A
+tech_lead escalation loses all three of its requests — the push to the zero-code
+lane, the comment to `shape_requested_actions_for_tech_lead`, the label to the
+recovery door — and `NEEDS_HUMAN` deliberately plans nothing, because for an
+ordinary session the requested `needs-human` label is what holds the issue.
+With no label there is no holder: the `in-progress` claim is reaped, the issue
+returns to the queue, and the question the agent asked was never written
+anywhere an operator looks. `agent_needs_human_completion` speaks exactly where
+that happens — when the role may NOT leave the label — reporting the question,
+the reason the subject carries no label, and releasing the claim. A role that
+MAY leave the label keeps the generic policy untouched.
+
 ### 5. Sequencing and scope boundaries
 
 Hygiene precedes construction: the dead batch-trigger engine and its
