@@ -38,6 +38,7 @@ from .timeline_presentation import (
     _timeline_event_recommended_actions,
     _timeline_event_requires_run_dir,
 )
+from .web_after_response import AfterResponseMiddleware
 from .web_diagnostics_routes import install_web_diagnostics_dependencies, web_diagnostics_router
 from .web_event_stream import read_engine_liveness, stream_events
 from .web_retrospective_review_routes import web_retrospective_review_router
@@ -178,6 +179,13 @@ if os.environ.get("IO_DEV"):
         if request.url.path.startswith("/static/"):
             response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
         return response
+
+
+# Added last, so it is the outermost user middleware: the ``send`` it
+# wraps is the server's own, which is the only point at which a response
+# is provably on the wire. ``/api/shutdown`` defers its destructive
+# uvicorn teardown behind it (#277).
+app.add_middleware(AfterResponseMiddleware)
 
 
 @app.post("/login")

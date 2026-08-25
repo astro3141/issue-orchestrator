@@ -30,9 +30,19 @@ BROADCAST_TIMEOUT_SECONDS = 10.0
 class LiveDashboardServer:
     """Runs ``app`` in a background thread and reports its bound port."""
 
-    def __init__(self, app: FastAPI | None = None, *, name: str = "dashboard") -> None:
+    def __init__(
+        self,
+        app: FastAPI | None = None,
+        *,
+        name: str = "dashboard",
+        timeout_graceful_shutdown: int | None = None,
+    ) -> None:
         self._app = dashboard_app if app is None else app
         self._name = name
+        # ``run_web_dashboard`` deploys with ``timeout_graceful_shutdown=0``.
+        # Tests about shutdown ordering must reproduce that shape; tests
+        # about anything else keep uvicorn's default (None).
+        self._timeout_graceful_shutdown = timeout_graceful_shutdown
         self.port: int | None = None
         self._thread: threading.Thread | None = None
         self._server: Any = None
@@ -55,6 +65,7 @@ class LiveDashboardServer:
                 port=0,
                 log_level="error",
                 access_log=False,
+                timeout_graceful_shutdown=self._timeout_graceful_shutdown,
             )
             self._server = uvicorn.Server(config)
 
@@ -77,6 +88,22 @@ class LiveDashboardServer:
             )
         assert self.port is not None
         return self.port
+
+    def uvicorn_server(self) -> Any:
+        """The running ``uvicorn.Server``.
+
+        Handed to ``web.set_server`` by tests that need the production
+        ``trigger_server_shutdown`` to act on a real server rather than
+        on the ``None`` a test process usually leaves it as.
+        """
+        assert self._server is not None, "server has not been started"
+        return self._server
+
+    def wait_until_stopped(self, timeout: float = SHUTDOWN_TIMEOUT_SECONDS) -> bool:
+        """Wait for the serving thread to exit; ``True`` if it did."""
+        assert self._thread is not None, "server has not been started"
+        self._thread.join(timeout=timeout)
+        return not self._thread.is_alive()
 
     def base_url(self) -> str:
         """The origin a client should talk to; requires ``start`` first."""

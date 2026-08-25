@@ -218,13 +218,23 @@ class TestSSEFunctionality:
             # Build a Request stub the new endpoint can read JSON
             # body from. We can't import starlette's Request and
             # construct one cheaply, so use the SimpleNamespace +
-            # async ``json()`` helper pattern.
+            # async ``json()`` helper pattern. Its scope carries the
+            # list ``AfterResponseMiddleware`` installs, because the
+            # endpoint now defers its destructive teardown there (#277).
+            from issue_orchestrator.entrypoints.web_after_response import (
+                AFTER_RESPONSE_SCOPE_KEY,
+            )
+
             class _RequestStub:
+                def __init__(self):
+                    self.scope = {AFTER_RESPONSE_SCOPE_KEY: []}
+
                 async def json(self):
                     return {"reason": "sse test", "actor": "unit-test"}
 
+            request = _RequestStub()
             response = await web_operator_routes.shutdown(
-                _RequestStub(),  # type: ignore[arg-type]
+                request,  # type: ignore[arg-type]
                 orchestrator,
                 operator_deps,
                 force=False,
@@ -236,6 +246,9 @@ class TestSSEFunctionality:
             assert event["data"]["reason"] == "sse test"
             assert orchestrator.shutdown_called is True
             ShutdownRequestedPayload.model_validate(event["data"])
+            # The broadcast is the request's own work; the teardown is
+            # queued for after the response, not run alongside it.
+            assert len(request.scope[AFTER_RESPONSE_SCOPE_KEY]) == 1
         finally:
             web.remove_event_subscriber(queue)
             set_orchestrator(original)
