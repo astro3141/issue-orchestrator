@@ -19,3 +19,5 @@ What remains under `docs/selfhosting/` is executed, not narrated:
 
 `SELF_HOSTING_READY.md` is a dated milestone record of what was established on
 2026-08-12, not operating instructions.
+
+R20 promotion canary record: a self-hosting lifecycle ran on 2026-08-25 against candidate commit `9efcab66` (issue #259) — a dated record only, not operating instructions.
