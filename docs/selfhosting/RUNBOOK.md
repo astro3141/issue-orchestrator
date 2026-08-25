@@ -19,3 +19,5 @@ What remains under `docs/selfhosting/` is executed, not narrated:
 
 `SELF_HOSTING_READY.md` is a dated milestone record of what was established on
 2026-08-12, not operating instructions.
+
+R21 promotion canary record: a self-hosting lifecycle ran on 2026-08-25 under the R21 promotion candidate artifact built from `2445e3f2`, the candidate under test being this branch's own HEAD (issue #271) — a dated record only, not operating instructions.
