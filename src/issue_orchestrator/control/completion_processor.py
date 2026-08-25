@@ -98,8 +98,8 @@ from .completion_result_artifacts import (
     build_pr_body,
     build_processing_result,
     cleanup_completion_record,
-    clear_completion_records,
     preserve_completion_record,
+    remove_completion_record,
     write_reviewer_feedback_file,
 )
 from .completion_review_exchange import CompletionReviewExchange
@@ -719,8 +719,8 @@ class CompletionProcessor:
         error_details: list[dict[str, Any]] = []  # Full diagnostic info per error
 
         # Read and validate completion record. The selection is made ONCE here
-        # and travels to the audit copy and to cleanup, so those three cannot
-        # end up meaning different files on the same path (#264).
+        # and travels to the audit copy and to the cleanup log, so the record
+        # this run acted on and the record it reports are the same file (#264).
         selection, session_name, error_result = self._read_and_validate_record(
             worktree,
             completion_path,
@@ -857,6 +857,7 @@ class CompletionProcessor:
             errors=errors,
             error_details=error_details,
             total_duration=total_duration,
+            completion_path=completion_path,
             selection=selection,
             preserved_completion_path=preserved_completion_path,
             run_assets=run_assets,
@@ -2672,11 +2673,13 @@ class CompletionProcessor:
     def _cleanup_completion_record(
         self,
         worktree: Path,
+        completion_path: str | None,
         selection: CompletionRecordSelection,
         issue_number: int,
     ) -> None:
         cleanup_completion_record(
             worktree=worktree,
+            completion_path=completion_path,
             selection=selection,
             issue_number=issue_number,
             cleanup_record=self.cleanup_record,
@@ -2695,12 +2698,10 @@ class CompletionProcessor:
             )
         )
 
-    def cleanup_record(self, selection: CompletionRecordSelection) -> bool:
-        """Remove the completion record files this run occupies.
+    def cleanup_record(self, worktree: Path, completion_path: str | None = None) -> bool:
+        """Remove the completion record after processing.
 
-        Takes the selection rather than a worktree and a path hint, because
-        the file the orchestrator ACTED on is the one that has to go and only
-        the selection owner knows which that is. See
-        ``clear_completion_records`` for what removal means and why.
+        The canonical record and nothing else, unchanged by #264. See
+        ``remove_completion_record`` for why siblings are left alone.
         """
-        return clear_completion_records(selection)
+        return remove_completion_record(worktree, completion_path)

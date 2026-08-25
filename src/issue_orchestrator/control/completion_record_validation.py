@@ -324,28 +324,18 @@ class CompletionRecordSelection:
 
     @property
     def superseded_path(self) -> Path | None:
-        """The placeholder the selected retry took over from, if any."""
+        """The placeholder the selected retry took over from, if any.
+
+        Descriptive only. This owner answers WHICH file speaks for the run;
+        it does not decide which files may be removed, and #264 removes
+        nothing it did not already remove — both records stay on disk except
+        for the canonical file the pre-existing cleanup has always unlinked.
+        Cleanup reads this to say in its log which record it deliberately
+        LEFT behind, never to widen what it deletes.
+        """
         if self.path == self.canonical_path:
             return None
         return self.canonical_path
-
-    def occupied_paths(self) -> tuple[Path, ...]:
-        """Every file this run's completion occupies, authoritative first.
-
-        What cleanup has to remove. Removing only the canonical path would
-        leave the record the orchestrator ACTED on sitting beside it while
-        reporting the completion as cleaned — the same file-the-decision-did-
-        not-read split that made #264 invisible, on the other half of the
-        preserve/cleanup pair.
-
-        Deliberately excludes ``unresolved_candidates``: those exist only
-        where this owner refused to choose, and unresolved evidence is not
-        this function's to delete.
-        """
-        superseded = self.superseded_path
-        if superseded is None:
-            return (self.path,)
-        return (self.path, superseded)
 
     def lookup_fields(self) -> dict[str, object]:
         """Explain the choice to a log line or a trace event payload.
@@ -370,10 +360,16 @@ def select_completion_record(
     """Choose WHICH completion record file speaks for a run.
 
     The ONE owner of that question. The observer that watches sessions,
-    the controller that decides their outcome, the audit copy, and
-    cleanup all route here, so a record one of them acts on can never be
-    a record another cannot see — the split that left a valid completion
+    the controller that decides their outcome, and the run-scoped audit
+    copy all route here, so a record one of them acts on can never be a
+    record another cannot see — the split that left a valid completion
     invisible on disk while its session ran to timeout (#264).
+
+    It decides authority, not lifetime. Nothing here moves, renames,
+    overwrites, or deletes any file, and #264 leaves record cleanup
+    exactly as it found it: the pre-existing cleanup unlinks the
+    canonical path and no other. Cleanup consults this only to report
+    which record it left behind.
 
     Takes ``(worktree, completion_path)`` rather than a resolved file so
     that callers cannot re-derive the join themselves and drift; it asks

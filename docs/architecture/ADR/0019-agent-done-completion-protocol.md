@@ -137,8 +137,8 @@ Two questions, two owners, one chain. `completion_record_path` in
 of a worktree and the stored relative hint, so no caller re-derives it.
 `select_completion_record` in `control/completion_record_validation.py`
 starts from that answer and owns **which** file is authoritative. The
-observer, the session controller, the run-scoped audit copy, and cleanup all
-ask, so none of them can act on — or report — a record another cannot see:
+observer, the session controller, and the run-scoped audit copy all ask, so
+none of them can act on — or report — a record another cannot see:
 
 - canonical missing or **valid** → canonical, always. Siblings are ignored;
   authority is never re-assigned between two valid completions.
@@ -155,16 +155,29 @@ Every candidate is read through `load_completion_record_result`, so the
 file-size gate and field bounds apply to siblings exactly as they do to the
 canonical record. Selection itself moves, renames, and deletes nothing.
 
-Processing resolves the selection **once**, then hands that same object to
-the run-scoped audit copy and to cleanup. Cleanup clears every path the
-selection says the run occupies — the record that was acted on and any
-placeholder it superseded — and names the acted-on one in its log. Both
-halves matter: leaving the acted-on record behind would report a completion
-as cleaned while it survived on disk, and leaving the placeholder behind
-would block `restore_completion_record` on the publish-retry path, which
-no-ops when something already occupies the canonical path. Siblings the
-owner refused to choose between are left alone; unresolved evidence is not
-cleanup's to delete.
+**Selection decides authority, not lifetime.** Record cleanup is exactly
+what it was before this rule existed: it unlinks the canonical path and no
+other file. Every sibling — a retry that superseded a placeholder, a second
+review after rework, candidates the owner refused to choose between — stays
+where the producer wrote it. Giving selection a say in what may be deleted
+would be a new retention policy, and that is a decision of its own, not a
+consequence of teaching two readers to agree.
+
+The one thing cleanup owes the reader is an honest account. When a retry
+superseded a placeholder, the file cleanup removes is the placeholder, so
+its log names that path *and* the retained record beside it. Reporting only
+`path=<canonical> exists_after=False` would read as "the completion was
+cleaned up" while the record the orchestrator acted on sat on disk — the
+same naming-a-file-the-decision-did-not-read gap that made the original
+defect invisible.
+
+Processing therefore resolves the selection **once** and hands that same
+object to the audit copy and to the cleanup log. The ordering matters for
+the publish-retry path: `preserve_completion_record` copies the *selected*
+record to the run-scoped copy before cleanup frees the canonical path, so
+`restore_completion_record` — which no-ops only while that path is occupied
+— restores the record that was actually acted on, and the next selection
+sees a valid canonical file and takes it.
 
 ## Consequences
 

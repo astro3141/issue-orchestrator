@@ -7243,7 +7243,7 @@ class TestRunScopedArtifacts:
         assert not completion_path.exists()
         assert manifest["completion_record_path"] == str(preserved_path)
 
-    def test_process_preserves_and_clears_the_retry_that_superseded_a_placeholder(
+    def test_process_preserves_the_retry_and_leaves_it_on_disk(
         self,
         tmp_path,
         mock_label_adapter,
@@ -7251,12 +7251,14 @@ class TestRunScopedArtifacts:
         mock_git_adapter,
         event_bus,
     ) -> None:
-        """The audit copy and cleanup must mean the SAME file (#264 F1).
+        """The audit copy is the retry; cleanup stays what it always was (#264).
 
         A crashed ``coding-done`` leaves a placeholder on the canonical
-        path and the retry lands on a numbered sibling. Preserving the
-        retry while cleanup removed only the placeholder would leave the
-        record the orchestrator acted on sitting on disk, unreported.
+        path and the retry lands on a numbered sibling. The run-scoped
+        copy must be the retry — that is the record the orchestrator acted
+        on, and the one a publish retry restores. Selecting it must not
+        make #264 delete the sibling: the issue keeps both files on disk
+        and reserves record lifetime for a decision of its own.
         """
         worktree = tmp_path / "worktree"
         worktree.mkdir()
@@ -7317,9 +7319,10 @@ class TestRunScopedArtifacts:
         preserved = json.loads(preserved_path.read_text())
         assert preserved["implementation"] == "Implemented the issue on the retry"
         assert "agent_done_error" not in preserved
-        # Both files this run's completion occupied are gone: the record
-        # that was acted on, and the placeholder it superseded.
-        assert not retry.exists()
+        # Cleanup removed the canonical placeholder, exactly as it did
+        # before #264. The retry it superseded is left where the producer
+        # wrote it — selecting a record does not license deleting one.
+        assert retry.exists()
         assert not canonical.exists()
 
     def test_review_exchange_summary_is_stored_in_review_run_dir(

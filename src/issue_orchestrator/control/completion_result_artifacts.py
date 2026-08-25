@@ -9,7 +9,11 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from ..domain.events import SessionEvent
-from ..domain.models import CompletionRecord, RequestedAction
+from ..domain.models import (
+    CompletionRecord,
+    RequestedAction,
+    completion_record_path,
+)
 from ..domain.review_exchange_run import ReviewExchangeRunAssets
 from ..domain.runtime_identity import RuntimeIdentity
 from ..domain.session_run import SessionRunAssets
@@ -31,8 +35,10 @@ from .completion_types import (
 logger = logging.getLogger(__name__)
 
 EmitCompletionEvent = Callable[[SessionEvent, int, dict[str, Any]], None]
-CleanupRecord = Callable[[CompletionRecordSelection], bool]
-CleanupCompletionRecord = Callable[[Path, CompletionRecordSelection, int], None]
+CleanupRecord = Callable[[Path, str | None], bool]
+CleanupCompletionRecord = Callable[
+    [Path, str | None, CompletionRecordSelection, int], None
+]
 
 
 class PostIssueComment(Protocol):
@@ -55,6 +61,7 @@ def build_processing_result(
     errors: list[str],
     error_details: list[dict[str, Any]],
     total_duration: float,
+    completion_path: str | None,
     selection: CompletionRecordSelection,
     preserved_completion_path: str | None,
     run_assets: SessionRunAssets,
@@ -140,7 +147,7 @@ def build_processing_result(
         )
         post_issue_comment(issue_number, comment, context="processing failure")
 
-    cleanup_completion_record_fn(worktree, selection, issue_number)
+    cleanup_completion_record_fn(worktree, completion_path, selection, issue_number)
 
     review_exchange_halted = any(
         error.startswith(REVIEW_EXCHANGE_ERROR_PREFIX) for error in errors
@@ -171,7 +178,12 @@ def preserve_completion_record(
     Takes the selection the caller already made rather than re-deriving a
     path, so the audit copy is the record the orchestrator actually acted
     on — not a producer-error placeholder a valid retry already superseded
-    (#264) — and cannot disagree with the cleanup that follows it.
+    (#264).
+
+    This runs before cleanup deliberately: cleanup removes the canonical
+    file, so the durable copy is what a later publish retry restores, and
+    it has to be the selected record for that retry to republish the work
+    that was actually approved.
     """
     source_path = selection.path
     if not source_path.exists():
@@ -194,69 +206,72 @@ def preserve_completion_record(
         return None
 
 
-def clear_completion_records(selection: CompletionRecordSelection) -> bool:
-    """Remove every file this run's completion occupies.
+def remove_completion_record(worktree: Path, completion_path: str | None) -> bool:
+    """Delete the run's canonical completion record.
 
-    Both halves are load-bearing. Leaving the record that was ACTED on
-    behind would report a completion as cleaned while it survived on disk —
-    the same file-the-decision-did-not-read split that made #264 invisible,
-    on the cleanup side of the preserve/cleanup pair. Leaving the superseded
-    placeholder behind would strand the publish-retry path, whose
-    ``restore_completion_record`` no-ops when the canonical path is occupied.
+    The canonical path and nothing else, as it has always been. #264 gave
+    completion-record *selection* one owner; record lifetime was explicitly
+    outside it ("both files stay on disk"), so a numbered sibling — a retry
+    that superseded a producer error, a legitimate second review, or a
+    candidate the owner refused to choose between — is left where the
+    producer wrote it.
 
     Returns:
-        True if every occupied path is gone, False if any removal failed.
+        True if the record is gone, False if the removal failed.
     """
-    removed = True
-    for record_path in selection.occupied_paths():
-        try:
-            if record_path.exists():
-                record_path.unlink()
-                logger.debug("Removed completion record: %s", record_path)
-        except Exception as exc:
-            logger.warning(
-                "Failed to remove completion record %s: %s", record_path, exc
-            )
-            removed = False
-    return removed
+    record_path = completion_record_path(worktree, completion_path)
+    try:
+        if record_path.exists():
+            record_path.unlink()
+            logger.debug("Removed completion record: %s", record_path)
+        return True
+    except Exception as exc:
+        logger.warning("Failed to remove completion record: %s", exc)
+        return False
 
 
 def cleanup_completion_record(
     *,
     worktree: Path,
+    completion_path: str | None,
     selection: CompletionRecordSelection,
     issue_number: int,
     cleanup_record: CleanupRecord,
     post_issue_comment: PostIssueComment,
 ) -> None:
-    """Clean up the completion record files after processing.
+    """Clean up the completion record after processing.
 
-    Clears every path the selection says this run's completion occupies —
-    the record that was acted on AND any placeholder it superseded — and
-    names the acted-on one in the log. Reporting the canonical path as
-    cleaned while the record the orchestrator actually read survived beside
-    it is the same lie, on the cleanup side, that #264 was on the lookup
-    side (#264 review round 1, F1).
+    Removes the canonical record and nothing else, exactly as it did before
+    #264. That leaf gave completion-record *selection* one owner; it does
+    not own record lifetime, and inventing a deletion policy for the files
+    selection now looks at is a separate decision nobody has made.
+
+    ``selection`` is here for the log, not for the removal: when a retry
+    superseded a producer-error placeholder, the file this function unlinks
+    is the placeholder while the record the orchestrator actually acted on
+    stays on disk. Saying only ``path=<canonical> exists_after=False`` would
+    read as "the completion was cleaned up" — the same file-the-decision-did-
+    not-read gap that made #264 invisible — so the line names the retained
+    record explicitly.
     """
-    record_paths = selection.occupied_paths()
-    existed_before = [path for path in record_paths if path.exists()]
-    cleanup_ok = cleanup_record(selection)
-    remaining = [path for path in record_paths if path.exists()]
+    record_path = selection.canonical_path
+    retained = selection.path if selection.superseded_path is not None else None
+    existed_before = record_path.exists()
+    cleanup_ok = cleanup_record(worktree, completion_path)
+    exists_after = record_path.exists()
     logger.warning(
-        "CLEANUP: issue=%d path=%s choice=%s superseded=%s "
-        "existed_before=%s exists_after=%s",
+        "CLEANUP: issue=%d path=%s existed_before=%s exists_after=%s retained=%s",
         issue_number,
-        selection.path,
-        selection.choice.value,
-        selection.superseded_path,
-        bool(existed_before),
-        [str(path) for path in remaining],
+        record_path,
+        existed_before,
+        exists_after,
+        retained,
     )
-    if existed_before and remaining and not cleanup_ok:
+    if existed_before and exists_after and not cleanup_ok:
         comment = build_cleanup_failure_comment(
             issue_number=issue_number,
             worktree=worktree,
-            record_path=remaining[0],
+            record_path=record_path,
         )
         post_issue_comment(issue_number, comment, context="cleanup warning")
 
