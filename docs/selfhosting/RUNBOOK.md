@@ -19,3 +19,5 @@ What remains under `docs/selfhosting/` is executed, not narrated:
 
 `SELF_HOSTING_READY.md` is a dated milestone record of what was established on
 2026-08-12, not operating instructions.
+
+R21 promotion canary (Proof-B, issue #281): ran 2026-08-25 against candidate `23b30a31e714dc6d5f1a809a931277f997840935`.
