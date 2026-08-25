@@ -649,3 +649,331 @@ def test_fix_class_values_match_the_domain_contract(variant: str) -> None:
     clause = _fix_class_clause(PROMPT_VARIANTS[variant])
     for value in VALID_FINDING_FIX_CLASSES:
         assert f'`"{value}"`' in clause, f"{variant} omits fix_class value {value}"
+
+
+# --- Planning Investigation Flow (#261) ------------------------------------
+#
+# These guardrails are scoped to the DEPLOYED prompt on purpose. The planning
+# lane runs `repo-specific/prompts/tech-lead.md` — the file this repository's
+# `.issue-orchestrator/config/modes/default/main.yaml` hands `agent:tech-lead`
+# — and #261's contract is about what that shipped prompt tells the already
+# authorized `planning_investigation` role to DO. Nothing here widens runtime
+# authority: the capability row, the target scope, and the label rule are all
+# pinned below to the domain owners that already enforce them.
+#
+# Before #261 the shipped prompt told the planning role it "has no flow of its
+# own yet" and to use `escalate_to_human` to hand the preparation question to a
+# person — the exact Human relay the bounded planning lane exists to remove. An
+# agent obeying that prompt could correctly refuse to prepare anything.
+
+DEPLOYED_PROMPT = PROMPT_VARIANTS["repo_specific"]
+
+PLANNING_ASSIGNMENT_MARKER = "- **`planning_investigation`**"
+
+
+def _planning_flow() -> str:
+    """The deployed `## Planning Investigation Flow` section."""
+    return _flow_section(DEPLOYED_PROMPT, "Planning Investigation Flow")
+
+
+def _planning_assignment_entry() -> str:
+    """The `planning_investigation` bullet of the Your Assignment list.
+
+    Bounded to the bullet (it ends at the next unindented line) so an
+    assertion about what the ASSIGNMENT says cannot be satisfied by prose
+    from the flow section far below it.
+    """
+    assert PLANNING_ASSIGNMENT_MARKER in DEPLOYED_PROMPT, (
+        "planning_investigation assignment entry missing from the deployed prompt"
+    )
+    start = DEPLOYED_PROMPT.index(PLANNING_ASSIGNMENT_MARKER)
+    rest = DEPLOYED_PROMPT[start + len(PLANNING_ASSIGNMENT_MARKER) :]
+    match = re.search(r"\n(?=\S)", rest)
+    end = start + len(PLANNING_ASSIGNMENT_MARKER) + (
+        match.start() if match else len(rest)
+    )
+    return DEPLOYED_PROMPT[start:end]
+
+
+def test_planning_flow_exists_and_the_assignment_points_at_it() -> None:
+    """Acceptance 1: the flow is reachable from the assignment entry."""
+    assert "## Planning Investigation Flow" in DEPLOYED_PROMPT, (
+        "deployed prompt has no dedicated Planning Investigation Flow"
+    )
+    entry = _planning_assignment_entry()
+    assert "Planning Investigation Flow" in entry, (
+        "the planning_investigation assignment entry does not point at its flow"
+    )
+    assert "no flow of its own" not in DEPLOYED_PROMPT, (
+        "deployed prompt still tells planning_investigation it has no flow"
+    )
+
+
+def test_planning_assignment_no_longer_defaults_to_a_human_relay() -> None:
+    """Acceptance 3: routine preparation is not handed to a person."""
+    entry = _normalized(_planning_assignment_entry())
+    assert "escalate_to_human" not in entry, (
+        "the planning assignment entry still routes preparation to a human"
+    )
+    assert "hand the preparation question to a person" not in _normalized(
+        DEPLOYED_PROMPT
+    ), "the superseded default-human-relay instruction is still shipped"
+
+
+def test_planning_flow_names_create_issue_as_the_normal_bounded_output() -> None:
+    """Acceptance 2 and 5: one bounded, self-contained leaf is the result."""
+    flow = _normalized(_planning_flow())
+    assert "The normal successful output is exactly ONE bounded `create_issue`" in (
+        flow
+    ), "the planning flow does not name create_issue as its normal output"
+    assert "self-contained" in flow, (
+        "the planning flow does not require a self-contained issue body"
+    )
+    for token in (
+        "governing provenance",
+        "acceptance criteria",
+        "non-goals",
+        "failure direction",
+        "measured seam",
+    ):
+        assert token in flow, (
+            f"the planning flow does not require {token!r} in the proposed leaf"
+        )
+
+
+def test_planning_flow_requires_an_unscheduled_leaf() -> None:
+    """Acceptance 6: a successful run must leave the leaf unscheduled."""
+    flow = _normalized(_planning_flow())
+    assert "UNSCHEDULED" in flow, (
+        "the planning flow does not require the proposed leaf to stay unscheduled"
+    )
+    assert "`agent:*`" in flow, (
+        "the planning flow does not forbid the agent:* scheduling label"
+    )
+    assert "workflow-control label" in flow, (
+        "the planning flow does not forbid workflow-control labels generally"
+    )
+
+
+def test_planning_scheduling_label_ban_matches_the_runtime_label_rule() -> None:
+    """The prompt forbids what the completion contract actually rejects.
+
+    Pins the `agent:*` ban the planning flow teaches to
+    ``protected_tech_lead_label_violations`` — the check a `create_issue`
+    proposal is judged by — so the prompt cannot end up forbidding a label the
+    runtime accepts, or (worse) permitting one it rejects.
+    """
+    config = Config()
+    labels = LabelManager(config)
+    assert protected_tech_lead_label_violations(
+        ("agent:backend",), config=config, labels=labels
+    ), "runtime no longer rejects agent:* labels the planning flow forbids"
+    assert (
+        protected_tech_lead_label_violations(
+            ("enhancement",), config=config, labels=labels
+        )
+        == []
+    ), "runtime rejects the plain descriptive labels the planning flow asks for"
+
+
+def test_planning_flow_reserves_escalation_for_an_authority_boundary() -> None:
+    """Acceptance 3: escalation is the exception, not the default path."""
+    flow = _normalized(_planning_flow())
+    assert "`escalate_to_human` is reserved for a real authority boundary" in flow, (
+        "the planning flow does not reserve escalation for an authority boundary"
+    )
+    assert "genuinely NEW strategy, policy or authority decision" in flow, (
+        "the planning flow does not say what makes a question a human one"
+    )
+    assert "are NOT human questions" in flow, (
+        "the planning flow does not exclude routine decomposition from escalation"
+    )
+
+
+def test_planning_flow_excludes_the_failure_investigation_procedure() -> None:
+    """Acceptance 4: the failure rubric must not leak into planning."""
+    flow = _normalized(_planning_flow())
+    assert "Do NOT borrow the Failure Investigation Flow" in flow, (
+        "the planning flow does not exclude the failure-investigation procedure"
+    )
+    assert "do NOT key your result on `validation.passed`" in flow, (
+        "the planning flow does not exclude the validation.passed outcome rubric"
+    )
+    assert "code-candidate publication/validation gate" in flow, (
+        "the planning flow does not exclude the code-candidate validation gate"
+    )
+    assert "healthy OPEN planning subject as a failed implementation" in flow, (
+        "the planning flow does not warn against reading its subject as failed"
+    )
+    # Non-vacuity: the excluded rubric really does live in the failure flow, so
+    # this guardrail keeps testing something after a rewrite of either section.
+    failure = _normalized(_flow_section(DEPLOYED_PROMPT, "Failure Investigation Flow"))
+    assert "`validation.passed`" in failure, (
+        "the failure flow no longer keys on validation.passed; re-anchor the"
+        " planning exclusion"
+    )
+
+
+def test_planning_flow_preserves_bounded_read_only_seam_measurement() -> None:
+    """Acceptance 4: excluding the failure rubric must not blind the role."""
+    flow = _normalized(_planning_flow())
+    assert "READ-ONLY inspection is allowed" in flow, (
+        "the planning flow no longer permits bounded read-only seam measurement"
+    )
+    assert "Do NOT edit product code, config or policy" in flow, (
+        "the planning flow does not keep preparation separate from implementation"
+    )
+
+
+def test_planning_flow_requires_canonical_context_provenance() -> None:
+    """Acceptance 5: provenance first, and the missing/clipped fail-safe."""
+    flow = _normalized(_planning_flow())
+    for token in (
+        "canonical-context.json",
+        "`issue_number`",
+        "`updated_at`",
+        "`body_sha256`",
+        '`"staged": false`',
+        "`comment_count`",
+        "CLIPPED",
+    ):
+        assert token in flow, (
+            f"the planning flow does not teach canonical provenance token {token!r}"
+        )
+    assert "If load-bearing evidence is missing or truncated, do NOT invent it" in (
+        flow
+    ), "the planning flow lost the missing/truncated-source fail-safe"
+    assert "instead of converting it into a generic governance escalation" in flow, (
+        "the planning flow does not keep an evidence blocker out of escalation"
+    )
+
+
+def test_planning_provenance_fields_match_the_staged_descriptor() -> None:
+    """The prompt names the REAL descriptor fields, not drifted aliases.
+
+    A guardrail asserting on field names the orchestrator never writes would
+    pass while the agent looked for provenance that does not exist.
+    """
+    from issue_orchestrator.domain.canonical_context import (
+        CANONICAL_CONTEXT_FILENAME,
+        CanonicalContextSnapshot,
+        CanonicalSource,
+        CanonicalSourceKind,
+    )
+
+    snapshot = CanonicalContextSnapshot(
+        subject_issue_number=7,
+        sources=(
+            CanonicalSource(
+                kind=CanonicalSourceKind.SUBJECT,
+                issue_number=7,
+                required=True,
+                fetched_at="2026-08-25T00:00:00",
+                staged=True,
+                updated_at="2026-08-24T00:00:00",
+                body_sha256="a" * 64,
+                comment_count=2,
+            ),
+        ),
+    )
+    source = snapshot.to_dict()["sources"][0]
+    for field in ("issue_number", "updated_at", "body_sha256", "staged", "comment_count"):
+        assert field in source, f"staged descriptor no longer carries {field!r}"
+    assert CANONICAL_CONTEXT_FILENAME == "canonical-context.json"
+
+
+def test_planning_flow_forbids_post_comment_as_the_leaf_substitute() -> None:
+    """Acceptance 5/6: the plan may not be relayed through a comment."""
+    flow = _normalized(_planning_flow())
+    assert "`post_comment` is not a substitute for the leaf" in flow, (
+        "the planning flow permits dumping the plan onto the subject instead"
+    )
+    assert "reconstruct into an issue" in flow, (
+        "the planning flow does not forbid human reconstruction of the plan"
+    )
+
+
+def test_planning_flow_contains_no_batch_only_instructions() -> None:
+    """A planning session gets no PR manifest; batch steps must not reach it."""
+    flow = _planning_flow()
+    for tell in _BATCH_ONLY_TELLS:
+        assert tell not in flow, (
+            f"planning flow contains batch-only instruction {tell!r}"
+        )
+
+
+def test_planning_flow_target_scope_matches_the_launch_authority() -> None:
+    """Acceptance 7: the flow restates the runtime scope, it does not widen it."""
+    from issue_orchestrator.domain.tech_lead_session import (
+        TechLeadLaunchAuthority,
+        TechLeadSessionFlavor,
+    )
+
+    authority = TechLeadLaunchAuthority(
+        flavor=TechLeadSessionFlavor.PLANNING_INVESTIGATION,
+        anchor_issue_number=99,
+        focus_issue_number=42,
+    )
+    assert authority.allowed_targets() == frozenset({42})
+    assert authority.allowed_act_level_targets() == frozenset()
+
+    flow = _normalized(_planning_flow())
+    assert (
+        "`post_comment` and `escalate_to_human` may only target your"
+        " `focus_issue_number`" in flow
+    ), "the planning flow does not scope its comment/escalation targets"
+    assert "You own no act-level target and no recovery kind" in flow, (
+        "the planning flow does not state that it owns no act-level target"
+    )
+
+
+def test_planning_flow_recovery_exclusion_matches_the_capability_table() -> None:
+    """Acceptance 7: recovery stays structurally unreachable for planning."""
+    from issue_orchestrator.domain.tech_lead_capabilities import (
+        TECH_LEAD_ACTION_CAPABILITIES,
+    )
+    from issue_orchestrator.domain.tech_lead_session import TechLeadSessionFlavor
+
+    flavor = TechLeadSessionFlavor.PLANNING_INVESTIGATION
+    assert not TECH_LEAD_ACTION_CAPABILITIES.permits_recovery(flavor)
+    kinds = TECH_LEAD_ACTION_CAPABILITIES.allowed_kinds(flavor)
+    assert "create_issue" in kinds, (
+        "planning may no longer propose the create_issue leaf the flow teaches"
+    )
+
+    flow = _normalized(_planning_flow())
+    for forbidden in sorted({"reset_retry", "kill_hung_session"} - set(kinds)):
+        assert f"`{forbidden}`" in flow, (
+            f"the planning flow does not name {forbidden} as outside its row"
+        )
+
+
+def test_planning_flow_routes_completion_through_the_decision_artifact() -> None:
+    """Acceptance 5/9: the artifact asks for the issue, not report prose."""
+    flow = _normalized(_planning_flow())
+    assert "Write both required artifacts (below), then complete with" in flow, (
+        "the planning flow does not require the mandatory artifact pair"
+    )
+    assert "`coding-done`" in flow, (
+        "the planning flow does not complete through the coding-done path"
+    )
+    assert (
+        "The decision artifact is what asks the orchestrator to create the issue"
+        in flow
+    ), "the planning flow does not name the decision artifact as the effect channel"
+
+
+def test_generic_target_rule_names_the_planning_focus_scope() -> None:
+    """The generic rule must not omit the planning role's only target.
+
+    ``allowed_targets`` is the focus issue for BOTH issue-focused flavors, so a
+    generic rule naming only the failure investigation would tell a planning
+    agent its one legal comment target was out of scope.
+    """
+    section = _flow_section(
+        DEPLOYED_PROMPT, "Required Output Artifacts (MANDATORY)"
+    )
+    normalized = _normalized(section)
+    assert "planning investigation" in normalized, (
+        "the generic target-scope rule does not name the planning focus scope"
+    )
