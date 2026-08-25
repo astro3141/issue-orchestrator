@@ -17,9 +17,7 @@ engine never publishes one, or the port is the 0 sentinel — this fails.
 
 from __future__ import annotations
 
-import asyncio
 import re
-import threading
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -34,16 +32,12 @@ from issue_orchestrator.entrypoints.control_api import (
     get_configured_api_token,
 )
 from issue_orchestrator.entrypoints.engine_startup import EngineStartup
-from issue_orchestrator.entrypoints.web import (
-    app,
-    configure_dashboard_admin_token,
-    get_configured_dashboard_admin_token,
-)
 from issue_orchestrator.infra.agent_callback_endpoint import (
     RuntimeAgentCallbackEndpoint,
 )
 from issue_orchestrator.infra.api_token import AGENT_CALLBACK_TOKEN_ENV_VAR
 from issue_orchestrator.infra.config import Config
+from tests.integration.live_dashboard_server import LiveDashboardServer
 
 _PORT_EXPORT = re.compile(r"ISSUE_ORCHESTRATOR_API_PORT='(\d+)'")
 
@@ -66,57 +60,9 @@ AGENT_CALLBACK_PATHS = (
 )
 
 
-class _LiveServer:
-    """A real uvicorn server on an auto-assigned port."""
-
-    def __init__(self) -> None:
-        self.port: int | None = None
-        self._thread: threading.Thread | None = None
-        self._server = None
-        self._loop: asyncio.AbstractEventLoop | None = None
-
-    def start(self) -> int:
-        import uvicorn
-
-        ready = threading.Event()
-
-        def _run() -> None:
-            self._loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(self._loop)
-            # port=0 mirrors the deployment: the OS picks the port and
-            # only the running server knows which one.
-            config = uvicorn.Config(
-                app, host="127.0.0.1", port=0, log_level="error", access_log=False
-            )
-            self._server = uvicorn.Server(config)
-
-            async def _serve() -> None:
-                task = self._loop.create_task(self._server.serve())
-                while not self._server.started:
-                    await asyncio.sleep(0.01)
-                self.port = self._server.servers[0].sockets[0].getsockname()[1]
-                ready.set()
-                await task
-
-            self._loop.run_until_complete(_serve())
-
-        self._thread = threading.Thread(target=_run, daemon=True)
-        self._thread.start()
-        if not ready.wait(timeout=30):
-            raise RuntimeError("server did not start within 30s")
-        assert self.port is not None
-        return self.port
-
-    def stop(self) -> None:
-        if self._server is not None:
-            self._server.should_exit = True
-        if self._thread is not None:
-            self._thread.join(timeout=15)
-
-
 @pytest.fixture
 def live_server():
-    server = _LiveServer()
+    server = LiveDashboardServer(name="agent-callback")
     try:
         yield server
     finally:
@@ -126,7 +72,6 @@ def live_server():
 @pytest.fixture
 def clean_auth_state(monkeypatch: pytest.MonkeyPatch):
     """Start from a process that has never seen a callback token."""
-    prev_dashboard = get_configured_dashboard_admin_token()
     prev_admin = get_configured_api_token()
     prev_agent = get_configured_agent_callback_token()
     # Absent, not pre-seeded — pre-seeding is what let the earlier test
@@ -138,7 +83,6 @@ def clean_auth_state(monkeypatch: pytest.MonkeyPatch):
     try:
         yield
     finally:
-        configure_dashboard_admin_token(prev_dashboard)
         configure_api_token(prev_admin, agent_callback=prev_agent)
 
 
@@ -158,7 +102,7 @@ def _post(url: str, token: str) -> int:
 
 @pytest.mark.integration
 def test_agent_callback_is_deliverable_from_the_generated_environment(
-    live_server: _LiveServer,
+    live_server: LiveDashboardServer,
     clean_auth_state: None,
     tmp_path: Path,
 ) -> None:
@@ -211,7 +155,7 @@ def test_agent_callback_is_deliverable_from_the_generated_environment(
 
 @pytest.mark.integration
 def test_agent_token_still_cannot_reach_admin_routes(
-    live_server: _LiveServer,
+    live_server: LiveDashboardServer,
     clean_auth_state: None,
 ) -> None:
     """The fix must not turn the scoped token into an admin credential."""

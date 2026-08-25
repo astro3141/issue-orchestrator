@@ -18,9 +18,7 @@ returns one. These run against a real uvicorn server and a real HTTP client:
 
 from __future__ import annotations
 
-import asyncio
 import json
-import threading
 
 import httpx
 import pytest
@@ -30,13 +28,8 @@ from issue_orchestrator.entrypoints.control_api import (
     get_configured_agent_callback_token,
     get_configured_api_token,
 )
-from issue_orchestrator.entrypoints.web import (
-    app,
-    broadcast_event,
-    configure_dashboard_admin_token,
-    get_configured_dashboard_admin_token,
-)
 from issue_orchestrator.infra import browser_session
+from tests.integration.live_dashboard_server import LiveDashboardServer
 
 ADMIN_TOKEN = "sse-subscription-admin-token"
 # Bounded waits only: these coordinate with a real server over a real socket,
@@ -44,81 +37,23 @@ ADMIN_TOKEN = "sse-subscription-admin-token"
 READ_TIMEOUT_SECONDS = 10.0
 
 
-class _LiveDashboard:
-    """A real uvicorn server hosting the dashboard app on an OS-picked port."""
-
-    def __init__(self) -> None:
-        self.port: int | None = None
-        self._thread: threading.Thread | None = None
-        self._server = None
-        self._loop: asyncio.AbstractEventLoop | None = None
-
-    def start(self) -> int:
-        import uvicorn
-
-        ready = threading.Event()
-
-        def _run() -> None:
-            self._loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(self._loop)
-            config = uvicorn.Config(
-                app, host="127.0.0.1", port=0, log_level="error", access_log=False
-            )
-            self._server = uvicorn.Server(config)
-
-            async def _serve() -> None:
-                task = self._loop.create_task(self._server.serve())
-                while not self._server.started:
-                    await asyncio.sleep(0.01)
-                self.port = self._server.servers[0].sockets[0].getsockname()[1]
-                ready.set()
-                await task
-
-            self._loop.run_until_complete(_serve())
-
-        self._thread = threading.Thread(target=_run, daemon=True)
-        self._thread.start()
-        if not ready.wait(timeout=30):
-            raise RuntimeError("dashboard server did not start within 30s")
-        assert self.port is not None
-        return self.port
-
-    def broadcast(self, event_type: str, data: dict) -> None:
-        """Emit an event the way the engine does — from the server's loop."""
-        assert self._loop is not None
-        future = asyncio.run_coroutine_threadsafe(
-            broadcast_event(event_type, data), self._loop
-        )
-        future.result(timeout=READ_TIMEOUT_SECONDS)
-
-    def stop(self) -> None:
-        if self._server is not None:
-            self._server.should_exit = True
-            self._server.force_exit = True
-        if self._thread is not None:
-            self._thread.join(timeout=15)
-
-
 @pytest.fixture
 def live_dashboard():
     """Dashboard on a real port with the real browser-auth gate enabled."""
-    prev_dashboard = get_configured_dashboard_admin_token()
     prev_admin = get_configured_api_token()
     prev_agent = get_configured_agent_callback_token()
 
     browser_session.shutdown()
     browser_session.initialize(admin_token=ADMIN_TOKEN)
-    configure_dashboard_admin_token(ADMIN_TOKEN)
     configure_api_token(ADMIN_TOKEN, agent_callback=None)
 
-    server = _LiveDashboard()
+    server = LiveDashboardServer()
     try:
         server.start()
         yield server
     finally:
         server.stop()
         browser_session.shutdown()
-        configure_dashboard_admin_token(prev_dashboard)
         configure_api_token(prev_admin, agent_callback=prev_agent)
 
 
@@ -126,7 +61,7 @@ def live_dashboard():
 def signed_in(live_dashboard):
     """A browser-shaped client that has logged in through the real form."""
     with httpx.Client(
-        base_url=f"http://127.0.0.1:{live_dashboard.port}", timeout=15.0
+        base_url=live_dashboard.base_url(), timeout=15.0
     ) as client:
         response = client.post("/login", json={"token": ADMIN_TOKEN})
         assert response.status_code == 200, response.text
