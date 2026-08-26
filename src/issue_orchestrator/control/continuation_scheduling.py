@@ -28,14 +28,22 @@ it: the handoff is only correct AFTER the exclusion release it depends on has
 been published, and putting it anywhere a caller could forget it is how the
 gap it closes appeared in the first place.
 
-It is also the only step in the sequence that is narrowed by the engine's issue
-scope (#304). Every step above it is board-wide because reconciliation is: a
-release names every lease the derived live set does not, so an engine that
-looked at less than the whole board would report other issues' running
-operations as finished. Admitting WORK is the opposite question — #303 measured
-an engine started with ``--issue 301`` filing, queueing and launching rework for
-held issue #293 purely because it could see it — so the sixth step holds the
-scope owner, and the five before it deliberately do not.
+The fifth and sixth steps are the two that ACT, and they are the two the
+engine's issue scope narrows (#304, #307). Everything above them is board-wide
+because reconciliation is: a release names every lease the derived live set does
+not, so an engine that looked at less than the whole board would report other
+issues' running operations as finished. Acting is the opposite question, and it
+was measured twice from the same root — #303 saw an engine started with
+``--issue 301`` file, queue and launch rework for held issue #293, and #306 saw
+a scoped engine advance a LIVE continuation for an issue it was never started
+for. So both actuating steps hold the one scope owner
+:func:`build_control_continuation` constructs, and the four before them
+deliberately hold nothing of the kind.
+
+The narrowing withholds; it never releases. An out-of-scope operation stays
+derived, stays owned and goes on excluding ordinary work, so the lease a scoped
+engine declines to advance is the same lease a later engine whose scope includes
+that issue adopts and advances.
 
 ``QueueCache`` is untouched and still reads only the published projection. No
 raw ownership-store read reaches the scheduler, here or anywhere.
@@ -241,6 +249,12 @@ def build_control_continuation(
 
     in_flight = ContinuationsInFlight()
     runs = ContinuationRuns(deps.worktree_manager)
+    # ONE scope owner for the whole continuation subsystem (#307). Both
+    # actuating steps hold this same object, so "may this engine act on that
+    # issue" has exactly one answer here — a runner and a handoff built from
+    # two instances could not disagree today, but two constructions are two
+    # places a later reading of ``--issue`` can be added to.
+    scope = EngineIssueScope(config)
     return ControlContinuation(
         ControlOperationOwnership(state, deps.continuation_ports.ownership_store),
         ContinuationLiveTruth(
@@ -251,6 +265,11 @@ def build_control_continuation(
         ),
         ControlContinuationRunner(
             state=state,
+            # The engine's actuation scope, binding the step that STARTS work
+            # (#307). The four steps above it stay board-wide for the reason
+            # the module docstring gives: reconciliation that looked at less
+            # would release another engine's running operation.
+            scope=scope,
             revalidation_route=deps.publication_revalidation,
             attempts=deps.attempt_store,
             worktrees=deps.worktree_manager,
@@ -276,13 +295,13 @@ def build_control_continuation(
         ),
         ContinuationReworkHandoff(
             state=state,
-            # The engine's configured actuation scope, from the same owner
-            # ``QueueCache`` asks (#304). It binds the WORK-ADMITTING step and
-            # nothing before it: the derivation above stays board-wide, because
-            # that is what makes the ownership release correct, and narrowing it
-            # to close this gap would trade a cross-issue mutation for a
-            # cross-issue deadlock.
-            scope=EngineIssueScope(config),
+            # The SAME scope owner the runner above holds, and the one
+            # ``QueueCache`` asks (#304). It binds the WORK-ADMITTING step;
+            # what it does not bind is the derivation and the ownership
+            # reconciliation, which stay board-wide because that is what makes
+            # the release correct, and narrowing them to close this gap would
+            # trade a cross-issue mutation for a cross-issue deadlock.
+            scope=scope,
             # The engine's own PR reader, so the admitted rework targets the
             # PR the rest of the lifecycle is already talking about.
             pull_requests=deps.repository_host,

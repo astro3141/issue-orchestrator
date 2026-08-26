@@ -820,6 +820,37 @@ exactly as before. That carve-out is read off the result's own
 claiming a finished exchange without naming one cannot reach the one outcome
 that settles without evidence.
 
+### Owning a live operation is not authority to work it
+
+The same invariant [#304] established for the rework handoff binds the step
+before it. Reconciliation is board-wide because it has to be, and the [#146]
+ownership holder is the stable `single-instance` one, so the `owned` half of a
+`ContinuationReconciliation` says only that *this deployment* holds the durable
+lease — never that this engine was started to work the issue. [#306] measured what follows
+when the runner treats that as permission: an engine scoped `--issue A`
+advanced a LIVE continuation for issue B, taking its execution claim, submitting
+its job, cutting its worktree and running its gate.
+
+So `ControlContinuationRunner._start` asks the engine's actuation scope first —
+the same `EngineIssueScope` the handoff and `QueueCache` ask, constructed once
+by `build_control_continuation` and held by both actuating steps, so the two
+cannot drift about what `--issue` means. It is asked *before* the in-flight
+claim, which puts the job, the [#139] revalidation route, the checkout, the
+provisioning recipe, the quick gate and every durable attempt write out of reach
+for an out-of-scope operation.
+
+Everything above the actuation step is unchanged and must stay that way:
+`ContinuationLiveTruth.read` still reads the whole board, the phase is still
+derived, the lease is still reserved or adopted, and the exclusion projection
+still names the issue — so an out-of-scope live operation goes on holding its
+issue against ordinary work, which is the conservative direction. The refusal is
+withheld, never released, and nothing durable records it, so a later engine
+whose scope includes that issue adopts the very same lease and advances it with
+no lease surgery. It is logged rather than published, for the reason [#304]
+gives one step further down: a narrowed engine announcing a refusal about a
+foreign issue is the cross-issue traffic this removes, wearing a different
+shape.
+
 ### A paused engine reconciles but starts nothing
 
 Pause is a barrier to new work, not a cancellation ([#161]). A paused engine

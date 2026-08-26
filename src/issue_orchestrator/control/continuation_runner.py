@@ -15,7 +15,26 @@ ownership and exclusion                 :class:`~.control_operation_ownership.Co
 
 What is left here is the decision of *which* owned operation to advance now,
 and the re-entry of a run that already exists into the completion pipeline.
-Seven rules keep that from becoming a second lifecycle.
+Eight rules keep that from becoming a second lifecycle.
+
+**It never acts on an issue this engine was not started for.** Everything above
+this module is board-wide by design: a reconciliation releases every lease the
+derived live set does not name, so an engine that LOOKED at less would report
+another engine's running operation as finished and free it. The set handed here
+is therefore the whole board's, and ``owned`` says only that this deployment
+holds the durable lease — the stable ``single-instance`` holder every engine on
+this checkout shares. #306 measured what follows if that visibility is taken as
+permission: an engine started with ``--issue A`` advanced a LIVE continuation
+for issue B — claiming it, submitting its job, cutting its worktree and running
+its gate. So the first question asked of an owned operation is the engine's own
+actuation scope, taken from the owner :class:`~.queue_cache.QueueCache` and the
+#304 rework handoff already ask (:class:`~.issue_scope.EngineIssueScope`) rather
+than re-derived here from ``--issue``. It is asked before the execution claim,
+which makes every boundary below it — the job, the revalidation route, the
+checkout, the gate, the durable attempt write — unreachable for an out-of-scope
+operation. Withholding is not releasing: B stays derived, stays owned, keeps
+excluding ordinary work, and is advanced by whichever engine's scope includes it
+(see :meth:`ControlContinuationRunner._refuse_outside_scope`).
 
 **It never decides admission.** A ``RETRY_PENDING`` operation is handed whole
 to #139, which re-checks the contract, the allowance and the reserve-before-
@@ -125,6 +144,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from .continuation_live_truth import ContinuationReconciliation
     from .continuation_quick_validation import ContinuationQuickValidation
     from .continuation_runs import ContinuationRuns
+    from .issue_scope import EngineIssueScope
     from .publication_revalidation import PublicationRevalidation
     from .worktree_runnability import WorktreeRunnability
 
@@ -179,6 +199,7 @@ class ControlContinuationRunner:
         self,
         *,
         state: "OrchestratorState",
+        scope: "EngineIssueScope",
         revalidation_route: "PublicationRevalidation",
         attempts: "AttemptStore",
         worktrees: "WorktreeManager",
@@ -195,6 +216,14 @@ class ControlContinuationRunner:
         repo_root: Path,
     ) -> None:
         self._state = state
+        #: What this engine may ACT on (#307). Required, with no default: a
+        #: runner assembled without one is the engine #306 measured, and it
+        #: looks entirely healthy right up to the moment it cuts a worktree for
+        #: an issue nobody asked it about. The OWNER, never a ``Config`` — this
+        #: module must not be able to form its own opinion about ``--issue``,
+        #: and it must not be able to disagree with the one the #304 rework
+        #: handoff holds.
+        self._scope = scope
         self._revalidation = revalidation_route
         # Opening a run is its own subject: an ordered sequence of owners in
         # which every refusal costs the same thing. Composed here from the
@@ -300,6 +329,14 @@ class ControlContinuationRunner:
             )
 
     def _start(self, operation: LiveContinuation) -> None:
+        # Authority first, before anything this engine could be said to have
+        # started (#307). The reconciliation that produced this operation was
+        # board-wide because it had to be, and the lease it holds is the stable
+        # single-instance holder's — neither is a statement that THIS engine
+        # was started to work the issue.
+        if self._scope.excludes(operation.issue):
+            self._refuse_outside_scope(operation)
+            return
         issue_number = operation.issue.number
         if self._has_active_session(issue_number):
             logger.debug(
@@ -339,6 +376,38 @@ class ControlContinuationRunner:
             # way every claim is: process-local, so a restart clears it.
             self._in_flight.release(operation.key)
             logger.debug("[CONTINUATION] %s not started this tick", operation.key)
+
+    def _refuse_outside_scope(self, operation: LiveContinuation) -> None:
+        """Leave an operation this engine reconciled but may not work (#307).
+
+        Withheld, not released, and the difference is the whole of why this
+        refusal is safe. The operation keeps its lease, its recorded intent,
+        its allowances and any run already open; it stays in live truth, so it
+        goes on excluding ordinary work on that issue, which is the
+        conservative direction — a live control operation still holds the issue
+        against a queue that would otherwise start a session on it.
+
+        Nothing durable records the refusal either, which is what keeps it from
+        becoming a scope-induced deadlock. The ownership holder is stable and
+        restart-adoptable by design, so a later engine whose scope includes the
+        issue adopts the very same lease, derives the very same phase, and
+        starts the operation with no lease surgery and no state to unwind. The
+        refusal is a fact about THIS engine's configuration, not about the
+        candidate, and it lasts exactly as long as that configuration does.
+
+        Logged rather than published, for the reason #304 gives for the same
+        refusal one step further down the sequence: a narrowed engine
+        announcing a refusal about a foreign issue is the cross-issue traffic
+        this leaf removes, wearing a different shape. Nothing is stuck — the
+        operation is somebody's, just not this engine's.
+        """
+        logger.debug(
+            "[CONTINUATION] %s stays owned but idle: issue #%d is outside this"
+            " engine's issue scope, so this engine reconciles it without"
+            " advancing it",
+            operation.key,
+            operation.issue.number,
+        )
 
     def _has_active_session(self, issue_number: int) -> bool:
         return any(
