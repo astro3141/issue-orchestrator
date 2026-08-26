@@ -289,10 +289,16 @@ def test_completion_record_schema_contract_for_all_statuses(tmp_path: Path) -> N
     _init_git_repo(repo)
 
     completion_path = repo / ".issue-orchestrator" / "completion.json"
+    # A managed session's run assets come from its owner — every launch site
+    # allocates the run before it exports the session env — so the env this
+    # contract runs under names a run that really exists, the way the sibling
+    # review-action test below does.
+    run_assets = make_session_run_assets(repo, session_name="issue-1")
     common_env = {
         **os.environ,
         "ISSUE_ORCHESTRATOR_COMPLETION_PATH": ".issue-orchestrator/completion.json",
         "ISSUE_ORCHESTRATOR_SESSION_ID": "issue-1",
+        "ISSUE_ORCHESTRATOR_RUN_DIR": str(run_assets.run_dir),
     }
 
     cases = [

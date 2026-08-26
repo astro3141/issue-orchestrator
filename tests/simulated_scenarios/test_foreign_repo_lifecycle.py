@@ -27,6 +27,7 @@ import pytest
 from issue_orchestrator.adapters.worktree.api import sync_cli_tools
 from issue_orchestrator.domain.models import Issue
 from issue_orchestrator.events import EventName
+from issue_orchestrator.execution.session_output_adapter import FileSystemSessionOutput
 from issue_orchestrator.execution.terminal_subprocess import SubprocessPlugin
 from issue_orchestrator.execution.worktree_adapter import GitWorktreeManager
 from issue_orchestrator.infra.config import Config
@@ -203,12 +204,29 @@ def _coder_session_contract(
     worktree_path: Path,
     completion_rel: str = ".issue-orchestrator/completion.json",
 ) -> ForeignSessionContract:
+    """Allocate the run a launching session owner allocates, then name it.
+
+    ``ISSUE_ORCHESTRATOR_RUN_DIR`` is not a string the launcher invents: every
+    launch site calls ``start_run`` first, which creates the run directory and
+    writes its manifest, and exports the directory it got back. Orchestrator-
+    managed completion then *requires* that contract rather than rediscovering
+    one. Naming a directory no owner ever allocated would simulate a session
+    shape production cannot produce, and would let this suite pass while a real
+    managed session failed.
+    """
     session_name = f"coder-{issue_number}"
+    assets = FileSystemSessionOutput().start_run(
+        worktree_path,
+        session_name,
+        issue_number=issue_number,
+        agent_label="agent:coder",
+        completion_path=completion_rel,
+    )
     return ForeignSessionContract(
         issue_number=issue_number,
         session_name=session_name,
         completion_rel=completion_rel,
-        run_dir=worktree_path / ".issue-orchestrator" / "sessions" / session_name,
+        run_dir=assets.run_dir,
         worktree_path=worktree_path,
     )
 

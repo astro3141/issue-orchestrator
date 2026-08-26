@@ -150,6 +150,21 @@ class TestTechLeadAssignmentValidation:
         with pytest.raises(json.JSONDecodeError):
             TechLeadAssignment.read(path)
 
+    @pytest.mark.parametrize("payload", ["3", "[]", "null", '"x"', "true"])
+    def test_valid_json_that_is_not_an_object_raises_value_error(
+        self, tmp_path: Path, payload: str
+    ) -> None:
+        """Callers fail safe on ValueError, so nothing may escape as AttributeError.
+
+        The file sits in agent-writable space; a botched rewrite or a garbage
+        write must not crash a completion that followed its contract.
+        """
+        path = tmp_path / TECH_LEAD_ASSIGNMENT_FILENAME
+        path.write_text(payload)
+
+        with pytest.raises(ValueError, match="must be a JSON object"):
+            TechLeadAssignment.read(path)
+
 
 class TestCreationOriginHasExactlyTwoValidStates:
     """#6957 round-2 review F6/A6: authority is stated, never inferred.

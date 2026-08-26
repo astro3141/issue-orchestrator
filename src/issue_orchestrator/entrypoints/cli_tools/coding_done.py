@@ -14,6 +14,7 @@ import os
 import subprocess
 import sys
 import traceback
+from dataclasses import dataclass
 from pathlib import Path
 
 from .agent_done import (
@@ -45,6 +46,9 @@ from .dirty_retry_budget import (
 from .orchestrator_resume import trigger_orchestrator_resume
 from .orchestrator_run_assets import require_orchestrator_run_assets_for_session
 
+from ...control.agent_gate import AgentGateResult
+from ...control.completion_quick_gate import route_completion_quick_gate
+from ...domain.session_run import SessionRunAssets
 from ...execution.git_planted_paths import local_repo_owns_planted_cli_tools
 from ...infra.env import get_env
 from ...infra.logging_config import issue_log
@@ -75,6 +79,10 @@ CODING_STATUSES = [
     AgentStatus.BLOCKED,
     AgentStatus.NEEDS_HUMAN,
 ]
+
+# Only a completion offers a candidate for the quick gate to judge; BLOCKED and
+# NEEDS_HUMAN are reports of a problem and have always skipped it.
+STATUSES_REQUIRING_VALIDATION = {AgentStatus.COMPLETED}
 
 
 def _is_managed_session() -> bool:
@@ -264,6 +272,90 @@ def _handle_dirty_files_rejection(
     sys.exit(1)
 
 
+@dataclass(frozen=True, slots=True)
+class QuickGateRun:
+    """A quick gate that actually ran, with the run assets holding its evidence.
+
+    The verdict and the artifacts it must be written into are one fact, so they
+    travel as one value: there is no way to hold a result whose evidence has
+    nowhere to go, and no way to open run assets for a gate that never started.
+    A gate that did not run is the absence of this value, not a pair of
+    ``None``\\ s the caller has to re-correlate.
+    """
+
+    result: AgentGateResult
+    assets: SessionRunAssets
+
+
+def _run_quick_validation_gate(
+    *,
+    worktree_root: Path,
+    session_id: str,
+    managed: bool,
+    verbose: bool,
+) -> QuickGateRun | None:
+    """Run the local immediate-feedback quick gate, when this completion has one.
+
+    This is the agent's own fast feedback; the canonical publication validation
+    is a separate gate the orchestrator runs later, and nothing here stands in
+    for it.
+
+    Returns ``None`` when no gate ran — either because :func:`route_completion_quick_gate`
+    found this completion has no code candidate for the gate to judge (#293), or
+    because the repository configures no quick gate at all. A gate that does not
+    run leaves no trace at all: no process starts, no run assets are opened for
+    it, and the caller therefore records no validation evidence. The absence is
+    visible rather than papered over with a manufactured PASS.
+
+    **Routing is decided before the candidate gate's configuration is read.** A
+    completion with no code candidate never touches
+    :func:`load_validation_cmd` or :func:`run_validation` for the candidate
+    quick gate, so the planning lane cannot be made to depend on — or fail
+    on — configuration that describes a candidate it does not have (#293). The
+    routing question is asked only of an orchestrator-MANAGED session, because
+    it is answered from the run contract the orchestrator injected. A standalone
+    developer invocation has no such contract and keeps the gate
+    unconditionally.
+    """
+    if not session_id:
+        logger.error("[coding-done] Validation requires session_id but none found")
+        sys.exit(1)
+    if managed:
+        assets = require_orchestrator_run_assets_for_session(worktree_root, session_id)
+        routing = route_completion_quick_gate(assets)
+        if not routing.runs_quick_gate:
+            print(f"Note: no quick validation for this completion — {routing.detail}")
+            logger.info("[coding-done] quick gate not run: %s", routing.detail)
+            return None
+        # The managed run's assets are already allocated by the orchestrator, so
+        # nothing here needs the selection up front: ``run_validation`` reads it
+        # and answers None when the repository configures no quick gate.
+    else:
+        selection = load_validation_cmd(worktree_root)
+        if not selection.cmd:
+            return None
+        assets = FileSystemSessionOutput().start_run(
+            worktree_root,
+            session_id,
+            # Unmanaged run: the orchestrator never allocated one, so the
+            # profile this session actually resolved is the only honest thing
+            # to freeze onto it (#7059).
+            validation_profile=selection.profile,
+        )
+    result = run_validation(
+        worktree_root,
+        session_output_dir=assets.run_dir,
+        verbose=verbose,
+    )
+    if result is None:
+        # No quick gate is configured for this worktree, so no process ran and
+        # there is no verdict to carry — the same answer as every other
+        # did-not-run path. (The standalone branch above has already ruled this
+        # out for itself, because it needs the selection to freeze a profile.)
+        return None
+    return QuickGateRun(result=result, assets=assets)
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Build argument parser for coding-done."""
     parser = argparse.ArgumentParser(
@@ -411,42 +503,24 @@ def main() -> None:  # noqa: C901, PLR0912
     # 3. Run quick validation if configured. This is the immediate feedback
     #    path for coding agents; deeper publish validation runs later through
     #    the orchestrator-controlled pre-push/pre-publish gate.
-    validation_result = None
-    statuses_requiring_validation = {AgentStatus.COMPLETED}
-    assets = None
-    if status in statuses_requiring_validation:
-        selection = load_validation_cmd(worktree_root)
-        if selection.cmd:
-            if not record.session_id:
-                logger.error("[coding-done] Validation requires session_id but none found")
-                sys.exit(1)
-            if managed:
-                assets = require_orchestrator_run_assets_for_session(
-                    worktree_root,
-                    record.session_id,
-                )
-            else:
-                assets = FileSystemSessionOutput().start_run(
-                    worktree_root,
-                    record.session_id,
-                    # Unmanaged run: the orchestrator never allocated one, so
-                    # the profile this session actually resolved is the only
-                    # honest thing to freeze onto it (#7059).
-                    validation_profile=selection.profile,
-                )
-            validation_result = run_validation(
-                worktree_root,
-                session_output_dir=assets.run_dir,
-                verbose=args.verbose,
-            )
+    quick_gate = None
+    if status in STATUSES_REQUIRING_VALIDATION:
+        quick_gate = _run_quick_validation_gate(
+            worktree_root=worktree_root,
+            session_id=record.session_id,
+            managed=managed,
+            verbose=args.verbose,
+        )
     elif status in {AgentStatus.BLOCKED, AgentStatus.NEEDS_HUMAN}:
         print(f"Note: Skipping validation for '{status}' status (agent is reporting a problem)")
 
-    if validation_result and assets is not None:
+    validation_result = quick_gate.result if quick_gate is not None else None
+
+    if quick_gate is not None:
         validation_record_path = record_validation_artifacts(
             worktree_root,
-            assets.validation_artifacts,
-            validation_result,
+            quick_gate.assets.validation_artifacts,
+            quick_gate.result,
         )
         if validation_record_path is not None:
             record.validation_record_path = str(validation_record_path)
