@@ -2398,6 +2398,44 @@ class OrchestratorState:
         self.pending_validation_retries.extend([retry])
         return True
 
+    def record_discovered_rework(self, rework: DiscoveredRework) -> bool:
+        """Record a rework fact for the Planner, at most once per issue (#297).
+
+        Sibling of :meth:`queue_pending_rework`, and it carries the same kind of
+        rule for the same reason: ``discovered_reworks`` is a per-tick fact
+        buffer, and a producer that re-derives the same candidate on a second
+        pass within one tick must not file it twice. The rule lives with the
+        collection rather than with each producer, so a new producer inherits it
+        instead of re-implementing it.
+
+        Returns True when the fact was recorded, False when the issue already
+        holds one this tick.
+        """
+
+        if any(
+            existing.issue_number == rework.issue_number
+            for existing in self.discovered_reworks
+        ):
+            return False
+        self.discovered_reworks.extend([rework])
+        return True
+
+    def record_discovered_escalation(self, escalation: DiscoveredEscalation) -> bool:
+        """Record a rework-cycle escalation fact, at most once per issue (#297).
+
+        The other half of :meth:`record_discovered_rework`: a candidate whose
+        cycle budget is spent produces an escalation instead of a rework, and it
+        must be filed exactly as sparingly.
+        """
+
+        if any(
+            existing.issue_number == escalation.issue_number
+            for existing in self.discovered_escalations
+        ):
+            return False
+        self.discovered_escalations.extend([escalation])
+        return True
+
     def record_discovered_failure(self, failure: DiscoveredFailure) -> None:
         """Record a session-failure fact for the Planner (owner boundary).
 

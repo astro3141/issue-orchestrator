@@ -64,56 +64,85 @@ from .review_verdict_binding import ReviewVerdictOutcome
 class ContinuationPhase(Enum):
     """Where one exact candidate sits in the control continuation.
 
-    ``live`` is a property of the member rather than a set held beside the
-    enum, so adding a phase forces its author to say whether it holds the
-    issue. A phase with no answer does not compile.
+    ``live`` and ``exits_to_rework`` are properties of the member rather than
+    sets held beside the enum, so adding a phase forces its author to say both
+    whether it holds the issue and whether it hands the candidate back. A phase
+    with no answer does not compile.
     """
 
     #: This engine has a run in flight for the candidate. Live whatever the
     #: durable facts currently say, because they are mid-change: the run has
     #: spent budgets, may be writing verdicts, and still holds a worktree.
-    EXECUTING = ("executing", True)
+    EXECUTING = ("executing", True, False)
     #: No recorded intent for this candidate, so there is no continuation to
     #: run. The absence is refusal, never a permissive default.
-    NO_RECORDED_INTENT = ("no_recorded_intent", False)
+    NO_RECORDED_INTENT = ("no_recorded_intent", False, False)
     #: Intent recorded, but the publication contract has never reported on this
     #: candidate. Nothing to retry and nothing to continue from.
-    NOT_EVALUATED = ("not_evaluated", False)
+    NOT_EVALUATED = ("not_evaluated", False, False)
     #: Non-PASS with the #139 allowance still unspent: one same-SHA
     #: revalidation may be admitted (by #139, never by this predicate).
-    RETRY_PENDING = ("retry_pending", True)
+    RETRY_PENDING = ("retry_pending", True, False)
     #: ``PASS(A)`` recorded and no exact-``A`` review has settled. The
     #: continuation keeps the operation live *through* the PASS.
-    PASS_PENDING_REVIEW = ("pass_pending_review", True)
+    PASS_PENDING_REVIEW = ("pass_pending_review", True, False)
     #: ``APPROVED(A)`` and the recorded intent asks for a pull request, which
     #: the board does not yet show.
-    APPROVED_PENDING_PR = ("approved_pending_pr", True)
+    APPROVED_PENDING_PR = ("approved_pending_pr", True, False)
     #: ``CHANGES_REQUESTED(A)``: the control continuation hands off to ordinary
     #: rework. Not live, so ownership is released before rework is evaluated.
-    EXIT_TO_REWORK = ("exit_to_rework", False)
+    EXIT_TO_REWORK = ("exit_to_rework", False, True)
     #: Nothing further is owed: either ``APPROVED(A)`` with no ``CREATE_PR`` in
     #: the recorded intent, or a run that recorded exactly that as its outcome.
-    SETTLED_NO_PR = ("settled_no_pr", False)
+    SETTLED_NO_PR = ("settled_no_pr", False, False)
     #: The continuation reached a pull request — either the run recorded that
     #: it opened one, or the board carries ``pr-pending``. Terminal.
-    SETTLED_PR = ("settled_pr", False)
+    SETTLED_PR = ("settled_pr", False, False)
     #: Non-PASS with the allowance spent. No second revalidation exists, so the
     #: candidate returns to ordinary rework with its evidence history intact.
-    EXHAUSTED = ("exhausted", False)
+    EXHAUSTED = ("exhausted", False, True)
     #: The continuation has opened every run it may (#149's own allowance) and
     #: none discharged the recorded intent. The same clean return ``EXHAUSTED``
     #: gives the revalidation half: ordinary rework takes the candidate back,
     #: with the descriptor, the evaluations and any review verdict intact.
-    RUNS_EXHAUSTED = ("runs_exhausted", False)
+    RUNS_EXHAUSTED = ("runs_exhausted", False, True)
 
-    def __init__(self, value: str, live: bool) -> None:
+    def __init__(self, value: str, live: bool, exits_to_rework: bool) -> None:
+        if live and exits_to_rework:
+            # The two answers are about the same instant: an operation that
+            # still holds its issue has not handed it to anybody, and a phase
+            # claiming both would have ordinary rework admitted onto an issue
+            # the continuation is simultaneously excluding from it.
+            raise ValueError(
+                f"continuation phase {value!r} cannot be live and exit to rework"
+            )
         self._value_ = value
         self._live = live
+        self._exits_to_rework = exits_to_rework
 
     @property
     def live(self) -> bool:
         """Whether an operation in this phase holds its issue against ordinary work."""
         return self._live
+
+    @property
+    def exits_to_rework(self) -> bool:
+        """Whether this phase returns the candidate to the ordinary rework lane.
+
+        The three phases that answer yes are the three whose own documentation
+        says so: ``CHANGES_REQUESTED(A)`` transfers the candidate, a spent
+        revalidation allowance returns it, and a spent run allowance returns it.
+        Every other non-live phase means something else entirely — no intent was
+        ever recorded, nothing was ever evaluated, or the continuation reached
+        its settlement — and handing any of those to rework would invent work
+        rather than continue it.
+
+        "Exits to rework" is not "is owed rework": the phase says the control
+        continuation is finished with the candidate, and the rework-cycle owner
+        still decides whether a cycle may be spent on it. Keeping the two apart
+        is what stops this predicate from becoming a second budget.
+        """
+        return self._exits_to_rework
 
 
 @dataclass(frozen=True, slots=True)

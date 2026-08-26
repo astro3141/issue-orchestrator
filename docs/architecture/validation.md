@@ -517,9 +517,43 @@ run opens so an interrupted one cannot refund itself. When it is gone the phase
 is `RUNS_EXHAUSTED`, which returns the candidate to ordinary rework with its
 descriptor, its evaluations and any review verdict intact.
 
+### Releasing the issue is not the same as handing the candidate back
+
+Three phases say in their own documentation that the candidate returns to
+ordinary rework — `EXIT_TO_REWORK`, `EXHAUSTED` and `RUNS_EXHAUSTED` — and
+`ContinuationPhase.exits_to_rework` is where each one says so, declared per
+member exactly as `live` is. Until [#297] the derivation dropped every non-live
+phase from ownership and produced nothing else, so the lease was released and
+no rework was ever admitted: a PR-backed candidate that failed canonical
+publication validation and spent its same-SHA allowance sat stranded until a
+human intervened, in an engine whose ordinary rework lane was idle beside it.
+
+`control/continuation_rework_handoff.py` is the missing producer, and it owns no
+policy of its own. The phase stays a derived predicate; the PR identity and
+branch come from the existing open-PR owner (`get_open_pr_for_issue`); the cycle
+number and the ceiling come from `control/rework_cycle_policy.py`, the single
+rework-cycle owner `PRScanner` now decides through as well. What the handoff
+adds is assembly: it files a `DiscoveredRework` (or a `DiscoveredEscalation`
+when the ceiling is passed) carrying the failed candidate's SHA, the publish
+gate's command and verdict, the durable evidence path and the intent the agent
+recorded — so the correction needs no human relay — and the planner turns that
+fact into the same `QueueReworkAction` the ordinary lane produces.
+
+The transition is `continuation -> ordinary rework on the same PR lineage`,
+never `continuation -> issue release`: [#195]'s PR-backed shield is untouched,
+the session-history claim stands, `QueueCache.abandoned_candidates()` still
+excludes the issue, and no fresh coding session is created for it. Repetition is
+bounded by what already bounds rework — the cycle owner refuses while anything
+holds the issue, `OrchestratorState.record_discovered_rework` admits at most one
+fact per issue per tick, and the `rework-cycle-N` label the launcher writes is
+the durable counter a restart re-reads. No new budget exists.
+
 `control/continuation_scheduling.py` is the one hydration path: it derives,
-reconciles, publishes, advances what this engine owns, and only then lets
-`QueueCache` evaluate eligibility. Derivation runs inside the ownership owner's
+reconciles, publishes, advances what this engine owns, admits the rework its
+exits imply, and only then lets `QueueCache` evaluate eligibility. The handoff
+runs last because it depends on the release that precedes it, and an unreadable
+durable record admits nothing for the same reason it releases nothing.
+Derivation runs inside the ownership owner's
 own lock (`reconcile_derived`), which is what makes a stale snapshot unable to
 release a newer claim. `control/continuation_runner.py` executes: it hands a
 `RETRY_PENDING` candidate whole to [#139] — no second admission predicate and

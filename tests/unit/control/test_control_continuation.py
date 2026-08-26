@@ -21,10 +21,12 @@ premise of a control operation is that none of those exist.
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import pytest
+
+from tests.unit.session_run_helpers import make_session_run_assets
 
 from issue_orchestrator.adapters.sidecar_attempt_store import SidecarAttemptStore
 from issue_orchestrator.control.continuation_descriptor_writer import (
@@ -40,11 +42,17 @@ from issue_orchestrator.control.continuation_live_truth import (
     ContinuationLiveTruth,
     ContinuationReconciliation,
 )
+from issue_orchestrator.control.continuation_rework_handoff import (
+    CONTINUATION_EXIT_SOURCE,
+    ContinuationReworkHandoff,
+)
 from issue_orchestrator.control.continuation_scheduling import ControlContinuation
 from issue_orchestrator.control.control_operation_ownership import (
     ControlOperationOwnership,
 )
+from issue_orchestrator.control.label_manager import LabelManager
 from issue_orchestrator.control.queue_cache import QueueCache, QueueMutationStatus
+from issue_orchestrator.control.rework_cycle_policy import ReworkCycleBudget
 from issue_orchestrator.domain.attempt import (
     CONTINUATION_RUN_ALLOWANCE,
     Attempt,
@@ -59,11 +67,17 @@ from issue_orchestrator.domain.continuation_settlement import (
 from issue_orchestrator.domain.control_operation import ControlOperationKey
 from issue_orchestrator.domain.issue_key import GitHubIssueKey
 from issue_orchestrator.domain.models import (
+    AgentConfig,
     CompletionOutcome,
     CompletionRecord,
     Issue,
     OrchestratorState,
+    PendingRework,
     RequestedAction,
+    Session,
+    SessionHistoryEntry,
+    SessionKey,
+    TaskKind,
 )
 from issue_orchestrator.domain.session_run import SessionRunAssets
 from issue_orchestrator.domain.review_verdict_binding import (
@@ -88,6 +102,7 @@ from issue_orchestrator.ports.control_operation_ownership_store import (
     ControlOperationReservation,
     ControlOperationReservationStatus,
 )
+from issue_orchestrator.ports.pull_request_tracker import PRInfo
 from issue_orchestrator.ports.session_output import ValidationRecord
 
 REPO = "owner/repo"
@@ -260,6 +275,34 @@ class UnreadableAttempts:
 
 
 @dataclass
+class RecordingPullRequests:
+    """The board's open pull requests, as GitHub would answer for them.
+
+    A double at the PR port rather than at the handoff, so the production
+    open-PR owner (``get_open_pr_for_issue``) really runs — including its
+    issue/branch matching, which is what "same lineage" is actually about.
+    Every read is counted, because a handoff that re-reads GitHub on every
+    reconciliation for a candidate nothing can act on is a defect of its own.
+    """
+
+    prs: dict[int, PRInfo] = field(default_factory=dict)
+    reads: list[int] = field(default_factory=list)
+
+    def create_pr(self, *args: object, **kwargs: object) -> PRInfo:
+        raise AssertionError("the continuation must not create pull requests")
+
+    def get_prs_for_issue(
+        self, issue_number: int, state: str = "open"
+    ) -> list[PRInfo]:
+        self.reads.append(issue_number)
+        pr = self.prs.get(issue_number)
+        return [pr] if pr is not None else []
+
+    def get_prs_for_branch(self, branch: str, state: str = "open") -> list[PRInfo]:
+        raise AssertionError("the continuation must not scan branches")
+
+
+@dataclass
 class Engine:
     """One orchestrator engine's continuation stack over real durable stores."""
 
@@ -270,6 +313,9 @@ class Engine:
     runner: RecordingRunner
     continuation: ControlContinuation
     config: Config
+    #: The open pull requests the handoff's open-PR owner will find. Shared
+    #: across a restart, because GitHub is what a new process re-reads.
+    pull_requests: RecordingPullRequests
     #: What this engine is executing, as the real runner claims into it. A
     #: restart gets a fresh one, which is exactly what a new process gets.
     in_flight: ContinuationsInFlight
@@ -284,7 +330,12 @@ class Engine:
         return self.attempts.update(attempt.key, lambda _current: attempt)
 
 
-def _engine(root: Path, *, attempts: object | None = None) -> Engine:
+def _engine(
+    root: Path,
+    *,
+    attempts: object | None = None,
+    pull_requests: RecordingPullRequests | None = None,
+) -> Engine:
     """A fresh engine over ``root``. A second one is a restart."""
     state = OrchestratorState()
     config = Config()
@@ -296,6 +347,7 @@ def _engine(root: Path, *, attempts: object | None = None) -> Engine:
     runner = RecordingRunner()
     in_flight = ContinuationsInFlight()
     runs = ContinuationRuns(_NoWorktrees())  # type: ignore[arg-type]
+    prs = pull_requests if pull_requests is not None else RecordingPullRequests()
     continuation = ControlContinuation(
         ownership,
         ContinuationLiveTruth(
@@ -305,6 +357,13 @@ def _engine(root: Path, *, attempts: object | None = None) -> Engine:
             runs=runs,
         ),
         runner,  # type: ignore[arg-type]
+        ContinuationReworkHandoff(
+            state=state,
+            pull_requests=prs,  # type: ignore[arg-type]
+            budget=ReworkCycleBudget(
+                LabelManager(config), max_rework_cycles=config.max_rework_cycles
+            ),
+        ),
     )
     return Engine(
         root=root,
@@ -314,8 +373,41 @@ def _engine(root: Path, *, attempts: object | None = None) -> Engine:
         runner=runner,
         continuation=continuation,
         config=config,
+        pull_requests=prs,
         in_flight=in_flight,
         runs=runs,
+    )
+
+
+def _continuation(
+    ownership: ControlOperationOwnership,
+    attempts: object,
+    runner: RecordingRunner,
+    *,
+    state: OrchestratorState,
+    in_flight: ContinuationsInFlight | None = None,
+    runs: ContinuationRuns | None = None,
+    pull_requests: RecordingPullRequests,
+) -> ControlContinuation:
+    """A continuation over caller-chosen stores, for the outage directions."""
+    config = Config()
+    config.repo = REPO
+    return ControlContinuation(
+        ownership,
+        ContinuationLiveTruth(
+            attempts,  # type: ignore[arg-type]
+            pr_pending_label=PR_PENDING,
+            in_flight=in_flight if in_flight is not None else ContinuationsInFlight(),
+            runs=runs if runs is not None else ContinuationRuns(_NoWorktrees()),  # type: ignore[arg-type]
+        ),
+        runner,  # type: ignore[arg-type]
+        ContinuationReworkHandoff(
+            state=state,
+            pull_requests=pull_requests,  # type: ignore[arg-type]
+            budget=ReworkCycleBudget(
+                LabelManager(config), max_rework_cycles=config.max_rework_cycles
+            ),
+        ),
     )
 
 
@@ -335,6 +427,68 @@ def _failed_candidate(
         lambda attempt: attempt.with_completed_evaluation(
             _receipt(head_sha)
         ).with_continuation_descriptor(_descriptor(*actions)),
+    )
+
+
+def _exhausted(
+    engine: Engine,
+    *actions: RequestedAction,
+    head_sha: str = SHA_A,
+) -> Attempt:
+    """The #297 shape: publication non-PASS, and the same-SHA allowance spent.
+
+    Exactly what #293 left behind — two durable non-PASS publication
+    evaluations against one commit, with ``revalidation_budget_used=1``.
+    """
+    _failed_candidate(engine, *actions, head_sha=head_sha)
+    return engine.attempts.update(
+        _attempt_key(head_sha),
+        lambda attempt: attempt.with_revalidation_reserved().with_completed_evaluation(
+            _receipt(head_sha)
+        ),
+    )
+
+
+def _with_validation_record(engine: Engine, path: str) -> Attempt:
+    """The candidate after the gate recorded where its evidence landed."""
+    return engine.attempts.update(
+        _attempt_key(),
+        lambda attempt: replace(attempt, validation_record_path=path),
+    )
+
+
+def _active_session(engine: Engine, issue: Issue) -> Session:
+    """A running session for ``issue``. Only its issue number is under test."""
+    worktree = engine.root / f"worktree-{issue.number}"
+    worktree.mkdir(parents=True, exist_ok=True)
+    return Session(
+        key=SessionKey(issue=issue.key, task=TaskKind.CODE),
+        issue=issue,
+        agent_config=AgentConfig(prompt_path=engine.root / "prompt.md"),
+        terminal_id=f"issue-{issue.number}",
+        worktree_path=worktree,
+        branch_name=f"{issue.number}-continuation-lineage",
+        run_assets=make_session_run_assets(
+            worktree, session_name=f"issue-{issue.number}"
+        ),
+    )
+
+
+def _open_pr(
+    *,
+    number: int = 294,
+    labels: list[str] | None = None,
+    branch: str = f"{ISSUE_NUMBER}-continuation-lineage",
+) -> PRInfo:
+    """The open PR the candidate is backed by, as GitHub reports it."""
+    return PRInfo(
+        number=number,
+        title=f"#{ISSUE_NUMBER}: the candidate under correction",
+        url=f"https://example.test/{REPO}/pull/{number}",
+        branch=branch,
+        body="",
+        state="open",
+        labels=labels if labels is not None else [],
     )
 
 
@@ -895,20 +1049,22 @@ class TestStoreOutage:
         readable.continuation.reconcile(board)
         assert readable.ownership.exclusions.owns(_operation_key())
 
-        blind = ControlContinuation(
+        blind_prs = RecordingPullRequests(prs={ISSUE_NUMBER: _open_pr()})
+        blind = _continuation(
             readable.ownership,
-            ContinuationLiveTruth(
-                UnreadableAttempts(),  # type: ignore[arg-type]
-                pr_pending_label=PR_PENDING,
-                in_flight=ContinuationsInFlight(),
-                runs=ContinuationRuns(_NoWorktrees()),  # type: ignore[arg-type]
-            ),
-            readable.runner,  # type: ignore[arg-type]
+            UnreadableAttempts(),
+            readable.runner,
+            state=readable.state,
+            pull_requests=blind_prs,
         )
         result = blind.reconcile(board)
 
         assert result.readable is False
         assert result.exclusions.owns(_operation_key())
+        # Ignorance admits nothing either: an unreadable record cannot say the
+        # continuation exited, so the handoff never even asks GitHub.
+        assert blind_prs.reads == []
+        assert readable.state.discovered_reworks == []
 
     def test_an_unreadable_attempt_store_advances_nothing(
         self, tmp_path: Path
@@ -916,15 +1072,12 @@ class TestStoreOutage:
         readable = _engine(tmp_path)
         _failed_candidate(readable, RequestedAction.CREATE_PR)
         runner = RecordingRunner()
-        blind = ControlContinuation(
+        blind = _continuation(
             readable.ownership,
-            ContinuationLiveTruth(
-                UnreadableAttempts(),  # type: ignore[arg-type]
-                pr_pending_label=PR_PENDING,
-                in_flight=ContinuationsInFlight(),
-                runs=ContinuationRuns(_NoWorktrees()),  # type: ignore[arg-type]
-            ),
-            runner,  # type: ignore[arg-type]
+            UnreadableAttempts(),
+            runner,
+            state=readable.state,
+            pull_requests=RecordingPullRequests(),
         )
 
         blind.reconcile([_issue("agent:backend")])
@@ -941,15 +1094,14 @@ class TestStoreOutage:
         blind_ownership = ControlOperationOwnership(
             engine.state, _UnreadableOwnershipStore()
         )
-        continuation = ControlContinuation(
+        continuation = _continuation(
             blind_ownership,
-            ContinuationLiveTruth(
-                engine.attempts,
-                pr_pending_label=PR_PENDING,
-                in_flight=engine.in_flight,
-                runs=engine.runs,
-            ),
-            engine.runner,  # type: ignore[arg-type]
+            engine.attempts,
+            engine.runner,
+            state=engine.state,
+            in_flight=engine.in_flight,
+            runs=engine.runs,
+            pull_requests=engine.pull_requests,
         )
         issue = _issue("agent:backend")
 
@@ -970,15 +1122,12 @@ class TestStoreOutage:
         issue = _issue("agent:backend")
         readable.continuation.reconcile([issue])
 
-        blind = ControlContinuation(
+        blind = _continuation(
             readable.ownership,
-            ContinuationLiveTruth(
-                UnreadableAttempts(),  # type: ignore[arg-type]
-                pr_pending_label=PR_PENDING,
-                in_flight=ContinuationsInFlight(),
-                runs=ContinuationRuns(_NoWorktrees()),  # type: ignore[arg-type]
-            ),
-            readable.runner,  # type: ignore[arg-type]
+            UnreadableAttempts(),
+            readable.runner,
+            state=readable.state,
+            pull_requests=RecordingPullRequests(),
         )
         blind.hydrate_queue(readable.queue_cache(), [issue])
 
@@ -1496,3 +1645,429 @@ class TestRestartMatrix:
             command=PUBLISH_COMMAND,
             profile=PROFILE,
         )
+
+
+# ======================================================================
+# 16. The EXHAUSTED PR-backed handoff (#297)
+# ======================================================================
+
+
+class TestExhaustedPrBackedHandoffAdmitsRework:
+    """``EXHAUSTED`` on an open PR admits ordinary rework, in this process.
+
+    #296 measured the gap exactly: reconciliation released the lease and
+    produced nothing, so a PR-backed candidate that failed canonical
+    publication validation and spent its same-SHA allowance sat stranded while
+    the ordinary rework lane sat idle beside it. Every direction below is one
+    of the issue's acceptance clauses, and the first is the mutation proof:
+    remove the producer and it is the one that fails.
+    """
+
+    def _board(self) -> list[Issue]:
+        return [_issue("agent:backend")]
+
+    def _exhausted_pr_backed(
+        self, engine: Engine, *, pr: PRInfo | None = None
+    ) -> PRInfo:
+        open_pr = pr if pr is not None else _open_pr()
+        engine.pull_requests.prs[ISSUE_NUMBER] = open_pr
+        _exhausted(engine, RequestedAction.CREATE_PR)
+        return open_pr
+
+    # -- 1. Same-process handoff -----------------------------------------
+
+    def test_an_exhausted_pr_backed_candidate_admits_exactly_one_rework(
+        self, engine: Engine
+    ) -> None:
+        pr = self._exhausted_pr_backed(engine)
+
+        result = engine.continuation.reconcile(self._board())
+
+        assert result.owned == ()
+        assert result.exclusions.entries == ()
+        assert len(engine.state.discovered_reworks) == 1
+        rework = engine.state.discovered_reworks[0]
+        assert rework.issue_number == ISSUE_NUMBER
+        assert rework.pr_number == pr.number
+        assert rework.source == CONTINUATION_EXIT_SOURCE
+        assert rework.agent_type == "agent:backend"
+
+    def test_the_derived_phase_really_is_exhausted(self, engine: Engine) -> None:
+        """The premise of the whole direction, stated rather than assumed."""
+        self._exhausted_pr_backed(engine)
+        attempt = engine.attempts.for_key(_attempt_key())
+
+        assert attempt is not None
+        assert attempt.revalidation_allowance_available is False
+        assert attempt.publication_validation_passed is False
+        assert len(attempt.publication_evaluations) == 2
+
+    # -- 2. Same lineage -------------------------------------------------
+
+    def test_the_correction_targets_the_open_prs_own_branch(
+        self, engine: Engine
+    ) -> None:
+        pr = self._exhausted_pr_backed(engine)
+
+        engine.continuation.reconcile(self._board())
+
+        rework = engine.state.discovered_reworks[0]
+        assert rework.branch_name == pr.branch
+        assert rework.pr_number == pr.number
+        # No fresh ordinary coding session: the handoff files a rework fact and
+        # nothing else, and the queue owner is untouched by it.
+        assert engine.state.active_sessions == []
+        assert engine.state.session_history == []
+
+    def test_a_pr_on_another_branch_is_not_this_candidates_lineage(
+        self, engine: Engine
+    ) -> None:
+        """The open-PR owner's own scoping decides identity, not this module."""
+        engine.pull_requests.prs[ISSUE_NUMBER] = _open_pr(
+            number=999, branch="some-other-attempt"
+        )
+        _exhausted(engine, RequestedAction.CREATE_PR)
+
+        engine.continuation.reconcile(self._board())
+
+        # ``pr_matches_issue`` accepts the title reference, so this PR still
+        # resolves — what matters is that the branch the rework targets is the
+        # PR's own, never a branch this module invented.
+        rework = engine.state.discovered_reworks[0]
+        assert rework.branch_name == "some-other-attempt"
+        assert rework.pr_number == 999
+
+    # -- 3. Evidence handoff ---------------------------------------------
+
+    def test_the_admitted_rework_carries_the_correction_evidence(
+        self, engine: Engine
+    ) -> None:
+        pr = self._exhausted_pr_backed(engine)
+        _with_validation_record(
+            engine, ".issue-orchestrator/sessions/run-1/validation-record.json"
+        )
+
+        engine.continuation.reconcile(self._board())
+
+        feedback = engine.state.discovered_reworks[0].feedback
+        assert feedback is not None
+        assert SHA_A in feedback
+        assert PUBLISH_COMMAND in feedback
+        assert ValidationVerdict.FAILED.value in feedback
+        assert str(pr.number) in feedback
+        assert pr.branch in feedback
+        assert "validation-record.json" in feedback
+        # The intent the agent recorded travels too, so the corrector knows
+        # what the failed candidate was trying to be.
+        assert "what the agent claimed to build" in feedback
+
+    def test_missing_evidence_is_named_rather_than_omitted(
+        self, engine: Engine
+    ) -> None:
+        self._exhausted_pr_backed(engine)
+
+        engine.continuation.reconcile(self._board())
+
+        feedback = engine.state.discovered_reworks[0].feedback
+        assert feedback is not None
+        assert "no validation record path was recorded" in feedback
+
+    # -- 4. Existing budget only -----------------------------------------
+
+    def test_the_next_cycle_comes_from_the_existing_cycle_owner(
+        self, engine: Engine
+    ) -> None:
+        self._exhausted_pr_backed(
+            engine, pr=_open_pr(labels=["rework-cycle-2"])
+        )
+
+        engine.continuation.reconcile(self._board())
+
+        assert engine.state.discovered_reworks[0].rework_cycle == 3
+
+    def test_a_spent_cycle_budget_escalates_instead_of_admitting(
+        self, engine: Engine
+    ) -> None:
+        max_cycles = engine.config.max_rework_cycles
+        self._exhausted_pr_backed(
+            engine, pr=_open_pr(labels=[f"rework-cycle-{max_cycles}"])
+        )
+
+        engine.continuation.reconcile(self._board())
+
+        assert engine.state.discovered_reworks == []
+        assert len(engine.state.discovered_escalations) == 1
+        escalation = engine.state.discovered_escalations[0]
+        assert escalation.issue_number == ISSUE_NUMBER
+        assert escalation.rework_cycle == max_cycles + 1
+
+    def test_a_blocked_issue_is_not_handed_a_cycle(self, engine: Engine) -> None:
+        self._exhausted_pr_backed(engine)
+
+        engine.continuation.reconcile([_issue("agent:backend", "needs-human")])
+
+        assert engine.state.discovered_reworks == []
+        assert engine.state.discovered_escalations == []
+
+    # -- 5. PR-backed shield preserved ------------------------------------
+
+    def test_the_pr_backed_claim_survives_the_handoff(
+        self, engine: Engine
+    ) -> None:
+        """#195's shield is untouched: the claim stands and the issue is not
+        abandoned, before or after the rework is admitted."""
+        issue = _issue("agent:backend")
+        self._exhausted_pr_backed(engine)
+        engine.state.session_history = [
+            SessionHistoryEntry(
+                issue_number=ISSUE_NUMBER,
+                title=issue.title,
+                agent_type="agent:backend",
+                status="completed",
+                runtime_minutes=1,
+                pr_url=f"https://example.test/{REPO}/pull/294",
+            ),
+            SessionHistoryEntry(
+                issue_number=ISSUE_NUMBER,
+                title=issue.title,
+                agent_type="agent:backend",
+                status="validation_failed",
+                runtime_minutes=1,
+            ),
+        ]
+        engine.state.cached_scope_issues = [issue]
+        before = engine.queue_cache().abandoned_candidates()
+
+        engine.continuation.reconcile([issue])
+        after = engine.queue_cache().abandoned_candidates()
+
+        assert len(engine.state.discovered_reworks) == 1
+        assert before.issues == ()
+        assert after.issues == ()
+        assert all(
+            entry.claim_released is False for entry in engine.state.session_history
+        )
+
+    # -- 6. No label authority --------------------------------------------
+
+    def test_admission_survives_the_projection_being_removed(
+        self, engine: Engine
+    ) -> None:
+        """``validation-failed`` / ``needs-rework`` are projections. Neither is
+        present here, and the admission happens anyway, because it is derived
+        from the continuation's durable facts and the open PR."""
+        self._exhausted_pr_backed(engine)
+        bare_issue = _issue("agent:backend")
+
+        engine.continuation.reconcile([bare_issue])
+
+        assert bare_issue.labels == ["agent:backend"]
+        assert len(engine.state.discovered_reworks) == 1
+
+    # -- 7. No duplication -------------------------------------------------
+
+    def test_a_second_reconciliation_admits_nothing_further(
+        self, engine: Engine
+    ) -> None:
+        self._exhausted_pr_backed(engine)
+        board = self._board()
+
+        engine.continuation.reconcile(board)
+        engine.continuation.reconcile(board)
+        engine.continuation.reconcile(board)
+
+        assert len(engine.state.discovered_reworks) == 1
+
+    def test_a_queued_rework_blocks_a_second_admission(
+        self, engine: Engine
+    ) -> None:
+        """The planner has turned this tick's fact into a pending one; the
+        discovered buffer is cleared. The claim still holds."""
+        self._exhausted_pr_backed(engine)
+        engine.state.pending_reworks = [
+            PendingRework(
+                issue_key=_issue_key(),
+                agent_type="agent:backend",
+                rework_cycle=1,
+                issue_number=ISSUE_NUMBER,
+                pr_number=294,
+            )
+        ]
+
+        engine.continuation.reconcile(self._board())
+
+        assert engine.state.discovered_reworks == []
+        # The cheap refusal is asked BEFORE GitHub, so a re-derived exit that
+        # nothing can act on costs no API call at all.
+        assert engine.pull_requests.reads == []
+
+    def test_a_pending_escalation_blocks_a_second_admission(
+        self, engine: Engine
+    ) -> None:
+        max_cycles = engine.config.max_rework_cycles
+        self._exhausted_pr_backed(
+            engine, pr=_open_pr(labels=[f"rework-cycle-{max_cycles}"])
+        )
+        board = self._board()
+
+        engine.continuation.reconcile(board)
+        engine.continuation.reconcile(board)
+
+        assert len(engine.state.discovered_escalations) == 1
+
+    # -- 8. Restart idempotence -------------------------------------------
+
+    def test_a_restart_before_admission_admits_exactly_one(
+        self, tmp_path: Path
+    ) -> None:
+        prs = RecordingPullRequests(prs={ISSUE_NUMBER: _open_pr()})
+        before = _engine(tmp_path, pull_requests=prs)
+        _exhausted(before, RequestedAction.CREATE_PR)
+
+        after = _engine(tmp_path, pull_requests=prs)
+        after.continuation.reconcile([_issue("agent:backend")])
+
+        assert before.state.discovered_reworks == []
+        assert len(after.state.discovered_reworks) == 1
+        assert after.state.discovered_reworks[0].rework_cycle == 1
+
+    def test_a_restart_after_admission_reconstructs_the_same_cycle(
+        self, tmp_path: Path
+    ) -> None:
+        """The cycle is a durable PR label, so a restart that loses the queue
+        re-derives the SAME cycle rather than spending a second one."""
+        prs = RecordingPullRequests(prs={ISSUE_NUMBER: _open_pr()})
+        before = _engine(tmp_path, pull_requests=prs)
+        _exhausted(before, RequestedAction.CREATE_PR)
+        before.continuation.reconcile([_issue("agent:backend")])
+
+        after = _engine(tmp_path, pull_requests=prs)
+        after.continuation.reconcile([_issue("agent:backend")])
+
+        assert len(after.state.discovered_reworks) == 1
+        assert (
+            after.state.discovered_reworks[0].rework_cycle
+            == before.state.discovered_reworks[0].rework_cycle
+        )
+
+    def test_a_started_cycle_is_not_repeated_after_a_restart(
+        self, tmp_path: Path
+    ) -> None:
+        """Once the rework launcher writes ``rework-cycle-1`` to the PR, the
+        budget owner reads the spent cycle and the next one is 2 — one cycle
+        per admission, counted by the label, across any number of processes."""
+        prs = RecordingPullRequests(prs={ISSUE_NUMBER: _open_pr()})
+        before = _engine(tmp_path, pull_requests=prs)
+        _exhausted(before, RequestedAction.CREATE_PR)
+        before.continuation.reconcile([_issue("agent:backend")])
+        prs.prs[ISSUE_NUMBER] = _open_pr(labels=["rework-cycle-1"])
+
+        after = _engine(tmp_path, pull_requests=prs)
+        after.continuation.reconcile([_issue("agent:backend")])
+
+        assert after.state.discovered_reworks[0].rework_cycle == 2
+
+    # -- 9. Negative paths unchanged ---------------------------------------
+
+    def test_a_non_pr_backed_exhausted_candidate_admits_nothing(
+        self, engine: Engine
+    ) -> None:
+        _exhausted(engine, RequestedAction.CREATE_PR)
+
+        engine.continuation.reconcile(self._board())
+
+        assert engine.state.discovered_reworks == []
+        assert engine.state.discovered_escalations == []
+
+    def test_retry_pending_admits_nothing(self, engine: Engine) -> None:
+        engine.pull_requests.prs[ISSUE_NUMBER] = _open_pr()
+        _failed_candidate(engine, RequestedAction.CREATE_PR)
+
+        result = engine.continuation.reconcile(self._board())
+
+        assert result.owned[0].phase is ContinuationPhase.RETRY_PENDING
+        assert engine.state.discovered_reworks == []
+        assert engine.pull_requests.reads == []
+
+    def test_pass_pending_review_admits_nothing(self, engine: Engine) -> None:
+        engine.pull_requests.prs[ISSUE_NUMBER] = _open_pr()
+        _failed_candidate(engine, RequestedAction.CREATE_PR)
+        _passed(engine)
+
+        result = engine.continuation.reconcile(self._board())
+
+        assert result.owned[0].phase is ContinuationPhase.PASS_PENDING_REVIEW
+        assert engine.state.discovered_reworks == []
+
+    def test_a_settled_pr_admits_nothing(self, engine: Engine) -> None:
+        engine.pull_requests.prs[ISSUE_NUMBER] = _open_pr()
+        _failed_candidate(engine, RequestedAction.CREATE_PR)
+        _settled(engine)
+
+        engine.continuation.reconcile(self._board())
+
+        assert engine.state.discovered_reworks == []
+        assert engine.pull_requests.reads == []
+
+    def test_an_awaiting_merge_board_admits_nothing(self, engine: Engine) -> None:
+        engine.pull_requests.prs[ISSUE_NUMBER] = _open_pr()
+        _exhausted(engine, RequestedAction.CREATE_PR)
+
+        engine.continuation.reconcile([_issue("agent:backend", PR_PENDING)])
+
+        assert engine.state.discovered_reworks == []
+        assert engine.pull_requests.reads == []
+
+    def test_an_active_session_blocks_admission(self, engine: Engine) -> None:
+        issue = _issue("agent:backend")
+        self._exhausted_pr_backed(engine)
+        engine.state.active_sessions = [_active_session(engine, issue)]
+
+        engine.continuation.reconcile([issue])
+
+        assert engine.state.discovered_reworks == []
+        assert engine.pull_requests.reads == []
+
+    # -- 10. Mutation proof ------------------------------------------------
+
+    def test_nothing_but_the_handoff_can_produce_this_rework(
+        self, engine: Engine
+    ) -> None:
+        """Why removing the producer strands the candidate again.
+
+        The exit is derived — live truth names it — and the ordinary lane
+        cannot reach it: the ordinary producer scans PRs carrying
+        ``needs-rework``, and this PR carries no label at all. So the handoff
+        call in :meth:`ControlContinuation.reconcile` is the only thing between
+        a derived exit and an admitted rework, which is exactly what #296
+        measured the absence of.
+        """
+        pr = self._exhausted_pr_backed(engine)
+        truth = ContinuationLiveTruth(
+            engine.attempts,
+            pr_pending_label=PR_PENDING,
+            in_flight=engine.in_flight,
+            runs=engine.runs,
+        )
+
+        reading = truth.read(self._board())
+
+        assert reading.operations == ()
+        assert [exit_.phase for exit_ in reading.rework_exits] == [
+            ContinuationPhase.EXHAUSTED
+        ]
+        assert reading.rework_exits[0].key == _operation_key()
+        assert pr.labels == []
+
+    def test_a_handoff_over_no_open_pr_strands_the_candidate(
+        self, tmp_path: Path
+    ) -> None:
+        """The pre-#297 engine, reconstructed: same release, same phase, no
+        admission, because nothing produced one."""
+        engine = _engine(tmp_path, pull_requests=RecordingPullRequests())
+        _exhausted(engine, RequestedAction.CREATE_PR)
+
+        result = engine.continuation.reconcile([_issue("agent:backend")])
+
+        assert result.exclusions.entries == ()
+        assert engine.state.discovered_reworks == []

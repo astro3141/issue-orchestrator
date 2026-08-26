@@ -14,13 +14,19 @@ remember is not enforced at all. So the sequence lives in a type instead::
         -> reconcile #146 ownership
         -> publish ControlOperationExclusions
         -> advance the operations this engine owns
+        -> admit ordinary rework for the candidates it handed back
         -> only then evaluate Actor/rework eligibility
 
-Every method here does the first five before it does the sixth, and the sixth
-is the ONLY thing it delegates to :class:`~.queue_cache.QueueCache`. A caller
-holding this owner cannot express "hydrate without reconciling"; a caller
-holding the cache directly is not hydrating from a refreshed board, which is
-the distinction the two types draw.
+Every method here does the first six before it does the seventh, and the
+seventh is the ONLY thing it delegates to :class:`~.queue_cache.QueueCache`. A
+caller holding this owner cannot express "hydrate without reconciling"; a
+caller holding the cache directly is not hydrating from a refreshed board,
+which is the distinction the two types draw.
+
+The sixth step is #297's, and it belongs in this sequence rather than beside
+it: the handoff is only correct AFTER the exclusion release it depends on has
+been published, and putting it anywhere a caller could forget it is how the
+gap it closes appeared in the first place.
 
 ``QueueCache`` is untouched and still reads only the published projection. No
 raw ownership-store read reaches the scheduler, here or anywhere.
@@ -47,6 +53,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from ..infra.config import Config
     from ..ports.issue import Issue
     from .continuation_live_truth import ContinuationLiveReading, ContinuationLiveTruth
+    from .continuation_rework_handoff import ContinuationReworkHandoff
     from .continuation_runner import ControlContinuationRunner
     from .control_operation_ownership import ControlOperationOwnership
     from .orchestrator_deps import OrchestratorDeps
@@ -63,10 +70,16 @@ class ControlContinuation:
         ownership: "ControlOperationOwnership",
         live_truth: "ContinuationLiveTruth",
         runner: "ControlContinuationRunner",
+        rework_handoff: "ContinuationReworkHandoff",
     ) -> None:
         self._ownership = ownership
         self._live_truth = live_truth
         self._runner = runner
+        # Required, with no default. A continuation assembled without a handoff
+        # is exactly the engine #296 measured: it releases ownership of an
+        # exhausted PR-backed candidate and admits nothing, and it looks
+        # entirely healthy while doing it.
+        self._rework_handoff = rework_handoff
 
     def reconcile(self, board: Sequence["Issue"]) -> ContinuationReconciliation:
         """Publish the exclusions ``board``'s durable truth implies, then act.
@@ -93,12 +106,19 @@ class ControlContinuation:
         engine would hand a running control operation's issue back to ordinary
         work.
 
-        An unreadable durable record publishes NOTHING, advances nothing, and
-        returns the projection already standing. That is the fail-closed
-        direction: the standing projection was reconciled against a set that
-        WAS readable, so keeping it can only keep an exclusion, never invent or
-        drop one. Overwriting it with "nothing is live" would free every
-        running operation on the strength of a broken instrument.
+        An unreadable durable record publishes NOTHING, advances nothing,
+        admits nothing, and returns the projection already standing. That is
+        the fail-closed direction: the standing projection was reconciled
+        against a set that WAS readable, so keeping it can only keep an
+        exclusion, never invent or drop one. Overwriting it with "nothing is
+        live" would free every running operation on the strength of a broken
+        instrument, and admitting rework off it would send an agent at a
+        candidate nobody could read the verdict of.
+
+        The rework handoff runs LAST, after the release that lets ordinary work
+        onto the issue is in force (#297). Running it earlier would file a fact
+        the scheduler is still excluding the issue from acting on, and the two
+        would be describing different instants.
         """
         reading = self._read(board)
         if not reading.readable:
@@ -110,6 +130,7 @@ class ControlContinuation:
             operations=reading.operations,
         )
         self._runner.advance(reconciliation)
+        self._rework_handoff.admit(reading.rework_exits)
         return reconciliation
 
     def hydrate_queue(
@@ -194,9 +215,11 @@ def build_control_continuation(
     from .continuation_finalize import ContinuationFinalizer
     from .continuation_in_flight import ContinuationsInFlight
     from .continuation_live_truth import ContinuationLiveTruth
+    from .continuation_rework_handoff import ContinuationReworkHandoff
     from .continuation_runner import ControlContinuationRunner
     from .continuation_runs import ContinuationRuns
     from .control_operation_ownership import ControlOperationOwnership
+    from .rework_cycle_policy import ReworkCycleBudget
     from .worktree_runnability import WorktreeRunnability
 
     in_flight = ContinuationsInFlight()
@@ -233,6 +256,18 @@ def build_control_continuation(
             runs=runs,
             jobs=deps.services.background_job_supervisor or NullBackgroundJobRunner(),
             repo_root=config.repo_root,
+        ),
+        ContinuationReworkHandoff(
+            state=state,
+            # The engine's own PR reader, so the admitted rework targets the
+            # PR the rest of the lifecycle is already talking about.
+            pull_requests=deps.repository_host,
+            # The same two inputs ``PRScanner`` builds its budget from, so the
+            # ordinary lane and this one cannot disagree about which cycle is
+            # next or where the ceiling is (#297).
+            budget=ReworkCycleBudget(
+                deps.label_manager, max_rework_cycles=config.max_rework_cycles
+            ),
         ),
     )
 

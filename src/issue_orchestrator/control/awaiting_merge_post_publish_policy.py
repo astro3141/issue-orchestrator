@@ -8,6 +8,7 @@ from ..domain.models import (
     DiscoveredAwaitingMergeEscalation,
     PostPublishEscalationKind,
 )
+from .rework_cycle_policy import next_rework_cycle as _next_rework_cycle
 
 if TYPE_CHECKING:
     from ..ports.pull_request_tracker import PRInfo
@@ -71,10 +72,13 @@ def classify_post_approval_state(pr: PRInfo) -> PostApprovalAction:
 
 
 def next_rework_cycle(labels: list[str], label_manager: LabelManager) -> int:
-    cycle = label_manager.extract_rework_cycle(labels)
-    if cycle is not None:
-        return cycle + 1
-    return 1
+    """Re-exported from the shared rework-cycle owner (#297).
+
+    Kept as a name here because the awaiting-merge reconciler and the merge
+    queue coordinator both import it from this module, but the arithmetic now
+    lives in one place with the scanner's and the continuation handoff's.
+    """
+    return _next_rework_cycle(labels, label_manager)
 
 
 _REWORK_HEADERS: dict[PostApprovalAction, tuple[str, str, str]] = {

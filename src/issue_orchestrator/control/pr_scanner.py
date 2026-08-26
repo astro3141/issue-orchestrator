@@ -21,6 +21,11 @@ from ..domain.pr_attempt_scope import scope_prs_to_active_issue_branch
 from .publication_authority import PublicationVerdictReader
 from .review_validity import evaluate_review_validity
 from .review_scope import ReviewScopeChecker, extract_issue_number_from_pr
+from .rework_cycle_policy import (
+    ReworkAdmission,
+    ReworkAdmissionVerdict,
+    ReworkCycleBudget,
+)
 from ..ports import EventSink,  make_trace_event
 from ..ports.pull_request_tracker import PRInfo
 from ..infra import gh_audit
@@ -48,15 +53,6 @@ class ScanResult:
     reviews_to_queue: list[PendingReview]
     reworks_to_queue: list[PendingRework]
     escalations: list[tuple[int, int, int]]  # (pr_number, issue_number, rework_cycle)
-
-
-@dataclass(frozen=True)
-class _ReworkScanDecision:
-    decision: str  # "skip" | "queue" | "escalate"
-    issue_number: int
-    rework_cycle: int
-    blocking_labels: list[str]
-    reason: str
 
 
 class PRScanner:
@@ -104,6 +100,19 @@ class PRScanner:
         self._lm = label_manager
         self._publication_verdict = publication_verdict
         self._review_scope = ReviewScopeChecker(config, repository, log_prefix="SCANNER")
+
+    @property
+    def rework_budget(self) -> ReworkCycleBudget:
+        """The rework-cycle owner this scanner decides through (#297).
+
+        Built per read rather than cached, because the ceiling is a live
+        configuration value the scanner has always re-read per decision. The
+        continuation handoff builds the same owner over the same two inputs, so
+        neither producer can invent its own cycle arithmetic or ceiling.
+        """
+        return ReworkCycleBudget(
+            self._lm, max_rework_cycles=self.config.max_rework_cycles
+        )
 
     def load_issue_branches(self) -> dict[int, str]:
         """Load the current issue->branch map for scan-time scoping."""
@@ -272,9 +281,9 @@ class PRScanner:
         for pr in prs:
             decision = self._decide_rework_candidate(pr, queued_issue_ids, active_issue_numbers)
             self._log_rework_decision(pr, decision, queued_issue_ids, active_issue_numbers)
-            if decision.decision == "skip":
+            if decision.verdict is ReworkAdmissionVerdict.SKIP:
                 continue
-            if decision.decision == "escalate":
+            if decision.escalates:
                 escalations.append((pr.number, decision.issue_number, decision.rework_cycle))
                 continue
 
@@ -353,76 +362,50 @@ class PRScanner:
         pr: PRInfo,
         queued_issue_ids: set[int],
         active_issue_numbers: set[int],
-    ) -> _ReworkScanDecision:
+    ) -> ReworkAdmission:
+        """Scope the PR to an in-scope issue, then let the cycle owner decide.
+
+        Scope is the scanner's own question — it found the PR by label and must
+        resolve the issue behind it — and everything after it is the shared
+        rework-cycle policy, so the ordinary lane and the continuation handoff
+        cannot drift apart on cycle arithmetic or the ceiling (#297).
+        """
+        budget = self.rework_budget
         scope = self._review_scope.check_pr(pr)
         issue_number = scope.issue_number
 
         # Skip PRs whose linked issue is outside configured scope
         if not scope.in_scope:
-            return _ReworkScanDecision(
-                decision="skip",
+            return ReworkAdmission(
+                verdict=ReworkAdmissionVerdict.SKIP,
                 issue_number=issue_number,
                 rework_cycle=0,
-                blocking_labels=[],
                 reason="out_of_scope",
             )
 
-        if issue_number in queued_issue_ids:
-            return _ReworkScanDecision(
-                decision="skip",
-                issue_number=issue_number,
-                rework_cycle=0,
-                blocking_labels=[],
-                reason="already_queued",
-            )
-        if issue_number in active_issue_numbers:
-            return _ReworkScanDecision(
-                decision="skip",
-                issue_number=issue_number,
-                rework_cycle=0,
-                blocking_labels=[],
-                reason="active_session",
-            )
-        rework_cycle = self._get_rework_cycle_from_labels(pr.labels)
-        if self._lm.is_blocking_any(pr.labels):
-            return _ReworkScanDecision(
-                decision="skip",
-                issue_number=issue_number,
-                rework_cycle=rework_cycle,
-                blocking_labels=self._lm.get_blocking(pr.labels),
-                reason="blocking_label",
-            )
-        # Also check the linked issue's labels — a publish failure marks the
-        # issue as blocked-failed but may leave needs-rework on the PR.
+        held = budget.already_held(
+            issue_number,
+            queued_issue_numbers=queued_issue_ids,
+            active_issue_numbers=active_issue_numbers,
+        )
+        if held is not None:
+            return held
+        # Read once, and only once the cheap refusals are past: the linked
+        # issue's labels matter because a publish failure marks the issue as
+        # blocked-failed but may leave needs-rework standing on the PR.
         issue = scope.issue if scope.issue is not None else self.repository.get_issue(issue_number)
-        if issue is not None and self._lm.is_blocking_any(issue.labels):
-            return _ReworkScanDecision(
-                decision="skip",
-                issue_number=issue_number,
-                rework_cycle=rework_cycle,
-                blocking_labels=self._lm.get_blocking(issue.labels),
-                reason="issue_blocked",
-            )
-        if rework_cycle > self.config.max_rework_cycles:
-            return _ReworkScanDecision(
-                decision="escalate",
-                issue_number=issue_number,
-                rework_cycle=rework_cycle,
-                blocking_labels=[],
-                reason="max_rework_exceeded",
-            )
-        return _ReworkScanDecision(
-            decision="queue",
+        return budget.admit(
             issue_number=issue_number,
-            rework_cycle=rework_cycle,
-            blocking_labels=[],
-            reason="queue",
+            pr_labels=pr.labels,
+            issue_labels=issue.labels if issue is not None else [],
+            queued_issue_numbers=queued_issue_ids,
+            active_issue_numbers=active_issue_numbers,
         )
 
     def _log_rework_decision(
         self,
         pr: PRInfo,
-        decision: _ReworkScanDecision,
+        decision: ReworkAdmission,
         queued_issue_ids: set[int],
         active_issue_numbers: set[int],
     ) -> None:
@@ -442,7 +425,7 @@ class PRScanner:
             decision.issue_number in queued_issue_ids,
             decision.issue_number in active_issue_numbers,
         )
-        if decision.decision == "skip":
+        if decision.verdict is ReworkAdmissionVerdict.SKIP:
             extra = (
                 f" blocking={','.join(decision.blocking_labels)}"
                 if decision.reason == "blocking_label" and decision.blocking_labels
@@ -456,7 +439,7 @@ class PRScanner:
                 extra,
             )
             return
-        if decision.decision == "escalate":
+        if decision.escalates:
             logger.info(
                 "[TIMELINE] scanner.rework_escalate pr=%s issue=%s cycle=%s max=%s",
                 pr.number,
@@ -469,8 +452,7 @@ class PRScanner:
         """Extract rework cycle count from labels (rework-cycle-N).
 
         Returns the NEXT cycle number (e.g., rework-cycle-2 means next is cycle 3).
+        Delegated to the shared rework-cycle owner so this scanner and the
+        continuation handoff count with the same arithmetic (#297).
         """
-        cycle = self._lm.extract_rework_cycle(labels)
-        if cycle is not None:
-            return cycle + 1  # Next cycle
-        return 1  # First rework
+        return self.rework_budget.next_cycle(labels)

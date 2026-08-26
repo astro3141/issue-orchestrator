@@ -17,12 +17,18 @@ real reconciliation path.
 from __future__ import annotations
 
 from issue_orchestrator.control.continuation_in_flight import ContinuationsInFlight
+from issue_orchestrator.control.continuation_rework_handoff import (
+    ContinuationReworkHandoff,
+)
 from issue_orchestrator.control.continuation_runs import ContinuationRuns
 from issue_orchestrator.control.continuation_live_truth import ContinuationLiveTruth
 from issue_orchestrator.control.continuation_scheduling import ControlContinuation
 from issue_orchestrator.control.control_operation_ownership import (
     ControlOperationOwnership,
 )
+from issue_orchestrator.control.label_manager import LabelManager
+from issue_orchestrator.control.rework_cycle_policy import ReworkCycleBudget
+from issue_orchestrator.infra.config import Config
 from issue_orchestrator.domain.control_operation import ControlOperationKey
 from issue_orchestrator.domain.models import OrchestratorState
 from issue_orchestrator.ports.control_operation_ownership_store import (
@@ -137,13 +143,36 @@ class NoContinuationRunner:
         return None
 
 
+class NoPullRequests:
+    """A PR reader for a composition that derives no rework exit.
+
+    Refusing rather than answering "none": the inert stack holds no attempt at
+    all, so no exit can be derived and the handoff can never reach a PR read. A
+    suite that started reaching one would say so instead of quietly passing.
+    """
+
+    def create_pr(self, *args: object, **kwargs: object) -> object:
+        raise AssertionError("this suite must not create pull requests")
+
+    def get_prs_for_issue(
+        self, issue_number: int, state: str = "open"
+    ) -> list[object]:
+        raise AssertionError("this suite must not read pull requests")
+
+    def get_prs_for_branch(
+        self, branch: str, state: str = "open"
+    ) -> list[object]:
+        raise AssertionError("this suite must not read pull requests")
+
+
 def inert_control_continuation(
     state: OrchestratorState | None = None,
 ) -> ControlContinuation:
     """The real continuation stack over an empty durable record."""
+    engine_state = state if state is not None else OrchestratorState()
     return ControlContinuation(
         ControlOperationOwnership(
-            state if state is not None else OrchestratorState(),
+            engine_state,
             InMemoryControlOperationOwnershipStore(),
         ),
         ContinuationLiveTruth(
@@ -153,6 +182,13 @@ def inert_control_continuation(
             runs=ContinuationRuns(NoWorktrees()),  # type: ignore[arg-type]
         ),
         NoContinuationRunner(),  # type: ignore[arg-type]
+        ContinuationReworkHandoff(
+            state=engine_state,
+            pull_requests=NoPullRequests(),  # type: ignore[arg-type]
+            budget=ReworkCycleBudget(
+                LabelManager(Config()), max_rework_cycles=Config().max_rework_cycles
+            ),
+        ),
     )
 
 
@@ -170,6 +206,7 @@ __all__ = [
     "InMemoryControlOperationOwnershipStore",
     "NoAttempts",
     "NoContinuationRunner",
+    "NoPullRequests",
     "NoWorktrees",
     "inert_control_continuation",
 ]
