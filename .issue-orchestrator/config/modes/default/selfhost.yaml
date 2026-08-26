@@ -200,7 +200,25 @@ validation:
     # #25's four gate terms. Widen-only — no term either branch relied on was
     # dropped, and `--collect-only` was used to confirm both changes' tests are
     # still selected after the merge.
-    cmd: ".venv/bin/python -m pytest tests/unit tests/integration packages/agent_runner/tests -q --tb=short -p no:cacheprovider -k 'validation or profile or config or prepush or planted or cli_tools or dirty or worktree or review_verdict or review_exchange_records or review_artifacts or Verdict or codex_home or publication or publish or contract or gate or execution_identity or ExecutionIdentity or attempt' && make typecheck"
+    #
+    # #304 (continuation rework handoff must honor engine issue scope) added
+    # `Authority` and `scope`. Every one of its 15 new cases carried none of
+    # the terms above — the first run of this profile against the change
+    # reported `passed=true` having deselected all of them, which is the exact
+    # failure the paragraph at the top of this block describes. The change's
+    # proof lives in one class name repeated in two modules,
+    # `TestReconciliationVisibilityIsNotWorkAdmissionAuthority`, whose module
+    # names (`test_continuation_rework_handoff.py`,
+    # `test_control_continuation.py`) match nothing here; `Authority` reaches
+    # all 14 of its cases. The fifteenth, the cache/owner agreement regression
+    # `test_the_scope_owner_and_the_cache_cannot_disagree_about_scope`, is
+    # reached by `scope`, which also selects `test_queue_cache.py`'s existing
+    # scope suite — the production seam this change made delegate to the new
+    # `EngineIssueScope` owner. `issue_scope` would not do: neither that test
+    # name nor its module carries it. Widening only, confirmed with
+    # `--collect-only`: selection goes from 3869 to 4330 of 14168, all 15 new
+    # cases are selected, and no previously selected test is dropped.
+    cmd: ".venv/bin/python -m pytest tests/unit tests/integration packages/agent_runner/tests -q --tb=short -p no:cacheprovider -k 'validation or profile or config or prepush or planted or cli_tools or dirty or worktree or review_verdict or review_exchange_records or review_artifacts or Verdict or codex_home or publication or publish or contract or gate or execution_identity or ExecutionIdentity or attempt or Authority or scope' && make typecheck"
     timeout_seconds: 1800
   publish:
     # The upstream project's own gate, reproduced rather than invented:
