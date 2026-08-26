@@ -52,6 +52,7 @@ from issue_orchestrator.control.publication_gate import (
 )
 from issue_orchestrator.control.gate_failure_diagnostics import (
     DIAGNOSTIC_FILE_NAME,
+    FAILURE_LOG_TAIL_BYTES,
     GATE_FAILURES_DIR,
     STDERR_FILE_NAME,
     STDOUT_FILE_NAME,
@@ -572,6 +573,310 @@ class TestTheDiagnosticIsNotAnAuthority:
         ).certification(issue_key=ISSUE, head_sha=SHA_A, profiles=_registry())
         assert certification.admitted is False
         assert certification.reason == "publication_receipt_missing"
+
+
+# ---------------------------------------------------------------------------
+# Proof 3b — the one reader, and what it refuses to answer
+# ---------------------------------------------------------------------------
+
+
+class TestReadingTheExplanationBackByName:
+    """#297: the store answers "why did this candidate fail", after cleanup.
+
+    The read is monotone in the refusing direction — see the module docstring
+    of ``control/gate_failure_diagnostics``. Finding a bundle authorizes
+    nothing the receipt did not already authorize; failing to find one only
+    refuses. So what has to be pinned is that it never answers about the WRONG
+    candidate or the WRONG contract, and that "nothing survives" is answered
+    rather than approximated.
+    """
+
+    def test_the_failing_output_is_read_back_after_the_worktree_is_gone(
+        self, repo_root: Path, tmp_path: Path
+    ) -> None:
+        worktree = tmp_path / "issue-94-worktree"
+        worktree.mkdir()
+        _gate(repo_root=repo_root, runner=StubCommandRunner(returncode=1)).check(
+            worktree=worktree, run_assets=_run(worktree), issue_key=ISSUE
+        )
+        _remove_tree(worktree)
+
+        failure = (
+            GateFailureDiagnostics(repo_root)
+            .for_candidate(ISSUE)
+            .latest_failure(head_sha=SHA_A, suite=ValidationGateKind.PUBLISH.suite)
+        )
+
+        assert failure is not None
+        assert failure.receipt.head_sha == SHA_A
+        assert failure.receipt.verdict is ValidationVerdict.FAILED
+        assert failure.receipt.command == PUBLISH_SENTINEL
+        assert failure.exit_code == 1
+        assert failure.timed_out is False
+        assert failure.stdout.tail == FAILING_STDOUT
+        assert failure.stderr.tail == FAILING_STDERR
+        assert failure.stdout.truncated is False
+        assert failure.explains_the_failure is True
+        assert failure.directory.is_relative_to(repo_root)
+
+    def test_nothing_filed_reads_as_nothing_found(self, repo_root: Path) -> None:
+        assert (
+            GateFailureDiagnostics(repo_root)
+            .for_candidate(ISSUE)
+            .latest_failure(head_sha=SHA_A, suite=ValidationGateKind.PUBLISH.suite)
+        ) is None
+
+    def test_a_store_that_does_not_exist_reads_as_nothing_found(
+        self, tmp_path: Path
+    ) -> None:
+        assert (
+            GateFailureDiagnostics(tmp_path / "no-such-checkout")
+            .for_candidate(ISSUE)
+            .latest_failure(head_sha=SHA_A, suite=ValidationGateKind.PUBLISH.suite)
+        ) is None
+
+    def test_another_candidates_explanation_is_never_returned(
+        self, repo_root: Path, worktree: Path
+    ) -> None:
+        _gate(
+            repo_root=repo_root,
+            runner=StubCommandRunner(returncode=1),
+            head_sha=SHA_PRIME,
+        ).check(worktree=worktree, run_assets=_run(worktree), issue_key=ISSUE)
+
+        reader = GateFailureDiagnostics(repo_root).for_candidate(ISSUE)
+
+        assert (
+            reader.latest_failure(
+                head_sha=SHA_A, suite=ValidationGateKind.PUBLISH.suite
+            )
+            is None
+        )
+        assert (
+            reader.latest_failure(
+                head_sha=SHA_PRIME, suite=ValidationGateKind.PUBLISH.suite
+            )
+            is not None
+        )
+
+    def test_another_issues_explanation_is_never_returned(
+        self, repo_root: Path, worktree: Path
+    ) -> None:
+        _gate(repo_root=repo_root, runner=StubCommandRunner(returncode=1)).check(
+            worktree=worktree, run_assets=_run(worktree), issue_key=OTHER_ISSUE
+        )
+
+        assert (
+            GateFailureDiagnostics(repo_root)
+            .for_candidate(ISSUE)
+            .latest_failure(head_sha=SHA_A, suite=ValidationGateKind.PUBLISH.suite)
+        ) is None
+
+    def test_another_contracts_explanation_is_never_returned(
+        self, repo_root: Path
+    ) -> None:
+        """Two contracts can both fail one candidate; neither answers for the other."""
+        GateFailureDiagnostics(repo_root).for_candidate(ISSUE).record_failure(
+            GateFailureOutput(
+                record=_record(suite=ValidationGateKind.QUICK.suite),
+                stdout="the quick gate failed",
+                stderr="",
+            )
+        )
+
+        reader = GateFailureDiagnostics(repo_root).for_candidate(ISSUE)
+
+        assert (
+            reader.latest_failure(
+                head_sha=SHA_A, suite=ValidationGateKind.PUBLISH.suite
+            )
+            is None
+        )
+        assert (
+            reader.latest_failure(
+                head_sha=SHA_A, suite=ValidationGateKind.QUICK.suite
+            )
+            is not None
+        )
+
+    def test_the_newest_of_several_failures_is_the_one_returned(
+        self, repo_root: Path, worktree: Path
+    ) -> None:
+        """A retried publish files one bundle per run; the last one is current."""
+        for stdout in ("first reason", "second reason", "third reason"):
+            _gate(
+                repo_root=repo_root,
+                runner=StubCommandRunner(returncode=1, stdout=stdout),
+            ).check(worktree=worktree, run_assets=_run(worktree), issue_key=ISSUE)
+
+        failure = (
+            GateFailureDiagnostics(repo_root)
+            .for_candidate(ISSUE)
+            .latest_failure(head_sha=SHA_A, suite=ValidationGateKind.PUBLISH.suite)
+        )
+
+        assert failure is not None
+        assert failure.stdout.tail == "third reason"
+
+    def test_an_upper_case_sha_names_the_same_candidate(
+        self, repo_root: Path, worktree: Path
+    ) -> None:
+        _gate(repo_root=repo_root, runner=StubCommandRunner(returncode=1)).check(
+            worktree=worktree, run_assets=_run(worktree), issue_key=ISSUE
+        )
+
+        assert (
+            GateFailureDiagnostics(repo_root)
+            .for_candidate(ISSUE)
+            .latest_failure(
+                head_sha=SHA_A.upper(), suite=ValidationGateKind.PUBLISH.suite
+            )
+        ) is not None
+
+    def test_a_corrupt_bundle_falls_through_to_the_one_before_it(
+        self, repo_root: Path, worktree: Path, durable: DurableDiagnostics
+    ) -> None:
+        """An unreadable artefact costs detail, never all of the evidence."""
+        _gate(
+            repo_root=repo_root,
+            runner=StubCommandRunner(returncode=1, stdout="the older reason"),
+        ).check(worktree=worktree, run_assets=_run(worktree), issue_key=ISSUE)
+        _gate(
+            repo_root=repo_root,
+            runner=StubCommandRunner(returncode=1, stdout="the newer reason"),
+        ).check(worktree=worktree, run_assets=_run(worktree), issue_key=ISSUE)
+        newest = durable.for_candidate(ISSUE, SHA_A)[-1]
+        (newest / DIAGNOSTIC_FILE_NAME).write_text("{ not json", encoding="utf-8")
+
+        failure = (
+            GateFailureDiagnostics(repo_root)
+            .for_candidate(ISSUE)
+            .latest_failure(head_sha=SHA_A, suite=ValidationGateKind.PUBLISH.suite)
+        )
+
+        assert failure is not None
+        assert failure.stdout.tail == "the older reason"
+
+    def test_a_bundle_whose_payload_names_another_candidate_is_refused(
+        self, repo_root: Path, worktree: Path, durable: DurableDiagnostics
+    ) -> None:
+        """The name and the payload have to agree, or the bundle explains nothing.
+
+        Hand-editing one and not the other is how an explanation about A′ ends
+        up sitting where a reader looking for A would find it.
+        """
+        _gate(repo_root=repo_root, runner=StubCommandRunner(returncode=1)).check(
+            worktree=worktree, run_assets=_run(worktree), issue_key=ISSUE
+        )
+        directory = durable.only_for_candidate(ISSUE, SHA_A)
+        payload = durable.read(directory)
+        verdict = payload["verdict"]
+        assert isinstance(verdict, dict)
+        verdict["head_sha"] = SHA_PRIME
+        (directory / DIAGNOSTIC_FILE_NAME).write_text(
+            json.dumps(payload), encoding="utf-8"
+        )
+
+        assert (
+            GateFailureDiagnostics(repo_root)
+            .for_candidate(ISSUE)
+            .latest_failure(head_sha=SHA_A, suite=ValidationGateKind.PUBLISH.suite)
+        ) is None
+
+    def test_a_large_log_is_tailed_and_says_it_was(self, repo_root: Path) -> None:
+        head = "the beginning nobody will see"
+        tail_marker = "FAILED tests/unit/test_thing.py::test_it"
+        noise = "x" * (FAILURE_LOG_TAIL_BYTES * 3)
+        GateFailureDiagnostics(repo_root).for_candidate(ISSUE).record_failure(
+            GateFailureOutput(
+                record=_record(),
+                stdout=f"{head}\n{noise}\n{tail_marker}\n",
+                stderr="short",
+            )
+        )
+
+        failure = (
+            GateFailureDiagnostics(repo_root)
+            .for_candidate(ISSUE)
+            .latest_failure(head_sha=SHA_A, suite=ValidationGateKind.PUBLISH.suite)
+        )
+
+        assert failure is not None
+        assert failure.stdout.truncated is True
+        assert tail_marker in failure.stdout.tail
+        assert head not in failure.stdout.tail
+        assert len(failure.stdout.tail) <= FAILURE_LOG_TAIL_BYTES
+        # The other stream is untouched by the bound.
+        assert failure.stderr.truncated is False
+        assert failure.stderr.tail == "short"
+
+    def test_a_bundle_with_no_output_reads_as_nothing_found(
+        self, repo_root: Path
+    ) -> None:
+        """It repeats the receipt and adds nothing, which is not an explanation.
+
+        The reader applies that itself rather than handing the caller a bundle
+        and a predicate to remember: a caller that forgot the predicate would
+        put "publication failed" and no output in front of a correction agent,
+        which is the human relay the store exists to remove.
+        """
+        GateFailureDiagnostics(repo_root).for_candidate(ISSUE).record_failure(
+            GateFailureOutput(record=_record(), stdout="", stderr="  \n")
+        )
+
+        assert (
+            GateFailureDiagnostics(repo_root)
+            .for_candidate(ISSUE)
+            .latest_failure(head_sha=SHA_A, suite=ValidationGateKind.PUBLISH.suite)
+        ) is None
+
+    def test_an_empty_bundle_falls_through_to_the_one_before_it(
+        self, repo_root: Path, worktree: Path
+    ) -> None:
+        """The same fall-through a corrupt bundle gets, for the same reason.
+
+        A newest run that produced no output on either stream costs the caller
+        detail; stopping the search on it would cost the candidate ALL of its
+        evidence and strand it for a human, with an older run's real output for
+        the same ``(issue, commit, suite)`` sitting unread beside it.
+        """
+        _gate(
+            repo_root=repo_root,
+            runner=StubCommandRunner(returncode=1, stdout="the older reason"),
+        ).check(worktree=worktree, run_assets=_run(worktree), issue_key=ISSUE)
+        GateFailureDiagnostics(repo_root).for_candidate(ISSUE).record_failure(
+            GateFailureOutput(record=_record(), stdout="", stderr="")
+        )
+
+        failure = (
+            GateFailureDiagnostics(repo_root)
+            .for_candidate(ISSUE)
+            .latest_failure(head_sha=SHA_A, suite=ValidationGateKind.PUBLISH.suite)
+        )
+
+        assert failure is not None
+        assert failure.stdout.tail == "the older reason"
+        assert failure.explains_the_failure is True
+
+    def test_a_deleted_log_leaves_the_other_stream_readable(
+        self, repo_root: Path, worktree: Path, durable: DurableDiagnostics
+    ) -> None:
+        _gate(repo_root=repo_root, runner=StubCommandRunner(returncode=1)).check(
+            worktree=worktree, run_assets=_run(worktree), issue_key=ISSUE
+        )
+        directory = durable.only_for_candidate(ISSUE, SHA_A)
+        (directory / STDOUT_FILE_NAME).unlink()
+
+        failure = (
+            GateFailureDiagnostics(repo_root)
+            .for_candidate(ISSUE)
+            .latest_failure(head_sha=SHA_A, suite=ValidationGateKind.PUBLISH.suite)
+        )
+
+        assert failure is not None
+        assert failure.stdout.tail == ""
+        assert failure.stderr.tail == FAILING_STDERR
+        assert failure.explains_the_failure is True
 
 
 # ---------------------------------------------------------------------------

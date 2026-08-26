@@ -41,6 +41,7 @@ def test_scan_pending_pr_work_loads_issue_branches_once_and_reuses_map() -> None
         [],
         [],
         issue_branches=issue_branches,
+        claimed_issue_numbers=set(),
     )
 
 

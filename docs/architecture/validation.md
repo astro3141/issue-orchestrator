@@ -339,10 +339,34 @@ Three properties are the whole design:
   share a stem, and a reader holding the receipt can find the explanation
   without following a pointer. There is no pointer by design; see below.
 - **Diagnostic, never authority.** Nothing points at it from the attempt
-  record, and no predicate takes its path or its existence as input.
-  `Attempt.completed_evaluations` remains the only thing that decides what the
-  gate decided. A losing gate run must not be able to write anything that
-  admits work.
+  record, and nothing reads it to decide what the gate DECIDED.
+  `Attempt.completed_evaluations` remains the only thing that decides that. A
+  losing gate run must not be able to write anything that admits work.
+
+There is exactly one reader, `CandidateGateDiagnostics.latest_failure`, added by
+[#297] so the rework handed a failed publish candidate back carries the actual
+failing test rather than a pointer into a reaped worktree. It finds the newest
+bundle filed under `(issue, HEAD_SHA, suite)` — by name, because there is still
+no pointer — re-checks the bundle's own receipt against the candidate and the
+contract asked for, and returns the tail of each stream together with the
+directory holding the whole of it. The read is **monotone in the refusing
+direction**: finding a bundle authorizes nothing the receipt did not already
+authorize, and failing to find one can only refuse a handoff everything else
+admitted. So a hand-planted artefact still makes no work happen, and a deleted
+one strands the candidate loudly instead of degrading the correction.
+
+"Newest" means newest bundle that actually explains the failure, and the reader
+is what decides that rather than its caller. Two kinds of bundle explain
+nothing and both fall through to the one before them: one that cannot be read
+at all, and one that reads cleanly but carries no output on either stream — the
+latter repeats the receipt and adds nothing, which is exactly as useful to a
+correction agent as a bundle that was never filed. A retried publish files one
+bundle per run under the same `(issue, HEAD_SHA, suite)`, so stopping the search
+on an empty newest one would discard an older run's real output and strand the
+candidate for a human with the evidence sitting unread beside it. `None` from
+`latest_failure` therefore means "nothing filed for this candidate explains
+anything", and the handoff's fail-closed refusal is built directly on it with no
+second predicate of its own to forget.
 
 A pass writes no such artefact — its output stays where every passing run's
 output has always stayed — and the trigger is the *verdict* rather than the exit
@@ -517,9 +541,126 @@ run opens so an interrupted one cannot refund itself. When it is gone the phase
 is `RUNS_EXHAUSTED`, which returns the candidate to ordinary rework with its
 descriptor, its evaluations and any review verdict intact.
 
+### Releasing the issue is not the same as handing the candidate back
+
+Three phases say in their own documentation that the candidate returns to
+ordinary rework — `EXIT_TO_REWORK`, `EXHAUSTED` and `RUNS_EXHAUSTED` — and
+`ContinuationPhase.exits_to_rework` is where each one says so, declared per
+member exactly as `live` is. Until [#297] the derivation dropped every non-live
+phase from ownership and produced nothing else, so the lease was released and
+no rework was ever admitted: a PR-backed candidate that failed canonical
+publication validation and spent its same-SHA allowance sat stranded until a
+human intervened, in an engine whose ordinary rework lane was idle beside it.
+
+`control/continuation_rework_handoff.py` is the missing producer, and it owns no
+policy of its own. The phase stays a derived predicate; the PR identity and
+branch come from the existing open-PR owner (`look_up_open_pr_for_issue`); the cycle
+number and the ceiling come from `control/rework_cycle_policy.py`, the single
+rework-cycle owner `PRScanner` now decides through as well. What the handoff
+adds is assembly: it files a `DiscoveredRework` (or a `DiscoveredEscalation`
+when the ceiling is passed) carrying the failed candidate's SHA, the publish
+gate's command and verdict, the intent the agent recorded, and the gate's own
+failing output — so the correction needs no human relay — and the planner turns
+that fact into the same `QueueReworkAction` the ordinary lane produces.
+
+The output is the part that has to survive cleanup, and the receipt deliberately
+carries none. `Attempt.validation_record_path` is no help either: it points into
+the coder's run directory, inside a worktree that is usually already reaped by
+the time an exit is derived. So the handoff resolves [#94]'s durable bundle for
+that exact `(issue, SHA, suite)` through its owner and copies the failing output
+into the correction context, with the bundle's path for the rest of the log.
+`Attempt.publication_refusal` is what says an explanation is owed — a receipt in
+which the publication contract refused this candidate — so an exit that reached
+rework by another route (a reviewer asking for changes on a commit that passed)
+owes nothing here and is not held to it. When an explanation IS owed and none
+can be resolved, the handoff **strands the candidate** — `rework.skipped` with
+reason `missing_failure_evidence` — rather than queueing a cycle whose prompt
+would say "publication failed, go and find out why". That prompt is the human
+relay [#297] exists to remove, and spending a rework cycle on it arrives back at
+the same place one cycle poorer.
+
+That evidence gate guards the *spending* of a cycle, so it is the **last**
+question the handoff asks: after `ReworkCycleBudget.admit` has granted one, not
+before. The ceiling keeps its precedence — [#297] requires that at exhaustion
+today's escalation path fires and no new budget is introduced, so a candidate
+that is simultaneously at the ceiling and missing its explanation escalates,
+exactly as it would have with the explanation in hand. Asking the two questions
+the other way round would swap an escalation a human is waiting on for a strand
+nothing produces. Below the ceiling nothing changes: the refusal still happens
+before any `DiscoveredRework` is filed and before any principal is spawned, so
+no cycle is spent, and the same cycle is offered again on the next pass once the
+evidence gap is closed.
+
+The transition is `continuation -> ordinary rework on the same PR lineage`,
+never `continuation -> issue release`: [#195]'s PR-backed shield is untouched,
+the session-history claim stands, `QueueCache.abandoned_candidates()` still
+excludes the issue, and no fresh coding session is created for it. Repetition is
+bounded by what already bounds rework — the cycle owner refuses while anything
+holds the issue, `OrchestratorState.record_discovered_rework` admits at most one
+fact per issue per tick, and the `rework-cycle-N` label the launcher writes is
+the durable counter a restart re-reads. No new budget exists.
+
+Two rules keep that bound from costing GitHub reads. Every refusal decidable
+from facts the caller already holds is reached before any read *unless something
+outranks it*: `ReworkCycleBudget.already_held` takes whichever label set its
+caller has for free — the PR's, for the sweep that found it by label; the
+issue's, for the handoff that arrives holding a board issue — so a blocked
+candidate is refused without a read on every pass. (The one free refusal
+deliberately asked after the read is `missing_failure_evidence`, because the
+ceiling outranks it; see the paragraph above and the one below.) The refusal
+that genuinely needs a read, "there is no open PR", is a negative answer
+`AdapterCache` does not cache, so the handoff remembers it per candidate and
+drops the memo when the exit stops being derived.
+
+What may enter that memo is deliberately narrow, and it is `OpenPrLookup` that
+makes the distinction available: the PR port can *fail to answer* — a
+rate-limited `/search/issues` call, a timeout — and `get_open_pr_for_issue`
+collapses that into the same `None` it uses for "there is no open PR". A caller
+that caches the answer must not, so the handoff reads through
+`look_up_open_pr_for_issue` instead. A failed read refuses that pass only, as
+`pr_read_failed`, and settles nothing: the handoff is built once per engine and
+the exit keeps being derived, so a memoised outage would take the silent
+short-circuit forever and re-open the [#296] gap from a recoverable error. **A
+read that failed is not a fact**, which is this repo's fail-fast rule applied to
+a cache.
+
+The once-per-issue-per-tick rule belongs to the collection, so every producer
+inherits it: the `needs-rework` sweep, the post-publish reconciler and this
+handoff all write through `record_discovered_rework` /
+`record_discovered_escalation`, and all four ask "is this issue already
+claimed?" through `OrchestratorState.issues_with_claimed_rework`. Which fact
+survives is decided by content rather than arrival order — the steady-state
+refresh sweeps before it hydrates and startup hydrates before it sweeps, so a
+fact carrying correction context supersedes one that does not, and nothing
+supersedes a fact that already carries it. The three refusals that strand a
+candidate with nothing downstream to retry it — `no_open_pr`, `no_agent_label`
+and `missing_failure_evidence` — are published as `rework.skipped` rather than
+only logged, with the same payload shape for all three (and for
+`pr_read_failed`) so a consumer never has to branch on which one it got. The
+third is the one refusal that deliberately follows the PR read, because the
+ceiling outranks it; the read it pays for is a *positive* PR answer, which
+`AdapterCache` does cache, so a permanently unexplainable candidate costs what
+an admitted one costs rather than the uncached search `no_open_pr` avoids by
+memo.
+
+Those refusals are permanent by construction while the log line about them is
+not, so each is **logged every pass and published once**: the exit is
+re-derived on every reconciliation for as long as the durable facts stand, and
+an event per tick would tell a consumer something changed when nothing has. The
+announcement is remembered per `(candidate, reason)` and dropped by the same
+pruning as the `no_open_pr` memo, so a candidate that leaves the exit and comes
+back is news again — and a restarted process meets it for the first time. Only
+the *announcement* is remembered: the decision itself is re-made every pass, so
+a durable bundle that is restored, or written by a gate that ran after the
+strand, is picked up on the next reconciliation rather than being locked out by
+a cached refusal.
+
 `control/continuation_scheduling.py` is the one hydration path: it derives,
-reconciles, publishes, advances what this engine owns, and only then lets
-`QueueCache` evaluate eligibility. Derivation runs inside the ownership owner's
+reconciles, publishes, advances what this engine owns, admits the rework its
+exits imply, and only then lets `QueueCache` evaluate eligibility. The handoff
+runs last because it depends on the release that precedes it, and an unreadable
+durable record admits nothing for the same reason it releases nothing.
+Derivation runs inside the ownership owner's
 own lock (`reconcile_derived`), which is what makes a stale snapshot unable to
 release a newer claim. `control/continuation_runner.py` executes: it hands a
 `RETRY_PENDING` candidate whole to [#139] — no second admission predicate and

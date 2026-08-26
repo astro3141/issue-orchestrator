@@ -94,6 +94,40 @@ class TestEveryPhaseDeclaresLiveness:
         }
 
 
+class TestEveryPhaseDeclaresItsRework:
+    """The second answer every member must give (#297).
+
+    Which phases hand the candidate back is what decides whether ordinary
+    rework is admitted for it in-process, so it is stated per member rather
+    than inferred from "not live" — three of the seven non-live phases mean
+    something else entirely, and admitting rework for those would invent work
+    rather than continue it.
+    """
+
+    def test_the_rework_exits_are_exactly_the_three_that_hand_back(self) -> None:
+        exits = {phase for phase in ContinuationPhase if phase.exits_to_rework}
+
+        assert exits == {
+            ContinuationPhase.EXIT_TO_REWORK,
+            ContinuationPhase.EXHAUSTED,
+            ContinuationPhase.RUNS_EXHAUSTED,
+        }
+
+    def test_no_live_phase_also_exits_to_rework(self) -> None:
+        assert not any(
+            phase.live and phase.exits_to_rework for phase in ContinuationPhase
+        )
+
+    def test_a_settled_or_never_started_phase_hands_nothing_back(self) -> None:
+        for phase in (
+            ContinuationPhase.NO_RECORDED_INTENT,
+            ContinuationPhase.NOT_EVALUATED,
+            ContinuationPhase.SETTLED_NO_PR,
+            ContinuationPhase.SETTLED_PR,
+        ):
+            assert phase.exits_to_rework is False
+
+
 class TestNoRecordedIntent:
     @pytest.mark.parametrize(
         "overrides",

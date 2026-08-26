@@ -33,15 +33,28 @@ was actually lost:
   suite the gate stamped completes the name, because two contracts may both
   fail for one candidate and neither explanation may erase the other.
 
-Diagnostic only, deliberately. Nothing here is readable by admission: the
-artefact lives outside the attempt record, nothing points at it from the
-attempt, and no predicate in this codebase takes its path or its existence as
-input. ``Attempt.completed_evaluations`` remains the sole authority on what a
-gate decided (:mod:`.publication_evidence` is what reads it). An artefact that
-could admit work would be a second authority, and a second authority written by
-the losing side of a gate is the worst possible one. That holds a fortiori for a
-gate that files no receipt at all, such as the continuation's: its failure is
-explained here and admits nothing anywhere.
+Diagnostic, never authority. Nothing points at the artefact from the attempt
+record, and no predicate anywhere reads it to decide what a gate DECIDED.
+``Attempt.completed_evaluations`` remains the sole authority on that
+(:mod:`.publication_evidence` is what reads it). An artefact that could admit
+work would be a second authority, and a second authority written by the losing
+side of a gate is the worst possible one. That holds a fortiori for a gate that
+files no receipt at all, such as the continuation's: its failure is explained
+here and admits nothing anywhere.
+
+Which is why the one reader that exists (#297, :meth:`CandidateGateDiagnostics
+.latest_failure`) is safe, and why it is spelled the way it is. The continuation
+hands a failed publish candidate back to ordinary rework, and the correction
+agent must be told the actual failing test — the receipt carries the verdict and
+the command, and the only place the *output* survives worktree cleanup is here.
+That read is **monotone in the refusing direction**: finding a bundle authorizes
+nothing that was not already authorized by the receipt and the phase, and
+failing to find one can only REFUSE a handoff that everything else admitted. So
+a hand-planted artefact cannot make work happen, and a deleted one cannot make
+work happen either — it strands the candidate for a human, loudly, which is the
+fail-closed direction. The reader re-checks the bundle's own receipt against the
+candidate and the suite it was asked for, so a bundle filed under one name that
+describes another explains nothing rather than explaining the wrong candidate.
 
 The verdict fields it carries are not restated here either: they come from
 :func:`~.publication_verdict.receipt_for`, the same projection that produces the
@@ -52,14 +65,20 @@ stored twice with different lifetimes.
 
 from __future__ import annotations
 
+import json
 import logging
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
+from ..domain.commit_sha import normalize_commit_sha
 from ..domain.issue_key import IssueKey
 from ..domain.issue_key_codec import encode_issue_key, issue_key_path_part
-from ..domain.validation_verdict_receipt import ValidationVerdict
+from ..domain.validation_verdict_receipt import (
+    ValidationVerdict,
+    ValidationVerdictReceipt,
+)
 from ..infra.atomic_json import atomic_write_json
 from ..ports.session_output import ValidationRecord
 from .publication_verdict import receipt_for
@@ -84,6 +103,17 @@ STDOUT_FILE_NAME = "stdout.log"
 STDERR_FILE_NAME = "stderr.log"
 
 GATE_FAILURE_SCHEMA_VERSION = 1
+
+FAILURE_LOG_TAIL_BYTES = 8_192
+"""How much of each stream a reader takes when the whole log is larger.
+
+A publish contract's stdout is routinely megabytes, and the reader's one caller
+puts what it gets into an agent's prompt. The TAIL is the part that explains the
+failure — a test runner names what failed at the end — and the durable path
+travels with it, so an agent that needs more has somewhere to look rather than a
+truncation it cannot get past. The full log is never rewritten or trimmed: the
+bound is on the read, not on what #94 keeps.
+"""
 
 _NON_AUTHORITATIVE_NOTE = (
     "Diagnostic evidence only. It explains a gate failure and authorizes "
@@ -122,14 +152,73 @@ class GateFailureOutput:
     stderr: str
 
 
+@dataclass(frozen=True, slots=True)
+class GateFailureLog:
+    """One stream of a failed gate's output: where it lives, and its tail.
+
+    Both halves, because a reader needs both for different things. The tail is
+    what can be shown to somebody who has to act on the failure now; the path is
+    what makes the tail checkable and the rest of the log reachable. A value
+    carrying only the text would be evidence nobody could go back to, and one
+    carrying only the path would be the session-local pointer this whole store
+    exists because of.
+    """
+
+    path: Path
+    tail: str
+    truncated: bool
+
+    @property
+    def has_output(self) -> bool:
+        """Whether this stream said anything at all."""
+        return bool(self.tail.strip())
+
+
+@dataclass(frozen=True, slots=True)
+class DurableGateFailure:
+    """A failed gate's own explanation, resolved after its worktree is gone.
+
+    The read side of what :meth:`CandidateGateDiagnostics.record_failure` wrote,
+    and deliberately the same shape: the gate's receipt for what it decided, and
+    the output for why. The receipt here is re-parsed from the bundle rather
+    than taken from the caller, so a bundle can only ever describe the run that
+    produced it — and :meth:`CandidateGateDiagnostics.latest_failure` refuses to
+    return one whose receipt names a candidate or a contract other than the one
+    asked for.
+    """
+
+    directory: Path
+    receipt: ValidationVerdictReceipt
+    exit_code: int | None
+    timed_out: bool
+    stdout: GateFailureLog
+    stderr: GateFailureLog
+
+    @property
+    def explains_the_failure(self) -> bool:
+        """Whether this bundle actually carries the failure's output.
+
+        A bundle whose two streams are both empty repeats the receipt and adds
+        nothing — handing it to an agent would be a prompt that says "it failed"
+        and stops. :meth:`CandidateGateDiagnostics.latest_failure` applies this
+        itself, falling through to an older bundle rather than returning one,
+        so a caller never has to re-apply it and cannot forget to.
+        """
+        return self.stdout.has_output or self.stderr.has_output
+
+
 class CandidateGateDiagnostics:
-    """Files failed gate output for one candidate's issue identity.
+    """Files, and resolves, failed gate output for one candidate's issue identity.
 
     Bound to the issue at construction and to the commit by the record it is
     handed, so no caller can supply an identity that disagrees with the run:
     the ``head_sha`` is the gate's own, exactly as
     :func:`~.publication_verdict.receipt_for` takes it from the record rather
     than from a second read of the working copy.
+
+    Reading is on the same type as writing because the binding rule is the same
+    one: an artefact is findable only under the identity it was filed under, and
+    a reader that spelled that identity itself would be a second spelling of it.
     """
 
     def __init__(self, *, failures_dir: Path, issue_key: IssueKey) -> None:
@@ -233,8 +322,81 @@ class CandidateGateDiagnostics:
         everything filed for ``(issue, A)``, whatever ran.
         """
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
-        candidate = f"{issue_key_path_part(self._issue_key)}--{head_sha}"
-        return self._failures_dir / f"{candidate}--{suite}--{stamp}"
+        return self._failures_dir / f"{self._prefix_for(head_sha, suite)}{stamp}"
+
+    def latest_failure(
+        self, *, head_sha: str, suite: str
+    ) -> DurableGateFailure | None:
+        """The newest surviving explanation of ``suite`` refusing ``head_sha``.
+
+        Found by name and by nothing else: there is no pointer from the attempt
+        to follow, and adding one is what would turn this store into a second
+        authority. The name is built by :meth:`_prefix_for`, which is the same
+        expression :meth:`_destination_for` writes under, so the writer and the
+        reader cannot drift into two spellings of one candidate.
+
+        Newest first because a retried publish files one bundle per attempt and
+        the last one is the failure the candidate is actually sitting on. Older
+        bundles are not skipped over silently, though: a newest bundle that
+        does not explain the failure falls through to the one before it, so a
+        damaged artefact costs the caller detail rather than all of its
+        evidence. Two things fail to explain it and both fall through — a bundle
+        that cannot be read at all, and one that reads cleanly but carries no
+        output on either stream. The second is not a lesser case of the first:
+        it repeats the receipt and adds nothing, which is precisely as useful
+        to a corrector as a bundle that was never there, and stopping the search
+        on it would discard an older run's real output for the same
+        ``(issue, commit, suite)``.
+
+        Returns ``None`` when nothing filed under that name can be read as being
+        about this exact candidate and this exact contract *and* says why it
+        failed. ``None`` is the honest answer for "no explanation survives", and
+        the caller's own fail-closed behaviour is built on its being answered
+        rather than approximated: see :mod:`.continuation_rework_handoff`.
+        """
+        prefix = self._prefix_for(head_sha, suite)
+        try:
+            bundles = sorted(
+                (
+                    path
+                    for path in self._failures_dir.iterdir()
+                    if path.is_dir() and path.name.startswith(prefix)
+                ),
+                key=lambda path: path.name,
+                reverse=True,
+            )
+        except OSError:
+            # No store yet, or one this process cannot list. Either way nothing
+            # is resolvable, which is what the caller is asking.
+            return None
+        for directory in bundles:
+            failure = _read_failure(directory, head_sha=head_sha, suite=suite)
+            if failure is None:
+                continue
+            if not failure.explains_the_failure:
+                logger.warning(
+                    "[GATE_DIAGNOSTIC] the %s bundle at %s for %s@%s carries no "
+                    "output on either stream; looking further back",
+                    suite,
+                    directory,
+                    self._issue_key,
+                    head_sha[:12],
+                )
+                continue
+            return failure
+        return None
+
+    def _prefix_for(self, head_sha: str, suite: str) -> str:
+        """The one name a ``(candidate, suite)`` bundle is filed under.
+
+        The commit is canonicalised on the way in, because the writer's is: it
+        comes from a receipt, and ``ValidationVerdictReceipt`` normalises case.
+        A reader handed an upper-case SHA is naming the same commit and must
+        find the same bundle.
+        """
+        commit = normalize_commit_sha(head_sha, field_name="head_sha")
+        candidate = f"{issue_key_path_part(self._issue_key)}--{commit}"
+        return f"{candidate}--{suite}--"
 
 
 class GateFailureDiagnostics:
@@ -255,20 +417,117 @@ class GateFailureDiagnostics:
         return self._failures_dir
 
     def for_candidate(self, issue_key: IssueKey) -> CandidateGateDiagnostics:
-        """A writer bound to ``issue_key``, for the commit its records name."""
+        """A reader/writer bound to ``issue_key``, for the commit its records name."""
         return CandidateGateDiagnostics(
             failures_dir=self._failures_dir, issue_key=issue_key
         )
 
 
+def _read_failure(
+    directory: Path, *, head_sha: str, suite: str
+) -> DurableGateFailure | None:
+    """One bundle, read back and checked against what the caller asked for.
+
+    Every refusal below returns ``None`` and says so in the log rather than
+    raising. The caller is resolving evidence for a candidate that has already
+    failed, and an unreadable artefact is one more thing that failed — not a
+    reason to take down the reconciliation pass that asked.
+    """
+    try:
+        payload = json.loads(
+            (directory / DIAGNOSTIC_FILE_NAME).read_text(encoding="utf-8")
+        )
+    except (OSError, ValueError) as exc:
+        logger.warning(
+            "[GATE_DIAGNOSTIC] %s is not a readable failure bundle: %s",
+            directory,
+            exc,
+        )
+        return None
+    if not isinstance(payload, Mapping):
+        logger.warning("[GATE_DIAGNOSTIC] %s holds no failure object", directory)
+        return None
+    verdict = payload.get("verdict")
+    if not isinstance(verdict, Mapping):
+        logger.warning("[GATE_DIAGNOSTIC] %s records no verdict", directory)
+        return None
+    try:
+        receipt = ValidationVerdictReceipt.from_payload(verdict)
+    except (TypeError, ValueError) as exc:
+        logger.warning(
+            "[GATE_DIAGNOSTIC] %s records an unreadable verdict: %s", directory, exc
+        )
+        return None
+    if receipt.suite != suite or not receipt.covers(head_sha):
+        # The name said one thing and the payload says another. Returning it
+        # would be the exact mislabelling the candidate binding exists to make
+        # impossible, one layer up: an explanation read as being about A′.
+        logger.warning(
+            "[GATE_DIAGNOSTIC] %s describes %s@%s, not %s@%s",
+            directory,
+            receipt.suite,
+            receipt.head_sha[:12],
+            suite,
+            head_sha[:12],
+        )
+        return None
+    exit_code = payload.get("exit_code")
+    return DurableGateFailure(
+        directory=directory,
+        receipt=receipt,
+        exit_code=exit_code if isinstance(exit_code, int) else None,
+        timed_out=payload.get("timed_out") is True,
+        # The file names are the store's own constants rather than the payload's
+        # ``stdout_log``/``stderr_log`` strings: those exist to tell a human
+        # reader what to open, and following them would let a bundle name a path
+        # outside itself.
+        stdout=_read_log(directory / STDOUT_FILE_NAME),
+        stderr=_read_log(directory / STDERR_FILE_NAME),
+    )
+
+
+def _read_log(path: Path) -> GateFailureLog:
+    """The tail of one stream, bounded by :data:`FAILURE_LOG_TAIL_BYTES`.
+
+    Seeks rather than reading the whole file, because a publish contract's
+    stdout is routinely large and this runs inside a reconciliation pass. A
+    stream that cannot be read at all reports itself as empty and keeps its
+    path: the bundle's other stream may still explain the failure, and the
+    caller decides what "no output at all" means.
+    """
+    truncated = False
+    try:
+        size = path.stat().st_size
+        with path.open("rb") as handle:
+            if size > FAILURE_LOG_TAIL_BYTES:
+                handle.seek(size - FAILURE_LOG_TAIL_BYTES)
+                truncated = True
+            raw = handle.read()
+    except OSError as exc:
+        logger.warning("[GATE_DIAGNOSTIC] could not read %s: %s", path, exc)
+        return GateFailureLog(path=path, tail="", truncated=False)
+    text = raw.decode("utf-8", errors="replace")
+    if truncated:
+        # The seek landed mid-line and mid-character. Dropping through the first
+        # newline costs one line and removes both, so what is shown is text the
+        # log actually contains rather than a mangled prefix of it.
+        _, newline, remainder = text.partition("\n")
+        if newline:
+            text = remainder
+    return GateFailureLog(path=path, tail=text, truncated=truncated)
+
+
 __all__ = [
     "DIAGNOSTIC_FILE_NAME",
+    "FAILURE_LOG_TAIL_BYTES",
     "GATE_FAILURES_DIR",
     "GATE_FAILURE_SCHEMA_VERSION",
     "STDERR_FILE_NAME",
     "STDOUT_FILE_NAME",
     "CandidateGateDiagnostics",
+    "DurableGateFailure",
     "GateFailureDiagnostics",
+    "GateFailureLog",
     "GateFailureOutput",
     "needs_durable_diagnostic",
 ]

@@ -55,6 +55,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from ..ports.attempt_store import AttemptStore
     from ..ports.issue import Issue
     from .continuation_in_flight import ContinuationsInFlight
+    from .continuation_rework_handoff import ContinuationHandoffResult
     from .continuation_runs import ContinuationRuns
 
 logger = logging.getLogger(__name__)
@@ -79,6 +80,28 @@ class LiveContinuation:
 
 
 @dataclass(frozen=True, slots=True)
+class ContinuationReworkExit:
+    """One candidate whose continuation has handed it back to ordinary rework.
+
+    The other half of the same derivation that produces
+    :class:`LiveContinuation`, and produced by the same pass for the same
+    reason the phase travels with the key: whoever acts on the exit must act on
+    the phase this reading decided, not on a later re-read that might disagree
+    with the release the reconciliation already performed.
+
+    An exit is a statement about the CONTINUATION, never about rework: it says
+    the control operation is finished with the candidate. Whether a rework
+    cycle may actually be spent is the rework-cycle owner's question, asked
+    downstream in :mod:`.continuation_rework_handoff`.
+    """
+
+    key: ControlOperationKey
+    issue: "Issue"
+    attempt: Attempt
+    phase: ContinuationPhase
+
+
+@dataclass(frozen=True, slots=True)
 class ContinuationLiveReading:
     """What the durable record said, or that it could not be read.
 
@@ -90,6 +113,11 @@ class ContinuationLiveReading:
 
     readable: bool
     operations: tuple[LiveContinuation, ...] = ()
+    #: Candidates this pass found sitting in a phase that returns them to
+    #: ordinary rework. Empty when the record is unreadable, for the same
+    #: reason ``operations`` is: ignorance may not produce an admission any
+    #: more than it may produce a release.
+    rework_exits: tuple[ContinuationReworkExit, ...] = ()
     detail: str = ""
 
     @property
@@ -115,6 +143,12 @@ class ContinuationReconciliation:
     #: ``exclusions`` is the projection that was already standing rather than a
     #: fresh one, and ``operations`` is empty — ignorance, not "nothing is live".
     readable: bool = True
+    #: What the rework handoff decided about every exit this pass derived
+    #: (#297), including the refusals. Carried here rather than discarded at
+    #: the call site so a caller of ``reconcile`` can see that the handoff ran
+    #: and what it produced; the refusals that strand a candidate are also
+    #: published as events, because a log line is not something the UI may read.
+    rework_handoff: "ContinuationHandoffResult | None" = None
 
     @property
     def keys(self) -> tuple[ControlOperationKey, ...]:
@@ -177,22 +211,41 @@ class ContinuationLiveTruth:
         The derivation is per candidate, but the *result* holds at most one
         operation per issue by construction — an issue's recorded intent lives
         on exactly one attempt, because filing it supersedes the older one.
+
+        The same pass names the candidates whose phase RETURNS them to ordinary
+        rework. One pass rather than two because both answers come from one
+        phase decision, and a second derivation would be a second reading, at a
+        second moment, that could disagree with the release this one drove.
         """
         operations: list[LiveContinuation] = []
+        exits: list[ContinuationReworkExit] = []
         for issue in board:
             try:
-                operations.extend(self._live_for_issue(issue))
+                self._derive_for_issue(issue, operations, exits)
             except (OSError, ValueError) as exc:
                 detail = f"attempt records for issue #{issue.number} unreadable: {exc}"
                 logger.warning("[CONTINUATION] %s", detail)
                 return ContinuationLiveReading(readable=False, detail=detail)
         return ContinuationLiveReading(
-            readable=True, operations=tuple(operations)
+            readable=True,
+            operations=tuple(operations),
+            rework_exits=tuple(exits),
         )
 
-    def _live_for_issue(self, issue: "Issue") -> list[LiveContinuation]:
+    def _derive_for_issue(
+        self,
+        issue: "Issue",
+        operations: list[LiveContinuation],
+        exits: list[ContinuationReworkExit],
+    ) -> None:
+        """Decide every candidate of ``issue`` once, into whichever half it belongs.
+
+        Appends into the caller's collections rather than returning two lists
+        so a partial issue can never be half-recorded: the caller abandons the
+        whole reading on an unreadable record, and there is no intermediate
+        result for it to keep by accident.
+        """
         board_shows_pr_pending = self._pr_pending_label in tuple(issue.labels)
-        live: list[LiveContinuation] = []
         for attempt in self._attempts.for_issue(issue.key):
             key = _operation_key(issue.key, attempt)
             phase = derive_continuation_phase(
@@ -203,14 +256,18 @@ class ContinuationLiveTruth:
                     engine_holds_open_run=self._runs.holds(key),
                 )
             )
-            if not phase.live:
-                continue
-            live.append(
-                LiveContinuation(
-                    key=key, issue=issue, attempt=attempt, phase=phase
+            if phase.live:
+                operations.append(
+                    LiveContinuation(
+                        key=key, issue=issue, attempt=attempt, phase=phase
+                    )
                 )
-            )
-        return live
+            elif phase.exits_to_rework:
+                exits.append(
+                    ContinuationReworkExit(
+                        key=key, issue=issue, attempt=attempt, phase=phase
+                    )
+                )
 
 
 def _facts(
@@ -269,5 +326,6 @@ __all__ = [
     "ContinuationLiveReading",
     "ContinuationLiveTruth",
     "ContinuationReconciliation",
+    "ContinuationReworkExit",
     "LiveContinuation",
 ]
