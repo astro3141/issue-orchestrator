@@ -1345,6 +1345,17 @@ completions only. Its shape matters as much as its existence:
   depend on — or die on — configuration describing a candidate it does not
   have. Deciding late would leave the completion record hostage to a config
   read the planning run has no use for.
+- **Asking first means the managed lane reaches its run contract first.** The
+  routing question is answered from the run assets the session owner injected,
+  so a managed `coding-done completed` now requires them before it can learn
+  whether a quick gate is configured at all — including in a repository that
+  configures none. That is the entrypoint contract already stated in
+  `entrypoints/AGENTS.md` (a missing `ISSUE_ORCHESTRATOR_RUN_DIR` in a managed
+  session is a hard error, not a reason to search), and every launch site
+  satisfies it by construction: each one calls `start_run` — which creates the
+  run directory and writes its manifest — and exports the directory it got
+  back. A session env naming a run directory nobody allocated is a shape
+  production cannot produce.
 - **The signal is a routing hint, never authority.** It reads the launch-time
   `tech-lead-assignment.json`, which lives in the run directory *inside the
   agent-writable worktree*. A session that writes itself a planning assignment

@@ -257,6 +257,53 @@ class TestRoutingIsDecidedBeforeTheCandidateConfigIsRead:
         assert repo.gate_ran is True
 
 
+class TestARepositoryThatConfiguresNoQuickGate:
+    """A3. Asking routing first must not make an unconfigured repository fail.
+
+    Deciding routing before the config read means the managed lane reaches its
+    injected run contract *before* it can learn whether a quick gate exists at
+    all. That is the documented entrypoint contract — a managed session's run
+    assets come from its owner and are never rediscovered — but "this repository
+    configures no quick gate" is the ordinary shape of a foreign target repo,
+    not an error, and it must still complete. Losing this is invisible to every
+    other test in this file, because they all configure a gate.
+    """
+
+    @pytest.fixture()
+    def unconfigured(self, repo: Repo) -> Repo:
+        (repo.root / ".issue-orchestrator" / "config" / "default.yaml").unlink()
+        return repo
+
+    def test_an_ordinary_actor_completion_still_writes_its_record(
+        self, unconfigured: Repo
+    ) -> None:
+        with completing(unconfigured):
+            coding_done_main()
+
+        assert unconfigured.completion_record().outcome is CompletionOutcome.COMPLETED
+        assert unconfigured.gate_ran is False
+
+    def test_no_validation_evidence_is_fabricated(self, unconfigured: Repo) -> None:
+        """No gate ran, so nothing may claim one did — the same answer as A."""
+        with completing(unconfigured):
+            coding_done_main()
+
+        assert unconfigured.completion_record().validation_record_path is None
+        assert not list(unconfigured.run_dir.glob("validation-*"))
+
+    def test_a_planning_completion_still_writes_its_record(
+        self, unconfigured: Repo
+    ) -> None:
+        """And still without reading the candidate configuration it lacks."""
+        unconfigured.assign(PLANNING)
+
+        with completing(unconfigured), candidate_config_refused():
+            coding_done_main()
+
+        assert unconfigured.completion_record().outcome is CompletionOutcome.COMPLETED
+        assert unconfigured.gate_ran is False
+
+
 class TestTheExactPlanningCompletion:
     """A. A managed planning run on a clean, unchanged checkout completes."""
 
