@@ -36,8 +36,12 @@ from issue_orchestrator.control.continuation_live_truth import (
 from issue_orchestrator.control.continuation_quick_validation import (
     ContinuationQuickValidation,
 )
-from issue_orchestrator.control.continuation_runner import ControlContinuationRunner
+from issue_orchestrator.control.continuation_runner import (
+    ContinuationJobs,
+    ControlContinuationRunner,
+)
 from issue_orchestrator.control.gate_failure_diagnostics import GATE_FAILURES_DIR
+from issue_orchestrator.control.issue_scope import EngineIssueScope
 from issue_orchestrator.control.continuation_scheduling import (
     ControlContinuation,
     build_control_continuation,
@@ -547,13 +551,35 @@ class RefusingJobs:
 # ----------------------------------------------------------------------
 
 
-def _issue(*labels: str) -> Issue:
+def _issue(*labels: str, number: int = ISSUE_NUMBER) -> Issue:
     return Issue(
-        number=ISSUE_NUMBER,
-        title=f"Issue {ISSUE_NUMBER}",
+        number=number,
+        title=f"Issue {number}",
         labels=list(labels),
         repo=REPO,
     )
+
+
+def _scope(
+    *, issue: int | None = None, required_label: str | None = None
+) -> EngineIssueScope:
+    """The engine's actuation scope, built the way production builds it (#307).
+
+    From a real ``Config`` carrying the operator's narrowing, never from a
+    hand-written predicate: what is under test is that the ENGINE's own
+    configured answer reaches the runner, and a double that answered for itself
+    would prove nothing about whether it arrives.
+
+    ``required_label`` is the other half of the same owner's composite question
+    (``filtering.label``), and it is here because the owner is what the runner
+    must consult — not a bespoke ``--issue`` comparison that happens to agree
+    with it on the narrow case.
+    """
+    config = Config()
+    config.repo = REPO
+    config.filtering.issue = issue
+    config.filtering.label = required_label
+    return EngineIssueScope(config)
 
 
 def _descriptor(*actions: RequestedAction) -> ContinuationDescriptor:
@@ -570,9 +596,10 @@ def _descriptor(*actions: RequestedAction) -> ContinuationDescriptor:
 def _attempt(
     *actions: RequestedAction,
     head_sha: str = SHA_A,
+    number: int = ISSUE_NUMBER,
     verdict: ValidationVerdict = ValidationVerdict.PASSED,
 ) -> Attempt:
-    key = AttemptKey(_issue().key, head_sha)
+    key = AttemptKey(_issue(number=number).key, head_sha)
     return Attempt(key=key).with_completed_evaluation(
         ValidationVerdictReceipt(
             suite=ValidationGateKind.PUBLISH.suite,
@@ -588,20 +615,21 @@ def _operation(
     attempt: Attempt,
     phase: ContinuationPhase,
     *labels: str,
+    number: int = ISSUE_NUMBER,
 ) -> LiveContinuation:
     return LiveContinuation(
         key=ControlOperationKey(
-            _issue().key, attempt.key.head_sha, CONTINUATION_KIND
+            _issue(number=number).key, attempt.key.head_sha, CONTINUATION_KIND
         ),
-        issue=_issue(*(labels or (AGENT,))),
+        issue=_issue(*(labels or (AGENT,)), number=number),
         attempt=attempt,
         phase=phase,
     )
 
 
-def _worktree_name_for(attempt: Attempt) -> str:
+def _worktree_name_for(attempt: Attempt, *, number: int = ISSUE_NUMBER) -> str:
     """The deterministic per-candidate checkout name the runner asks for."""
-    return f"continuation-{ISSUE_NUMBER}-{attempt.key.head_sha[:12]}"
+    return f"continuation-{number}-{attempt.key.head_sha[:12]}"
 
 
 def _owned(*operations: LiveContinuation) -> ContinuationReconciliation:
@@ -620,7 +648,6 @@ def _owned(*operations: LiveContinuation) -> ContinuationReconciliation:
 
 @dataclass
 class Harness:
-    runner: ControlContinuationRunner
     state: OrchestratorState
     revalidation: FakeRevalidation
     worktrees: FakeWorktrees
@@ -642,6 +669,66 @@ class Harness:
     #: itself the contract (#160): a worktree that is not runnable must not
     #: reach the run assets, the completion record or the exchange.
     journal: list[str]
+    #: The runner under test, assembled by :meth:`runner_with` from everything
+    #: above. Assigned by the fixture rather than passed in, because it is made
+    #: OF this harness — see :meth:`runner_with`.
+    runner: ControlContinuationRunner = field(init=False)
+
+    def runner_with(
+        self,
+        *,
+        scope: EngineIssueScope | None = None,
+        jobs: ContinuationJobs | None = None,
+        runnability: WorktreeRunnability | None = None,
+        quick_validation: ContinuationQuickValidation | None = None,
+    ) -> ControlContinuationRunner:
+        """A runner over this harness's collaborators, with one seam swapped.
+
+        Every deployment the runner has is a real production type or a fake at
+        a port boundary, and a test that varies ONE of them must not have to
+        respell the other twelve — a construction repeated per direction is a
+        construction that drifts, and a new required collaborator would then be
+        defaulted differently in each copy.
+
+        The default ``scope`` is an unnarrowed engine, which is what every
+        direction other than #307's is about: an operator who passed no
+        ``--issue`` acts on the whole board exactly as before.
+        """
+        return ControlContinuationRunner(
+            state=self.state,
+            scope=scope if scope is not None else _scope(),
+            revalidation_route=self.revalidation,  # type: ignore[arg-type]
+            attempts=self.attempts,
+            worktrees=self.worktrees,  # type: ignore[arg-type]
+            working_copy=self.working_copy,  # type: ignore[arg-type]
+            runnability=(
+                runnability
+                if runnability is not None
+                else _runnability(self.working_copy, self.commands)
+            ),
+            quick_validation=(
+                quick_validation
+                if quick_validation is not None
+                else _quick_validation(
+                    self.working_copy,
+                    self.commands,
+                    self.session_output,
+                    self.repo_root,
+                )
+            ),
+            session_output=self.session_output,  # type: ignore[arg-type]
+            completion_processor=self.completion,  # type: ignore[arg-type]
+            review_verdicts=self.verdicts,
+            finalizer=ContinuationFinalizer(
+                attempts=self.attempts,
+                action_applier=self.labels,  # type: ignore[arg-type]
+                pr_pending_label=PR_PENDING,
+            ),
+            in_flight=self.in_flight,
+            runs=self.runs,
+            jobs=jobs if jobs is not None else self.jobs,  # type: ignore[arg-type]
+            repo_root=self.repo_root,
+        )
 
 
 def _runnability(
@@ -716,31 +803,7 @@ def harness(tmp_path: Path) -> Harness:
     labels = FakeActionApplier()
     in_flight = ContinuationsInFlight()
     runs = ContinuationRuns(worktrees)  # type: ignore[arg-type]
-    runner = ControlContinuationRunner(
-        state=state,
-        revalidation_route=revalidation,  # type: ignore[arg-type]
-        attempts=attempts,
-        worktrees=worktrees,  # type: ignore[arg-type]
-        working_copy=working_copy,  # type: ignore[arg-type]
-        runnability=_runnability(working_copy, commands),
-        quick_validation=_quick_validation(
-            working_copy, commands, session_output, tmp_path / "primary"
-        ),
-        session_output=session_output,  # type: ignore[arg-type]
-        completion_processor=completion,  # type: ignore[arg-type]
-        review_verdicts=verdicts,
-        finalizer=ContinuationFinalizer(
-            attempts=attempts,
-            action_applier=labels,  # type: ignore[arg-type]
-            pr_pending_label=PR_PENDING,
-        ),
-        in_flight=in_flight,
-        runs=runs,
-        jobs=jobs,  # type: ignore[arg-type]
-        repo_root=tmp_path / "primary",
-    )
-    return Harness(
-        runner=runner,
+    harness = Harness(
         state=state,
         revalidation=revalidation,
         worktrees=worktrees,
@@ -757,6 +820,8 @@ def harness(tmp_path: Path) -> Harness:
         repo_root=tmp_path / "primary",
         journal=journal,
     )
+    harness.runner = harness.runner_with()
+    return harness
 
 
 # ======================================================================
@@ -880,34 +945,9 @@ class TestActiveSessionRefusal:
         assert harness.completion.calls == []
 
     def test_a_job_already_in_flight_is_not_resubmitted(
-        self, harness: Harness, tmp_path: Path
+        self, harness: Harness
     ) -> None:
-        runner = ControlContinuationRunner(
-            state=harness.state,
-            revalidation_route=harness.revalidation,  # type: ignore[arg-type]
-            attempts=harness.attempts,
-            worktrees=harness.worktrees,  # type: ignore[arg-type]
-            working_copy=harness.working_copy,  # type: ignore[arg-type]
-            runnability=_runnability(harness.working_copy, harness.commands),
-            quick_validation=_quick_validation(
-                harness.working_copy,
-                harness.commands,
-                harness.session_output,
-                harness.repo_root,
-            ),
-            session_output=harness.session_output,  # type: ignore[arg-type]
-            completion_processor=harness.completion,  # type: ignore[arg-type]
-            review_verdicts=harness.verdicts,
-            finalizer=ContinuationFinalizer(
-                attempts=harness.attempts,
-                action_applier=harness.labels,  # type: ignore[arg-type]
-                pr_pending_label=PR_PENDING,
-            ),
-            in_flight=harness.in_flight,
-            runs=harness.runs,
-            jobs=RefusingJobs(),  # type: ignore[arg-type]
-            repo_root=tmp_path / "primary",
-        )
+        runner = harness.runner_with(jobs=RefusingJobs())  # type: ignore[arg-type]
         operation = _operation(
             _attempt(RequestedAction.CREATE_PR),
             ContinuationPhase.PASS_PENDING_REVIEW,
@@ -2235,36 +2275,13 @@ class TestTheCoderWorktreeIsMadeRunnable:
         assert harness.state.active_sessions == []
 
     def test_a_repository_with_no_recipe_opens_its_run_exactly_as_before(
-        self, harness: Harness, tmp_path: Path
+        self, harness: Harness
     ) -> None:
         """An empty recipe is not a provisioning failure: nothing to install."""
-        runner = ControlContinuationRunner(
-            state=harness.state,
-            revalidation_route=harness.revalidation,  # type: ignore[arg-type]
-            attempts=harness.attempts,
-            worktrees=harness.worktrees,  # type: ignore[arg-type]
-            working_copy=harness.working_copy,  # type: ignore[arg-type]
+        runner = harness.runner_with(
             runnability=_runnability(
                 harness.working_copy, harness.commands, commands=[]
-            ),
-            quick_validation=_quick_validation(
-                harness.working_copy,
-                harness.commands,
-                harness.session_output,
-                harness.repo_root,
-            ),
-            session_output=harness.session_output,  # type: ignore[arg-type]
-            completion_processor=harness.completion,  # type: ignore[arg-type]
-            review_verdicts=harness.verdicts,
-            finalizer=ContinuationFinalizer(
-                attempts=harness.attempts,
-                action_applier=harness.labels,  # type: ignore[arg-type]
-                pr_pending_label=PR_PENDING,
-            ),
-            in_flight=harness.in_flight,
-            runs=harness.runs,
-            jobs=harness.jobs,  # type: ignore[arg-type]
-            repo_root=tmp_path / "primary",
+            )
         )
         attempt = _attempt(RequestedAction.CREATE_PR)
         harness.attempts.update(attempt.key, lambda _current: attempt)
@@ -2600,7 +2617,7 @@ class TestTheFirstReviewersEvidenceIsGenuinelyProduced:
         ]
 
     def test_a_repository_with_no_quick_contract_names_no_evidence(
-        self, harness: Harness, tmp_path: Path
+        self, harness: Harness
     ) -> None:
         """The honest absence, not a placeholder.
 
@@ -2609,32 +2626,14 @@ class TestTheFirstReviewersEvidenceIsGenuinelyProduced:
         configures no quick contract has none for an ordinary coder turn
         either.
         """
-        runner = ControlContinuationRunner(
-            state=harness.state,
-            revalidation_route=harness.revalidation,  # type: ignore[arg-type]
-            attempts=harness.attempts,
-            worktrees=harness.worktrees,  # type: ignore[arg-type]
-            working_copy=harness.working_copy,  # type: ignore[arg-type]
-            runnability=_runnability(harness.working_copy, harness.commands),
+        runner = harness.runner_with(
             quick_validation=_quick_validation(
                 harness.working_copy,
                 harness.commands,
                 harness.session_output,
                 harness.repo_root,
                 quick_cmd=None,
-            ),
-            session_output=harness.session_output,  # type: ignore[arg-type]
-            completion_processor=harness.completion,  # type: ignore[arg-type]
-            review_verdicts=harness.verdicts,
-            finalizer=ContinuationFinalizer(
-                attempts=harness.attempts,
-                action_applier=harness.labels,  # type: ignore[arg-type]
-                pr_pending_label=PR_PENDING,
-            ),
-            in_flight=harness.in_flight,
-            runs=harness.runs,
-            jobs=harness.jobs,  # type: ignore[arg-type]
-            repo_root=tmp_path / "primary",
+            )
         )
         attempt = _twice_evaluated(RequestedAction.CREATE_PR)
         harness.attempts.update(attempt.key, lambda _current: attempt)
@@ -3255,15 +3254,20 @@ class BuiltEngine:
     journal: list[str]
     issue: Issue
     config: Config
+    #: Every issue this engine's tick fetches. Separate from ``issue`` — which
+    #: stays the one the directions above are about — because reconciliation is
+    #: board-wide by design, and #307's whole subject is an engine that sees
+    #: more than it may act on.
+    board: list[Issue]
 
     def reconcile(self) -> ContinuationReconciliation:
-        """One tick's hydration over a board holding just this issue."""
-        return self.continuation.reconcile([self.issue])
+        """One tick's hydration over this engine's whole board."""
+        return self.continuation.reconcile(self.board)
 
     def refresh_queue(self) -> list[Issue]:
         """The refresh path: reconcile over the board, then replace the queue."""
         return self.continuation.hydrate_queue(
-            QueueCache(self.config, self.state), [self.issue]
+            QueueCache(self.config, self.state), self.board
         )
 
     def hydrate_in_progress(self) -> None:
@@ -3274,7 +3278,7 @@ class BuiltEngine:
         record that a control operation is still live.
         """
         self.continuation.hydrate_issues(
-            QueueCache(self.config, self.state), [], board=[self.issue]
+            QueueCache(self.config, self.state), [], board=self.board
         )
 
     def file(self, attempt: Attempt) -> Attempt:
@@ -3296,11 +3300,20 @@ class BuiltEngine:
         self.commands.failing = False
 
 
-def _config_for(root: Path, *, agents: bool = False) -> Config:
-    """A repository configured the way an operator configures one."""
+def _config_for(
+    root: Path, *, agents: bool = False, scoped_to: int | None = None
+) -> Config:
+    """A repository configured the way an operator configures one.
+
+    ``scoped_to`` is the operator's ``--issue N``, set on the real ``Config``
+    the production builder reads its scope owner from. Injecting a predicate
+    instead would prove nothing about whether the ENGINE's own answer reaches
+    the runner, which is the whole of #307.
+    """
     config = Config()
     config.repo = REPO
     config.repo_root = root
+    config.filtering.issue = scoped_to
     root.mkdir(parents=True, exist_ok=True)
     config.worktree_base = root / "worktrees"
     config.setup_worktree = [SETUP_SENTINEL]
@@ -3330,11 +3343,24 @@ def _orchestrator_for(config: Config, board: list[Issue]) -> "Orchestrator":
         return build_orchestrator_for_testing(config=config, github=github)
 
 
-def _built(tmp_path: Path) -> BuiltEngine:
-    """The continuation this repository's own configuration assembles."""
-    config = _config_for(tmp_path / "primary", agents=True)
+def _built(
+    tmp_path: Path,
+    *,
+    scoped_to: int | None = None,
+    board: list[Issue] | None = None,
+) -> BuiltEngine:
+    """The continuation this repository's own configuration assembles.
+
+    A second call over the same ``tmp_path`` is a RESTART: the sqlite lease
+    ledger and the attempt sidecars both live under ``repo_root``, so the new
+    engine meets the durable state the previous one left. Everything
+    process-local — the in-flight registry, the open runs, the journal — is
+    fresh, which is what a new process gets.
+    """
+    config = _config_for(tmp_path / "primary", agents=True, scoped_to=scoped_to)
     issue = _issue(AGENT)
-    orchestrator = _orchestrator_for(config, [issue])
+    fetched = board if board is not None else [issue]
+    orchestrator = _orchestrator_for(config, fetched)
 
     journal: list[str] = []
     worktrees = FakeWorktrees(root=tmp_path / "checkouts", journal=journal)
@@ -3380,6 +3406,7 @@ def _built(tmp_path: Path) -> BuiltEngine:
         journal=journal,
         issue=issue,
         config=config,
+        board=fetched,
     )
 
 
@@ -3681,3 +3708,447 @@ class TestAPausedAssemblyHydratesButStartsNothing:
         stored = engine.attempts.for_key(attempt.key)
         assert stored is not None
         assert stored.continuation_runs_used == 1
+
+
+# ======================================================================
+# Owning a live operation is not authority to work it (#307)
+# ======================================================================
+
+
+#: The issue this engine was NOT started for. On the board, and in the durable
+#: record, because reconciliation needs the whole board and for no other reason.
+OTHER_ISSUE_NUMBER = 293
+#: Deliberately the same candidate SHA as the target issue's. The branch a
+#: continuation is checked against is the ISSUE's, so giving B a different head
+#: would retire its intent as superseded and refuse it for a reason that has
+#: nothing to do with scope — the refusal would then pass with the scope
+#: binding deleted.
+OTHER_SHA = SHA_A
+
+
+def _other_issue_operation(
+    phase: ContinuationPhase,
+    *,
+    verdict: ValidationVerdict = ValidationVerdict.PASSED,
+) -> LiveContinuation:
+    """A live continuation for the issue this engine was not started for."""
+    return _operation(
+        _attempt(
+            RequestedAction.CREATE_PR,
+            head_sha=OTHER_SHA,
+            number=OTHER_ISSUE_NUMBER,
+            verdict=verdict,
+        ),
+        phase,
+        number=OTHER_ISSUE_NUMBER,
+    )
+
+
+class TestOwningALiveOperationIsNotWorkActuationAuthority:
+    """#307: a scoped engine reconciles the whole board and ADVANCES one issue.
+
+    #149 made the reconciliation board-wide because it had to be — a release
+    names every lease the derived live set does not, so an engine that looked at
+    less would report another engine's running operation as finished and free
+    it — and #146's ownership holder is the stable ``single-instance`` one, so
+    "this deployment owns the lease" is true of every operation on the checkout.
+    Neither fact says the engine was started to work the issue. #306 measured
+    what follows: an engine scoped ``--issue A`` advanced a LIVE continuation
+    for issue B, claiming it, submitting its job, cutting its worktree and
+    running its gate.
+
+    This is #304's invariant one step earlier in the same sequence, so the
+    refusal is the same shape: withheld, never released. Every direction below
+    therefore asserts on a real actuation boundary — the revalidation route, a
+    submitted job, a created checkout, a completion re-entry, a durable attempt
+    write — rather than on a predicate's return value. Delete
+    ``self._scope.excludes(...)`` from the runner and each of them fails on one
+    of those, because the operation is admissible in every other respect.
+    """
+
+    # -- 1. The central isolation proof, one per live phase ---------------
+
+    def test_an_out_of_scope_retry_never_reaches_the_revalidation_route(
+        self, harness: Harness
+    ) -> None:
+        """The phase whose execution spends somebody else's allowance (#139).
+
+        Nothing here is a refusal #139 makes: handed the candidate, it would
+        admit it. The route is simply never called, and the claim that would
+        have preceded the call was never taken.
+        """
+        operation = _other_issue_operation(
+            ContinuationPhase.RETRY_PENDING, verdict=ValidationVerdict.FAILED
+        )
+        stored = harness.attempts.update(
+            operation.attempt.key, lambda _current: operation.attempt
+        )
+        runner = harness.runner_with(scope=_scope(issue=ISSUE_NUMBER))
+
+        runner.advance(_owned(operation))
+
+        assert harness.revalidation.candidates == []
+        assert harness.jobs.submitted == []
+        assert harness.in_flight.is_executing(operation.key) is False
+        assert harness.worktrees.created == []
+        assert harness.journal == []
+        after = harness.attempts.for_key(operation.attempt.key)
+        assert after is not None
+        assert after.revalidation_budget_used == stored.revalidation_budget_used
+
+    def test_an_out_of_scope_review_continuation_opens_no_run(
+        self, harness: Harness
+    ) -> None:
+        """The phase that cuts a checkout, runs a gate and creates a PR.
+
+        Every boundary #306 observed, asserted in the order the runner would
+        have crossed them: the job, the checkout, the provisioning recipe, the
+        quick contract, the completion re-entry — and the durable allowance,
+        which is the one an out-of-scope pass could spend and never give back.
+        """
+        operation = _other_issue_operation(ContinuationPhase.PASS_PENDING_REVIEW)
+        harness.attempts.update(
+            operation.attempt.key, lambda _current: operation.attempt
+        )
+        runner = harness.runner_with(scope=_scope(issue=ISSUE_NUMBER))
+
+        runner.advance(_owned(operation))
+
+        assert harness.jobs.submitted == []
+        assert harness.worktrees.created == []
+        assert harness.commands.setup_commands == []
+        assert harness.commands.quick_commands == []
+        assert harness.session_output.runs == []
+        assert harness.completion.calls == []
+        assert harness.journal == []
+        stored = harness.attempts.for_key(operation.attempt.key)
+        assert stored is not None
+        assert stored.continuation_runs_used == 0
+        assert stored.continuation_review_verdict is None
+        assert stored.continuation_settlement is None
+        assert harness.labels.applied == []
+
+    def test_the_refusal_is_the_scope_owners_answer_and_not_a_second_one(
+        self, harness: Harness
+    ) -> None:
+        """Asked of ``EngineIssueScope``, not of ``--issue`` in the runner.
+
+        The narrowing here is ``filtering.label``, which is part of the same
+        owner's composite question and no part of ``--issue``. A runner that had
+        grown its own reading of the operator's issue number would advance this
+        operation, because the engine is not narrowed to an issue at all.
+        """
+        operation = _operation(
+            _attempt(RequestedAction.CREATE_PR),
+            ContinuationPhase.PASS_PENDING_REVIEW,
+            AGENT,
+        )
+        harness.attempts.update(
+            operation.attempt.key, lambda _current: operation.attempt
+        )
+        runner = harness.runner_with(
+            scope=_scope(required_label="orchestrate")
+        )
+
+        runner.advance(_owned(operation))
+
+        assert harness.jobs.submitted == []
+        assert harness.worktrees.created == []
+        assert harness.completion.calls == []
+
+    # -- 2. The engine's own issue is untouched ---------------------------
+
+    def test_the_engines_own_operation_advances_in_the_same_pass(
+        self, harness: Harness
+    ) -> None:
+        """Acceptance 3: A advances, unchanged, WITH B owned beside it.
+
+        On one reconciliation and in one pass, because a narrowing that let A
+        through only when B was absent would be a narrowing that had not been
+        tested at all. B is listed first, so a refusal that also aborted the
+        loop would fail here.
+        """
+        target = _operation(
+            _attempt(RequestedAction.CREATE_PR), ContinuationPhase.PASS_PENDING_REVIEW
+        )
+        harness.attempts.update(target.attempt.key, lambda _current: target.attempt)
+        other = _other_issue_operation(ContinuationPhase.PASS_PENDING_REVIEW)
+        harness.attempts.update(other.attempt.key, lambda _current: other.attempt)
+        runner = harness.runner_with(scope=_scope(issue=ISSUE_NUMBER))
+
+        runner.advance(_owned(other, target))
+
+        assert harness.worktrees.created == [_worktree_name_for(target.attempt)]
+        assert [call["issue_number"] for call in harness.completion.calls] == [
+            ISSUE_NUMBER
+        ]
+        assert harness.journal == [
+            "materialize",
+            "setup",
+            "start_run",
+            "quick_validation",
+            "process",
+        ]
+        stored = harness.attempts.for_key(target.attempt.key)
+        assert stored is not None
+        assert stored.continuation_runs_used == 1
+
+    def test_an_unnarrowed_engine_advances_every_issue_it_owns(
+        self, harness: Harness
+    ) -> None:
+        """The operator who passed no ``--issue`` loses nothing.
+
+        The board-wide engine is the ordinary case, and this leaf must not have
+        narrowed it: both operations open their runs, in the order the
+        reconciliation named them.
+        """
+        target = _operation(
+            _attempt(RequestedAction.CREATE_PR), ContinuationPhase.PASS_PENDING_REVIEW
+        )
+        harness.attempts.update(target.attempt.key, lambda _current: target.attempt)
+        other = _other_issue_operation(ContinuationPhase.PASS_PENDING_REVIEW)
+        harness.attempts.update(other.attempt.key, lambda _current: other.attempt)
+
+        harness.runner.advance(_owned(other, target))
+
+        assert harness.worktrees.created == [
+            _worktree_name_for(other.attempt, number=OTHER_ISSUE_NUMBER),
+            _worktree_name_for(target.attempt),
+        ]
+        assert [call["issue_number"] for call in harness.completion.calls] == [
+            OTHER_ISSUE_NUMBER,
+            ISSUE_NUMBER,
+        ]
+
+    # -- 3. The withheld operation stays startable ------------------------
+
+    def test_a_withheld_operation_leaves_no_claim_for_the_next_engine(
+        self, harness: Harness
+    ) -> None:
+        """Acceptance 4, at the boundary a scoped refusal could have poisoned.
+
+        The claim is process-local and refused BEFORE it is taken, so an engine
+        whose scope includes the issue finds the lane free — even one sharing
+        this registry. A refusal placed after the claim would leave the lane
+        held by a run that never started, and this is what would say so.
+        """
+        operation = _other_issue_operation(ContinuationPhase.PASS_PENDING_REVIEW)
+        harness.attempts.update(
+            operation.attempt.key, lambda _current: operation.attempt
+        )
+        harness.runner_with(scope=_scope(issue=ISSUE_NUMBER)).advance(
+            _owned(operation)
+        )
+        assert harness.in_flight.is_executing(operation.key) is False
+
+        harness.runner_with(scope=_scope(issue=OTHER_ISSUE_NUMBER)).advance(
+            _owned(operation)
+        )
+
+        assert harness.worktrees.created == [
+            _worktree_name_for(operation.attempt, number=OTHER_ISSUE_NUMBER)
+        ]
+        assert [call["issue_number"] for call in harness.completion.calls] == [
+            OTHER_ISSUE_NUMBER
+        ]
+        stored = harness.attempts.for_key(operation.attempt.key)
+        assert stored is not None
+        assert stored.continuation_runs_used == 1
+
+    # -- 4. The collaborator itself ---------------------------------------
+
+    def test_the_runner_cannot_be_assembled_without_an_actuation_scope(
+        self,
+    ) -> None:
+        """Required, with no default — the #304 handoff's rule, for the runner.
+
+        A default would make the gap re-openable by omission: a second
+        composition root, or a future one, could assemble a runner that
+        advances everything it owns and looks entirely healthy doing it.
+        Asserted on the constructor because what must not exist cannot be
+        observed by running it.
+        """
+        parameters = inspect.signature(ControlContinuationRunner.__init__).parameters
+
+        assert parameters["scope"].default is inspect.Parameter.empty
+        assert parameters["scope"].annotation.strip("\"'") == (
+            EngineIssueScope.__name__
+        )
+        # The OWNER, never a ``Config``: this module must not be able to form
+        # its own opinion about what ``--issue`` means.
+        assert "config" not in parameters
+
+
+class TestTheBuilderBindsActuationAuthorityToTheEnginesScope:
+    """#307 through the production assembly, over real durable stores.
+
+    The hand-wired directions above prove what the runner does with a scope it
+    is handed. This proves the engine's OWN configured scope is what it holds —
+    and that binding it changed nothing above the actuation step, which is the
+    half a repair that "looked at less" would have broken.
+    """
+
+    def _board(self) -> list[Issue]:
+        """A and B, in the order a real fetch hands them over."""
+        return [_issue(AGENT), _issue(AGENT, number=OTHER_ISSUE_NUMBER)]
+
+    def _other_candidate(self, engine: BuiltEngine) -> Attempt:
+        return engine.file(
+            _attempt(
+                RequestedAction.CREATE_PR,
+                head_sha=OTHER_SHA,
+                number=OTHER_ISSUE_NUMBER,
+            )
+        )
+
+    def test_a_scoped_engine_reconciles_the_other_issue_without_advancing_it(
+        self, tmp_path: Path
+    ) -> None:
+        """Acceptance 1, 5 and 6 in one direction, through the real builder.
+
+        Derivation, phase and ownership are asserted first and positively: B is
+        live, B is OWNED, B excludes ordinary work. A repair that narrowed
+        ``ContinuationLiveTruth`` or dropped B from ownership reconciliation
+        fails on those three lines before it reaches the actuation ones — which
+        is the point of asserting them together.
+        """
+        engine = _built(
+            tmp_path, scoped_to=ISSUE_NUMBER, board=self._board()
+        )
+        attempt = self._other_candidate(engine)
+
+        reconciliation = engine.reconcile()
+
+        other_key = ControlOperationKey(
+            _issue(number=OTHER_ISSUE_NUMBER).key, OTHER_SHA, CONTINUATION_KIND
+        )
+        assert [operation.key for operation in reconciliation.operations] == [
+            other_key
+        ]
+        assert [operation.phase for operation in reconciliation.owned] == [
+            ContinuationPhase.PASS_PENDING_REVIEW
+        ]
+        assert reconciliation.exclusions.owns(other_key)
+        assert reconciliation.exclusions.excludes_issue(
+            _issue(number=OTHER_ISSUE_NUMBER).key
+        )
+        # And nothing was started for it: no checkout, no recipe, no gate, no
+        # completion re-entry, no allowance spent.
+        assert engine.journal == []
+        assert engine.worktrees.created == []
+        assert engine.session_output.runs == []
+        assert engine.completion.calls == []
+        stored = engine.attempts.for_key(attempt.key)
+        assert stored is not None
+        assert stored.continuation_runs_used == 0
+
+    def test_a_later_engine_whose_scope_includes_it_adopts_the_lease_and_runs(
+        self, tmp_path: Path
+    ) -> None:
+        """Acceptance 4: withholding is not a durable deadlock.
+
+        A real restart over the same durable stores — the sqlite lease ledger
+        the first engine wrote into, and the same attempt sidecars — with a
+        scope that includes B. It adopts the standing lease rather than
+        contending with it, and advances the operation the previous engine
+        declined. No lease surgery, no state to unwind, nothing skipped.
+        """
+        first = _built(tmp_path, scoped_to=ISSUE_NUMBER, board=self._board())
+        attempt = self._other_candidate(first)
+        first.reconcile()
+        assert first.journal == []
+
+        second = _built(
+            tmp_path, scoped_to=OTHER_ISSUE_NUMBER, board=self._board()
+        )
+        reconciliation = second.reconcile()
+
+        other_key = ControlOperationKey(
+            _issue(number=OTHER_ISSUE_NUMBER).key, OTHER_SHA, CONTINUATION_KIND
+        )
+        assert reconciliation.exclusions.owns(other_key)
+        assert second.journal == [
+            "materialize",
+            "setup",
+            "start_run",
+            "quick_validation",
+            "process",
+        ]
+        assert [call["issue_number"] for call in second.completion.calls] == [
+            OTHER_ISSUE_NUMBER
+        ]
+        stored = second.attempts.for_key(attempt.key)
+        assert stored is not None
+        assert stored.continuation_runs_used == 1
+
+    def test_an_unnarrowed_engine_over_the_same_board_advances_it(
+        self, tmp_path: Path
+    ) -> None:
+        """The control: the ONLY thing withholding B is the engine's scope.
+
+        Same board, same durable record, same assembly — no ``--issue`` — and
+        the operation runs. So the direction above is measuring the scope
+        binding and not some unrelated refusal the two-issue board introduced.
+        """
+        engine = _built(tmp_path, board=self._board())
+        attempt = self._other_candidate(engine)
+
+        engine.reconcile()
+
+        assert [call["issue_number"] for call in engine.completion.calls] == [
+            OTHER_ISSUE_NUMBER
+        ]
+        stored = engine.attempts.for_key(attempt.key)
+        assert stored is not None
+        assert stored.continuation_runs_used == 1
+
+    def test_one_scope_binds_both_steps_the_builder_wires(
+        self, tmp_path: Path
+    ) -> None:
+        """Acceptance 7: the #304 composition, preserved by construction.
+
+        Two out-of-scope candidates in ONE pass, one per actuating step: a LIVE
+        continuation the runner would advance, and an ``EXHAUSTED`` one the
+        #297 handoff would admit rework for. The builder hands both steps the
+        same scope owner, so one operator narrowing settles both — and a
+        composition that bound only the newer step would fail here on the
+        journal, while one that bound only the older would fail on the outcome.
+
+        The handoff's PR reader is the engine's real repository host, which
+        this assembly leaves as a mock. That is deliberate: an exit that got
+        past the scope question would reach it and raise, so "refused before
+        any GitHub read" is enforced rather than asserted.
+        """
+        exhausted_number = OTHER_ISSUE_NUMBER + 1
+        board = [
+            *self._board(),
+            _issue(AGENT, number=exhausted_number),
+        ]
+        engine = _built(tmp_path, scoped_to=ISSUE_NUMBER, board=board)
+        self._other_candidate(engine)
+        engine.file(
+            _attempt(
+                RequestedAction.CREATE_PR,
+                head_sha=OTHER_SHA,
+                number=exhausted_number,
+                verdict=ValidationVerdict.FAILED,
+            ).with_revalidation_reserved()
+        )
+
+        reconciliation = engine.reconcile()
+
+        # The runner's half: the live operation is owned and never started.
+        assert [operation.phase for operation in reconciliation.owned] == [
+            ContinuationPhase.PASS_PENDING_REVIEW
+        ]
+        assert engine.journal == []
+        assert engine.completion.calls == []
+        # The handoff's half: the exhausted candidate exits and is refused for
+        # the same reason, by the same owner.
+        handoff = reconciliation.rework_handoff
+        assert handoff is not None
+        assert [
+            (outcome.issue_number, outcome.reason) for outcome in handoff.outcomes
+        ] == [(exhausted_number, "outside_engine_scope")]
+        assert handoff.reworks == ()
+        assert engine.state.discovered_reworks == []
