@@ -355,6 +355,19 @@ authorize, and failing to find one can only refuse a handoff everything else
 admitted. So a hand-planted artefact still makes no work happen, and a deleted
 one strands the candidate loudly instead of degrading the correction.
 
+"Newest" means newest bundle that actually explains the failure, and the reader
+is what decides that rather than its caller. Two kinds of bundle explain
+nothing and both fall through to the one before them: one that cannot be read
+at all, and one that reads cleanly but carries no output on either stream — the
+latter repeats the receipt and adds nothing, which is exactly as useful to a
+correction agent as a bundle that was never filed. A retried publish files one
+bundle per run under the same `(issue, HEAD_SHA, suite)`, so stopping the search
+on an empty newest one would discard an older run's real output and strand the
+candidate for a human with the evidence sitting unread beside it. `None` from
+`latest_failure` therefore means "nothing filed for this candidate explains
+anything", and the handoff's fail-closed refusal is built directly on it with no
+second predicate of its own to forget.
+
 A pass writes no such artefact — its output stays where every passing run's
 output has always stayed — and the trigger is the *verdict* rather than the exit
 code alone, so a timeout is covered by the same seam with no timeout-specific
@@ -541,7 +554,7 @@ human intervened, in an engine whose ordinary rework lane was idle beside it.
 
 `control/continuation_rework_handoff.py` is the missing producer, and it owns no
 policy of its own. The phase stays a derived predicate; the PR identity and
-branch come from the existing open-PR owner (`get_open_pr_for_issue`); the cycle
+branch come from the existing open-PR owner (`look_up_open_pr_for_issue`); the cycle
 number and the ceiling come from `control/rework_cycle_policy.py`, the single
 rework-cycle owner `PRScanner` now decides through as well. What the handoff
 adds is assembly: it files a `DiscoveredRework` (or a `DiscoveredEscalation`
@@ -588,14 +601,28 @@ fact per issue per tick, and the `rework-cycle-N` label the launcher writes is
 the durable counter a restart re-reads. No new budget exists.
 
 Two rules keep that bound from costing GitHub reads. Every refusal decidable
-from facts the caller already holds is reached before any read:
-`ReworkCycleBudget.already_held` takes whichever label set its caller has for
-free — the PR's, for the sweep that found it by label; the issue's, for the
-handoff that arrives holding a board issue — so a blocked candidate is refused
-without a read on every pass. The one refusal that genuinely needs a read,
-"there is no open PR", is a negative answer `AdapterCache` does not cache, so
-the handoff remembers it per candidate and drops the memo when the exit stops
-being derived.
+from facts the caller already holds is reached before any read *unless something
+outranks it*: `ReworkCycleBudget.already_held` takes whichever label set its
+caller has for free — the PR's, for the sweep that found it by label; the
+issue's, for the handoff that arrives holding a board issue — so a blocked
+candidate is refused without a read on every pass. (The one free refusal
+deliberately asked after the read is `missing_failure_evidence`, because the
+ceiling outranks it; see the paragraph above and the one below.) The refusal
+that genuinely needs a read, "there is no open PR", is a negative answer
+`AdapterCache` does not cache, so the handoff remembers it per candidate and
+drops the memo when the exit stops being derived.
+
+What may enter that memo is deliberately narrow, and it is `OpenPrLookup` that
+makes the distinction available: the PR port can *fail to answer* — a
+rate-limited `/search/issues` call, a timeout — and `get_open_pr_for_issue`
+collapses that into the same `None` it uses for "there is no open PR". A caller
+that caches the answer must not, so the handoff reads through
+`look_up_open_pr_for_issue` instead. A failed read refuses that pass only, as
+`pr_read_failed`, and settles nothing: the handoff is built once per engine and
+the exit keeps being derived, so a memoised outage would take the silent
+short-circuit forever and re-open the [#296] gap from a recoverable error. **A
+read that failed is not a fact**, which is this repo's fail-fast rule applied to
+a cache.
 
 The once-per-issue-per-tick rule belongs to the collection, so every producer
 inherits it: the `needs-rework` sweep, the post-publish reconciler and this
@@ -608,12 +635,25 @@ fact carrying correction context supersedes one that does not, and nothing
 supersedes a fact that already carries it. The three refusals that strand a
 candidate with nothing downstream to retry it — `no_open_pr`, `no_agent_label`
 and `missing_failure_evidence` — are published as `rework.skipped` rather than
-only logged, with the same payload shape for all three so a consumer never has
-to branch on which one it got. The third is the one refusal that deliberately
-follows the PR read, because the ceiling outranks it; the read it pays for is a
-*positive* PR answer, which `AdapterCache` does cache, so a permanently
-unexplainable candidate costs what an admitted one costs rather than the
-uncached search `no_open_pr` avoids by memo.
+only logged, with the same payload shape for all three (and for
+`pr_read_failed`) so a consumer never has to branch on which one it got. The
+third is the one refusal that deliberately follows the PR read, because the
+ceiling outranks it; the read it pays for is a *positive* PR answer, which
+`AdapterCache` does cache, so a permanently unexplainable candidate costs what
+an admitted one costs rather than the uncached search `no_open_pr` avoids by
+memo.
+
+Those refusals are permanent by construction while the log line about them is
+not, so each is **logged every pass and published once**: the exit is
+re-derived on every reconciliation for as long as the durable facts stand, and
+an event per tick would tell a consumer something changed when nothing has. The
+announcement is remembered per `(candidate, reason)` and dropped by the same
+pruning as the `no_open_pr` memo, so a candidate that leaves the exit and comes
+back is news again — and a restarted process meets it for the first time. Only
+the *announcement* is remembered: the decision itself is re-made every pass, so
+a durable bundle that is restored, or written by a gate that ran after the
+strand, is picked up on the next reconciliation rather than being locked out by
+a cached refusal.
 
 `control/continuation_scheduling.py` is the one hydration path: it derives,
 reconciles, publishes, advances what this engine owns, admits the rework its

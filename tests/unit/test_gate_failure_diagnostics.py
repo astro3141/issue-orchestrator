@@ -810,11 +810,42 @@ class TestReadingTheExplanationBackByName:
         assert failure.stderr.truncated is False
         assert failure.stderr.tail == "short"
 
-    def test_a_bundle_with_no_output_says_it_explains_nothing(
+    def test_a_bundle_with_no_output_reads_as_nothing_found(
         self, repo_root: Path
     ) -> None:
+        """It repeats the receipt and adds nothing, which is not an explanation.
+
+        The reader applies that itself rather than handing the caller a bundle
+        and a predicate to remember: a caller that forgot the predicate would
+        put "publication failed" and no output in front of a correction agent,
+        which is the human relay the store exists to remove.
+        """
         GateFailureDiagnostics(repo_root).for_candidate(ISSUE).record_failure(
             GateFailureOutput(record=_record(), stdout="", stderr="  \n")
+        )
+
+        assert (
+            GateFailureDiagnostics(repo_root)
+            .for_candidate(ISSUE)
+            .latest_failure(head_sha=SHA_A, suite=ValidationGateKind.PUBLISH.suite)
+        ) is None
+
+    def test_an_empty_bundle_falls_through_to_the_one_before_it(
+        self, repo_root: Path, worktree: Path
+    ) -> None:
+        """The same fall-through a corrupt bundle gets, for the same reason.
+
+        A newest run that produced no output on either stream costs the caller
+        detail; stopping the search on it would cost the candidate ALL of its
+        evidence and strand it for a human, with an older run's real output for
+        the same ``(issue, commit, suite)`` sitting unread beside it.
+        """
+        _gate(
+            repo_root=repo_root,
+            runner=StubCommandRunner(returncode=1, stdout="the older reason"),
+        ).check(worktree=worktree, run_assets=_run(worktree), issue_key=ISSUE)
+        GateFailureDiagnostics(repo_root).for_candidate(ISSUE).record_failure(
+            GateFailureOutput(record=_record(), stdout="", stderr="")
         )
 
         failure = (
@@ -824,7 +855,8 @@ class TestReadingTheExplanationBackByName:
         )
 
         assert failure is not None
-        assert failure.explains_the_failure is False
+        assert failure.stdout.tail == "the older reason"
+        assert failure.explains_the_failure is True
 
     def test_a_deleted_log_leaves_the_other_stream_readable(
         self, repo_root: Path, worktree: Path, durable: DurableDiagnostics

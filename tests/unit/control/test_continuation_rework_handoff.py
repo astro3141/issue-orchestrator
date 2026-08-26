@@ -22,6 +22,7 @@ from pathlib import Path
 
 import pytest
 
+from issue_orchestrator.adapters.github.errors import GitHubTransportError
 from issue_orchestrator.control.continuation_live_truth import (
     CONTINUATION_KIND,
     ContinuationReworkExit,
@@ -125,6 +126,33 @@ class CountingPullRequests(StubPullRequests):
     ) -> list[PRInfo]:
         self.reads += 1
         return super().get_prs_for_issue(issue_number, state)
+
+
+class RateLimitedPullRequests(CountingPullRequests):
+    """A PR port that refuses to answer, exactly as a live outage does.
+
+    The real transport error, not a stand-in: ``get_prs_for_issue`` goes through
+    ``/search/issues`` on a 30 req/min budget, and ``HttpGitHubClient`` raises
+    ``GitHubTransportError`` for the timeouts and blips that produce it. What
+    the handoff has to do with that is unrelated to which exception class it is
+    — but a double that raised something the production catch could not see
+    would prove nothing about the production path.
+    """
+
+    def __init__(self, prs: dict[int, PRInfo] | None = None) -> None:
+        super().__init__(prs)
+        #: Flip to let the read succeed, which is what recovery looks like.
+        self.reachable = False
+
+    def get_prs_for_issue(
+        self, issue_number: int, state: str = "open"
+    ) -> list[PRInfo]:
+        if self.reachable:
+            return super().get_prs_for_issue(issue_number, state)
+        self.reads += 1
+        raise GitHubTransportError(
+            f"GitHub search unavailable for issue {issue_number}"
+        )
 
 
 def _issue(*labels: str) -> Issue:
@@ -500,6 +528,96 @@ class TestNoRefusalCostsAGitHubRead:
         assert pull_requests.reads == 2
 
 
+class TestAReadThatFailedIsNotAFact:
+    """A recoverable GitHub error must not settle anything, ever.
+
+    The memo above is what keeps a re-derived exit off the search API, and it is
+    also the sharpest edge in this module: it is an instance attribute of a
+    handoff the composition root builds ONCE per engine, and the exit that feeds
+    it keeps being derived for as long as the durable facts stand. So an entry
+    written from a rate-limited search would never expire — the candidate would
+    take the short-circuit on every subsequent reconciliation, silently, with no
+    read and nothing published, until the process restarted. That is
+    ``BOUNDED_PR_BACKED_CONTINUATION_GAP`` all over again, reached from a blip
+    rather than from a design gap, and reached past the very fix #297 is.
+
+    The rule that closes it is the repo's own: a read that failed is not a fact.
+    ``OpenPrLookup`` is what carries the difference, so the handoff never has to
+    infer it from a bare ``None``.
+    """
+
+    def test_an_unreachable_github_is_read_again_next_pass(
+        self, repo_root: Path
+    ) -> None:
+        pull_requests = RateLimitedPullRequests()
+        handoff = _handoff(repo_root, OrchestratorState(), pull_requests)
+        exit_ = _exit(_issue(), _attempt())
+
+        first = handoff.admit([exit_])
+        second = handoff.admit([exit_])
+
+        assert first.outcomes[0].reason == "pr_read_failed"
+        assert second.outcomes[0].reason == "pr_read_failed"
+        assert pull_requests.reads == 2
+
+    def test_the_candidate_is_admitted_as_soon_as_the_read_succeeds(
+        self, repo_root: Path
+    ) -> None:
+        """The whole point: the outage costs a pass, not the candidate."""
+        state = OrchestratorState()
+        pull_requests = RateLimitedPullRequests({ISSUE_NUMBER: _pr()})
+        handoff = _handoff(repo_root, state, pull_requests)
+        exit_ = _exit(_issue(), _attempt())
+
+        refused = handoff.admit([exit_])
+        assert refused.reworks == ()
+        assert state.discovered_reworks == []
+
+        pull_requests.reachable = True
+        admitted = handoff.admit([exit_])
+
+        assert admitted.outcomes[0].verdict is ReworkAdmissionVerdict.QUEUE
+        assert admitted.admitted_issue_numbers == (ISSUE_NUMBER,)
+        assert admitted.reworks[0].rework_cycle == 1
+
+    def test_a_failed_read_never_becomes_a_settled_absence(
+        self, repo_root: Path
+    ) -> None:
+        """The regression itself: the outage must not be filed as "no open PR".
+
+        A pass whose read failed and then a pass whose read answered "no open
+        PR" must both reach the port. If the first had settled the memo, the
+        second would never read at all — and the reason it reported would be a
+        conclusion nothing ever checked.
+        """
+        pull_requests = RateLimitedPullRequests()
+        handoff = _handoff(repo_root, OrchestratorState(), pull_requests)
+        exit_ = _exit(_issue(), _attempt())
+
+        handoff.admit([exit_])
+        pull_requests.reachable = True
+        answered = handoff.admit([exit_])
+
+        assert answered.outcomes[0].reason == "no_open_pr"
+        assert pull_requests.reads == 2
+
+    def test_an_outage_is_published_once_rather_than_every_pass(
+        self, repo_root: Path
+    ) -> None:
+        """A budget that stays exhausted keeps a candidate from moving, so it is
+        visible — but it is one candidate stuck, not one event per tick."""
+        events = RecordingEvents()
+        handoff = _handoff(
+            repo_root, OrchestratorState(), RateLimitedPullRequests(), events
+        )
+        exit_ = _exit(_issue(), _attempt())
+
+        for _ in range(4):
+            handoff.admit([exit_])
+
+        assert events.reasons() == ["pr_read_failed"]
+
+
 class TestARefusalThatStrandsACandidateIsPublished:
     """N1: the refusals nothing downstream retries reach the UI as events.
 
@@ -581,6 +699,76 @@ class TestARefusalThatStrandsACandidateIsPublished:
         handoff.admit([_exit(_issue(), _attempt())])
 
         assert events.published == []
+
+    def test_a_permanent_strand_is_announced_once_not_once_per_tick(
+        self, unexplained_root: Path
+    ) -> None:
+        """The exit is re-derived forever; the news happens once.
+
+        ``missing_failure_evidence`` is permanent by construction — a bundle
+        that is not there now was never written — and the exit that produces it
+        keeps being derived until a human acts. An event per reconciliation
+        would tell a consumer something changed on every tick for the rest of
+        the candidate's life, when nothing has.
+        """
+        events = RecordingEvents()
+        handoff = _handoff(
+            unexplained_root,
+            OrchestratorState(),
+            StubPullRequests({ISSUE_NUMBER: _pr()}),
+            events,
+        )
+        exit_ = _exit(_issue(), _attempt())
+
+        for _ in range(4):
+            result = handoff.admit([exit_])
+            # The decision is still re-made every pass — only the announcement
+            # is remembered, so a bundle that appears later is still picked up.
+            assert result.outcomes[0].reason == "missing_failure_evidence"
+
+        assert events.reasons() == ["missing_failure_evidence"]
+
+    def test_a_candidate_that_leaves_the_exit_and_returns_is_news_again(
+        self, unexplained_root: Path
+    ) -> None:
+        events = RecordingEvents()
+        handoff = _handoff(
+            unexplained_root,
+            OrchestratorState(),
+            StubPullRequests({ISSUE_NUMBER: _pr()}),
+            events,
+        )
+        exit_ = _exit(_issue(), _attempt())
+
+        handoff.admit([exit_])
+        handoff.admit([])  # the durable facts changed; nothing exits this pass
+        handoff.admit([exit_])
+
+        assert events.reasons() == [
+            "missing_failure_evidence",
+            "missing_failure_evidence",
+        ]
+
+    def test_a_later_bundle_still_closes_a_strand_that_was_announced(
+        self, unexplained_root: Path
+    ) -> None:
+        """Announcing once must not settle the decision.
+
+        The announcement memo is about the event stream, not about the
+        candidate: the evidence read still happens on every pass, so a bundle
+        that is restored — or one written by a gate that ran after the strand —
+        is picked up on the very next reconciliation.
+        """
+        state = OrchestratorState()
+        handoff = _handoff(
+            unexplained_root, state, StubPullRequests({ISSUE_NUMBER: _pr()})
+        )
+        exit_ = _exit(_issue(), _attempt())
+        assert handoff.admit([exit_]).reworks == ()
+
+        _file_failure(unexplained_root)
+
+        assert handoff.admit([exit_]).admitted_issue_numbers == (ISSUE_NUMBER,)
 
 
 class TestTheFactBufferOwnsItsOwnAdmission:

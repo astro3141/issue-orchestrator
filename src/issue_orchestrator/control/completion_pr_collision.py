@@ -3,6 +3,7 @@
 import logging
 import re
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
@@ -110,17 +111,44 @@ def create_pr_with_collision_handling(
         raise
 
 
-def get_open_pr_for_issue(
+@dataclass(frozen=True, slots=True)
+class OpenPrLookup:
+    """The three answers a search for an issue's open PR can give.
+
+    "GitHub says there is no open PR" and "GitHub could not be asked" are
+    different facts, and collapsing them into one ``None`` is only safe for a
+    caller that acts the same way on both. A caller that *remembers* the answer
+    must not: a rate-limited search or a network blip would be memoised as a
+    durable "this issue has no PR", and nothing would ever re-read it. That is
+    the fail-fast rule this repo states plainly — a read that failed is not a
+    fact.
+    """
+
+    #: The open PR scoped to this issue's active branch, when one was found.
+    pr: PRInfo | None = None
+    #: Whether the port could not be asked at all. When true, :attr:`pr` says
+    #: nothing: it is ``None`` because nothing was read, not because nothing
+    #: is there.
+    read_failed: bool = False
+
+    @property
+    def absent(self) -> bool:
+        """Whether the port answered, and its answer was "no open PR"."""
+        return not self.read_failed and self.pr is None
+
+
+def look_up_open_pr_for_issue(
     pr_adapter: CompletionPrAdapter,
     issue_number: int,
     *,
     expected_branch: str | None = None,
-) -> PRInfo | None:
+) -> OpenPrLookup:
+    """Find this issue's open PR, keeping "not there" apart from "not read"."""
     try:
         prs = pr_adapter.get_prs_for_issue(issue_number, state="open")
     except Exception as exc:
         logger.warning("Failed to query open PRs for issue %s: %s", issue_number, exc)
-        return None
+        return OpenPrLookup(read_failed=True)
     matching_prs = [pr for pr in prs if pr_matches_issue(pr, issue_number)]
     scoped = scope_prs_to_active_issue_branch(
         issue_number,
@@ -135,7 +163,27 @@ def get_open_pr_for_issue(
             pr.branch,
             scoped.expected_branch,
         )
-    return scoped.first_matching
+    return OpenPrLookup(pr=scoped.first_matching)
+
+
+def get_open_pr_for_issue(
+    pr_adapter: CompletionPrAdapter,
+    issue_number: int,
+    *,
+    expected_branch: str | None = None,
+) -> PRInfo | None:
+    """This issue's open PR, or ``None`` for "there is not one *or* it could not
+    be read".
+
+    The collapsing form, kept for callers that act identically on both — PR
+    creation retries the whole publish next completion either way, so the
+    distinction changes nothing for them. A caller that caches the answer, or
+    whose behaviour differs between the two, must use
+    :func:`look_up_open_pr_for_issue` instead.
+    """
+    return look_up_open_pr_for_issue(
+        pr_adapter, issue_number, expected_branch=expected_branch
+    ).pr
 
 
 def maybe_switch_branch_for_pr_collision(

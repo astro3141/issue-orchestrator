@@ -199,8 +199,10 @@ class DurableGateFailure:
         """Whether this bundle actually carries the failure's output.
 
         A bundle whose two streams are both empty repeats the receipt and adds
-        nothing — the reader's caller must treat it as no evidence rather than
-        hand an agent a prompt that says "it failed" and stops.
+        nothing — handing it to an agent would be a prompt that says "it failed"
+        and stops. :meth:`CandidateGateDiagnostics.latest_failure` applies this
+        itself, falling through to an older bundle rather than returning one,
+        so a caller never has to re-apply it and cannot forget to.
         """
         return self.stdout.has_output or self.stderr.has_output
 
@@ -336,14 +338,21 @@ class CandidateGateDiagnostics:
         Newest first because a retried publish files one bundle per attempt and
         the last one is the failure the candidate is actually sitting on. Older
         bundles are not skipped over silently, though: a newest bundle that
-        cannot be read falls through to the one before it, so an unreadable
-        artefact costs the caller detail rather than all of its evidence.
+        does not explain the failure falls through to the one before it, so a
+        damaged artefact costs the caller detail rather than all of its
+        evidence. Two things fail to explain it and both fall through — a bundle
+        that cannot be read at all, and one that reads cleanly but carries no
+        output on either stream. The second is not a lesser case of the first:
+        it repeats the receipt and adds nothing, which is precisely as useful
+        to a corrector as a bundle that was never there, and stopping the search
+        on it would discard an older run's real output for the same
+        ``(issue, commit, suite)``.
 
         Returns ``None`` when nothing filed under that name can be read as being
-        about this exact candidate and this exact contract. ``None`` is the
-        honest answer for "no explanation survives", and the caller's own
-        fail-closed behaviour is built on its being answered rather than
-        approximated: see :mod:`.continuation_rework_handoff`.
+        about this exact candidate and this exact contract *and* says why it
+        failed. ``None`` is the honest answer for "no explanation survives", and
+        the caller's own fail-closed behaviour is built on its being answered
+        rather than approximated: see :mod:`.continuation_rework_handoff`.
         """
         prefix = self._prefix_for(head_sha, suite)
         try:
@@ -362,8 +371,19 @@ class CandidateGateDiagnostics:
             return None
         for directory in bundles:
             failure = _read_failure(directory, head_sha=head_sha, suite=suite)
-            if failure is not None:
-                return failure
+            if failure is None:
+                continue
+            if not failure.explains_the_failure:
+                logger.warning(
+                    "[GATE_DIAGNOSTIC] the %s bundle at %s for %s@%s carries no "
+                    "output on either stream; looking further back",
+                    suite,
+                    directory,
+                    self._issue_key,
+                    head_sha[:12],
+                )
+                continue
+            return failure
         return None
 
     def _prefix_for(self, head_sha: str, suite: str) -> str:

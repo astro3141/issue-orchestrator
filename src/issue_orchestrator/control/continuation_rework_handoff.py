@@ -15,7 +15,7 @@ that can be one.
 
 **It owns no policy of its own.** The phase stays a derived predicate
 (:mod:`..domain.continuation_phase`); the PR identity and branch come from the
-existing open-PR owner (:func:`..control.completion_pr_collision.get_open_pr_for_issue`);
+existing open-PR owner (:func:`..control.completion_pr_collision.look_up_open_pr_for_issue`);
 the cycle number and the ceiling come from the shared rework-cycle owner
 (:mod:`.rework_cycle_policy`), which the ordinary scanner decides through too.
 What is left here is assembly: which exits are PR-backed, what evidence travels
@@ -44,12 +44,33 @@ writes ``rework-cycle-N`` to the PR, and that durable label is what makes a
 restart re-derive the same bounded state instead of a second cycle.
 
 **A re-derived exit must not cost a GitHub read.** Every refusal this module
-can reach from facts it already holds is reached before the PR read: the board
-issue arrives with the exit, so its blocking labels and its agent label are
-free. The one refusal that genuinely needs the read is "there is no open PR",
-and a negative answer there is not cached anywhere downstream, so it is
-remembered here per candidate rather than re-searched on every reconciliation
-for the rest of the candidate's life.
+can reach from facts it already holds is reached before the PR read *unless
+something outranks it* — the board issue arrives with the exit, so its blocking
+labels and its agent label are free. (The one free refusal deliberately asked
+*after* the read is ``missing_failure_evidence``; see the paragraph on the
+evidence gate below for why the ceiling has to outrank it.) The refusal that
+genuinely needs the read is "there is no open PR", and a negative answer there
+is not cached anywhere downstream, so it is remembered here per candidate rather
+than re-searched on every reconciliation for the rest of the candidate's life.
+
+**Only an answer may be remembered, never a failure to ask.** The PR port can
+refuse to answer — a rate-limited ``/search/issues`` call, a timeout, a blip —
+and the open-PR owner reports that as :attr:`OpenPrLookup.read_failed` rather
+than folding it into "there is no PR". Memoising a read that failed would strand
+the candidate for the life of the process: the exit keeps being derived, the
+memo keeps short-circuiting, and #296's gap would be reachable from a recoverable
+error. So a failed read refuses this pass only, records nothing, and the next
+reconciliation reads again.
+
+**A refusal that repeats is logged every time and published once.** The strands
+below are permanent by construction: nothing downstream retries them, and the
+exit keeps being derived until a human acts. Re-publishing the same
+``rework.skipped`` on every reconciliation forever would make the event stream
+say something new when nothing is, so the announcement is remembered per
+(candidate, reason) — for exactly as long as the memo above lives, and dropped
+by the same pruning. The log line still fires every pass; it is the human's
+channel, and repetition there is how an operator sees a candidate is still
+stuck.
 
 **A publication failure is handed over with its own output, or not at all.**
 The receipt says the publish contract refused ``A``, and which command it ran;
@@ -101,7 +122,7 @@ from typing import TYPE_CHECKING
 from ..domain.models import DiscoveredEscalation, DiscoveredRework
 from ..events import EventName
 from ..ports import make_trace_event
-from .completion_pr_collision import get_open_pr_for_issue
+from .completion_pr_collision import look_up_open_pr_for_issue
 from .gate_failure_diagnostics import (
     DIAGNOSTIC_FILE_NAME,
     FAILURE_LOG_TAIL_BYTES,
@@ -177,6 +198,21 @@ class PublicationFailureEvidence:
 
 
 @dataclass(frozen=True, slots=True)
+class _LaunchableExit:
+    """What the free phase established about an exit it did not refuse.
+
+    One field, and it earns its type: ``Issue.agent_type`` is ``str | None``,
+    "this exit names an agent to launch as" is settled before the PR is read,
+    and a later phase re-deriving it from the same optional would be a second
+    answer to a question already asked — with a fallback branch that can never
+    run and can never be tested. Carrying the proof instead is what this repo's
+    fail-fast rule asks for.
+    """
+
+    agent_type: str
+
+
+@dataclass(frozen=True, slots=True)
 class ContinuationHandoffResult:
     """Everything one handoff pass decided and filed."""
 
@@ -219,7 +255,12 @@ class ContinuationReworkHandoff:
         self._events = events
         #: Candidates this handoff has already established have no open PR,
         #: keyed by (issue, candidate SHA). See :meth:`_no_open_pr_is_settled`.
+        #: Only an ANSWER from the PR port enters here — never a read that
+        #: failed, which is the difference between a fact and an outage.
         self._settled_without_pr: set[tuple[int, str]] = set()
+        #: Refusals this handoff has already announced, keyed by
+        #: (issue, candidate SHA, reason). See :meth:`_announce_once`.
+        self._announced: set[tuple[int, str, str]] = set()
 
     def admit(
         self, exits: Sequence["ContinuationReworkExit"]
@@ -246,13 +287,52 @@ class ContinuationReworkHandoff:
         reworks: list[DiscoveredRework],
         escalations: list[DiscoveredEscalation],
     ) -> ContinuationHandoffOutcome:
+        """One exit, decided in the three phases this module's docstring names.
+
+        The PR read is the seam, and it is why the phases are separate: what
+        comes before it must cost nothing, and what comes after it is the
+        budget's decision and this producer's own last question about it.
+        """
+        # Phase 1: everything this exit's own facts already settle.
+        free = self._refuse_before_the_pr_read(exit_)
+        if isinstance(free, ContinuationHandoffOutcome):
+            return free
+
+        # Phase 2: the one read, and the two different answers it can fail with.
+        lookup = look_up_open_pr_for_issue(self._pull_requests, exit_.issue.number)
+        if lookup.read_failed:
+            # Not a fact about the candidate — a fact about GitHub, this pass.
+            # Nothing is remembered, so the next reconciliation reads again and
+            # a candidate whose search happened to be rate-limited is not
+            # stranded for the life of the process.
+            return self._refuse_unreadable_pr(exit_)
+        if lookup.pr is None:
+            self._settle_without_pr(exit_)
+            return self._strand(
+                exit_,
+                "no_open_pr",
+                "[CONTINUATION] issue #%d exits to rework but has no open PR; "
+                "left for the no-PR recovery path",
+            )
+
+        # Phase 3: the cycle owner decides, and only then is the cycle spent.
+        return self._admit_against_pr(
+            exit_, free.agent_type, lookup.pr, reworks, escalations
+        )
+
+    def _refuse_before_the_pr_read(
+        self, exit_: "ContinuationReworkExit"
+    ) -> "ContinuationHandoffOutcome | _LaunchableExit":
+        """Every refusal reachable from facts already in hand, or what they proved.
+
+        Free in the sense that matters: no GitHub call. The board issue arrives
+        with the exit, so its labels and its agent label cost nothing, and this
+        is what stops a re-derived exit from paying a search-API read on every
+        reconciliation for a refusal it will make forever.
+        """
         issue = exit_.issue
         issue_number = issue.number
-        # Everything decidable for free is decided first, and decided by the
-        # cycle owner rather than re-implemented here. The board issue this
-        # exit carries is already in hand, so its labels cost nothing — and
-        # this is what stops a re-derived exit from paying a search-API read on
-        # every reconciliation for a refusal it will make forever.
+        # Decided by the cycle owner rather than re-implemented here.
         held = self._budget.already_held(
             issue_number,
             queued_issue_numbers=self._claimed_issue_numbers(),
@@ -269,7 +349,7 @@ class ContinuationReworkHandoff:
             # run the wrong prompt against a real PR. Asked before the PR read
             # because the answer is on the issue, not the PR.
             return self._strand(
-                issue_number,
+                exit_,
                 "no_agent_label",
                 "[CONTINUATION] issue #%d exits to rework but carries no agent "
                 "label; left for the ordinary lane",
@@ -278,23 +358,27 @@ class ContinuationReworkHandoff:
         # The non-PR-backed exit. It is not this producer's case: with no open
         # PR there is no lineage to correct, and #195's own no-PR recovery path
         # is the owner of what happens next. Behaviour there is unchanged
-        # precisely because nothing is filed here.
+        # precisely because nothing is filed here. Answered from the memo, so
+        # the search that established it is paid once per candidate.
         if self._no_open_pr_is_settled(exit_):
             return ContinuationHandoffOutcome(
                 issue_number=issue_number,
                 verdict=ReworkAdmissionVerdict.SKIP,
                 reason="no_open_pr",
             )
-        pr = get_open_pr_for_issue(self._pull_requests, issue_number)
-        if pr is None:
-            self._settle_without_pr(exit_)
-            return self._strand(
-                issue_number,
-                "no_open_pr",
-                "[CONTINUATION] issue #%d exits to rework but has no open PR; "
-                "left for the no-PR recovery path",
-            )
+        return _LaunchableExit(agent_type=agent_type)
 
+    def _admit_against_pr(
+        self,
+        exit_: "ContinuationReworkExit",
+        agent_type: str,
+        pr: "PRInfo",
+        reworks: list[DiscoveredRework],
+        escalations: list[DiscoveredEscalation],
+    ) -> ContinuationHandoffOutcome:
+        """Spend a cycle on this open PR, or say which refusal stopped it."""
+        issue = exit_.issue
+        issue_number = issue.number
         admission = self._budget.admit(
             issue_number=issue_number,
             pr_labels=pr.labels,
@@ -341,7 +425,7 @@ class ContinuationReworkHandoff:
         evidence = self._durable_failure(exit_)
         if evidence.missing:
             return self._strand(
-                issue_number,
+                exit_,
                 "missing_failure_evidence",
                 "[CONTINUATION] issue #%d exits to rework after a publication "
                 "failure whose durable output cannot be resolved; refusing to "
@@ -407,9 +491,12 @@ class ContinuationReworkHandoff:
         :func:`~..domain.issue_key_codec.issue_key_path_part` spells identically
         to the stored one — that is the property the whole store is filed under.
 
-        A bundle that resolves but carries no output on either stream is treated
-        as no bundle. It repeats the receipt and adds nothing, and the point of
-        this read is the output.
+        A bundle that resolves but carries no output on either stream is not an
+        explanation — it repeats the receipt and adds nothing — and the store's
+        own reader is what enforces that, falling through to an older bundle for
+        the same ``(issue, SHA, suite)`` exactly as it does for one it cannot
+        read. So ``None`` here means "nothing filed for this candidate explains
+        anything", not "the newest thing filed happened to be empty".
         """
         refusal = exit_.attempt.publication_refusal
         if refusal is None:
@@ -417,15 +504,6 @@ class ContinuationReworkHandoff:
         failure = self._diagnostics.for_candidate(exit_.issue.key).latest_failure(
             head_sha=exit_.attempt.key.head_sha, suite=refusal.suite
         )
-        if failure is not None and not failure.explains_the_failure:
-            logger.warning(
-                "[CONTINUATION] the durable %s diagnostic at %s for issue #%d "
-                "carries no output on either stream",
-                refusal.suite,
-                failure.directory,
-                exit_.issue.number,
-            )
-            failure = None
         return PublicationFailureEvidence(required=True, failure=failure)
 
     def _claimed_issue_numbers(self) -> set[int]:
@@ -464,6 +542,12 @@ class ContinuationReworkHandoff:
         this engine no longer derives are dropped by
         :meth:`_forget_exits_no_longer_derived`, so the memo never outgrows the
         set of candidates currently sitting in the exit.
+
+        What may enter is narrow, and that is the whole safety of it: an
+        ANSWER of "there is no open PR", never a read that failed. The two are
+        kept apart by :class:`~.completion_pr_collision.OpenPrLookup` rather
+        than inferred from a bare ``None`` here, because a memoised outage is
+        indistinguishable from a memoised fact and only one of them is true.
         """
         return self._exit_identity(exit_) in self._settled_without_pr
 
@@ -474,13 +558,74 @@ class ContinuationReworkHandoff:
         self, exits: Sequence["ContinuationReworkExit"]
     ) -> None:
         """Drop memos for candidates this pass no longer sees in the exit."""
-        self._settled_without_pr.intersection_update(
-            self._exit_identity(exit_) for exit_ in exits
+        derived = {self._exit_identity(exit_) for exit_ in exits}
+        self._settled_without_pr.intersection_update(derived)
+        self._announced = {
+            announced
+            for announced in self._announced
+            if announced[:2] in derived
+        }
+
+    def _announce_once(
+        self, exit_: "ContinuationReworkExit", reason: str
+    ) -> None:
+        """Publish this refusal the first time this candidate reaches it.
+
+        Per this repo's events-vs-logs rule a UI cannot read the log line that
+        says a candidate is stuck, so the refusal is published. But the exit is
+        re-derived on every reconciliation for as long as the durable facts
+        stand, and a refusal nothing retries is reached again every single pass:
+        publishing each time would put an unbounded stream of identical events
+        in front of a consumer for which nothing has changed. So the
+        announcement is remembered per (candidate, reason), and dropped by
+        :meth:`_forget_exits_no_longer_derived` with the rest — a candidate that
+        leaves the exit and comes back is news again, and so is one a restarted
+        process meets for the first time.
+        """
+        issue_number = exit_.issue.number
+        announced = (*self._exit_identity(exit_), reason)
+        if announced in self._announced:
+            return
+        self._announced.add(announced)
+        self._events.publish(
+            make_trace_event(
+                EventName.REWORK_SKIPPED,
+                {
+                    "reason": reason,
+                    "issue_number": issue_number,
+                    "source": CONTINUATION_EXIT_SOURCE,
+                },
+            )
+        )
+
+    def _refuse_unreadable_pr(
+        self, exit_: "ContinuationReworkExit"
+    ) -> ContinuationHandoffOutcome:
+        """Refuse this pass because GitHub could not be asked, and remember nothing.
+
+        The one refusal here that is about the engine's surroundings rather
+        than about the candidate, and therefore the one that must not settle
+        anything: the very next reconciliation reads again. It is published on
+        the same channel as the strands because a search budget that stays
+        exhausted keeps a candidate from moving just as effectively — and once,
+        for the same reason they are.
+        """
+        issue_number = exit_.issue.number
+        logger.warning(
+            "[CONTINUATION] could not read the open PR for issue #%d; leaving "
+            "the exit for the next reconciliation",
+            issue_number,
+        )
+        self._announce_once(exit_, "pr_read_failed")
+        return ContinuationHandoffOutcome(
+            issue_number=issue_number,
+            verdict=ReworkAdmissionVerdict.SKIP,
+            reason="pr_read_failed",
         )
 
     def _strand(
         self,
-        issue_number: int,
+        exit_: "ContinuationReworkExit",
         reason: str,
         log_message: str,
         *,
@@ -509,19 +654,10 @@ class ContinuationReworkHandoff:
         rediscover a failure nobody kept, which spends a cycle to arrive back
         here; this spends none and says exactly what is missing.
         """
-        logger.warning(log_message, issue_number)
-        self._events.publish(
-            make_trace_event(
-                EventName.REWORK_SKIPPED,
-                {
-                    "reason": reason,
-                    "issue_number": issue_number,
-                    "source": CONTINUATION_EXIT_SOURCE,
-                },
-            )
-        )
+        logger.warning(log_message, exit_.issue.number)
+        self._announce_once(exit_, reason)
         return ContinuationHandoffOutcome(
-            issue_number=issue_number,
+            issue_number=exit_.issue.number,
             verdict=ReworkAdmissionVerdict.SKIP,
             reason=reason,
             pr_number=pr_number,
