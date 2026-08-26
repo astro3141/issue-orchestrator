@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Sequence
+from dataclasses import replace
 from typing import TYPE_CHECKING
 
 from .continuation_live_truth import ContinuationReconciliation
@@ -118,7 +119,10 @@ class ControlContinuation:
         The rework handoff runs LAST, after the release that lets ordinary work
         onto the issue is in force (#297). Running it earlier would file a fact
         the scheduler is still excluding the issue from acting on, and the two
-        would be describing different instants.
+        would be describing different instants. What it decided is carried back
+        on the returned reconciliation rather than dropped, so "the handoff ran
+        and refused everything" is distinguishable from "the handoff never ran"
+        — the distinction #296 could not make.
         """
         reading = self._read(board)
         if not reading.readable:
@@ -130,8 +134,10 @@ class ControlContinuation:
             operations=reading.operations,
         )
         self._runner.advance(reconciliation)
-        self._rework_handoff.admit(reading.rework_exits)
-        return reconciliation
+        return replace(
+            reconciliation,
+            rework_handoff=self._rework_handoff.admit(reading.rework_exits),
+        )
 
     def hydrate_queue(
         self, cache: "QueueCache", board: Sequence["Issue"]
@@ -268,6 +274,9 @@ def build_control_continuation(
             budget=ReworkCycleBudget(
                 deps.label_manager, max_rework_cycles=config.max_rework_cycles
             ),
+            # The engine's own sink, so the refusals that strand a candidate
+            # reach the UI as events rather than only as log text (#297).
+            events=deps.events,
         ),
     )
 

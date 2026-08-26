@@ -1047,6 +1047,83 @@ class TestScanForReworksEscalation:
         assert escalations[0][1] == 2    # Issue number
 
 
+class TestAReworkRefusalCostsNoIssueRead:
+    """#297 F1: the PR's own labels are free here — it was found BY label.
+
+    A ``needs-rework`` PR also carrying a blocking label is refused on every
+    sweep for as long as it sits on the board, which for a blocked-and-labelled
+    PR is days. Paying an issue read per sweep to reach a refusal the PR's own
+    labels already settle is the regression these directions bound.
+    """
+
+    def _reads(self, mock_repository) -> list[int]:
+        reads: list[int] = []
+        real = mock_repository.get_issue
+
+        def counting(issue_number: int):
+            reads.append(issue_number)
+            return real(issue_number)
+
+        mock_repository.get_issue = counting
+        return reads
+
+    def test_a_blocking_pr_label_refuses_before_the_issue_is_read(
+        self, scanner, mock_repository
+    ):
+        add_issue_with_agent(mock_repository, 42, "agent:developer")
+        mock_repository.prs["42-feature"] = [
+            make_pr_info(
+                100,
+                branch="42-feature",
+                body="Closes #42",
+                labels=["needs-rework", "needs-human"],
+            )
+        ]
+        reads = self._reads(mock_repository)
+
+        result, escalations = scanner.scan_for_reworks(
+            already_queued=[], active_sessions=[]
+        )
+
+        assert result == []
+        assert escalations == []
+        assert reads == []
+
+    def test_an_admissible_pr_still_reads_its_issue(self, scanner, mock_repository):
+        add_issue_with_agent(mock_repository, 42, "agent:developer")
+        mock_repository.prs["42-feature"] = [
+            make_pr_info(
+                100, branch="42-feature", body="Closes #42", labels=["needs-rework"]
+            )
+        ]
+        reads = self._reads(mock_repository)
+
+        result, _ = scanner.scan_for_reworks(already_queued=[], active_sessions=[])
+
+        assert len(result) == 1
+        assert reads == [42]
+
+    def test_an_issue_another_producer_claimed_is_not_swept_again(
+        self, scanner, mock_repository
+    ):
+        """A1: the sweep answers "already claimed" from every producer's facts."""
+        add_issue_with_agent(mock_repository, 42, "agent:developer")
+        mock_repository.prs["42-feature"] = [
+            make_pr_info(
+                100, branch="42-feature", body="Closes #42", labels=["needs-rework"]
+            )
+        ]
+
+        result, escalations = scanner.scan_for_reworks(
+            already_queued=[],
+            active_sessions=[],
+            claimed_issue_numbers={42},
+        )
+
+        assert result == []
+        assert escalations == []
+
+
 class TestScanForReworksEvents:
     """Tests for event emission in rework scanning."""
 

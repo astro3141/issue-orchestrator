@@ -548,6 +548,28 @@ holds the issue, `OrchestratorState.record_discovered_rework` admits at most one
 fact per issue per tick, and the `rework-cycle-N` label the launcher writes is
 the durable counter a restart re-reads. No new budget exists.
 
+Two rules keep that bound from costing GitHub reads. Every refusal decidable
+from facts the caller already holds is reached before any read:
+`ReworkCycleBudget.already_held` takes whichever label set its caller has for
+free — the PR's, for the sweep that found it by label; the issue's, for the
+handoff that arrives holding a board issue — so a blocked candidate is refused
+without a read on every pass. The one refusal that genuinely needs a read,
+"there is no open PR", is a negative answer `AdapterCache` does not cache, so
+the handoff remembers it per candidate and drops the memo when the exit stops
+being derived.
+
+The once-per-issue-per-tick rule belongs to the collection, so every producer
+inherits it: the `needs-rework` sweep, the post-publish reconciler and this
+handoff all write through `record_discovered_rework` /
+`record_discovered_escalation`, and all four ask "is this issue already
+claimed?" through `OrchestratorState.issues_with_claimed_rework`. Which fact
+survives is decided by content rather than arrival order — the steady-state
+refresh sweeps before it hydrates and startup hydrates before it sweeps, so a
+fact carrying correction context supersedes one that does not, and nothing
+supersedes a fact that already carries it. The two refusals that strand a
+candidate with nothing downstream to retry it, `no_open_pr` and
+`no_agent_label`, are published as `rework.skipped` rather than only logged.
+
 `control/continuation_scheduling.py` is the one hydration path: it derives,
 reconciles, publishes, advances what this engine owns, admits the rework its
 exits imply, and only then lets `QueueCache` evaluate eligibility. The handoff

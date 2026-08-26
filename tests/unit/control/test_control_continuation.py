@@ -94,6 +94,7 @@ from issue_orchestrator.execution.control_operation_ownership_store import (
 )
 from issue_orchestrator.execution.pending_work_claim_store import STORE_FILENAME
 from issue_orchestrator.infra.config import Config
+from issue_orchestrator.ports import NullEventSink
 from issue_orchestrator.ports.control_operation_ownership_store import (
     ControlOperationOwnershipRead,
     ControlOperationReadStatus,
@@ -363,6 +364,7 @@ def _engine(
             budget=ReworkCycleBudget(
                 LabelManager(config), max_rework_cycles=config.max_rework_cycles
             ),
+            events=NullEventSink(),
         ),
     )
     return Engine(
@@ -407,6 +409,7 @@ def _continuation(
             budget=ReworkCycleBudget(
                 LabelManager(config), max_rework_cycles=config.max_rework_cycles
             ),
+            events=NullEventSink(),
         ),
     )
 

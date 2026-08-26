@@ -141,14 +141,23 @@ class GitHubWorkflow:
         state: "OrchestratorState",
         issue_branches: dict[int, str] | None = None,
     ) -> None:
-        """Scan for PRs that need rework and add to discovered_reworks/escalations."""
+        """Scan for PRs that need rework and add to discovered_reworks/escalations.
+
+        The sweep is told everything already claimed this tick, not just what is
+        queued, so it and the continuation handoff answer "is this issue already
+        claimed?" from the same facts (#297). Both collections are written
+        through their owner methods for the same reason: the once-per-issue
+        rule lives with the collection, so this producer inherits it rather
+        than re-implementing it.
+        """
         reworks, escalations = self.pr_scanner.scan_for_reworks(
             state.pending_reworks,
             [s.issue.number for s in state.active_sessions],
             issue_branches=issue_branches,
+            claimed_issue_numbers=state.issues_with_claimed_rework(),
         )
         for pr, issue, cycle in escalations:
-            state.discovered_escalations.append(DiscoveredEscalation(issue, pr, cycle))
+            state.record_discovered_escalation(DiscoveredEscalation(issue, pr, cycle))
         for r in reworks:
             issue_number = r.resolve_issue_number()
             if issue_number is None:
@@ -157,7 +166,7 @@ class GitHubWorkflow:
                     r.issue_key,
                 )
                 continue
-            state.discovered_reworks.append(
+            state.record_discovered_rework(
                 DiscoveredRework(
                     issue_number,
                     r.pr_number or 0,
@@ -216,7 +225,11 @@ class GitHubWorkflow:
         ).discover(state)
         state.discovered_awaiting_merge_reconciliations.extend(result.reconciliations)
         state.discovered_awaiting_merge_drifts.extend(result.drifts)
-        state.discovered_reworks.extend(result.reworks)
+        # Through the collection's owner, so the post-publish producer is bound
+        # by the same once-per-issue-per-tick rule as the sweep and the
+        # continuation handoff (#297).
+        for rework in result.reworks:
+            state.record_discovered_rework(rework)
         state.discovered_awaiting_merge_escalations.extend(result.escalations)
         state.discovered_merge_queue_enqueues.extend(result.enqueues)
         if result.discovered:

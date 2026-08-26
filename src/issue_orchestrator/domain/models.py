@@ -1823,6 +1823,18 @@ class DiscoveredRework:
     # state, not the comment).
     feedback_comment_already_posted: bool = False
 
+    @property
+    def carries_correction_context(self) -> bool:
+        """True when this fact says WHY the rework is needed, not just that it is.
+
+        The ``needs-rework`` label sweep can only report that the label is
+        standing on a PR; a producer that watched the failure happen also holds
+        the feedback the rework agent must be launched with. That is what
+        :meth:`OrchestratorState.record_discovered_rework` weighs when two
+        producers reach the same issue in one tick (#297).
+        """
+        return bool(self.feedback)
+
 
 @dataclass(frozen=True)
 class DiscoveredEscalation:
@@ -2398,6 +2410,43 @@ class OrchestratorState:
         self.pending_validation_retries.extend([retry])
         return True
 
+    def issues_with_claimed_rework(
+        self, *, superseding_context: bool = False
+    ) -> set[int]:
+        """Issue numbers a rework is already spoken for on, at any age (#297).
+
+        One answer for every producer that must ask "is this issue already
+        claimed?", so the ordinary ``needs-rework`` sweep and the continuation
+        handoff stop asking it from different collections. All three ages count:
+        a pending rework is queued for launch, a discovered rework is this
+        tick's fact the Planner has not acted on yet, and a discovered
+        escalation means the cycle budget was spent and a human was asked
+        instead.
+
+        ``superseding_context`` is set by a producer that holds the correction
+        context a discovered rework may be missing. For that caller a
+        context-free discovered fact is not a claim to yield to — it is one
+        :meth:`record_discovered_rework` will supersede — so it is left out of
+        the answer. Nothing else is: a pending rework is already being launched
+        and an escalation has already asked a human, and neither may be
+        overwritten by a later fact.
+        """
+
+        claimed: set[int] = set()
+        for pending in self.pending_reworks:
+            issue_number = pending.resolve_issue_number()
+            if issue_number is not None:
+                claimed.add(issue_number)
+        claimed.update(
+            discovered.issue_number
+            for discovered in self.discovered_reworks
+            if not (superseding_context and not discovered.carries_correction_context)
+        )
+        claimed.update(
+            escalation.issue_number for escalation in self.discovered_escalations
+        )
+        return claimed
+
     def record_discovered_rework(self, rework: DiscoveredRework) -> bool:
         """Record a rework fact for the Planner, at most once per issue (#297).
 
@@ -2408,14 +2457,29 @@ class OrchestratorState:
         collection rather than with each producer, so a new producer inherits it
         instead of re-implementing it.
 
-        Returns True when the fact was recorded, False when the issue already
-        holds one this tick.
+        Which fact survives is decided here too, and by content rather than by
+        arrival order. Two producers can reach the same issue in one tick — the
+        label sweep, which only knows that ``needs-rework`` is standing, and a
+        producer that watched the failure and holds the feedback the rework
+        agent must be launched with — and which of them runs first differs by
+        entry point (the steady-state refresh sweeps before it hydrates,
+        startup hydrates before it sweeps). So a fact carrying correction
+        context supersedes one that does not, and nothing supersedes a fact
+        that already carries it.
+
+        Returns True when the fact was recorded or superseded a context-free
+        one, False when the issue's claim already stands.
         """
 
-        if any(
-            existing.issue_number == rework.issue_number
-            for existing in self.discovered_reworks
-        ):
+        for index, existing in enumerate(self.discovered_reworks):
+            if existing.issue_number != rework.issue_number:
+                continue
+            if (
+                rework.carries_correction_context
+                and not existing.carries_correction_context
+            ):
+                self.discovered_reworks[index] = rework
+                return True
             return False
         self.discovered_reworks.extend([rework])
         return True

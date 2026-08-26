@@ -31,6 +31,7 @@ from issue_orchestrator.control.rework_cycle_policy import ReworkCycleBudget
 from issue_orchestrator.infra.config import Config
 from issue_orchestrator.domain.control_operation import ControlOperationKey
 from issue_orchestrator.domain.models import OrchestratorState
+from issue_orchestrator.ports import NullEventSink
 from issue_orchestrator.ports.control_operation_ownership_store import (
     ControlOperationOwnershipRead,
     ControlOperationOwnershipRow,
@@ -188,6 +189,7 @@ def inert_control_continuation(
             budget=ReworkCycleBudget(
                 LabelManager(Config()), max_rework_cycles=Config().max_rework_cycles
             ),
+            events=NullEventSink(),
         ),
     )
 

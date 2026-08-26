@@ -43,6 +43,14 @@ running session all refuse. Once a cycle actually starts, the rework launcher
 writes ``rework-cycle-N`` to the PR, and that durable label is what makes a
 restart re-derive the same bounded state instead of a second cycle.
 
+**A re-derived exit must not cost a GitHub read.** Every refusal this module
+can reach from facts it already holds is reached before the PR read: the board
+issue arrives with the exit, so its blocking labels and its agent label are
+free. The one refusal that genuinely needs the read is "there is no open PR",
+and a negative answer there is not cached anywhere downstream, so it is
+remembered here per candidate rather than re-searched on every reconciliation
+for the rest of the candidate's life.
+
 The exit itself is not consumed, and deliberately so: consuming it would be the
 stored continuation state machine the phase predicate exists to avoid. It stops
 being derived when the durable facts change — a newer refused candidate
@@ -62,6 +70,8 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from ..domain.models import DiscoveredEscalation, DiscoveredRework
+from ..events import EventName
+from ..ports import make_trace_event
 from .completion_pr_collision import get_open_pr_for_issue
 from .rework_cycle_policy import (
     ReworkAdmission,
@@ -72,6 +82,7 @@ from .rework_cycle_policy import (
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from ..domain.attempt import Attempt
     from ..domain.models import OrchestratorState
+    from ..ports import EventSink
     from ..ports.pull_request_tracker import PRInfo
     from .completion_pr_collision import CompletionPrAdapter
     from .continuation_live_truth import ContinuationReworkExit
@@ -126,6 +137,7 @@ class ContinuationReworkHandoff:
         state: "OrchestratorState",
         pull_requests: "CompletionPrAdapter",
         budget: ReworkCycleBudget,
+        events: "EventSink",
     ) -> None:
         #: The engine's live facts. Held rather than passed per call because
         #: what already holds an issue changes between reconciliations within
@@ -134,11 +146,19 @@ class ContinuationReworkHandoff:
         self._state = state
         self._pull_requests = pull_requests
         self._budget = budget
+        #: Refusals that strand a candidate are published, not merely logged.
+        #: They are the ones a human has to act on, and per this repo's
+        #: events-vs-logs rule the UI cannot react to a ``logger.warning``.
+        self._events = events
+        #: Candidates this handoff has already established have no open PR,
+        #: keyed by (issue, candidate SHA). See :meth:`_no_open_pr_is_settled`.
+        self._settled_without_pr: set[tuple[int, str]] = set()
 
     def admit(
         self, exits: Sequence["ContinuationReworkExit"]
     ) -> ContinuationHandoffResult:
         """File ordinary rework for every PR-backed exit that may take a cycle."""
+        self._forget_exits_no_longer_derived(exits)
         if not exits:
             return ContinuationHandoffResult()
         outcomes: list[ContinuationHandoffOutcome] = []
@@ -161,46 +181,51 @@ class ContinuationReworkHandoff:
     ) -> ContinuationHandoffOutcome:
         issue = exit_.issue
         issue_number = issue.number
-        # Asked first, and asked of the cycle owner rather than re-implemented
-        # here: it needs nothing but process-local facts, and it is what stops
-        # a re-derived exit from paying for a PR read on every reconciliation
-        # once a rework is already queued or running.
+        # Everything decidable for free is decided first, and decided by the
+        # cycle owner rather than re-implemented here. The board issue this
+        # exit carries is already in hand, so its labels cost nothing — and
+        # this is what stops a re-derived exit from paying a search-API read on
+        # every reconciliation for a refusal it will make forever.
         held = self._budget.already_held(
             issue_number,
             queued_issue_numbers=self._claimed_issue_numbers(),
             active_issue_numbers=self._active_issue_numbers(),
+            issue_labels=list(issue.labels),
         )
         if held is not None:
             return _refused(issue_number, held)
-
-        pr = get_open_pr_for_issue(self._pull_requests, issue_number)
-        if pr is None:
-            # The non-PR-backed exit. It is not this producer's case: with no
-            # open PR there is no lineage to correct, and #195's own no-PR
-            # recovery path is the owner of what happens next. Behaviour there
-            # is unchanged precisely because nothing is filed here.
-            return ContinuationHandoffOutcome(
-                issue_number=issue_number,
-                verdict=ReworkAdmissionVerdict.SKIP,
-                reason="no_open_pr",
-            )
 
         agent_type = issue.agent_type
         if not agent_type:
             # The same refusal the ordinary scanner makes, for the same reason:
             # a rework has to be launched as some agent, and guessing one would
-            # run the wrong prompt against a real PR.
-            logger.warning(
-                "[CONTINUATION] issue #%d exits to rework but carries no agent "
-                "label; PR #%d left for the ordinary lane",
+            # run the wrong prompt against a real PR. Asked before the PR read
+            # because the answer is on the issue, not the PR.
+            return self._strand(
                 issue_number,
-                pr.number,
+                "no_agent_label",
+                "[CONTINUATION] issue #%d exits to rework but carries no agent "
+                "label; left for the ordinary lane",
             )
+
+        # The non-PR-backed exit. It is not this producer's case: with no open
+        # PR there is no lineage to correct, and #195's own no-PR recovery path
+        # is the owner of what happens next. Behaviour there is unchanged
+        # precisely because nothing is filed here.
+        if self._no_open_pr_is_settled(exit_):
             return ContinuationHandoffOutcome(
                 issue_number=issue_number,
                 verdict=ReworkAdmissionVerdict.SKIP,
-                reason="no_agent_label",
-                pr_number=pr.number,
+                reason="no_open_pr",
+            )
+        pr = get_open_pr_for_issue(self._pull_requests, issue_number)
+        if pr is None:
+            self._settle_without_pr(exit_)
+            return self._strand(
+                issue_number,
+                "no_open_pr",
+                "[CONTINUATION] issue #%d exits to rework but has no open PR; "
+                "left for the no-PR recovery path",
             )
 
         admission = self._budget.admit(
@@ -276,29 +301,81 @@ class ContinuationReworkHandoff:
         )
 
     def _claimed_issue_numbers(self) -> set[int]:
-        """Issues a rework is already queued or discovered for.
+        """Issues already spoken for, asked of the collection's own owner.
 
-        Both collections, because they are the same claim at two ages: the
-        planner has not yet turned this tick's discovered facts into pending
-        ones, and a second reconciliation inside the same tick would otherwise
-        file a duplicate for a candidate it just filed one for.
+        ``superseding_context`` because this producer holds the publication
+        failure's evidence and the ordinary label sweep does not. A context-free
+        fact the sweep filed earlier in the same tick is not a claim to yield
+        to — it is one this handoff's fact replaces on the way in — and yielding
+        to it would make the correction context's survival depend on which
+        entry point ran first.
         """
-        claimed: set[int] = set()
-        for pending in self._state.pending_reworks:
-            issue_number = pending.resolve_issue_number()
-            if issue_number is not None:
-                claimed.add(issue_number)
-        claimed.update(
-            discovered.issue_number for discovered in self._state.discovered_reworks
-        )
-        claimed.update(
-            escalation.issue_number
-            for escalation in self._state.discovered_escalations
-        )
-        return claimed
+        return self._state.issues_with_claimed_rework(superseding_context=True)
 
     def _active_issue_numbers(self) -> set[int]:
         return {session.issue.number for session in self._state.active_sessions}
+
+    @staticmethod
+    def _exit_identity(exit_: "ContinuationReworkExit") -> tuple[int, str]:
+        return (exit_.issue.number, exit_.attempt.key.head_sha)
+
+    def _no_open_pr_is_settled(self, exit_: "ContinuationReworkExit") -> bool:
+        """Whether "this candidate has no open PR" is already established.
+
+        The one negative answer worth remembering. ``AdapterCache`` caches only
+        positive PR answers, so an issue with no open PR is a full
+        ``get_prs_for_issue`` search — on a 30 req/min budget — every time the
+        exit is re-derived, which is every reconciliation, forever, for a
+        refusal that records nothing and changes nothing.
+
+        The memo is keyed by the candidate, not the issue, and that is what
+        bounds it. A PR appearing for this issue means a session ran, which
+        means the issue was in ``active_sessions`` while it ran (refused above,
+        never reaching here) and a NEWER attempt was recorded when it finished
+        — a different SHA, a different key, and a fresh read. Entries for exits
+        this engine no longer derives are dropped by
+        :meth:`_forget_exits_no_longer_derived`, so the memo never outgrows the
+        set of candidates currently sitting in the exit.
+        """
+        return self._exit_identity(exit_) in self._settled_without_pr
+
+    def _settle_without_pr(self, exit_: "ContinuationReworkExit") -> None:
+        self._settled_without_pr.add(self._exit_identity(exit_))
+
+    def _forget_exits_no_longer_derived(
+        self, exits: Sequence["ContinuationReworkExit"]
+    ) -> None:
+        """Drop memos for candidates this pass no longer sees in the exit."""
+        self._settled_without_pr.intersection_update(
+            self._exit_identity(exit_) for exit_ in exits
+        )
+
+    def _strand(
+        self, issue_number: int, reason: str, log_message: str
+    ) -> ContinuationHandoffOutcome:
+        """Refuse an exit in a way that leaves the candidate for a human.
+
+        ``no_open_pr`` and ``no_agent_label`` are the two refusals nothing
+        downstream retries: the candidate sits until somebody looks. So they
+        are published as well as logged — a UI that could only read the log
+        text would be parsing it, which this repo's events-vs-logs rule forbids.
+        """
+        logger.warning(log_message, issue_number)
+        self._events.publish(
+            make_trace_event(
+                EventName.REWORK_SKIPPED,
+                {
+                    "reason": reason,
+                    "issue_number": issue_number,
+                    "source": CONTINUATION_EXIT_SOURCE,
+                },
+            )
+        )
+        return ContinuationHandoffOutcome(
+            issue_number=issue_number,
+            verdict=ReworkAdmissionVerdict.SKIP,
+            reason=reason,
+        )
 
 
 def _refused(
@@ -354,7 +431,16 @@ def build_continuation_rework_feedback(
             "- Publication gate: no verdict was recorded for this commit."
         )
     lines.append(
-        f"- Failure evidence: {attempt.validation_record_path}"
+        # Named as possibly-gone rather than offered as a path to open. The
+        # record lives in the session directory inside the CODER's worktree
+        # (``domain.attempt``), and by the time a rework cycle launches that
+        # worktree may have been reaped. The durable half of the evidence — the
+        # command, the verdict, the suite and the profile — is on the receipt
+        # above, so an agent told the file may be gone knows to stop there
+        # rather than hunt for it.
+        f"- Failure evidence (recorded at {attempt.validation_record_path}; "
+        "the worktree it was written in may since have been reaped, in which "
+        "case the receipt above is the whole record)."
         if attempt.validation_record_path
         else "- Failure evidence: no validation record path was recorded."
     )

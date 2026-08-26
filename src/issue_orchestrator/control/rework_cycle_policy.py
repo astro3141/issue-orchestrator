@@ -108,19 +108,46 @@ class ReworkCycleBudget:
         *,
         queued_issue_numbers: Sequence[int] | frozenset[int] | set[int],
         active_issue_numbers: Sequence[int] | frozenset[int] | set[int],
+        pr_labels: Sequence[str] | None = None,
+        issue_labels: Sequence[str] | None = None,
     ) -> ReworkAdmission | None:
-        """The refusals that need no knowledge of the PR, or ``None``.
+        """Every refusal decidable from what the caller ALREADY holds, or ``None``.
 
-        Split out so a caller that must pay for the PR read can ask the cheap
-        half first, and so it asks it of THIS owner rather than re-implementing
-        "already queued" beside it. :meth:`admit` asks the same question in the
-        same order, so the split changes when the answer is known, never what
-        it is.
+        Split out so a caller that must pay a GitHub read to complete the
+        picture can first ask what it can answer for free — and so it asks it
+        of THIS owner rather than re-implementing "already queued" beside it.
+        :meth:`admit` reaches the same refusals in the same order by delegating
+        here, so the split changes when an answer is known, never what it is.
+
+        ``None`` for a label set means "not read", which is deliberately
+        distinct from "read and empty": the owner then skips that side's
+        refusal rather than answering it from ignorance. Both callers hold one
+        side for free — the scanner found the PR by label, the handoff is
+        holding a board issue — so passing the free side here is what keeps a
+        refusal from costing a read.
+
+        The one thing partial knowledge changes is which side gets NAMED when
+        both are blocked: a caller that knows only the issue's labels reports
+        ``issue_blocked`` where a caller holding both would have reported
+        ``blocking_label``. The verdict is ``SKIP`` either way, and naming the
+        side that was actually read is the honest report.
         """
         if issue_number in queued_issue_numbers:
             return self._refuse(issue_number, 0, "already_queued")
         if issue_number in active_issue_numbers:
             return self._refuse(issue_number, 0, "active_session")
+        # Unknown PR labels mean an unknown cycle. Reported as 0 for the same
+        # reason the two refusals above report 0: it is "not read", not "one".
+        cycle = 0 if pr_labels is None else self.next_cycle(pr_labels)
+        # One refusal, asked of whichever sides the caller actually read, in
+        # the order this owner has always asked them: the PR's own state first,
+        # then the issue's. A side that was not read is skipped, not answered.
+        for side, reason in ((pr_labels, "blocking_label"), (issue_labels, "issue_blocked")):
+            if side is None:
+                continue
+            blocking = self._lm.get_blocking(side)
+            if blocking:
+                return self._refuse(issue_number, cycle, reason, blocking=blocking)
         return None
 
     def admit(
@@ -145,24 +172,12 @@ class ReworkCycleBudget:
             issue_number,
             queued_issue_numbers=queued_issue_numbers,
             active_issue_numbers=active_issue_numbers,
+            pr_labels=pr_labels,
+            issue_labels=issue_labels,
         )
         if held is not None:
             return held
         cycle = self.next_cycle(pr_labels)
-        if self._lm.is_blocking_any(pr_labels):
-            return self._refuse(
-                issue_number,
-                cycle,
-                "blocking_label",
-                blocking=self._lm.get_blocking(pr_labels),
-            )
-        if self._lm.is_blocking_any(issue_labels):
-            return self._refuse(
-                issue_number,
-                cycle,
-                "issue_blocked",
-                blocking=self._lm.get_blocking(issue_labels),
-            )
         if cycle > self._max_rework_cycles:
             return ReworkAdmission(
                 verdict=ReworkAdmissionVerdict.ESCALATE,

@@ -175,3 +175,110 @@ class TestTheCheapHalfAgreesWithTheWholeDecision:
             )
             is None
         )
+
+
+class TestARefusalCostsOnlyWhatTheCallerAlreadyHolds:
+    """Whichever label set a caller has for free settles what it can settle.
+
+    Both callers hold one side without paying for it — the sweep found the PR by
+    label, the handoff arrives holding a board issue — and every refusal that
+    side can reach must be reachable before the other side is read.
+    """
+
+    def test_a_blocking_pr_label_alone_refuses(
+        self, budget: ReworkCycleBudget
+    ) -> None:
+        held = budget.already_held(
+            ISSUE_NUMBER,
+            queued_issue_numbers=set(),
+            active_issue_numbers=set(),
+            pr_labels=["needs-rework", "needs-human"],
+        )
+
+        assert held is not None
+        assert held.reason == "blocking_label"
+        assert held.verdict is ReworkAdmissionVerdict.SKIP
+        assert held.blocking_labels == ("needs-human",)
+
+    def test_a_blocking_issue_label_alone_refuses(
+        self, budget: ReworkCycleBudget
+    ) -> None:
+        held = budget.already_held(
+            ISSUE_NUMBER,
+            queued_issue_numbers=set(),
+            active_issue_numbers=set(),
+            issue_labels=["agent:backend", "needs-human"],
+        )
+
+        assert held is not None
+        assert held.reason == "issue_blocked"
+
+    def test_an_unread_label_set_is_not_an_empty_one(
+        self, budget: ReworkCycleBudget
+    ) -> None:
+        """``None`` must skip that side's refusal, not answer it as "clean"."""
+        assert (
+            budget.already_held(
+                ISSUE_NUMBER,
+                queued_issue_numbers=set(),
+                active_issue_numbers=set(),
+                pr_labels=None,
+                issue_labels=None,
+            )
+            is None
+        )
+
+    def test_an_unread_pr_reports_an_unknown_cycle_not_the_first(
+        self, budget: ReworkCycleBudget
+    ) -> None:
+        held = budget.already_held(
+            ISSUE_NUMBER,
+            queued_issue_numbers=set(),
+            active_issue_numbers=set(),
+            issue_labels=["needs-human"],
+        )
+
+        assert held is not None
+        assert held.rework_cycle == 0
+
+    def test_a_caller_holding_the_pr_still_reports_the_cycle_it_refused(
+        self, budget: ReworkCycleBudget
+    ) -> None:
+        held = budget.already_held(
+            ISSUE_NUMBER,
+            queued_issue_numbers=set(),
+            active_issue_numbers=set(),
+            pr_labels=["rework-cycle-2", "needs-human"],
+        )
+
+        assert held is not None
+        assert held.rework_cycle == 3
+
+    @pytest.mark.parametrize(
+        ("pr_labels", "issue_labels"),
+        [
+            (["needs-human"], []),
+            ([], ["needs-human"]),
+            (["rework-cycle-2"], []),
+            ([], []),
+        ],
+    )
+    def test_the_full_picture_still_answers_exactly_as_admit_does(
+        self,
+        budget: ReworkCycleBudget,
+        pr_labels: list[str],
+        issue_labels: list[str],
+    ) -> None:
+        held = budget.already_held(
+            ISSUE_NUMBER,
+            queued_issue_numbers=set(),
+            active_issue_numbers=set(),
+            pr_labels=pr_labels,
+            issue_labels=issue_labels,
+        )
+        whole = _admit(budget, pr_labels=pr_labels, issue_labels=issue_labels)
+
+        if held is None:
+            assert whole.verdict is not ReworkAdmissionVerdict.SKIP
+        else:
+            assert held == whole

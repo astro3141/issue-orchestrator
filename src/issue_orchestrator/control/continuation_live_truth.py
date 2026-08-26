@@ -55,6 +55,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from ..ports.attempt_store import AttemptStore
     from ..ports.issue import Issue
     from .continuation_in_flight import ContinuationsInFlight
+    from .continuation_rework_handoff import ContinuationHandoffResult
     from .continuation_runs import ContinuationRuns
 
 logger = logging.getLogger(__name__)
@@ -142,6 +143,12 @@ class ContinuationReconciliation:
     #: ``exclusions`` is the projection that was already standing rather than a
     #: fresh one, and ``operations`` is empty — ignorance, not "nothing is live".
     readable: bool = True
+    #: What the rework handoff decided about every exit this pass derived
+    #: (#297), including the refusals. Carried here rather than discarded at
+    #: the call site so a caller of ``reconcile`` can see that the handoff ran
+    #: and what it produced; the refusals that strand a candidate are also
+    #: published as events, because a log line is not something the UI may read.
+    rework_handoff: "ContinuationHandoffResult | None" = None
 
     @property
     def keys(self) -> tuple[ControlOperationKey, ...]:
