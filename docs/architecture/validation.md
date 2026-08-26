@@ -339,10 +339,21 @@ Three properties are the whole design:
   share a stem, and a reader holding the receipt can find the explanation
   without following a pointer. There is no pointer by design; see below.
 - **Diagnostic, never authority.** Nothing points at it from the attempt
-  record, and no predicate takes its path or its existence as input.
-  `Attempt.completed_evaluations` remains the only thing that decides what the
-  gate decided. A losing gate run must not be able to write anything that
-  admits work.
+  record, and nothing reads it to decide what the gate DECIDED.
+  `Attempt.completed_evaluations` remains the only thing that decides that. A
+  losing gate run must not be able to write anything that admits work.
+
+There is exactly one reader, `CandidateGateDiagnostics.latest_failure`, added by
+[#297] so the rework handed a failed publish candidate back carries the actual
+failing test rather than a pointer into a reaped worktree. It finds the newest
+bundle filed under `(issue, HEAD_SHA, suite)` — by name, because there is still
+no pointer — re-checks the bundle's own receipt against the candidate and the
+contract asked for, and returns the tail of each stream together with the
+directory holding the whole of it. The read is **monotone in the refusing
+direction**: finding a bundle authorizes nothing the receipt did not already
+authorize, and failing to find one can only refuse a handoff everything else
+admitted. So a hand-planted artefact still makes no work happen, and a deleted
+one strands the candidate loudly instead of degrading the correction.
 
 A pass writes no such artefact — its output stays where every passing run's
 output has always stayed — and the trigger is the *verdict* rather than the exit
@@ -535,9 +546,25 @@ number and the ceiling come from `control/rework_cycle_policy.py`, the single
 rework-cycle owner `PRScanner` now decides through as well. What the handoff
 adds is assembly: it files a `DiscoveredRework` (or a `DiscoveredEscalation`
 when the ceiling is passed) carrying the failed candidate's SHA, the publish
-gate's command and verdict, the durable evidence path and the intent the agent
-recorded — so the correction needs no human relay — and the planner turns that
-fact into the same `QueueReworkAction` the ordinary lane produces.
+gate's command and verdict, the intent the agent recorded, and the gate's own
+failing output — so the correction needs no human relay — and the planner turns
+that fact into the same `QueueReworkAction` the ordinary lane produces.
+
+The output is the part that has to survive cleanup, and the receipt deliberately
+carries none. `Attempt.validation_record_path` is no help either: it points into
+the coder's run directory, inside a worktree that is usually already reaped by
+the time an exit is derived. So the handoff resolves [#94]'s durable bundle for
+that exact `(issue, SHA, suite)` through its owner and copies the failing output
+into the correction context, with the bundle's path for the rest of the log.
+`Attempt.publication_refusal` is what says an explanation is owed — a receipt in
+which the publication contract refused this candidate — so an exit that reached
+rework by another route (a reviewer asking for changes on a commit that passed)
+owes nothing here and is not held to it. When an explanation IS owed and none
+can be resolved, the handoff **strands the candidate** — `rework.skipped` with
+reason `missing_failure_evidence` — rather than queueing a cycle whose prompt
+would say "publication failed, go and find out why". That prompt is the human
+relay [#297] exists to remove, and spending a rework cycle on it arrives back at
+the same place one cycle poorer.
 
 The transition is `continuation -> ordinary rework on the same PR lineage`,
 never `continuation -> issue release`: [#195]'s PR-backed shield is untouched,
@@ -566,9 +593,13 @@ claimed?" through `OrchestratorState.issues_with_claimed_rework`. Which fact
 survives is decided by content rather than arrival order — the steady-state
 refresh sweeps before it hydrates and startup hydrates before it sweeps, so a
 fact carrying correction context supersedes one that does not, and nothing
-supersedes a fact that already carries it. The two refusals that strand a
-candidate with nothing downstream to retry it, `no_open_pr` and
-`no_agent_label`, are published as `rework.skipped` rather than only logged.
+supersedes a fact that already carries it. The three refusals that strand a
+candidate with nothing downstream to retry it — `no_open_pr`, `no_agent_label`
+and `missing_failure_evidence` — are published as `rework.skipped` rather than
+only logged. The third is asked before the PR read as well: #94 writes at
+gate-execution time, so a bundle absent now was never written and never will be,
+and re-searching GitHub for a candidate refused forever would cost one API call
+per reconciliation for the rest of its life.
 
 `control/continuation_scheduling.py` is the one hydration path: it derives,
 reconciles, publishes, advances what this engine owns, admits the rework its

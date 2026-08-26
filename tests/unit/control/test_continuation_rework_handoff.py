@@ -6,9 +6,19 @@ caller of the owner sees directly: every exit produces a stated outcome
 including the refusals, and the correction context is COPIED from durable
 records rather than re-derived — a handoff that reported only its admissions
 would be indistinguishable from the pre-#297 engine that reported nothing.
+
+The evidence half is proved against the REAL #94 store on a real filesystem,
+never a double. Acceptance 3 requires that a rework launched after the failed
+candidate's worktree is gone still receive the failing output, and a double
+standing in for the store would prove only that this module can be handed a
+value — which is exactly what a session-local ``record_path`` also does, right
+up to the moment somebody tries to read it.
 """
 
 from __future__ import annotations
+
+import shutil
+from pathlib import Path
 
 import pytest
 
@@ -21,11 +31,20 @@ from issue_orchestrator.control.continuation_rework_handoff import (
     ContinuationReworkHandoff,
     build_continuation_rework_feedback,
 )
+from issue_orchestrator.control.gate_failure_diagnostics import (
+    FAILURE_LOG_TAIL_BYTES,
+    STDERR_FILE_NAME,
+    STDOUT_FILE_NAME,
+    DurableGateFailure,
+    GateFailureDiagnostics,
+    GateFailureOutput,
+)
 from issue_orchestrator.control.label_manager import LabelManager
 from issue_orchestrator.control.rework_cycle_policy import (
     ReworkAdmissionVerdict,
     ReworkCycleBudget,
 )
+from issue_orchestrator.control.validation import VALIDATION_SCHEMA_VERSION
 from issue_orchestrator.domain.attempt import Attempt, AttemptKey
 from issue_orchestrator.domain.continuation_descriptor import ContinuationDescriptor
 from issue_orchestrator.domain.continuation_phase import ContinuationPhase
@@ -45,13 +64,25 @@ from issue_orchestrator.domain.validation_verdict_receipt import (
 )
 from issue_orchestrator.infra.config import Config
 from issue_orchestrator.ports.pull_request_tracker import PRInfo
+from issue_orchestrator.ports.session_output import ValidationRecord
 
 REPO = "owner/repo"
 ISSUE_NUMBER = 297
 SHA = "c" * 40
+OTHER_SHA = "d" * 40
 PUBLISH_COMMAND = "make validate-pr-raw"
 PROFILE = "default"
-RECORD_PATH = ".issue-orchestrator/sessions/run-7/validation-record.json"
+PUBLISH_SUITE = ValidationGateKind.PUBLISH.suite
+QUICK_SUITE = ValidationGateKind.QUICK.suite
+
+#: The session-local pointer the attempt carries. It lives inside the CODER's
+#: worktree, which is what makes it worthless once the worktree is reaped.
+RUN_RECORD_RELATIVE = ".issue-orchestrator/sessions/run-7/validation-record.json"
+
+#: The failing output a correction agent has to be handed. Two streams, because
+#: a failure explained only by its stdout is one whose traceback was elsewhere.
+FAILING_STDOUT = "FAILED tests/unit/test_widget.py::test_it - AssertionError: boom"
+FAILING_STDERR = "make: *** [validate-pr-raw] Error 1"
 
 
 class StubPullRequests:
@@ -120,8 +151,9 @@ def _pr(*, labels: list[str] | None = None) -> PRInfo:
 def _attempt(
     *,
     with_descriptor: bool = True,
-    record: str | None = RECORD_PATH,
+    record: str | None = RUN_RECORD_RELATIVE,
     sha: str = SHA,
+    publication_passed: bool = False,
 ) -> Attempt:
     issue = _issue()
     attempt = Attempt(
@@ -129,9 +161,13 @@ def _attempt(
         validation_record_path=record,
         completed_evaluations=(
             ValidationVerdictReceipt(
-                suite=ValidationGateKind.PUBLISH.suite,
+                suite=PUBLISH_SUITE,
                 head_sha=sha,
-                verdict=ValidationVerdict.FAILED,
+                verdict=(
+                    ValidationVerdict.PASSED
+                    if publication_passed
+                    else ValidationVerdict.FAILED
+                ),
                 command=PUBLISH_COMMAND,
                 profile=PROFILE,
             ),
@@ -145,19 +181,23 @@ def _attempt(
             requested_actions=(RequestedAction.CREATE_PR,),
             implementation="what the agent claimed to build",
             problems="the publish gate refused it",
-            suite=ValidationGateKind.PUBLISH.suite,
+            suite=PUBLISH_SUITE,
             command=PUBLISH_COMMAND,
             profile=PROFILE,
         )
     )
 
 
-def _exit(issue: Issue, attempt: Attempt) -> ContinuationReworkExit:
+def _exit(
+    issue: Issue,
+    attempt: Attempt,
+    phase: ContinuationPhase = ContinuationPhase.EXHAUSTED,
+) -> ContinuationReworkExit:
     return ContinuationReworkExit(
         key=ControlOperationKey(issue.key, attempt.key.head_sha, CONTINUATION_KIND),
         issue=issue,
         attempt=attempt,
-        phase=ContinuationPhase.EXHAUSTED,
+        phase=phase,
     )
 
 
@@ -199,7 +239,94 @@ class RecordingEvents:
         return [str(data.get("reason")) for _, data in self.published]
 
 
+# ---------------------------------------------------------------------------
+# The durable #94 store, exercised for real
+# ---------------------------------------------------------------------------
+
+
+def _validation_record(
+    *, sha: str = SHA, suite: str = PUBLISH_SUITE, run_dir: Path | None = None
+) -> ValidationRecord:
+    """A failed gate run, as the gate itself would have recorded it.
+
+    ``run_dir`` is where the run wrote its own copy — inside the coder worktree,
+    which is exactly what the durable store exists because of.
+    """
+    stdout_path = (
+        str(run_dir / STDOUT_FILE_NAME) if run_dir is not None else RUN_RECORD_RELATIVE
+    )
+    stderr_path = (
+        str(run_dir / STDERR_FILE_NAME) if run_dir is not None else RUN_RECORD_RELATIVE
+    )
+    return ValidationRecord(
+        schema_version=VALIDATION_SCHEMA_VERSION,
+        suite=suite,
+        head_sha=sha,
+        passed=False,
+        exit_code=1,
+        command=PUBLISH_COMMAND,
+        started_at="2026-08-26T00:00:00+00:00",
+        ended_at="2026-08-26T00:11:00+00:00",
+        timed_out=False,
+        stdout_path=stdout_path,
+        stderr_path=stderr_path,
+        profile=PROFILE,
+    )
+
+
+def _file_failure(
+    repo_root: Path,
+    *,
+    sha: str = SHA,
+    suite: str = PUBLISH_SUITE,
+    stdout: str = FAILING_STDOUT,
+    stderr: str = FAILING_STDERR,
+    run_dir: Path | None = None,
+) -> Path:
+    """File a failed gate's output through the real #94 writer."""
+    written = (
+        GateFailureDiagnostics(repo_root)
+        .for_candidate(_issue().key)
+        .record_failure(
+            GateFailureOutput(
+                record=_validation_record(sha=sha, suite=suite, run_dir=run_dir),
+                stdout=stdout,
+                stderr=stderr,
+            )
+        )
+    )
+    assert written is not None
+    return written
+
+
+def _resolved_failure(repo_root: Path, *, sha: str = SHA) -> DurableGateFailure:
+    """What the handoff resolves, read back through the store's own reader."""
+    failure = (
+        GateFailureDiagnostics(repo_root)
+        .for_candidate(_issue().key)
+        .latest_failure(head_sha=sha, suite=PUBLISH_SUITE)
+    )
+    assert failure is not None
+    return failure
+
+
+@pytest.fixture
+def unexplained_root(tmp_path: Path) -> Path:
+    """A primary checkout in which no failure output was ever kept."""
+    root = tmp_path / "primary-checkout"
+    root.mkdir()
+    return root
+
+
+@pytest.fixture
+def repo_root(unexplained_root: Path) -> Path:
+    """A primary checkout holding the failed candidate's durable explanation."""
+    _file_failure(unexplained_root)
+    return unexplained_root
+
+
 def _handoff(
+    repo_root: Path,
     state: OrchestratorState,
     pull_requests: StubPullRequests,
     events: RecordingEvents | None = None,
@@ -211,14 +338,17 @@ def _handoff(
         budget=ReworkCycleBudget(
             LabelManager(config), max_rework_cycles=config.max_rework_cycles
         ),
+        diagnostics=GateFailureDiagnostics(repo_root),
         events=events if events is not None else RecordingEvents(),  # type: ignore[arg-type]
     )
 
 
 class TestEveryExitProducesAStatedOutcome:
-    def test_an_admitted_exit_reports_the_pr_and_the_cycle(self) -> None:
+    def test_an_admitted_exit_reports_the_pr_and_the_cycle(
+        self, repo_root: Path
+    ) -> None:
         state = OrchestratorState()
-        handoff = _handoff(state, StubPullRequests({ISSUE_NUMBER: _pr()}))
+        handoff = _handoff(repo_root, state, StubPullRequests({ISSUE_NUMBER: _pr()}))
 
         result = handoff.admit([_exit(_issue(), _attempt())])
 
@@ -229,28 +359,31 @@ class TestEveryExitProducesAStatedOutcome:
         assert outcome.rework_cycle == 1
         assert result.admitted_issue_numbers == (ISSUE_NUMBER,)
 
-    def test_a_candidate_with_no_open_pr_says_so(self) -> None:
+    def test_a_candidate_with_no_open_pr_says_so(self, repo_root: Path) -> None:
         state = OrchestratorState()
-        handoff = _handoff(state, StubPullRequests())
+        handoff = _handoff(repo_root, state, StubPullRequests())
 
         result = handoff.admit([_exit(_issue(), _attempt())])
 
         assert result.reworks == ()
         assert result.outcomes[0].reason == "no_open_pr"
 
-    def test_a_candidate_with_no_agent_label_says_so(self) -> None:
+    def test_a_candidate_with_no_agent_label_says_so(self, repo_root: Path) -> None:
         state = OrchestratorState()
-        handoff = _handoff(state, StubPullRequests({ISSUE_NUMBER: _pr()}))
+        handoff = _handoff(repo_root, state, StubPullRequests({ISSUE_NUMBER: _pr()}))
 
         result = handoff.admit([_exit(_issue("some-other-label"), _attempt())])
 
         assert result.reworks == ()
         assert result.outcomes[0].reason == "no_agent_label"
 
-    def test_an_escalated_exit_reports_the_cycle_it_could_not_take(self) -> None:
+    def test_an_escalated_exit_reports_the_cycle_it_could_not_take(
+        self, repo_root: Path
+    ) -> None:
         state = OrchestratorState()
         config = Config()
         handoff = _handoff(
+            repo_root,
             state,
             StubPullRequests(
                 {ISSUE_NUMBER: _pr(labels=[f"rework-cycle-{config.max_rework_cycles}"])}
@@ -264,8 +397,10 @@ class TestEveryExitProducesAStatedOutcome:
         assert result.outcomes[0].verdict is ReworkAdmissionVerdict.ESCALATE
         assert result.outcomes[0].rework_cycle == config.max_rework_cycles + 1
 
-    def test_no_exits_asks_nothing_of_anybody(self) -> None:
-        handoff = _handoff(OrchestratorState(), UnreachablePullRequests())
+    def test_no_exits_asks_nothing_of_anybody(self, repo_root: Path) -> None:
+        handoff = _handoff(
+            repo_root, OrchestratorState(), UnreachablePullRequests()
+        )
 
         result = handoff.admit([])
 
@@ -273,9 +408,11 @@ class TestEveryExitProducesAStatedOutcome:
         assert result.reworks == ()
         assert result.escalations == ()
 
-    def test_a_held_issue_refuses_before_github_is_reached(self) -> None:
+    def test_a_held_issue_refuses_before_github_is_reached(
+        self, repo_root: Path
+    ) -> None:
         state = OrchestratorState()
-        handoff = _handoff(state, UnreachablePullRequests())
+        handoff = _handoff(repo_root, state, UnreachablePullRequests())
         assert state.record_discovered_rework(_handoff_fact())
 
         result = handoff.admit([_exit(_issue(), _attempt())])
@@ -288,13 +425,18 @@ class TestNoRefusalCostsAGitHubRead:
     """F1: every refusal the exit's own facts can settle is settled for free.
 
     The board issue arrives with the exit, so its blocking labels and its agent
-    label cost nothing to consult. Reaching the PR port to answer from them
-    would be one search-API call per reconciliation, forever, for a candidate
-    that is refused every time.
+    label cost nothing to consult, and #94's store is on the same filesystem as
+    the engine. Reaching the PR port to answer from any of them would be one
+    search-API call per reconciliation, forever, for a candidate that is refused
+    every time.
     """
 
-    def test_a_blocked_issue_refuses_before_the_pr_is_read(self) -> None:
-        handoff = _handoff(OrchestratorState(), UnreachablePullRequests())
+    def test_a_blocked_issue_refuses_before_the_pr_is_read(
+        self, repo_root: Path
+    ) -> None:
+        handoff = _handoff(
+            repo_root, OrchestratorState(), UnreachablePullRequests()
+        )
 
         result = handoff.admit(
             [_exit(_issue("agent:backend", "needs-human"), _attempt())]
@@ -303,17 +445,41 @@ class TestNoRefusalCostsAGitHubRead:
         assert result.reworks == ()
         assert result.outcomes[0].reason == "issue_blocked"
 
-    def test_a_missing_agent_label_refuses_before_the_pr_is_read(self) -> None:
-        handoff = _handoff(OrchestratorState(), UnreachablePullRequests())
+    def test_a_missing_agent_label_refuses_before_the_pr_is_read(
+        self, repo_root: Path
+    ) -> None:
+        handoff = _handoff(
+            repo_root, OrchestratorState(), UnreachablePullRequests()
+        )
 
         result = handoff.admit([_exit(_issue("some-other-label"), _attempt())])
 
         assert result.reworks == ()
         assert result.outcomes[0].reason == "no_agent_label"
 
-    def test_a_settled_absence_of_a_pr_is_not_searched_for_again(self) -> None:
+    def test_unexplainable_failure_refuses_before_the_pr_is_read(
+        self, unexplained_root: Path
+    ) -> None:
+        """The refusal is permanent, so it must never cost an API call.
+
+        #94 writes at gate-execution time: a bundle absent now was never
+        written, and re-deriving this exit on every reconciliation for the rest
+        of the candidate's life must not re-search GitHub each time.
+        """
+        handoff = _handoff(
+            unexplained_root, OrchestratorState(), UnreachablePullRequests()
+        )
+
+        result = handoff.admit([_exit(_issue(), _attempt())])
+
+        assert result.reworks == ()
+        assert result.outcomes[0].reason == "missing_failure_evidence"
+
+    def test_a_settled_absence_of_a_pr_is_not_searched_for_again(
+        self, repo_root: Path
+    ) -> None:
         pull_requests = CountingPullRequests()
-        handoff = _handoff(OrchestratorState(), pull_requests)
+        handoff = _handoff(repo_root, OrchestratorState(), pull_requests)
         exit_ = _exit(_issue(), _attempt())
 
         for _ in range(4):
@@ -322,18 +488,21 @@ class TestNoRefusalCostsAGitHubRead:
 
         assert pull_requests.reads == 1
 
-    def test_a_newer_candidate_is_searched_for_afresh(self) -> None:
+    def test_a_newer_candidate_is_searched_for_afresh(self, repo_root: Path) -> None:
         pull_requests = CountingPullRequests()
-        handoff = _handoff(OrchestratorState(), pull_requests)
+        handoff = _handoff(repo_root, OrchestratorState(), pull_requests)
+        _file_failure(repo_root, sha=OTHER_SHA)
 
         handoff.admit([_exit(_issue(), _attempt())])
-        handoff.admit([_exit(_issue(), _attempt(sha="d" * 40))])
+        handoff.admit([_exit(_issue(), _attempt(sha=OTHER_SHA))])
 
         assert pull_requests.reads == 2
 
-    def test_an_exit_that_stops_being_derived_is_forgotten(self) -> None:
+    def test_an_exit_that_stops_being_derived_is_forgotten(
+        self, repo_root: Path
+    ) -> None:
         pull_requests = CountingPullRequests()
-        handoff = _handoff(OrchestratorState(), pull_requests)
+        handoff = _handoff(repo_root, OrchestratorState(), pull_requests)
         exit_ = _exit(_issue(), _attempt())
 
         handoff.admit([exit_])
@@ -344,16 +513,21 @@ class TestNoRefusalCostsAGitHubRead:
 
 
 class TestARefusalThatStrandsACandidateIsPublished:
-    """N1: the two refusals nothing downstream retries reach the UI as events.
+    """N1: the refusals nothing downstream retries reach the UI as events.
 
-    A candidate refused for ``no_open_pr`` or ``no_agent_label`` sits until a
-    human looks at it. Per this repo's events-vs-logs rule a UI may not read the
-    log line that says so, so these are published.
+    A candidate refused for ``no_open_pr``, ``no_agent_label`` or
+    ``missing_failure_evidence`` sits until a human looks at it. Per this repo's
+    events-vs-logs rule a UI may not read the log line that says so, so these
+    are published.
     """
 
-    def test_a_stranded_candidate_publishes_its_reason(self) -> None:
+    def test_a_stranded_candidate_publishes_its_reason(
+        self, repo_root: Path
+    ) -> None:
         events = RecordingEvents()
-        handoff = _handoff(OrchestratorState(), StubPullRequests(), events)
+        handoff = _handoff(
+            repo_root, OrchestratorState(), StubPullRequests(), events
+        )
 
         handoff.admit([_exit(_issue(), _attempt())])
 
@@ -368,20 +542,52 @@ class TestARefusalThatStrandsACandidateIsPublished:
             )
         ]
 
-    def test_a_candidate_with_no_agent_label_publishes_too(self) -> None:
+    def test_a_candidate_with_no_agent_label_publishes_too(
+        self, repo_root: Path
+    ) -> None:
         events = RecordingEvents()
         handoff = _handoff(
-            OrchestratorState(), StubPullRequests({ISSUE_NUMBER: _pr()}), events
+            repo_root,
+            OrchestratorState(),
+            StubPullRequests({ISSUE_NUMBER: _pr()}),
+            events,
         )
 
         handoff.admit([_exit(_issue("some-other-label"), _attempt())])
 
         assert events.reasons() == ["no_agent_label"]
 
-    def test_an_admitted_exit_publishes_no_refusal(self) -> None:
+    def test_an_unexplainable_failure_publishes_too(
+        self, unexplained_root: Path
+    ) -> None:
         events = RecordingEvents()
         handoff = _handoff(
-            OrchestratorState(), StubPullRequests({ISSUE_NUMBER: _pr()}), events
+            unexplained_root,
+            OrchestratorState(),
+            StubPullRequests({ISSUE_NUMBER: _pr()}),
+            events,
+        )
+
+        handoff.admit([_exit(_issue(), _attempt())])
+
+        assert events.published == [
+            (
+                EventName.REWORK_SKIPPED.value,
+                {
+                    "reason": "missing_failure_evidence",
+                    "issue_number": ISSUE_NUMBER,
+                    "source": CONTINUATION_EXIT_SOURCE,
+                },
+            )
+        ]
+
+    def test_an_admitted_exit_publishes_no_refusal(self, repo_root: Path) -> None:
+        events = RecordingEvents()
+        handoff = _handoff(
+            repo_root,
+            OrchestratorState(),
+            StubPullRequests({ISSUE_NUMBER: _pr()}),
+            events,
         )
 
         handoff.admit([_exit(_issue(), _attempt())])
@@ -464,10 +670,12 @@ class TestTheCorrectionContextSurvivesEitherOrdering:
 
         assert state.discovered_reworks == [_handoff_fact()]
 
-    def test_the_sweeps_fact_does_not_block_the_handoff_from_filing(self) -> None:
+    def test_the_sweeps_fact_does_not_block_the_handoff_from_filing(
+        self, repo_root: Path
+    ) -> None:
         state = OrchestratorState()
         state.record_discovered_rework(_sweep_fact())
-        handoff = _handoff(state, StubPullRequests({ISSUE_NUMBER: _pr()}))
+        handoff = _handoff(repo_root, state, StubPullRequests({ISSUE_NUMBER: _pr()}))
 
         result = handoff.admit([_exit(_issue(), _attempt())])
 
@@ -475,9 +683,11 @@ class TestTheCorrectionContextSurvivesEitherOrdering:
         assert len(state.discovered_reworks) == 1
         assert state.discovered_reworks[0].source == CONTINUATION_EXIT_SOURCE
 
-    def test_the_handoffs_own_fact_still_blocks_a_second_pass(self) -> None:
+    def test_the_handoffs_own_fact_still_blocks_a_second_pass(
+        self, repo_root: Path
+    ) -> None:
         state = OrchestratorState()
-        handoff = _handoff(state, StubPullRequests({ISSUE_NUMBER: _pr()}))
+        handoff = _handoff(repo_root, state, StubPullRequests({ISSUE_NUMBER: _pr()}))
 
         handoff.admit([_exit(_issue(), _attempt())])
         second = handoff.admit([_exit(_issue(), _attempt())])
@@ -486,12 +696,14 @@ class TestTheCorrectionContextSurvivesEitherOrdering:
         assert second.outcomes[0].reason == "already_queued"
         assert len(state.discovered_reworks) == 1
 
-    def test_an_escalation_is_a_claim_no_later_fact_may_supersede(self) -> None:
+    def test_an_escalation_is_a_claim_no_later_fact_may_supersede(
+        self, repo_root: Path
+    ) -> None:
         state = OrchestratorState()
         state.record_discovered_escalation(
             DiscoveredEscalation(issue_number=ISSUE_NUMBER, pr_number=294, rework_cycle=6)
         )
-        handoff = _handoff(state, UnreachablePullRequests())
+        handoff = _handoff(repo_root, state, UnreachablePullRequests())
 
         result = handoff.admit([_exit(_issue(), _attempt())])
 
@@ -499,63 +711,269 @@ class TestTheCorrectionContextSurvivesEitherOrdering:
         assert result.outcomes[0].reason == "already_queued"
 
 
+class TestThePublicationFailureIsHandedOverWithItsOutput:
+    """Acceptance 3: the next rework gets the actual failure, with no human relay.
+
+    The pre-correction handoff formatted ``Attempt.validation_record_path`` and
+    said it might have been reaped. That tells a corrector THAT publication
+    failed; the thing it must be told is WHAT failed, and after cleanup that
+    lives in exactly one place — #94's durable bundle in the primary checkout.
+    """
+
+    def test_the_failing_output_survives_the_candidates_worktree(
+        self, unexplained_root: Path, tmp_path: Path
+    ) -> None:
+        """The post-cleanup boundary, walked in the order production walks it.
+
+        The gate runs inside a worktree and files its output durably at the same
+        moment. Then ordinary cleanup takes the worktree — with the run
+        directory the attempt's ``validation_record_path`` points at — and only
+        after that does the handoff run.
+        """
+        worktree = tmp_path / "issue-297-worktree"
+        run_dir = worktree / ".issue-orchestrator" / "sessions" / "run-7"
+        run_dir.mkdir(parents=True)
+        (run_dir / STDOUT_FILE_NAME).write_text(FAILING_STDOUT, encoding="utf-8")
+        (run_dir / STDERR_FILE_NAME).write_text(FAILING_STDERR, encoding="utf-8")
+        record_path = run_dir / "validation-record.json"
+        record_path.write_text("{}", encoding="utf-8")
+        bundle = _file_failure(unexplained_root, run_dir=run_dir)
+
+        # Ordinary cleanup. Everything session-local about the failure is gone.
+        shutil.rmtree(worktree)
+        assert not record_path.exists()
+        assert not run_dir.exists()
+
+        state = OrchestratorState()
+        handoff = _handoff(
+            unexplained_root, state, StubPullRequests({ISSUE_NUMBER: _pr()})
+        )
+        result = handoff.admit(
+            [_exit(_issue(), _attempt(record=str(record_path)))]
+        )
+
+        assert result.admitted_issue_numbers == (ISSUE_NUMBER,)
+        feedback = result.reworks[0].feedback
+        assert feedback is not None
+        # The actual failing test and the actual failing command, not a pointer
+        # to somewhere a reader would have to go and find them.
+        assert FAILING_STDOUT in feedback
+        assert FAILING_STDERR in feedback
+        # And where the whole of it still is, in the primary checkout.
+        assert str(bundle) in feedback
+        assert bundle.is_relative_to(unexplained_root)
+        # The dead session-local pointer is not offered as evidence any more.
+        assert str(record_path) not in feedback
+
+    def test_the_failed_sha_and_the_publish_verdict_still_travel(
+        self, repo_root: Path
+    ) -> None:
+        state = OrchestratorState()
+        handoff = _handoff(repo_root, state, StubPullRequests({ISSUE_NUMBER: _pr()}))
+
+        result = handoff.admit([_exit(_issue(), _attempt())])
+
+        feedback = result.reworks[0].feedback
+        assert feedback is not None
+        assert SHA in feedback
+        assert PUBLISH_COMMAND in feedback
+        assert ValidationVerdict.FAILED.value in feedback
+
+    def test_a_failure_nobody_kept_is_not_handed_over_at_all(
+        self, unexplained_root: Path
+    ) -> None:
+        """Fail closed: no evidence, no rework, and the gap is named."""
+        state = OrchestratorState()
+        handoff = _handoff(
+            unexplained_root, state, StubPullRequests({ISSUE_NUMBER: _pr()})
+        )
+
+        result = handoff.admit([_exit(_issue(), _attempt())])
+
+        assert result.reworks == ()
+        assert result.escalations == ()
+        assert state.discovered_reworks == []
+        assert result.outcomes[0].verdict is ReworkAdmissionVerdict.SKIP
+        assert result.outcomes[0].reason == "missing_failure_evidence"
+
+    def test_another_candidates_explanation_does_not_stand_in_for_this_one(
+        self, unexplained_root: Path
+    ) -> None:
+        """A′'s bundle must not be read as A's — the #94 binding, from the read side."""
+        _file_failure(unexplained_root, sha=OTHER_SHA, stdout="A-prime failed there")
+
+        result = _handoff(
+            unexplained_root,
+            OrchestratorState(),
+            StubPullRequests({ISSUE_NUMBER: _pr()}),
+        ).admit([_exit(_issue(), _attempt())])
+
+        assert result.reworks == ()
+        assert result.outcomes[0].reason == "missing_failure_evidence"
+
+    def test_another_contracts_explanation_does_not_stand_in_either(
+        self, unexplained_root: Path
+    ) -> None:
+        """The quick gate's failure is not the publish gate's failure.
+
+        Both can be filed for one candidate, and the suite in the name is what
+        keeps them apart. A publish refusal explained by the quick gate's output
+        would send a corrector after the wrong contract.
+        """
+        _file_failure(
+            unexplained_root, suite=QUICK_SUITE, stdout="the quick gate failed"
+        )
+
+        result = _handoff(
+            unexplained_root,
+            OrchestratorState(),
+            StubPullRequests({ISSUE_NUMBER: _pr()}),
+        ).admit([_exit(_issue(), _attempt())])
+
+        assert result.reworks == ()
+        assert result.outcomes[0].reason == "missing_failure_evidence"
+
+    def test_a_bundle_with_no_output_explains_nothing(
+        self, unexplained_root: Path
+    ) -> None:
+        """It repeats the receipt and adds nothing, which is not evidence."""
+        _file_failure(unexplained_root, stdout="", stderr="   \n")
+
+        result = _handoff(
+            unexplained_root,
+            OrchestratorState(),
+            StubPullRequests({ISSUE_NUMBER: _pr()}),
+        ).admit([_exit(_issue(), _attempt())])
+
+        assert result.reworks == ()
+        assert result.outcomes[0].reason == "missing_failure_evidence"
+
+    def test_the_newest_explanation_is_the_one_handed_over(
+        self, repo_root: Path
+    ) -> None:
+        """A retried publish files one bundle per attempt; the last one is current."""
+        _file_failure(repo_root, stdout="the second reason it failed")
+
+        result = _handoff(
+            repo_root, OrchestratorState(), StubPullRequests({ISSUE_NUMBER: _pr()})
+        ).admit([_exit(_issue(), _attempt())])
+
+        feedback = result.reworks[0].feedback
+        assert feedback is not None
+        assert "the second reason it failed" in feedback
+        assert FAILING_STDOUT not in feedback
+
+    def test_an_exit_whose_publication_never_failed_needs_no_bundle(
+        self, unexplained_root: Path
+    ) -> None:
+        """``EXIT_TO_REWORK`` after a PASS owes no publish-gate explanation.
+
+        The obligation is read off the durable record — a publication receipt
+        that REFUSED this candidate — not off "the phase exits to rework". A
+        reviewer asking for changes on a commit that passed publication has no
+        gate failure to explain, and stranding it would break the exit #149's
+        own predicate declares.
+        """
+        result = _handoff(
+            unexplained_root,
+            OrchestratorState(),
+            StubPullRequests({ISSUE_NUMBER: _pr()}),
+        ).admit(
+            [
+                _exit(
+                    _issue(),
+                    _attempt(publication_passed=True),
+                    ContinuationPhase.EXIT_TO_REWORK,
+                )
+            ]
+        )
+
+        assert result.admitted_issue_numbers == (ISSUE_NUMBER,)
+
+
 class TestTheEvidenceIsCopiedNotDerived:
-    def test_every_correction_fact_appears_verbatim(self) -> None:
+    def test_every_correction_fact_appears_verbatim(self, repo_root: Path) -> None:
         pr = _pr()
         attempt = _attempt()
+        failure = _resolved_failure(repo_root)
 
         feedback = build_continuation_rework_feedback(
-            pr=pr, attempt=attempt, phase_reason=ContinuationPhase.EXHAUSTED.value
+            pr=pr,
+            attempt=attempt,
+            phase_reason=ContinuationPhase.EXHAUSTED.value,
+            failure=failure,
         )
 
         assert SHA in feedback
         assert PUBLISH_COMMAND in feedback
         assert ValidationVerdict.FAILED.value in feedback
-        assert RECORD_PATH in feedback
+        assert str(failure.directory) in feedback
+        assert FAILING_STDOUT in feedback
+        assert FAILING_STDERR in feedback
         assert pr.url in feedback
         assert pr.branch in feedback
         assert "what the agent claimed to build" in feedback
         assert "the publish gate refused it" in feedback
         assert ContinuationPhase.EXHAUSTED.value in feedback
 
-    @pytest.mark.parametrize(
-        ("attempt", "expected"),
-        [
-            (
-                _attempt(record=None),
-                "no validation record path was recorded",
-            ),
-            (
-                _attempt(with_descriptor=False),
-                "what the agent claimed to build",
-            ),
-        ],
-    )
-    def test_absent_evidence_is_never_invented(
-        self, attempt: Attempt, expected: str
-    ) -> None:
+    def test_a_long_log_is_tailed_and_says_so(self, unexplained_root: Path) -> None:
+        """The prompt gets the end of the log, and the path to the rest.
+
+        Truncating silently would hand a corrector a fragment it could not tell
+        was a fragment; the tail is where a test runner names what failed, and
+        the durable path is the way past the bound.
+        """
+        noise = "\n".join(f"line {index}" for index in range(20_000))
+        _file_failure(
+            unexplained_root, stdout=f"{noise}\n{FAILING_STDOUT}"
+        )
+        failure = _resolved_failure(unexplained_root)
+
         feedback = build_continuation_rework_feedback(
-            pr=_pr(), attempt=attempt, phase_reason="exhausted"
+            pr=_pr(),
+            attempt=_attempt(),
+            phase_reason="exhausted",
+            failure=failure,
         )
 
-        if expected.startswith("no "):
-            assert expected in feedback
-        else:
-            assert expected not in feedback
+        assert failure.stdout.truncated is True
+        assert FAILING_STDOUT in feedback
+        assert "line 0\n" not in feedback
+        assert f"last {FAILURE_LOG_TAIL_BYTES} bytes" in feedback
+        assert str(failure.directory) in feedback
 
     def test_a_candidate_with_no_recorded_verdict_says_so(self) -> None:
         issue = _issue()
         bare = Attempt(key=AttemptKey(issue.key, SHA))
 
         feedback = build_continuation_rework_feedback(
-            pr=_pr(), attempt=bare, phase_reason="exhausted"
+            pr=_pr(), attempt=bare, phase_reason="exhausted", failure=None
         )
 
         assert "no verdict was recorded" in feedback
 
-    def test_the_corrector_is_told_not_to_trust_the_failed_commit(self) -> None:
+    def test_an_unrecorded_intent_is_omitted_not_invented(
+        self, repo_root: Path
+    ) -> None:
         feedback = build_continuation_rework_feedback(
-            pr=_pr(), attempt=_attempt(), phase_reason="exhausted"
+            pr=_pr(),
+            attempt=_attempt(with_descriptor=False),
+            phase_reason="exhausted",
+            failure=_resolved_failure(repo_root),
+        )
+
+        assert "what the agent claimed to build" not in feedback
+        # The failure itself is still there; only the agent's own account is not.
+        assert FAILING_STDOUT in feedback
+
+    def test_the_corrector_is_told_not_to_trust_the_failed_commit(
+        self, repo_root: Path
+    ) -> None:
+        feedback = build_continuation_rework_feedback(
+            pr=_pr(),
+            attempt=_attempt(),
+            phase_reason="exhausted",
+            failure=_resolved_failure(repo_root),
         )
 
         assert "Do not treat the failed commit above as validated." in feedback

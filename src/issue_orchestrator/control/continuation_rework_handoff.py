@@ -51,6 +51,21 @@ and a negative answer there is not cached anywhere downstream, so it is
 remembered here per candidate rather than re-searched on every reconciliation
 for the rest of the candidate's life.
 
+**A publication failure is handed over with its own output, or not at all.**
+The receipt says the publish contract refused ``A``, and which command it ran;
+it deliberately carries no output, so a correction agent given only the receipt
+knows publication failed and nothing about *what* failed. The record path on the
+attempt is no better — it points into the coder's run directory, inside a
+worktree ordinary cleanup has usually already reaped, so it resolves to nothing
+at precisely the moment a rework is launched. The durable half exists already:
+#94 files a failed gate's stdout and stderr into the primary checkout at
+gate-execution time, bound to ``(issue, A, suite)``. So this handoff resolves
+that bundle through its owner and copies the failing output into the correction
+context. If the bundle cannot be resolved, the candidate is STRANDED rather than
+handed over: a rework whose prompt says "publication failed, go and find out
+why" is the human relay #297 exists to remove, and refusing it loudly leaves
+exactly one thing for a human to fix instead of an agent to rediscover.
+
 The exit itself is not consumed, and deliberately so: consuming it would be the
 stored continuation state machine the phase predicate exists to avoid. It stops
 being derived when the durable facts change — a newer refused candidate
@@ -73,6 +88,12 @@ from ..domain.models import DiscoveredEscalation, DiscoveredRework
 from ..events import EventName
 from ..ports import make_trace_event
 from .completion_pr_collision import get_open_pr_for_issue
+from .gate_failure_diagnostics import (
+    DIAGNOSTIC_FILE_NAME,
+    FAILURE_LOG_TAIL_BYTES,
+    STDERR_FILE_NAME,
+    STDOUT_FILE_NAME,
+)
 from .rework_cycle_policy import (
     ReworkAdmission,
     ReworkAdmissionVerdict,
@@ -86,6 +107,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from ..ports.pull_request_tracker import PRInfo
     from .completion_pr_collision import CompletionPrAdapter
     from .continuation_live_truth import ContinuationReworkExit
+    from .gate_failure_diagnostics import DurableGateFailure, GateFailureDiagnostics
 
 logger = logging.getLogger(__name__)
 
@@ -116,6 +138,31 @@ class ContinuationHandoffOutcome:
 
 
 @dataclass(frozen=True, slots=True)
+class PublicationFailureEvidence:
+    """What still explains this candidate's publication failure, if it had one.
+
+    Three situations, and only a type can keep them apart without a caller
+    re-deriving them: the candidate's publication was never refused, so there is
+    nothing to explain; it was refused and the durable bundle resolves; it was
+    refused and nothing survives to say why. The third is the only one that
+    refuses a handoff, and :attr:`missing` is the whole predicate — a caller
+    that compared ``failure is None`` would strand every exit that reached
+    rework by a route other than a failed publish contract.
+    """
+
+    #: Whether the durable record says the publication contract refused this
+    #: candidate, and therefore that an explanation is owed.
+    required: bool
+    #: The explanation, when one both is owed and survives.
+    failure: "DurableGateFailure | None" = None
+
+    @property
+    def missing(self) -> bool:
+        """Whether an explanation is owed and none can be produced."""
+        return self.required and self.failure is None
+
+
+@dataclass(frozen=True, slots=True)
 class ContinuationHandoffResult:
     """Everything one handoff pass decided and filed."""
 
@@ -137,6 +184,7 @@ class ContinuationReworkHandoff:
         state: "OrchestratorState",
         pull_requests: "CompletionPrAdapter",
         budget: ReworkCycleBudget,
+        diagnostics: "GateFailureDiagnostics",
         events: "EventSink",
     ) -> None:
         #: The engine's live facts. Held rather than passed per call because
@@ -146,6 +194,11 @@ class ContinuationReworkHandoff:
         self._state = state
         self._pull_requests = pull_requests
         self._budget = budget
+        #: #94's durable failed-gate store, rooted in the PRIMARY checkout. The
+        #: only thing that can still say why a publish contract refused this
+        #: candidate once its worktree is gone, which by the time an exit is
+        #: derived it usually is.
+        self._diagnostics = diagnostics
         #: Refusals that strand a candidate are published, not merely logged.
         #: They are the ones a human has to act on, and per this repo's
         #: events-vs-logs rule the UI cannot react to a ``logger.warning``.
@@ -206,6 +259,23 @@ class ContinuationReworkHandoff:
                 "no_agent_label",
                 "[CONTINUATION] issue #%d exits to rework but carries no agent "
                 "label; left for the ordinary lane",
+            )
+
+        # Asked before the PR read for the same reason the two above are: it is
+        # answered from the primary checkout's own filesystem, costs no API
+        # budget, and a candidate whose failure can never be explained is
+        # refused on every pass for the rest of its life. It is also permanent
+        # in a way the PR answer is not — #94 writes at gate-execution time, so
+        # a bundle that is not there now was never written and never will be —
+        # which is why it needs no memo to stay cheap.
+        evidence = self._durable_failure(exit_)
+        if evidence.missing:
+            return self._strand(
+                issue_number,
+                "missing_failure_evidence",
+                "[CONTINUATION] issue #%d exits to rework after a publication "
+                "failure whose durable output cannot be resolved; refusing to "
+                "hand over a correction nobody can act on",
             )
 
         # The non-PR-backed exit. It is not this producer's case: with no open
@@ -272,7 +342,10 @@ class ContinuationReworkHandoff:
             rework_cycle=admission.rework_cycle,
             source=CONTINUATION_EXIT_SOURCE,
             feedback=build_continuation_rework_feedback(
-                pr=pr, attempt=exit_.attempt, phase_reason=exit_.phase.value
+                pr=pr,
+                attempt=exit_.attempt,
+                phase_reason=exit_.phase.value,
+                failure=evidence.failure,
             ),
         )
         if not self._state.record_discovered_rework(rework):
@@ -299,6 +372,45 @@ class ContinuationReworkHandoff:
             pr_number=pr.number,
             rework_cycle=admission.rework_cycle,
         )
+
+    def _durable_failure(
+        self, exit_: "ContinuationReworkExit"
+    ) -> PublicationFailureEvidence:
+        """Resolve the failure output this exit owes its correction agent.
+
+        The obligation is read off the durable record rather than off the phase
+        name: an exit owes an explanation exactly when its attempt carries a
+        publication receipt that REFUSED it. That is what ``EXHAUSTED`` means,
+        and it is also true of the rarer exit that carries both a failed publish
+        receipt and a ``CHANGES_REQUESTED`` verdict — while an exit that reached
+        rework after a PASS owes nothing here and must not be stranded for it.
+
+        The suite comes from that receipt, so the bundle looked for is the one
+        the contract that actually refused this candidate wrote; the commit is
+        the attempt's own key. The issue identity is the BOARD's key, which
+        :func:`~..domain.issue_key_codec.issue_key_path_part` spells identically
+        to the stored one — that is the property the whole store is filed under.
+
+        A bundle that resolves but carries no output on either stream is treated
+        as no bundle. It repeats the receipt and adds nothing, and the point of
+        this read is the output.
+        """
+        refusal = exit_.attempt.publication_refusal
+        if refusal is None:
+            return PublicationFailureEvidence(required=False)
+        failure = self._diagnostics.for_candidate(exit_.issue.key).latest_failure(
+            head_sha=exit_.attempt.key.head_sha, suite=refusal.suite
+        )
+        if failure is not None and not failure.explains_the_failure:
+            logger.warning(
+                "[CONTINUATION] the durable %s diagnostic at %s for issue #%d "
+                "carries no output on either stream",
+                refusal.suite,
+                failure.directory,
+                exit_.issue.number,
+            )
+            failure = None
+        return PublicationFailureEvidence(required=True, failure=failure)
 
     def _claimed_issue_numbers(self) -> set[int]:
         """Issues already spoken for, asked of the collection's own owner.
@@ -355,10 +467,16 @@ class ContinuationReworkHandoff:
     ) -> ContinuationHandoffOutcome:
         """Refuse an exit in a way that leaves the candidate for a human.
 
-        ``no_open_pr`` and ``no_agent_label`` are the two refusals nothing
-        downstream retries: the candidate sits until somebody looks. So they
-        are published as well as logged — a UI that could only read the log
-        text would be parsing it, which this repo's events-vs-logs rule forbids.
+        ``no_open_pr``, ``no_agent_label`` and ``missing_failure_evidence`` are
+        the refusals nothing downstream retries: the candidate sits until
+        somebody looks. So they are published as well as logged — a UI that
+        could only read the log text would be parsing it, which this repo's
+        events-vs-logs rule forbids.
+
+        Stranding is the fail-closed direction for the third, not a
+        second-best. The alternative is a rework whose prompt asks an agent to
+        rediscover a failure nobody kept, which spends a cycle to arrive back
+        here; this spends none and says exactly what is missing.
         """
         logger.warning(log_message, issue_number)
         self._events.publish(
@@ -391,21 +509,32 @@ def _refused(
 
 
 def build_continuation_rework_feedback(
-    *, pr: "PRInfo", attempt: "Attempt", phase_reason: str
+    *,
+    pr: "PRInfo",
+    attempt: "Attempt",
+    phase_reason: str,
+    failure: "DurableGateFailure | None",
 ) -> str:
     """The correction context that travels with an admitted rework.
 
     Everything here is copied from a durable record, never re-derived: the
     candidate SHA is the attempt's own key, the publish command and verdict come
-    from the receipt the gate filed for that exact commit, the evidence path is
-    the record the gate wrote, and the intent is the descriptor copied from the
-    agent's completion record. The reviewer's own comments on the PR are NOT
-    repeated here — the rework launcher already fetches and appends them for
-    every cycle, and a second copy would drift from the first.
+    from the receipt the gate filed for that exact commit, the failing output
+    and its location come from #94's durable bundle for that same commit and
+    suite, and the intent is the descriptor copied from the agent's completion
+    record. The reviewer's own comments on the PR are NOT repeated here — the
+    rework launcher already fetches and appends them for every cycle, and a
+    second copy would drift from the first.
+
+    ``failure`` is ``None`` only for an exit whose publication was never
+    refused — a candidate handed back after a reviewer asked for changes on a
+    commit that passed. A publication failure with no resolvable output never
+    reaches here at all: its handoff is refused upstream, because "publication
+    failed, go and find out why" is a prompt that needs a human to answer it.
 
     A missing part is named as missing rather than omitted. An agent told
-    "publish validation failed" with no command and no artifact would go looking
-    for both; an agent told the artifact was not recorded knows not to.
+    "publish validation failed" with no command would go looking for one; an
+    agent told no verdict was recorded knows not to.
     """
     receipt = attempt.latest_publication_evaluation
     lines = [
@@ -430,20 +559,8 @@ def build_continuation_rework_feedback(
         lines.append(
             "- Publication gate: no verdict was recorded for this commit."
         )
-    lines.append(
-        # Named as possibly-gone rather than offered as a path to open. The
-        # record lives in the session directory inside the CODER's worktree
-        # (``domain.attempt``), and by the time a rework cycle launches that
-        # worktree may have been reaped. The durable half of the evidence — the
-        # command, the verdict, the suite and the profile — is on the receipt
-        # above, so an agent told the file may be gone knows to stop there
-        # rather than hunt for it.
-        f"- Failure evidence (recorded at {attempt.validation_record_path}; "
-        "the worktree it was written in may since have been reaped, in which "
-        "case the receipt above is the whole record)."
-        if attempt.validation_record_path
-        else "- Failure evidence: no validation record path was recorded."
-    )
+    if failure is not None:
+        lines.extend(_durable_failure_lines(failure))
     descriptor = attempt.continuation_descriptor
     if descriptor is not None:
         lines.extend(
@@ -466,10 +583,43 @@ def build_continuation_rework_feedback(
     return "\n".join(lines)
 
 
+def _durable_failure_lines(failure: "DurableGateFailure") -> list[str]:
+    """The failing run's own output, plus where the whole of it still lives.
+
+    Both, deliberately. The excerpt is what makes the prompt actionable without
+    a second lookup; the directory is what makes it checkable and gets an agent
+    to the rest of a log the excerpt is a tail of. The path is in the PRIMARY
+    checkout, not in any worktree, so it resolves from wherever the rework runs.
+    """
+    lines = [
+        "",
+        "The publication gate's own output for that commit was kept before the "
+        "candidate's worktree was removed, and is readable now at:",
+        "",
+        f"    {failure.directory}",
+        "",
+        f"({DIAGNOSTIC_FILE_NAME}, {STDOUT_FILE_NAME}, {STDERR_FILE_NAME}. "
+        f"Exit code: {failure.exit_code}"
+        f"{'; the run timed out' if failure.timed_out else ''}.)",
+    ]
+    for name, log in (("stdout", failure.stdout), ("stderr", failure.stderr)):
+        if not log.has_output:
+            continue
+        heading = f"Publication gate {name}"
+        if log.truncated:
+            heading += (
+                f" (last {FAILURE_LOG_TAIL_BYTES} bytes of {log.path.name}; "
+                "read the file above for the rest)"
+            )
+        lines.extend(["", f"{heading}:", "", "```", log.tail.rstrip("\n"), "```"])
+    return lines
+
+
 __all__ = [
     "CONTINUATION_EXIT_SOURCE",
     "ContinuationHandoffOutcome",
     "ContinuationHandoffResult",
     "ContinuationReworkHandoff",
+    "PublicationFailureEvidence",
     "build_continuation_rework_feedback",
 ]

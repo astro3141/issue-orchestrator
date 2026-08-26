@@ -20,6 +20,7 @@ premise of a control operation is that none of those exist.
 
 from __future__ import annotations
 
+import shutil
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -50,9 +51,14 @@ from issue_orchestrator.control.continuation_scheduling import ControlContinuati
 from issue_orchestrator.control.control_operation_ownership import (
     ControlOperationOwnership,
 )
+from issue_orchestrator.control.gate_failure_diagnostics import (
+    GateFailureDiagnostics,
+    GateFailureOutput,
+)
 from issue_orchestrator.control.label_manager import LabelManager
 from issue_orchestrator.control.queue_cache import QueueCache, QueueMutationStatus
 from issue_orchestrator.control.rework_cycle_policy import ReworkCycleBudget
+from issue_orchestrator.control.validation import VALIDATION_SCHEMA_VERSION
 from issue_orchestrator.domain.attempt import (
     CONTINUATION_RUN_ALLOWANCE,
     Attempt,
@@ -113,6 +119,14 @@ SHA_A_PRIME = "b" * 40
 PR_PENDING = "pr-pending"
 PUBLISH_COMMAND = "make validate-pr-raw"
 PROFILE = "default"
+PUBLISH_SUITE = ValidationGateKind.PUBLISH.suite
+
+#: What the publish gate actually printed when it refused the candidate. The
+#: thing a corrector has to be handed, and the thing that dies with the
+#: worktree unless #94's durable store kept it.
+FAILING_STDOUT = "FAILED tests/unit/test_widget.py::test_it - AssertionError: boom"
+FAILING_STDERR = "make: *** [validate-pr-raw] Error 1"
+FIRST_FAILURE_STDOUT = "FAILED tests/unit/test_widget.py::test_it - the first time"
 
 
 # ----------------------------------------------------------------------
@@ -364,6 +378,10 @@ def _engine(
             budget=ReworkCycleBudget(
                 LabelManager(config), max_rework_cycles=config.max_rework_cycles
             ),
+            # The real #94 store, over the same root the attempt sidecars live
+            # in — which is what production wires, and what makes a bundle
+            # filed by a gate readable by the handoff after cleanup.
+            diagnostics=GateFailureDiagnostics(root),
             events=NullEventSink(),
         ),
     )
@@ -390,8 +408,14 @@ def _continuation(
     in_flight: ContinuationsInFlight | None = None,
     runs: ContinuationRuns | None = None,
     pull_requests: RecordingPullRequests,
+    repo_root: Path | None = None,
 ) -> ControlContinuation:
-    """A continuation over caller-chosen stores, for the outage directions."""
+    """A continuation over caller-chosen stores, for the outage directions.
+
+    ``repo_root`` defaults to a path that does not exist: every direction here
+    is about an unreadable store deriving no exit at all, so the handoff must
+    never reach the evidence store either.
+    """
     config = Config()
     config.repo = REPO
     return ControlContinuation(
@@ -408,6 +432,11 @@ def _continuation(
             pull_requests=pull_requests,  # type: ignore[arg-type]
             budget=ReworkCycleBudget(
                 LabelManager(config), max_rework_cycles=config.max_rework_cycles
+            ),
+            diagnostics=GateFailureDiagnostics(
+                repo_root
+                if repo_root is not None
+                else Path("/nonexistent-primary-checkout")
             ),
             events=NullEventSink(),
         ),
@@ -437,19 +466,81 @@ def _exhausted(
     engine: Engine,
     *actions: RequestedAction,
     head_sha: str = SHA_A,
+    keep_failure_output: bool = True,
 ) -> Attempt:
     """The #297 shape: publication non-PASS, and the same-SHA allowance spent.
 
     Exactly what #293 left behind — two durable non-PASS publication
     evaluations against one commit, with ``revalidation_budget_used=1``.
+
+    Each of those two refusals also files its output through #94's real store,
+    because in production a failing publish gate does exactly that in the same
+    step that writes the receipt. ``keep_failure_output=False`` is the shape a
+    pre-#94 install (or an unwritable diagnostics directory) leaves behind: the
+    receipts stand and nothing explains them.
     """
     _failed_candidate(engine, *actions, head_sha=head_sha)
-    return engine.attempts.update(
+    if keep_failure_output:
+        _file_gate_failure(engine, head_sha=head_sha, stdout=FIRST_FAILURE_STDOUT)
+    attempt = engine.attempts.update(
         _attempt_key(head_sha),
         lambda attempt: attempt.with_revalidation_reserved().with_completed_evaluation(
             _receipt(head_sha)
         ),
     )
+    if keep_failure_output:
+        _file_gate_failure(engine, head_sha=head_sha)
+    return attempt
+
+
+def _file_gate_failure(
+    engine: Engine,
+    *,
+    head_sha: str = SHA_A,
+    suite: str = PUBLISH_SUITE,
+    stdout: str = FAILING_STDOUT,
+    stderr: str = FAILING_STDERR,
+    run_dir: Path | None = None,
+) -> Path:
+    """File a failed gate's output through #94's real writer, as the gate does.
+
+    ``run_dir``, when given, is where the run wrote its own copy — inside the
+    coder worktree, which is what makes the durable one load-bearing.
+    """
+    written = (
+        GateFailureDiagnostics(engine.root)
+        .for_candidate(_issue_key())
+        .record_failure(
+            GateFailureOutput(
+                record=ValidationRecord(
+                    schema_version=VALIDATION_SCHEMA_VERSION,
+                    suite=suite,
+                    head_sha=head_sha,
+                    passed=False,
+                    exit_code=1,
+                    command=PUBLISH_COMMAND,
+                    started_at="2026-08-26T00:00:00+00:00",
+                    ended_at="2026-08-26T00:11:00+00:00",
+                    timed_out=False,
+                    stdout_path=(
+                        str(run_dir / "validation-stdout.txt")
+                        if run_dir is not None
+                        else "validation-stdout.txt"
+                    ),
+                    stderr_path=(
+                        str(run_dir / "validation-stderr.txt")
+                        if run_dir is not None
+                        else "validation-stderr.txt"
+                    ),
+                    profile=PROFILE,
+                ),
+                stdout=stdout,
+                stderr=stderr,
+            )
+        )
+    )
+    assert written is not None
+    return written
 
 
 def _with_validation_record(engine: Engine, path: str) -> Attempt:
@@ -1746,9 +1837,6 @@ class TestExhaustedPrBackedHandoffAdmitsRework:
         self, engine: Engine
     ) -> None:
         pr = self._exhausted_pr_backed(engine)
-        _with_validation_record(
-            engine, ".issue-orchestrator/sessions/run-1/validation-record.json"
-        )
 
         engine.continuation.reconcile(self._board())
 
@@ -1759,21 +1847,89 @@ class TestExhaustedPrBackedHandoffAdmitsRework:
         assert ValidationVerdict.FAILED.value in feedback
         assert str(pr.number) in feedback
         assert pr.branch in feedback
-        assert "validation-record.json" in feedback
         # The intent the agent recorded travels too, so the corrector knows
         # what the failed candidate was trying to be.
         assert "what the agent claimed to build" in feedback
 
-    def test_missing_evidence_is_named_rather_than_omitted(
+    def test_the_actual_failure_survives_the_candidates_worktree(
         self, engine: Engine
     ) -> None:
+        """The post-cleanup boundary, in the order production walks it.
+
+        The publish gate runs inside the coder's worktree and files its output
+        durably in the primary checkout at the same moment. Ordinary cleanup
+        then takes the worktree, with the run directory the receipt's paths
+        point into. Only after that does the continuation exit and the handoff
+        run — so what reaches the rework has to come from the durable copy or
+        from nowhere.
+        """
+        worktree = engine.root / "coder-worktree"
+        run_dir = worktree / ".issue-orchestrator" / "sessions" / "run-1"
+        run_dir.mkdir(parents=True)
+        (run_dir / "validation-stdout.txt").write_text(
+            FAILING_STDOUT, encoding="utf-8"
+        )
         self._exhausted_pr_backed(engine)
+        bundle = _file_gate_failure(engine, run_dir=run_dir)
+        _with_validation_record(engine, str(run_dir / "validation-record.json"))
+
+        shutil.rmtree(worktree)
+        assert not run_dir.exists()
 
         engine.continuation.reconcile(self._board())
 
         feedback = engine.state.discovered_reworks[0].feedback
         assert feedback is not None
-        assert "no validation record path was recorded" in feedback
+        # The failing test itself, not a pointer into a directory that is gone.
+        assert FAILING_STDOUT in feedback
+        assert FAILING_STDERR in feedback
+        assert str(bundle) in feedback
+        assert bundle.is_relative_to(engine.root)
+        assert bundle.exists()
+        assert str(run_dir) not in feedback
+
+    def test_a_failure_nobody_kept_is_refused_rather_than_degraded(
+        self, engine: Engine
+    ) -> None:
+        """Fail closed. The alternative is a prompt that needs a human to answer.
+
+        The receipts still say publication refused this exact commit, and the
+        continuation is still finished with it — everything except the failure's
+        own output is present. That is precisely the state the correction was
+        being handed over in before this rule existed, and it is refused.
+        """
+        engine.pull_requests.prs[ISSUE_NUMBER] = _open_pr()
+        _exhausted(
+            engine, RequestedAction.CREATE_PR, keep_failure_output=False
+        )
+
+        result = engine.continuation.reconcile(self._board())
+
+        assert engine.state.discovered_reworks == []
+        assert engine.state.discovered_escalations == []
+        handoff = result.rework_handoff
+        assert handoff is not None
+        assert handoff.outcomes[0].reason == "missing_failure_evidence"
+
+    def test_the_evidence_still_resolves_after_a_restart(
+        self, tmp_path: Path
+    ) -> None:
+        """Durable means durable: a new process re-reads it from the checkout.
+
+        The engine that ran the gate holds nothing in memory that a restart
+        keeps, so an evidence binding that lived in process state would strand
+        every candidate whose engine died between the failure and the handoff.
+        """
+        prs = RecordingPullRequests(prs={ISSUE_NUMBER: _open_pr()})
+        before = _engine(tmp_path, pull_requests=prs)
+        _exhausted(before, RequestedAction.CREATE_PR)
+
+        after = _engine(tmp_path, pull_requests=prs)
+        after.continuation.reconcile([_issue("agent:backend")])
+
+        feedback = after.state.discovered_reworks[0].feedback
+        assert feedback is not None
+        assert FAILING_STDOUT in feedback
 
     # -- 4. Existing budget only -----------------------------------------
 

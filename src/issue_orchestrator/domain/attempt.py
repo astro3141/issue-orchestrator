@@ -308,6 +308,26 @@ class Attempt:
         return latest is not None and latest.certifies_publication(self.key.head_sha)
 
     @property
+    def publication_refusal(self) -> ValidationVerdictReceipt | None:
+        """The receipt in which the publication contract REFUSED this candidate.
+
+        The mirror of :attr:`publication_validation_passed`, and it exists
+        because "not passed" is three different situations and only one of them
+        has an explanation to go and find: never gated (no receipt), passed, and
+        refused. A caller that has to produce the failure's own output — the
+        continuation's rework handoff (#297) — needs the third, and needs the
+        receipt rather than a bool, because the suite on it is what says which
+        contract's explanation to look for.
+
+        ``None`` for a candidate that was never gated, exactly as it is for one
+        that passed: neither has a publication failure to explain.
+        """
+        latest = self.latest_publication_evaluation
+        if latest is None or latest.certifies_publication(self.key.head_sha):
+            return None
+        return latest
+
+    @property
     def revalidation_allowance_available(self) -> bool:
         """Whether a same-SHA revalidation may still be *started* (#139)."""
         return self.revalidation_budget_used < REVALIDATION_ALLOWANCE

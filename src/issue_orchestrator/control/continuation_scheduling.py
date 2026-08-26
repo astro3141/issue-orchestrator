@@ -225,6 +225,7 @@ def build_control_continuation(
     from .continuation_runner import ControlContinuationRunner
     from .continuation_runs import ContinuationRuns
     from .control_operation_ownership import ControlOperationOwnership
+    from .gate_failure_diagnostics import GateFailureDiagnostics
     from .rework_cycle_policy import ReworkCycleBudget
     from .worktree_runnability import WorktreeRunnability
 
@@ -274,6 +275,12 @@ def build_control_continuation(
             budget=ReworkCycleBudget(
                 deps.label_manager, max_rework_cycles=config.max_rework_cycles
             ),
+            # #94's durable failed-gate store, rooted in the PRIMARY checkout —
+            # the same root the publication gate and the continuation's quick
+            # gate write into, so what those two filed is what this reads. A
+            # store rooted anywhere else would resolve nothing and strand every
+            # publication failure (#297).
+            diagnostics=GateFailureDiagnostics(config.repo_root),
             # The engine's own sink, so the refusals that strand a candidate
             # reach the UI as events rather than only as log text (#297).
             events=deps.events,

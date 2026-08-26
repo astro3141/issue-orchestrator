@@ -16,6 +16,8 @@ real reconciliation path.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from issue_orchestrator.control.continuation_in_flight import ContinuationsInFlight
 from issue_orchestrator.control.continuation_rework_handoff import (
     ContinuationReworkHandoff,
@@ -25,6 +27,9 @@ from issue_orchestrator.control.continuation_live_truth import ContinuationLiveT
 from issue_orchestrator.control.continuation_scheduling import ControlContinuation
 from issue_orchestrator.control.control_operation_ownership import (
     ControlOperationOwnership,
+)
+from issue_orchestrator.control.gate_failure_diagnostics import (
+    GateFailureDiagnostics,
 )
 from issue_orchestrator.control.label_manager import LabelManager
 from issue_orchestrator.control.rework_cycle_policy import ReworkCycleBudget
@@ -168,8 +173,16 @@ class NoPullRequests:
 
 def inert_control_continuation(
     state: OrchestratorState | None = None,
+    *,
+    repo_root: Path | None = None,
 ) -> ControlContinuation:
-    """The real continuation stack over an empty durable record."""
+    """The real continuation stack over an empty durable record.
+
+    ``repo_root`` only names where #94's durable failed-gate store would be. The
+    inert stack derives no exit, so nothing ever resolves evidence from it; a
+    caller with no root gets one that does not exist, which is the same answer
+    an empty store gives.
+    """
     engine_state = state if state is not None else OrchestratorState()
     return ControlContinuation(
         ControlOperationOwnership(
@@ -188,6 +201,9 @@ def inert_control_continuation(
             pull_requests=NoPullRequests(),  # type: ignore[arg-type]
             budget=ReworkCycleBudget(
                 LabelManager(Config()), max_rework_cycles=Config().max_rework_cycles
+            ),
+            diagnostics=GateFailureDiagnostics(
+                repo_root if repo_root is not None else Path("/nonexistent-repo-root")
             ),
             events=NullEventSink(),
         ),
