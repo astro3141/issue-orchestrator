@@ -66,6 +66,20 @@ handed over: a rework whose prompt says "publication failed, go and find out
 why" is the human relay #297 exists to remove, and refusing it loudly leaves
 exactly one thing for a human to fix instead of an agent to rediscover.
 
+**That evidence gate is the last question asked, not the first.** It guards the
+*spending* of a cycle, so it is asked only once the cycle owner has granted one
+— after ``ReworkCycleBudget.admit``, not before it. A candidate that is both at
+the ceiling and missing its explanation is at the ceiling first: #297 says that
+at exhaustion today's escalation path fires, and an evidence refusal reached
+earlier would divert that candidate to ``missing_failure_evidence`` and quietly
+replace an escalation a human is waiting on with one nothing produces. The
+inverse costs nothing to keep: a candidate with a cycle available and no
+explanation is still refused before any rework is filed, so no cycle is spent
+on a prompt nobody can act on. The price of asking in this order is that the
+refusal follows the PR read — a *positive* answer, which ``AdapterCache`` does
+cache, so a permanently unexplainable candidate pays what an admitted one pays
+rather than the uncached search ``no_open_pr`` would have cost.
+
 The exit itself is not consumed, and deliberately so: consuming it would be the
 stored continuation state machine the phase predicate exists to avoid. It stops
 being derived when the durable facts change — a newer refused candidate
@@ -261,23 +275,6 @@ class ContinuationReworkHandoff:
                 "label; left for the ordinary lane",
             )
 
-        # Asked before the PR read for the same reason the two above are: it is
-        # answered from the primary checkout's own filesystem, costs no API
-        # budget, and a candidate whose failure can never be explained is
-        # refused on every pass for the rest of its life. It is also permanent
-        # in a way the PR answer is not — #94 writes at gate-execution time, so
-        # a bundle that is not there now was never written and never will be —
-        # which is why it needs no memo to stay cheap.
-        evidence = self._durable_failure(exit_)
-        if evidence.missing:
-            return self._strand(
-                issue_number,
-                "missing_failure_evidence",
-                "[CONTINUATION] issue #%d exits to rework after a publication "
-                "failure whose durable output cannot be resolved; refusing to "
-                "hand over a correction nobody can act on",
-            )
-
         # The non-PR-backed exit. It is not this producer's case: with no open
         # PR there is no lineage to correct, and #195's own no-PR recovery path
         # is the owner of what happens next. Behaviour there is unchanged
@@ -333,6 +330,25 @@ class ContinuationReworkHandoff:
                 admission.rework_cycle,
             )
             return _refused(issue_number, admission, pr_number=pr.number)
+
+        # A cycle has been granted. Whether it is SPENT is this producer's own
+        # last question, and it is asked here rather than earlier so that the
+        # ceiling keeps its precedence: a candidate at the ceiling has already
+        # taken today's escalation path above, and must not be diverted into an
+        # evidence refusal that produces nothing for the human waiting on it.
+        # Below the ceiling the answer still costs no cycle — nothing has been
+        # filed yet, and the granted cycle is granted again next pass.
+        evidence = self._durable_failure(exit_)
+        if evidence.missing:
+            return self._strand(
+                issue_number,
+                "missing_failure_evidence",
+                "[CONTINUATION] issue #%d exits to rework after a publication "
+                "failure whose durable output cannot be resolved; refusing to "
+                "hand over a correction nobody can act on",
+                pr_number=pr.number,
+                rework_cycle=admission.rework_cycle,
+            )
 
         rework = DiscoveredRework(
             issue_number=issue_number,
@@ -463,7 +479,13 @@ class ContinuationReworkHandoff:
         )
 
     def _strand(
-        self, issue_number: int, reason: str, log_message: str
+        self,
+        issue_number: int,
+        reason: str,
+        log_message: str,
+        *,
+        pr_number: int = 0,
+        rework_cycle: int = 0,
     ) -> ContinuationHandoffOutcome:
         """Refuse an exit in a way that leaves the candidate for a human.
 
@@ -471,7 +493,16 @@ class ContinuationReworkHandoff:
         the refusals nothing downstream retries: the candidate sits until
         somebody looks. So they are published as well as logged — a UI that
         could only read the log text would be parsing it, which this repo's
-        events-vs-logs rule forbids.
+        events-vs-logs rule forbids. The published payload is the same three
+        fields for all three, deliberately: two of them are reached before the
+        PR is read, and a key that appeared for only one of them would be a
+        shape a consumer has to branch on.
+
+        ``pr_number`` and ``rework_cycle`` are the outcome's own report, and
+        follow this module's "0 means not read" convention rather than
+        "unknown". The evidence refusal knows both — it is asked after the PR
+        read and after the cycle owner granted the cycle it is declining to
+        spend — and saying 0 there would understate what was decided.
 
         Stranding is the fail-closed direction for the third, not a
         second-best. The alternative is a rework whose prompt asks an agent to
@@ -493,6 +524,8 @@ class ContinuationReworkHandoff:
             issue_number=issue_number,
             verdict=ReworkAdmissionVerdict.SKIP,
             reason=reason,
+            pr_number=pr_number,
+            rework_cycle=rework_cycle,
         )
 
 

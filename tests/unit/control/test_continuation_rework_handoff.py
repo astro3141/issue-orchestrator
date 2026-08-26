@@ -425,10 +425,16 @@ class TestNoRefusalCostsAGitHubRead:
     """F1: every refusal the exit's own facts can settle is settled for free.
 
     The board issue arrives with the exit, so its blocking labels and its agent
-    label cost nothing to consult, and #94's store is on the same filesystem as
-    the engine. Reaching the PR port to answer from any of them would be one
-    search-API call per reconciliation, forever, for a candidate that is refused
-    every time.
+    label cost nothing to consult. Reaching the PR port to answer from either
+    would be one search-API call per reconciliation, forever, for a candidate
+    that is refused every time.
+
+    ``missing_failure_evidence`` is deliberately NOT in this class. Its input is
+    just as free — #94's store is on the engine's own filesystem — but the
+    ceiling outranks it (see :class:`TestTheCeilingOutranksTheEvidenceGate`), so
+    it is asked after the PR read. What it pays for is a positive PR answer,
+    which ``AdapterCache`` caches, rather than the uncached search the
+    ``no_open_pr`` memo below exists to avoid.
     """
 
     def test_a_blocked_issue_refuses_before_the_pr_is_read(
@@ -456,24 +462,6 @@ class TestNoRefusalCostsAGitHubRead:
 
         assert result.reworks == ()
         assert result.outcomes[0].reason == "no_agent_label"
-
-    def test_unexplainable_failure_refuses_before_the_pr_is_read(
-        self, unexplained_root: Path
-    ) -> None:
-        """The refusal is permanent, so it must never cost an API call.
-
-        #94 writes at gate-execution time: a bundle absent now was never
-        written, and re-deriving this exit on every reconciliation for the rest
-        of the candidate's life must not re-search GitHub each time.
-        """
-        handoff = _handoff(
-            unexplained_root, OrchestratorState(), UnreachablePullRequests()
-        )
-
-        result = handoff.admit([_exit(_issue(), _attempt())])
-
-        assert result.reworks == ()
-        assert result.outcomes[0].reason == "missing_failure_evidence"
 
     def test_a_settled_absence_of_a_pr_is_not_searched_for_again(
         self, repo_root: Path
@@ -889,6 +877,120 @@ class TestThePublicationFailureIsHandedOverWithItsOutput:
         )
 
         assert result.admitted_issue_numbers == (ISSUE_NUMBER,)
+
+
+class TestTheCeilingOutranksTheEvidenceGate:
+    """Acceptance 4: at exhaustion, today's escalation path fires. No exceptions.
+
+    The evidence gate guards the *spending* of a rework cycle, so it may only be
+    asked once the existing cycle owner has granted one. A candidate that is
+    simultaneously at the ceiling and missing its durable explanation is at the
+    ceiling first: #297 requires that exhaustion take today's escalation path
+    with no new budget, and an evidence refusal reached earlier would swap the
+    escalation a human is waiting on for a strand that produces nothing.
+
+    The inverse property is the one the round-1 correction bought, and it is
+    still here: below the ceiling, a failure nobody kept is refused before any
+    rework is filed and before any principal is spawned.
+    """
+
+    @staticmethod
+    def _pr_at_cycle(cycle: int) -> dict[int, PRInfo]:
+        """A PR whose durable ``rework-cycle-N`` label says N cycles are spent."""
+        return {ISSUE_NUMBER: _pr(labels=[f"rework-cycle-{cycle}"])}
+
+    def test_exhaustion_escalates_even_when_the_evidence_is_gone(
+        self, unexplained_root: Path
+    ) -> None:
+        state = OrchestratorState()
+        events = RecordingEvents()
+        ceiling = Config().max_rework_cycles
+        handoff = _handoff(
+            unexplained_root, state, StubPullRequests(self._pr_at_cycle(ceiling)), events
+        )
+
+        result = handoff.admit([_exit(_issue(), _attempt())])
+
+        assert result.outcomes[0].verdict is ReworkAdmissionVerdict.ESCALATE
+        assert result.outcomes[0].reason == "max_rework_exceeded"
+        assert result.outcomes[0].rework_cycle == ceiling + 1
+        # Today's escalation path, filed through the collection's own owner.
+        assert result.escalations == (
+            DiscoveredEscalation(
+                issue_number=ISSUE_NUMBER, pr_number=294, rework_cycle=ceiling + 1
+            ),
+        )
+        assert state.discovered_escalations == list(result.escalations)
+        # And not diverted into the strand that produces nothing for a human.
+        assert events.reasons() == []
+        assert result.reworks == ()
+
+    def test_the_ceiling_is_the_only_thing_that_outranks_it(
+        self, unexplained_root: Path
+    ) -> None:
+        """One cycle below the ceiling, the missing explanation still refuses."""
+        state = OrchestratorState()
+        ceiling = Config().max_rework_cycles
+        handoff = _handoff(
+            unexplained_root,
+            state,
+            StubPullRequests(self._pr_at_cycle(ceiling - 1)),
+        )
+
+        result = handoff.admit([_exit(_issue(), _attempt())])
+
+        assert result.outcomes[0].verdict is ReworkAdmissionVerdict.SKIP
+        assert result.outcomes[0].reason == "missing_failure_evidence"
+        assert result.reworks == ()
+        assert result.escalations == ()
+        assert state.discovered_reworks == []
+        assert state.discovered_escalations == []
+        # It refused the cycle the owner had granted, and says which one.
+        assert result.outcomes[0].pr_number == 294
+        assert result.outcomes[0].rework_cycle == ceiling
+
+    def test_the_refused_cycle_is_not_consumed(self, unexplained_root: Path) -> None:
+        """Fail-closed must not cost the candidate a cycle it never spent.
+
+        Nothing is filed and no principal is spawned, so the launcher never
+        writes ``rework-cycle-N`` — and the very next pass, once the evidence
+        gap is closed, is offered the same cycle the refusal declined.
+        """
+        state = OrchestratorState()
+        handoff = _handoff(
+            unexplained_root, state, StubPullRequests(self._pr_at_cycle(2))
+        )
+        refused = handoff.admit([_exit(_issue(), _attempt())])
+        assert refused.outcomes[0].rework_cycle == 3
+
+        _file_failure(unexplained_root)
+        admitted = handoff.admit([_exit(_issue(), _attempt())])
+
+        assert admitted.outcomes[0].verdict is ReworkAdmissionVerdict.QUEUE
+        assert admitted.outcomes[0].rework_cycle == 3
+        assert admitted.admitted_issue_numbers == (ISSUE_NUMBER,)
+
+    def test_a_ceiling_candidate_escalates_once_per_tick(
+        self, unexplained_root: Path
+    ) -> None:
+        """The escalation an unexplainable exit takes is the ordinary one.
+
+        Same owner, same once-per-issue-per-tick rule: a re-derived exit does
+        not file a second escalation, and it does not fall through to the
+        evidence strand on the second pass either.
+        """
+        state = OrchestratorState()
+        ceiling = Config().max_rework_cycles
+        handoff = _handoff(
+            unexplained_root, state, StubPullRequests(self._pr_at_cycle(ceiling))
+        )
+
+        handoff.admit([_exit(_issue(), _attempt())])
+        second = handoff.admit([_exit(_issue(), _attempt())])
+
+        assert len(state.discovered_escalations) == 1
+        assert second.reworks == ()
+        assert second.outcomes[0].reason == "already_queued"
 
 
 class TestTheEvidenceIsCopiedNotDerived:

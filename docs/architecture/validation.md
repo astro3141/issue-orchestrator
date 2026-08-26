@@ -566,6 +566,18 @@ would say "publication failed, go and find out why". That prompt is the human
 relay [#297] exists to remove, and spending a rework cycle on it arrives back at
 the same place one cycle poorer.
 
+That evidence gate guards the *spending* of a cycle, so it is the **last**
+question the handoff asks: after `ReworkCycleBudget.admit` has granted one, not
+before. The ceiling keeps its precedence — [#297] requires that at exhaustion
+today's escalation path fires and no new budget is introduced, so a candidate
+that is simultaneously at the ceiling and missing its explanation escalates,
+exactly as it would have with the explanation in hand. Asking the two questions
+the other way round would swap an escalation a human is waiting on for a strand
+nothing produces. Below the ceiling nothing changes: the refusal still happens
+before any `DiscoveredRework` is filed and before any principal is spawned, so
+no cycle is spent, and the same cycle is offered again on the next pass once the
+evidence gap is closed.
+
 The transition is `continuation -> ordinary rework on the same PR lineage`,
 never `continuation -> issue release`: [#195]'s PR-backed shield is untouched,
 the session-history claim stands, `QueueCache.abandoned_candidates()` still
@@ -596,10 +608,12 @@ fact carrying correction context supersedes one that does not, and nothing
 supersedes a fact that already carries it. The three refusals that strand a
 candidate with nothing downstream to retry it — `no_open_pr`, `no_agent_label`
 and `missing_failure_evidence` — are published as `rework.skipped` rather than
-only logged. The third is asked before the PR read as well: #94 writes at
-gate-execution time, so a bundle absent now was never written and never will be,
-and re-searching GitHub for a candidate refused forever would cost one API call
-per reconciliation for the rest of its life.
+only logged, with the same payload shape for all three so a consumer never has
+to branch on which one it got. The third is the one refusal that deliberately
+follows the PR read, because the ceiling outranks it; the read it pays for is a
+*positive* PR answer, which `AdapterCache` does cache, so a permanently
+unexplainable candidate costs what an admitted one costs rather than the
+uncached search `no_open_pr` avoids by memo.
 
 `control/continuation_scheduling.py` is the one hydration path: it derives,
 reconciles, publishes, advances what this engine owns, admits the rework its
