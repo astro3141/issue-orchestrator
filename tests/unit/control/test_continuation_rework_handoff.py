@@ -13,6 +13,12 @@ candidate's worktree is gone still receive the failing output, and a double
 standing in for the store would prove only that this module can be handed a
 value — which is exactly what a session-local ``record_path`` also does, right
 up to the moment somebody tries to read it.
+
+The last class is #304's, and it is about the question this owner must ask
+BEFORE any of the above: whether the engine is allowed to act on the issue the
+exit names at all. The end-to-end proof of that lives in
+``test_control_continuation.py`` too, for the same reason — only there does a
+real board-wide reconciliation put a foreign issue in front of the handoff.
 """
 
 from __future__ import annotations
@@ -27,10 +33,12 @@ from issue_orchestrator.control.continuation_live_truth import (
     CONTINUATION_KIND,
     ContinuationReworkExit,
 )
+from issue_orchestrator.control.continuation_rework_feedback import (
+    build_continuation_rework_feedback,
+)
 from issue_orchestrator.control.continuation_rework_handoff import (
     CONTINUATION_EXIT_SOURCE,
     ContinuationReworkHandoff,
-    build_continuation_rework_feedback,
 )
 from issue_orchestrator.control.gate_failure_diagnostics import (
     FAILURE_LOG_TAIL_BYTES,
@@ -40,6 +48,7 @@ from issue_orchestrator.control.gate_failure_diagnostics import (
     GateFailureDiagnostics,
     GateFailureOutput,
 )
+from issue_orchestrator.control.issue_scope import EngineIssueScope
 from issue_orchestrator.control.label_manager import LabelManager
 from issue_orchestrator.control.rework_cycle_policy import (
     ReworkAdmissionVerdict,
@@ -358,10 +367,21 @@ def _handoff(
     state: OrchestratorState,
     pull_requests: StubPullRequests,
     events: RecordingEvents | None = None,
+    *,
+    scoped_to: int | None = None,
 ) -> ContinuationReworkHandoff:
+    """The owner under test.
+
+    ``scoped_to`` is the operator's ``--issue N`` narrowing, set on the real
+    ``Config`` and read back through the engine's own scope owner. A test that
+    injected a hand-written predicate instead would prove the handoff can be
+    told "no", not that the engine's configured scope is what tells it (#304).
+    """
     config = Config()
+    config.filtering.issue = scoped_to
     return ContinuationReworkHandoff(
         state=state,
+        scope=EngineIssueScope(config),
         pull_requests=pull_requests,  # type: ignore[arg-type]
         budget=ReworkCycleBudget(
             LabelManager(config), max_rework_cycles=config.max_rework_cycles
@@ -1267,3 +1287,160 @@ class TestTheEvidenceIsCopiedNotDerived:
         )
 
         assert "Do not treat the failed commit above as validated." in feedback
+
+
+class TestReconciliationVisibilityIsNotWorkAdmissionAuthority:
+    """#304: an exit derived over the whole board is not a licence to work it.
+
+    ``ControlContinuation`` must reconcile continuation truth board-wide —
+    ownership release names every lease the derived live set does not, so an
+    engine that looked at less would report other issues' running operations as
+    finished. #297 attached this work-admitting producer to the end of that
+    board-wide sequence and gave it no scope predicate, and #303 measured the
+    consequence: an engine started with ``--issue 301`` filed, queued and
+    launched ordinary rework for held issue #293, created its worktree and
+    rebased its branch.
+
+    Every direction here is about the OUT-OF-SCOPE exit reaching this owner and
+    leaving nothing behind. The two facts this producer can file are asserted
+    separately, because they are reached by different routes: a rework below the
+    ceiling, an escalation at it.
+    """
+
+    #: The issue the operator narrowed this engine to. Not ``ISSUE_NUMBER``, so
+    #: the exits below belong to an issue the engine was never started for.
+    SCOPED_TO = 301
+
+    def test_an_out_of_scope_exit_files_no_rework(self, repo_root: Path) -> None:
+        state = OrchestratorState()
+        handoff = _handoff(
+            repo_root,
+            state,
+            StubPullRequests({ISSUE_NUMBER: _pr()}),
+            scoped_to=self.SCOPED_TO,
+        )
+
+        result = handoff.admit([_exit(_issue(), _attempt())])
+
+        assert result.reworks == ()
+        assert result.admitted_issue_numbers == ()
+        assert state.discovered_reworks == []
+
+    def test_an_out_of_scope_exit_at_the_ceiling_files_no_escalation(
+        self, repo_root: Path
+    ) -> None:
+        """The other producible fact, reached only past the cycle owner.
+
+        An escalation is filed when the budget refuses a cycle, which is a
+        different branch from the admission above and would survive a fix that
+        only guarded the first one.
+        """
+        state = OrchestratorState()
+        max_cycles = Config().max_rework_cycles
+        handoff = _handoff(
+            repo_root,
+            state,
+            StubPullRequests({ISSUE_NUMBER: _pr(labels=[f"rework-cycle-{max_cycles}"])}),
+            scoped_to=self.SCOPED_TO,
+        )
+
+        result = handoff.admit([_exit(_issue(), _attempt())])
+
+        assert result.escalations == ()
+        assert state.discovered_escalations == []
+
+    def test_the_refusal_is_stated_rather_than_silently_dropped(
+        self, repo_root: Path
+    ) -> None:
+        """Reconcile-only is a state the caller has to be able to see.
+
+        A handoff that filtered these out of its result would be
+        indistinguishable from one whose scope owner had accidentally been given
+        the whole board — which is the shape of the defect, not of the fix.
+        """
+        handoff = _handoff(
+            repo_root,
+            OrchestratorState(),
+            StubPullRequests({ISSUE_NUMBER: _pr()}),
+            scoped_to=self.SCOPED_TO,
+        )
+
+        result = handoff.admit([_exit(_issue(), _attempt())])
+
+        assert len(result.outcomes) == 1
+        outcome = result.outcomes[0]
+        assert outcome.issue_number == ISSUE_NUMBER
+        assert outcome.verdict is ReworkAdmissionVerdict.SKIP
+        assert outcome.reason == "outside_engine_scope"
+
+    def test_the_refusal_precedes_the_github_read(self, repo_root: Path) -> None:
+        """Authority is asked first, so a foreign exit costs no API call.
+
+        The exit is re-derived on every reconciliation for as long as the
+        durable facts stand. A scope refusal that paid a ``/search/issues`` read
+        each time would spend a narrowed engine's whole rate budget on issues it
+        is not allowed to touch.
+        """
+        handoff = _handoff(
+            repo_root,
+            OrchestratorState(),
+            UnreachablePullRequests(),
+            scoped_to=self.SCOPED_TO,
+        )
+
+        result = handoff.admit([_exit(_issue(), _attempt())])
+
+        assert result.outcomes[0].reason == "outside_engine_scope"
+
+    def test_the_refusal_is_not_announced_to_the_ui(self, repo_root: Path) -> None:
+        """Refused, not stranded — and the difference is who needs telling.
+
+        The three strands leave a candidate sitting until a human looks, so they
+        publish. This candidate is not stuck; it belongs to another engine's
+        scope. Publishing ``rework.skipped`` for it from an engine narrowed to a
+        different issue would put exactly the cross-issue traffic #304 removes
+        back into the stream a consumer reads.
+        """
+        events = RecordingEvents()
+        handoff = _handoff(
+            repo_root,
+            OrchestratorState(),
+            StubPullRequests({ISSUE_NUMBER: _pr()}),
+            events,
+            scoped_to=self.SCOPED_TO,
+        )
+
+        result = handoff.admit([_exit(_issue(), _attempt())])
+
+        assert result.outcomes[0].reason == "outside_engine_scope"
+        assert events.published == []
+
+    def test_the_narrowed_engines_own_issue_is_untouched(
+        self, repo_root: Path
+    ) -> None:
+        """Acceptance 3: the target issue behaves exactly as #297 intended."""
+        state = OrchestratorState()
+        handoff = _handoff(
+            repo_root,
+            state,
+            StubPullRequests({ISSUE_NUMBER: _pr()}),
+            scoped_to=ISSUE_NUMBER,
+        )
+
+        result = handoff.admit([_exit(_issue(), _attempt())])
+
+        assert result.outcomes[0].verdict is ReworkAdmissionVerdict.QUEUE
+        assert result.admitted_issue_numbers == (ISSUE_NUMBER,)
+        assert state.discovered_reworks[0].source == CONTINUATION_EXIT_SOURCE
+
+    def test_an_unnarrowed_engine_admits_every_exit_as_before(
+        self, repo_root: Path
+    ) -> None:
+        """Acceptance 4: without a single-issue narrowing nothing changes."""
+        state = OrchestratorState()
+        handoff = _handoff(repo_root, state, StubPullRequests({ISSUE_NUMBER: _pr()}))
+
+        result = handoff.admit([_exit(_issue(), _attempt())])
+
+        assert result.admitted_issue_numbers == (ISSUE_NUMBER,)
+        assert len(state.discovered_reworks) == 1

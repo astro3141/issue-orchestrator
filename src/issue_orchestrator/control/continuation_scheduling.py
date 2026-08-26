@@ -28,6 +28,15 @@ it: the handoff is only correct AFTER the exclusion release it depends on has
 been published, and putting it anywhere a caller could forget it is how the
 gap it closes appeared in the first place.
 
+It is also the only step in the sequence that is narrowed by the engine's issue
+scope (#304). Every step above it is board-wide because reconciliation is: a
+release names every lease the derived live set does not, so an engine that
+looked at less than the whole board would report other issues' running
+operations as finished. Admitting WORK is the opposite question — #303 measured
+an engine started with ``--issue 301`` filing, queueing and launching rework for
+held issue #293 purely because it could see it — so the sixth step holds the
+scope owner, and the five before it deliberately do not.
+
 ``QueueCache`` is untouched and still reads only the published projection. No
 raw ownership-store read reaches the scheduler, here or anywhere.
 
@@ -226,6 +235,7 @@ def build_control_continuation(
     from .continuation_runs import ContinuationRuns
     from .control_operation_ownership import ControlOperationOwnership
     from .gate_failure_diagnostics import GateFailureDiagnostics
+    from .issue_scope import EngineIssueScope
     from .rework_cycle_policy import ReworkCycleBudget
     from .worktree_runnability import WorktreeRunnability
 
@@ -266,6 +276,13 @@ def build_control_continuation(
         ),
         ContinuationReworkHandoff(
             state=state,
+            # The engine's configured actuation scope, from the same owner
+            # ``QueueCache`` asks (#304). It binds the WORK-ADMITTING step and
+            # nothing before it: the derivation above stays board-wide, because
+            # that is what makes the ownership release correct, and narrowing it
+            # to close this gap would trade a cross-issue mutation for a
+            # cross-issue deadlock.
+            scope=EngineIssueScope(config),
             # The engine's own PR reader, so the admitted rework targets the
             # PR the rest of the lifecycle is already talking about.
             pull_requests=deps.repository_host,

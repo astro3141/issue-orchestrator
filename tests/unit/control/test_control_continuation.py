@@ -55,6 +55,7 @@ from issue_orchestrator.control.gate_failure_diagnostics import (
     GateFailureDiagnostics,
     GateFailureOutput,
 )
+from issue_orchestrator.control.issue_scope import EngineIssueScope
 from issue_orchestrator.control.label_manager import LabelManager
 from issue_orchestrator.control.queue_cache import QueueCache, QueueMutationStatus
 from issue_orchestrator.control.rework_cycle_policy import ReworkCycleBudget
@@ -350,11 +351,20 @@ def _engine(
     *,
     attempts: object | None = None,
     pull_requests: RecordingPullRequests | None = None,
+    scoped_to: int | None = None,
 ) -> Engine:
-    """A fresh engine over ``root``. A second one is a restart."""
+    """A fresh engine over ``root``. A second one is a restart.
+
+    ``scoped_to`` is the operator's ``--issue N`` narrowing, set on the real
+    ``Config`` the whole stack reads it from rather than injected as a predicate:
+    #304 is about the engine's CONFIGURED scope reaching the work-admitting step,
+    and a test that handed the handoff its own answer would prove nothing about
+    whether the engine's own answer arrives there.
+    """
     state = OrchestratorState()
     config = Config()
     config.repo = REPO
+    config.filtering.issue = scoped_to
     store = SidecarAttemptStore(root) if attempts is None else attempts
     ownership = ControlOperationOwnership(
         state, SqliteControlOperationOwnershipStore(root / STORE_FILENAME)
@@ -374,6 +384,9 @@ def _engine(
         runner,  # type: ignore[arg-type]
         ContinuationReworkHandoff(
             state=state,
+            # The engine's own configured scope, so ``scoped_to`` above really
+            # is the operator's narrowing arriving at the admission step.
+            scope=EngineIssueScope(config),
             pull_requests=prs,  # type: ignore[arg-type]
             budget=ReworkCycleBudget(
                 LabelManager(config), max_rework_cycles=config.max_rework_cycles
@@ -429,6 +442,7 @@ def _continuation(
         runner,  # type: ignore[arg-type]
         ContinuationReworkHandoff(
             state=state,
+            scope=EngineIssueScope(config),
             pull_requests=pull_requests,  # type: ignore[arg-type]
             budget=ReworkCycleBudget(
                 LabelManager(config), max_rework_cycles=config.max_rework_cycles
@@ -452,10 +466,11 @@ def _failed_candidate(
     engine: Engine,
     *actions: RequestedAction,
     head_sha: str = SHA_A,
+    number: int = ISSUE_NUMBER,
 ) -> Attempt:
     """A candidate whose publication failed and whose intent was recorded."""
     return engine.attempts.update(
-        _attempt_key(head_sha),
+        _attempt_key(head_sha, number),
         lambda attempt: attempt.with_completed_evaluation(
             _receipt(head_sha)
         ).with_continuation_descriptor(_descriptor(*actions)),
@@ -466,6 +481,7 @@ def _exhausted(
     engine: Engine,
     *actions: RequestedAction,
     head_sha: str = SHA_A,
+    number: int = ISSUE_NUMBER,
     keep_failure_output: bool = True,
 ) -> Attempt:
     """The #297 shape: publication non-PASS, and the same-SHA allowance spent.
@@ -479,17 +495,19 @@ def _exhausted(
     pre-#94 install (or an unwritable diagnostics directory) leaves behind: the
     receipts stand and nothing explains them.
     """
-    _failed_candidate(engine, *actions, head_sha=head_sha)
+    _failed_candidate(engine, *actions, head_sha=head_sha, number=number)
     if keep_failure_output:
-        _file_gate_failure(engine, head_sha=head_sha, stdout=FIRST_FAILURE_STDOUT)
+        _file_gate_failure(
+            engine, head_sha=head_sha, number=number, stdout=FIRST_FAILURE_STDOUT
+        )
     attempt = engine.attempts.update(
-        _attempt_key(head_sha),
+        _attempt_key(head_sha, number),
         lambda attempt: attempt.with_revalidation_reserved().with_completed_evaluation(
             _receipt(head_sha)
         ),
     )
     if keep_failure_output:
-        _file_gate_failure(engine, head_sha=head_sha)
+        _file_gate_failure(engine, head_sha=head_sha, number=number)
     return attempt
 
 
@@ -497,6 +515,7 @@ def _file_gate_failure(
     engine: Engine,
     *,
     head_sha: str = SHA_A,
+    number: int = ISSUE_NUMBER,
     suite: str = PUBLISH_SUITE,
     stdout: str = FAILING_STDOUT,
     stderr: str = FAILING_STDERR,
@@ -509,7 +528,7 @@ def _file_gate_failure(
     """
     written = (
         GateFailureDiagnostics(engine.root)
-        .for_candidate(_issue_key())
+        .for_candidate(_issue_key(number))
         .record_failure(
             GateFailureOutput(
                 record=ValidationRecord(
@@ -572,14 +591,23 @@ def _open_pr(
     *,
     number: int = 294,
     labels: list[str] | None = None,
-    branch: str = f"{ISSUE_NUMBER}-continuation-lineage",
+    issue_number: int = ISSUE_NUMBER,
+    branch: str | None = None,
 ) -> PRInfo:
-    """The open PR the candidate is backed by, as GitHub reports it."""
+    """The open PR the candidate is backed by, as GitHub reports it.
+
+    ``issue_number`` shapes the title reference and the default branch together,
+    because the production open-PR owner really does match on both — a PR handed
+    a second issue's number but the first one's title would be discarded by
+    ``pr_matches_issue`` and prove nothing.
+    """
     return PRInfo(
         number=number,
-        title=f"#{ISSUE_NUMBER}: the candidate under correction",
+        title=f"#{issue_number}: the candidate under correction",
         url=f"https://example.test/{REPO}/pull/{number}",
-        branch=branch,
+        branch=(
+            branch if branch is not None else f"{issue_number}-continuation-lineage"
+        ),
         body="",
         state="open",
         labels=labels if labels is not None else [],
@@ -2230,3 +2258,276 @@ class TestExhaustedPrBackedHandoffAdmitsRework:
 
         assert result.exclusions.entries == ()
         assert engine.state.discovered_reworks == []
+
+
+# ======================================================================
+# 17. Reconciliation visibility is not work-admission authority (#304)
+# ======================================================================
+
+
+#: The issue this engine was NOT started for. Present on the board because
+#: reconciliation needs the whole board, and for no other reason.
+HELD_ISSUE_NUMBER = 293
+HELD_SHA = "e" * 40
+
+
+class TestReconciliationVisibilityIsNotWorkAdmissionAuthority:
+    """#304: a scoped engine reconciles the whole board and works one issue.
+
+    #297 attached a work-admitting producer to the end of a board-wide
+    reconciliation without giving it the engine's actuation scope, and #303
+    measured the result on a live engine: started with ``--issue 301``, it
+    admitted, queued and LAUNCHED ordinary rework for held issue #293 — created
+    its worktree, rebased its branch — purely because reconciliation could see
+    it.
+
+    The repair may not be "look at less". Ownership release names every lease
+    the derived live set does not name, so an engine that dropped #293 from
+    derivation would report a running operation on it as finished and free it.
+    Both halves are therefore asserted together in the central direction below:
+    the held issue is still derived and still reconciled, and nothing is filed
+    for it.
+    """
+
+    def _board(self) -> list[Issue]:
+        """A and B, in the order a real fetch would hand them over."""
+        return [
+            _issue("agent:backend"),
+            _issue("agent:backend", number=HELD_ISSUE_NUMBER),
+        ]
+
+    def _held_exit_ready(self, engine: Engine) -> PRInfo:
+        """The held issue, exhausted on an open PR — an admissible exit but B's.
+
+        Everything #297 needs to admit a rework is true of it: a PR-backed
+        candidate, publication refused, the same-SHA allowance spent, an agent
+        label, durable failure output, and a PR carrying no rework cycle yet.
+        The ONLY thing standing between it and a filed rework is the engine's
+        scope, which is what makes this the mutation proof.
+        """
+        pr = _open_pr(number=302, issue_number=HELD_ISSUE_NUMBER)
+        engine.pull_requests.prs[HELD_ISSUE_NUMBER] = pr
+        _exhausted(
+            engine,
+            RequestedAction.CREATE_PR,
+            head_sha=HELD_SHA,
+            number=HELD_ISSUE_NUMBER,
+        )
+        return pr
+
+    # -- 1. Single-issue isolation — the central proof --------------------
+
+    def test_a_held_issue_is_reconciled_without_being_admitted(
+        self, tmp_path: Path
+    ) -> None:
+        """Acceptance 1, 2 and 5 in one direction, across a real restart.
+
+        The first engine is unnarrowed and crashes with the held issue's
+        continuation still live, leaving a durable lease behind. The second is
+        the ``--issue A`` engine #303 ran: the held issue's candidate has since
+        become ``EXHAUSTED``, so a correct reconciliation must release that
+        lease — and must file nothing.
+
+        Remove the scope binding and this fails on the rework assertion, not on
+        a helper's return value: the held issue's exit is admissible in every
+        other respect, and the engine really does have an open PR to file it
+        against.
+        """
+        prs = RecordingPullRequests()
+        crashed = _engine(tmp_path, pull_requests=prs)
+        _failed_candidate(
+            crashed,
+            RequestedAction.CREATE_PR,
+            head_sha=HELD_SHA,
+            number=HELD_ISSUE_NUMBER,
+        )
+        crashed.continuation.reconcile(self._board())
+        held_key = _operation_key(HELD_SHA, HELD_ISSUE_NUMBER)
+        assert crashed.ownership.exclusions.owns(held_key)
+
+        scoped = _engine(tmp_path, pull_requests=prs, scoped_to=ISSUE_NUMBER)
+        held_pr = self._held_exit_ready(scoped)
+        result = scoped.continuation.reconcile(self._board())
+
+        # Derivation stayed board-wide: the held issue's phase was decided, and
+        # its exit reached the handoff, which is where it was refused.
+        handoff = result.rework_handoff
+        assert handoff is not None
+        assert [outcome.issue_number for outcome in handoff.outcomes] == [
+            HELD_ISSUE_NUMBER
+        ]
+        assert handoff.outcomes[0].reason == "outside_engine_scope"
+        # Ownership was reconciled for it exactly as before: the lease the
+        # crashed engine left is gone, released by an engine scoped elsewhere.
+        assert result.exclusions.owns(held_key) is False
+        assert result.exclusions.entries == ()
+        # And nothing was admitted, queued, claimed or started for it.
+        assert scoped.state.discovered_reworks == []
+        assert scoped.state.discovered_escalations == []
+        assert handoff.reworks == ()
+        assert handoff.escalations == ()
+        assert scoped.state.active_sessions == []
+        assert scoped.state.session_history == []
+        assert scoped.state.pending_reworks == []
+        # The PR the rework would have targeted was never even read, so no PR
+        # of the held issue's could have been mutated by this pass.
+        assert prs.reads == []
+        assert held_pr.labels == []
+
+    def test_the_held_issue_never_enters_the_scoped_engines_queue(
+        self, tmp_path: Path
+    ) -> None:
+        """No queue transition for B, asked of the queue owner itself.
+
+        The handoff files facts, and the planner turns facts into queue
+        transitions and sessions. This is the other end of that chain: after a
+        full hydration over the board, the held issue is in neither collection
+        the scheduler reads.
+        """
+        scoped = _engine(tmp_path, scoped_to=ISSUE_NUMBER)
+        self._held_exit_ready(scoped)
+
+        queue = scoped.continuation.hydrate_queue(
+            scoped.queue_cache(), self._board()
+        )
+
+        assert [issue.number for issue in queue] == [ISSUE_NUMBER]
+        assert scoped.state.discovered_reworks == []
+        assert (
+            scoped.queue_cache().is_outside_engine_scope(
+                _issue("agent:backend", number=HELD_ISSUE_NUMBER)
+            )
+            is True
+        )
+
+    def test_a_held_issue_at_its_ceiling_escalates_nothing_either(
+        self, tmp_path: Path
+    ) -> None:
+        """The second fact this producer can file, reached by the other branch.
+
+        An escalation is filed when the cycle owner REFUSES a cycle rather than
+        granting one, so a fix that only guarded the admission would leave this
+        one reachable — and an escalation against a held issue is a human's
+        notification about work nobody authorised.
+        """
+        scoped = _engine(tmp_path, scoped_to=ISSUE_NUMBER)
+        max_cycles = scoped.config.max_rework_cycles
+        scoped.pull_requests.prs[HELD_ISSUE_NUMBER] = _open_pr(
+            number=302,
+            issue_number=HELD_ISSUE_NUMBER,
+            labels=[f"rework-cycle-{max_cycles}"],
+        )
+        _exhausted(
+            scoped,
+            RequestedAction.CREATE_PR,
+            head_sha=HELD_SHA,
+            number=HELD_ISSUE_NUMBER,
+        )
+
+        scoped.continuation.reconcile(self._board())
+
+        assert scoped.state.discovered_escalations == []
+        assert scoped.state.discovered_reworks == []
+
+    # -- 3. The target issue is unchanged ---------------------------------
+
+    def test_the_engines_own_issue_still_reaches_the_297_handoff(
+        self, tmp_path: Path
+    ) -> None:
+        """Acceptance 3: same lineage, same cycle, same evidence, same feedback.
+
+        Proved in the presence of the held issue, on the same board and in the
+        same pass — a narrowing that admitted A only when B was absent would be
+        a narrowing that had not been tested at all.
+        """
+        scoped = _engine(tmp_path, scoped_to=ISSUE_NUMBER)
+        self._held_exit_ready(scoped)
+        target_pr = _open_pr()
+        scoped.pull_requests.prs[ISSUE_NUMBER] = target_pr
+        _exhausted(scoped, RequestedAction.CREATE_PR)
+
+        scoped.continuation.reconcile(self._board())
+
+        assert len(scoped.state.discovered_reworks) == 1
+        rework = scoped.state.discovered_reworks[0]
+        assert rework.issue_number == ISSUE_NUMBER
+        assert rework.pr_number == target_pr.number
+        assert rework.branch_name == target_pr.branch
+        assert rework.rework_cycle == 1
+        assert rework.source == CONTINUATION_EXIT_SOURCE
+        feedback = rework.feedback
+        assert feedback is not None
+        assert FAILING_STDOUT in feedback
+        assert PUBLISH_COMMAND in feedback
+        assert SHA_A in feedback
+        # The held issue's own failure output is filed under the held issue's
+        # key, and none of it may leak into another candidate's correction.
+        assert str(HELD_ISSUE_NUMBER) not in feedback
+
+    def test_the_shared_cycle_budget_is_still_the_only_arithmetic(
+        self, tmp_path: Path
+    ) -> None:
+        """Acceptance 7: no scope-specific counter, refund or cycle exception.
+
+        The narrowing refuses exits; it does not spend, refund or reserve
+        anything. So the cycle a scoped engine grants its own issue is read off
+        the same durable ``rework-cycle-N`` label the unscoped one reads.
+        """
+        scoped = _engine(tmp_path, scoped_to=ISSUE_NUMBER)
+        self._held_exit_ready(scoped)
+        scoped.pull_requests.prs[ISSUE_NUMBER] = _open_pr(labels=["rework-cycle-2"])
+        _exhausted(scoped, RequestedAction.CREATE_PR)
+
+        scoped.continuation.reconcile(self._board())
+
+        assert scoped.state.discovered_reworks[0].rework_cycle == 3
+
+    # -- 4. Unscoped behaviour is unchanged --------------------------------
+
+    def test_an_unnarrowed_engine_admits_the_same_issue_as_before(
+        self, tmp_path: Path
+    ) -> None:
+        """Acceptance 4: with no ``--issue``, every in-scope exit behaves as #297
+        intended — including the very exit the scoped engine refused."""
+        unscoped = _engine(tmp_path)
+        held_pr = self._held_exit_ready(unscoped)
+
+        unscoped.continuation.reconcile(self._board())
+
+        assert len(unscoped.state.discovered_reworks) == 1
+        rework = unscoped.state.discovered_reworks[0]
+        assert rework.issue_number == HELD_ISSUE_NUMBER
+        assert rework.pr_number == held_pr.number
+        assert rework.branch_name == held_pr.branch
+        assert rework.source == CONTINUATION_EXIT_SOURCE
+
+    # -- 9. Scope comes from the scope owner, never from a projection -------
+
+    def test_a_label_cannot_widen_a_narrowed_engine_back_out(
+        self, tmp_path: Path
+    ) -> None:
+        """Acceptance 9: labels are scheduler projections, not scope authority.
+
+        The held issue arrives carrying every label the ordinary rework lane
+        reacts to. None of them is a claim on this engine, and the refusal is
+        identical to the bare board's.
+        """
+        scoped = _engine(tmp_path, scoped_to=ISSUE_NUMBER)
+        self._held_exit_ready(scoped)
+        labelled_board = [
+            _issue("agent:backend"),
+            _issue(
+                "agent:backend",
+                "needs-rework",
+                "validation-failed",
+                number=HELD_ISSUE_NUMBER,
+            ),
+        ]
+
+        result = scoped.continuation.reconcile(labelled_board)
+
+        assert scoped.state.discovered_reworks == []
+        assert scoped.state.discovered_escalations == []
+        handoff = result.rework_handoff
+        assert handoff is not None
+        assert handoff.outcomes[0].reason == "outside_engine_scope"

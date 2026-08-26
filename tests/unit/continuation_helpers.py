@@ -31,6 +31,7 @@ from issue_orchestrator.control.control_operation_ownership import (
 from issue_orchestrator.control.gate_failure_diagnostics import (
     GateFailureDiagnostics,
 )
+from issue_orchestrator.control.issue_scope import EngineIssueScope
 from issue_orchestrator.control.label_manager import LabelManager
 from issue_orchestrator.control.rework_cycle_policy import ReworkCycleBudget
 from issue_orchestrator.infra.config import Config
@@ -198,6 +199,7 @@ def inert_control_continuation(
         NoContinuationRunner(),  # type: ignore[arg-type]
         ContinuationReworkHandoff(
             state=engine_state,
+            scope=EngineIssueScope(Config()),
             pull_requests=NoPullRequests(),  # type: ignore[arg-type]
             budget=ReworkCycleBudget(
                 LabelManager(Config()), max_rework_cycles=Config().max_rework_cycles
