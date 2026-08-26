@@ -19,3 +19,5 @@ What remains under `docs/selfhosting/` is executed, not narrated:
 
 `SELF_HOSTING_READY.md` is a dated milestone record of what was established on
 2026-08-12, not operating instructions.
+
+Canary record — post-#307 successor-artifact Proof-D canary ran 2026-08-26 on exact `ad4ecf9f` (#310; throwaway fixture, not for merge into product `main`).
