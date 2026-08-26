@@ -562,6 +562,33 @@ when the ceiling is passed) carrying the failed candidate's SHA, the publish
 gate's command and verdict, the intent the agent recorded, and the gate's own
 failing output — so the correction needs no human relay — and the planner turns
 that fact into the same `QueueReworkAction` the ordinary lane produces.
+Composing that correction prompt out of the resolved evidence is a separate
+concern and lives in `control/continuation_rework_feedback.py`; the handoff
+decides *whether* a candidate may take a cycle, the feedback module decides what
+the agent taking it is told.
+
+**Reconciliation visibility is not work-admission authority.** The exits the
+handoff receives come from a derivation that is board-wide by design and must
+stay that way — ownership release names every lease the derived live set does
+not, so an engine that looked at less than the whole board would report other
+issues' running operations as finished and free them. [#297] attached this
+work-admitting producer to the end of that sequence with no scope predicate, and
+[#303] measured the consequence on a live engine: started with `--issue 301`, it
+admitted, queued and *launched* ordinary rework for held issue #293, created its
+worktree and rebased its branch, purely because reconciliation could see it. So
+the first question the handoff asks about any exit is the engine's own actuation
+scope, through `control/issue_scope.py`'s `EngineIssueScope` — the same owner
+`QueueCache.is_outside_engine_scope` delegates to, so the two cannot drift about
+what `--issue` means, and the handoff cannot form its own opinion from labels or
+branch names. An out-of-scope exit is refused before any GitHub read and before
+any collection the handoff can write to is touched, reported as an outcome with
+reason `outside_engine_scope`, and — unlike the three strands — *not* published:
+it names no stuck candidate, and announcing `rework.skipped` for a foreign issue
+on every reconciliation would put back exactly the cross-issue traffic [#304]
+removes. The narrowing binds the admission step and nothing before it: [#304]
+requires that the held issue still be derived and still have its ownership
+reconciled, which is what keeps the repair from trading a cross-issue mutation
+for a cross-issue deadlock.
 
 The output is the part that has to survive cleanup, and the receipt deliberately
 carries none. `Attempt.validation_record_path` is no help either: it points into

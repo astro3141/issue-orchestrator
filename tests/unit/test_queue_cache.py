@@ -5,6 +5,7 @@ from unittest.mock import Mock
 
 import pytest
 
+from issue_orchestrator.control.issue_scope import EngineIssueScope
 from issue_orchestrator.control.queue_cache import (
     QUEUE_SHRINK_CONFIRM_DELAY_SECONDS,
     QueueCache,
@@ -385,6 +386,32 @@ def test_is_outside_engine_scope_applies_label_scope_without_a_single_issue_filt
 
     assert cache.is_outside_engine_scope(Issue(number=1, title="Keep", labels=["agent:web"])) is False
     assert cache.is_outside_engine_scope(Issue(number=2, title="Other", labels=["agent:other"])) is True
+
+
+def test_the_scope_owner_and_the_cache_cannot_disagree_about_scope():
+    """One definition of "is this issue mine to act on?", not two (#304).
+
+    The cache is no longer the only holder of the question: the continuation's
+    rework handoff must ask exactly this before it admits work, and #303 is what
+    a second, differently-spelled answer costs. So the cache DELEGATES, and this
+    is the direction that fails if it ever stops.
+    """
+    config = _make_config()
+    config.filtering.label = "agent:web"
+    config.filtering.issue = 45
+    cache = QueueCache(config, OrchestratorState())
+    scope = EngineIssueScope(config)
+    issues = [
+        Issue(number=45, title="Scoped", labels=["agent:web"]),
+        Issue(number=60, title="Unscoped", labels=["agent:web"]),
+        Issue(number=45, title="Wrong label", labels=["agent:other"]),
+        Issue(number=45, title="Closed", labels=["agent:web"], state="closed"),
+    ]
+
+    assert [scope.excludes(issue) for issue in issues] == [False, True, True, True]
+    assert [cache.is_outside_engine_scope(issue) for issue in issues] == [
+        scope.excludes(issue) for issue in issues
+    ]
 
 
 def test_is_outside_single_issue_scope_sees_the_filter_through_the_exclusion_guard():

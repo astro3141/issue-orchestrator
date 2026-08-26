@@ -71,6 +71,41 @@ def evaluate_issue_scope(
     return IssueScopeDecision(in_scope=True)
 
 
+class EngineIssueScope:
+    """What this engine is allowed to ACT on, as something a collaborator holds.
+
+    :func:`evaluate_issue_scope` is a decision *over a* ``Config``, and a
+    collaborator handed the ``Config`` to ask it is a collaborator that can ask
+    anything else of it too — including reading ``filtering.issue`` back out and
+    forming a second opinion about what ``--issue`` means. #304 measured what
+    the absence of an owner costs on the other side of the same coin: a
+    work-admitting producer that asked nothing at all, because there was nothing
+    it could naturally hold.
+
+    So the composite scope question — labels, milestone, open state AND the
+    operator's ``--issue`` narrowing — is handed over as an object with exactly
+    one method. :class:`~.queue_cache.QueueCache` and the continuation's rework
+    handoff cannot drift apart about the answer, because there is one expression
+    of it and they both hold it.
+
+    Scope only. "In scope but already claimed this run" is a different question
+    and stays with :meth:`~.queue_cache.QueueCache.evaluate_issue`; see
+    :meth:`~.queue_cache.QueueCache.is_outside_engine_scope` for why that
+    composite verdict cannot answer this one.
+    """
+
+    __slots__ = ("_config",)
+
+    def __init__(self, config: "Config") -> None:
+        self._config = config
+
+    def excludes(self, issue: "Issue") -> bool:
+        """Whether this engine's configured scope excludes ``issue`` outright."""
+        return not evaluate_issue_scope(
+            self._config, issue, include_issue_number_filter=True
+        ).in_scope
+
+
 def outside_single_issue_scope(config: "Config", issue: "Issue") -> bool:
     """Whether the engine's ``--issue`` filter alone excludes this issue.
 

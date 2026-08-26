@@ -19,7 +19,23 @@ existing open-PR owner (:func:`..control.completion_pr_collision.look_up_open_pr
 the cycle number and the ceiling come from the shared rework-cycle owner
 (:mod:`.rework_cycle_policy`), which the ordinary scanner decides through too.
 What is left here is assembly: which exits are PR-backed, what evidence travels
-with them, and where the resulting fact is filed.
+with them, and where the resulting fact is filed. Composing the correction
+prompt out of that evidence is a separate concern and lives in
+:mod:`.continuation_rework_feedback`; this module decides WHETHER a candidate
+may take a cycle, that one decides what the agent taking it is told.
+
+**Reconciliation visibility is not work-admission authority.** The exits arrive
+from a derivation that is board-wide by design and must stay that way: ownership
+release names every lease the live set does not, so an engine that stopped
+LOOKING at an issue would report another engine's running operation as finished
+and free it. #303 measured what follows if the producer at the end of that
+sequence inherits the visibility as permission — an engine started with
+``--issue 301`` admitted, queued and launched rework for a held issue #293,
+created its worktree and rebased its branch. So the first question asked about
+any exit is the engine's own actuation scope, taken from the scope owner
+:class:`~.queue_cache.QueueCache` asks (:class:`~.issue_scope.EngineIssueScope`)
+rather than re-derived here from ``--issue``, labels or branch names. An exit
+outside it is reported and dropped: reconciled, never worked.
 
 **It is a fact producer, not an actuator.** It appends ``DiscoveredRework`` and
 ``DiscoveredEscalation`` exactly as the awaiting-merge reconciler does, and the
@@ -123,12 +139,7 @@ from ..domain.models import DiscoveredEscalation, DiscoveredRework
 from ..events import EventName
 from ..ports import make_trace_event
 from .completion_pr_collision import look_up_open_pr_for_issue
-from .gate_failure_diagnostics import (
-    DIAGNOSTIC_FILE_NAME,
-    FAILURE_LOG_TAIL_BYTES,
-    STDERR_FILE_NAME,
-    STDOUT_FILE_NAME,
-)
+from .continuation_rework_feedback import build_continuation_rework_feedback
 from .rework_cycle_policy import (
     ReworkAdmission,
     ReworkAdmissionVerdict,
@@ -136,13 +147,13 @@ from .rework_cycle_policy import (
 )
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
-    from ..domain.attempt import Attempt
     from ..domain.models import OrchestratorState
     from ..ports import EventSink
     from ..ports.pull_request_tracker import PRInfo
     from .completion_pr_collision import CompletionPrAdapter
     from .continuation_live_truth import ContinuationReworkExit
     from .gate_failure_diagnostics import DurableGateFailure, GateFailureDiagnostics
+    from .issue_scope import EngineIssueScope
 
 logger = logging.getLogger(__name__)
 
@@ -232,6 +243,7 @@ class ContinuationReworkHandoff:
         self,
         *,
         state: "OrchestratorState",
+        scope: "EngineIssueScope",
         pull_requests: "CompletionPrAdapter",
         budget: ReworkCycleBudget,
         diagnostics: "GateFailureDiagnostics",
@@ -242,6 +254,12 @@ class ContinuationReworkHandoff:
         #: one tick, and an owner deciding from a snapshot taken earlier would
         #: admit a second rework for a candidate it just admitted one for.
         self._state = state
+        #: The engine's actuation scope (#304). Required, with no default: a
+        #: handoff assembled without one is the engine #303 measured, and it
+        #: looks entirely healthy right up to the moment it rebases a held
+        #: issue's branch. The OWNER, never a ``Config`` — this module must not
+        #: be able to form its own opinion about what ``--issue`` means.
+        self._scope = scope
         self._pull_requests = pull_requests
         self._budget = budget
         #: #94's durable failed-gate store, rooted in the PRIMARY checkout. The
@@ -287,12 +305,23 @@ class ContinuationReworkHandoff:
         reworks: list[DiscoveredRework],
         escalations: list[DiscoveredEscalation],
     ) -> ContinuationHandoffOutcome:
-        """One exit, decided in the three phases this module's docstring names.
+        """One exit, decided in the phases this module's docstring names.
 
-        The PR read is the seam, and it is why the phases are separate: what
+        The PR read is the seam, and it is why phases 1-3 are separate: what
         comes before it must cost nothing, and what comes after it is the
         budget's decision and this producer's own last question about it.
+
+        Phase 0 is not about the exit at all. It asks whether this engine may
+        act on the issue, and it is asked first because every other question
+        here presumes an answer of yes.
         """
+        # Phase 0: authority. The board this exit was derived from is complete
+        # by design; that is what makes the ownership release correct, and it is
+        # also what puts an issue this engine was never started for in front of
+        # this producer (#304).
+        if self._scope.excludes(exit_.issue):
+            return self._refuse_outside_scope(exit_)
+
         # Phase 1: everything this exit's own facts already settle.
         free = self._refuse_before_the_pr_read(exit_)
         if isinstance(free, ContinuationHandoffOutcome):
@@ -598,6 +627,44 @@ class ContinuationReworkHandoff:
             )
         )
 
+    def _refuse_outside_scope(
+        self, exit_: "ContinuationReworkExit"
+    ) -> ContinuationHandoffOutcome:
+        """Refuse an exit this engine reconciled but is not allowed to work.
+
+        Not a strand, and that is the whole difference in how it is reported.
+        The three strands leave a candidate sitting until a human looks, so they
+        are published; this candidate is not stuck at all. It belongs to another
+        engine's scope, or to this operator's next unscoped run, and its exit
+        stays derivable until whoever owns it admits it. Publishing
+        ``rework.skipped`` for it — on every reconciliation, from an engine
+        narrowed to a different issue — would put exactly the cross-issue
+        traffic #304 removes back into the stream a consumer reads, and would
+        make an operator's dashboard claim an issue is being refused by an
+        engine that was never asked about it.
+
+        The OUTCOME is still reported, and reported for every out-of-scope exit
+        rather than filtered out of the result. "Reconciled but not
+        work-admissible" is a state the caller has to be able to see: a handoff
+        that silently dropped these would be indistinguishable from one whose
+        scope owner had accidentally been given the whole board.
+
+        Nothing is remembered either. The memos here exist to save a GitHub read
+        or a repeated announcement, and this refusal costs neither — it is
+        decided from the board issue the exit arrived with, before any read and
+        before any collection this handoff can write to is touched.
+        """
+        logger.debug(
+            "[CONTINUATION] issue #%d exits to rework but is outside this "
+            "engine's issue scope; reconciled only, not admitted",
+            exit_.issue.number,
+        )
+        return ContinuationHandoffOutcome(
+            issue_number=exit_.issue.number,
+            verdict=ReworkAdmissionVerdict.SKIP,
+            reason="outside_engine_scope",
+        )
+
     def _refuse_unreadable_pr(
         self, exit_: "ContinuationReworkExit"
     ) -> ContinuationHandoffOutcome:
@@ -677,118 +744,10 @@ def _refused(
     )
 
 
-def build_continuation_rework_feedback(
-    *,
-    pr: "PRInfo",
-    attempt: "Attempt",
-    phase_reason: str,
-    failure: "DurableGateFailure | None",
-) -> str:
-    """The correction context that travels with an admitted rework.
-
-    Everything here is copied from a durable record, never re-derived: the
-    candidate SHA is the attempt's own key, the publish command and verdict come
-    from the receipt the gate filed for that exact commit, the failing output
-    and its location come from #94's durable bundle for that same commit and
-    suite, and the intent is the descriptor copied from the agent's completion
-    record. The reviewer's own comments on the PR are NOT repeated here — the
-    rework launcher already fetches and appends them for every cycle, and a
-    second copy would drift from the first.
-
-    ``failure`` is ``None`` only for an exit whose publication was never
-    refused — a candidate handed back after a reviewer asked for changes on a
-    commit that passed. A publication failure with no resolvable output never
-    reaches here at all: its handoff is refused upstream, because "publication
-    failed, go and find out why" is a prompt that needs a human to answer it.
-
-    A missing part is named as missing rather than omitted. An agent told
-    "publish validation failed" with no command would go looking for one; an
-    agent told no verdict was recorded knows not to.
-    """
-    receipt = attempt.latest_publication_evaluation
-    lines = [
-        "The control continuation for this candidate has ended without "
-        f"publishing it (phase: {phase_reason}). The work is yours to correct "
-        "on this same pull request; nothing has been pushed or merged on your "
-        "behalf.",
-        "",
-        f"- PR: #{pr.number} {pr.url}".rstrip(),
-        f"- Branch: {pr.branch}",
-        f"- Failed candidate commit: {attempt.key.head_sha}",
-    ]
-    if receipt is not None:
-        lines.extend(
-            [
-                f"- Publication gate command: {receipt.command}",
-                f"- Publication gate verdict: {receipt.verdict.value} "
-                f"(suite {receipt.suite}, profile {receipt.profile})",
-            ]
-        )
-    else:
-        lines.append(
-            "- Publication gate: no verdict was recorded for this commit."
-        )
-    if failure is not None:
-        lines.extend(_durable_failure_lines(failure))
-    descriptor = attempt.continuation_descriptor
-    if descriptor is not None:
-        lines.extend(
-            [
-                "",
-                "What the previous agent recorded for this candidate:",
-                "",
-                f"Implementation: {descriptor.implementation}",
-                f"Problems: {descriptor.problems}",
-            ]
-        )
-    lines.extend(
-        [
-            "",
-            "Fix the cause of the publication failure on this branch, then "
-            "complete through the ordinary rework contract. Do not treat the "
-            "failed commit above as validated.",
-        ]
-    )
-    return "\n".join(lines)
-
-
-def _durable_failure_lines(failure: "DurableGateFailure") -> list[str]:
-    """The failing run's own output, plus where the whole of it still lives.
-
-    Both, deliberately. The excerpt is what makes the prompt actionable without
-    a second lookup; the directory is what makes it checkable and gets an agent
-    to the rest of a log the excerpt is a tail of. The path is in the PRIMARY
-    checkout, not in any worktree, so it resolves from wherever the rework runs.
-    """
-    lines = [
-        "",
-        "The publication gate's own output for that commit was kept before the "
-        "candidate's worktree was removed, and is readable now at:",
-        "",
-        f"    {failure.directory}",
-        "",
-        f"({DIAGNOSTIC_FILE_NAME}, {STDOUT_FILE_NAME}, {STDERR_FILE_NAME}. "
-        f"Exit code: {failure.exit_code}"
-        f"{'; the run timed out' if failure.timed_out else ''}.)",
-    ]
-    for name, log in (("stdout", failure.stdout), ("stderr", failure.stderr)):
-        if not log.has_output:
-            continue
-        heading = f"Publication gate {name}"
-        if log.truncated:
-            heading += (
-                f" (last {FAILURE_LOG_TAIL_BYTES} bytes of {log.path.name}; "
-                "read the file above for the rest)"
-            )
-        lines.extend(["", f"{heading}:", "", "```", log.tail.rstrip("\n"), "```"])
-    return lines
-
-
 __all__ = [
     "CONTINUATION_EXIT_SOURCE",
     "ContinuationHandoffOutcome",
     "ContinuationHandoffResult",
     "ContinuationReworkHandoff",
     "PublicationFailureEvidence",
-    "build_continuation_rework_feedback",
 ]

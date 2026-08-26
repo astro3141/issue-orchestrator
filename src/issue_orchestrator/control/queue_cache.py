@@ -14,7 +14,7 @@ import traceback
 from typing import TYPE_CHECKING
 
 from .abandoned_candidates import AbandonedCandidate, AbandonedCandidates
-from .issue_scope import evaluate_issue_scope, issue_scope_skip_detail, outside_single_issue_scope
+from .issue_scope import EngineIssueScope, issue_scope_skip_detail, outside_single_issue_scope
 from .session_history import SessionHistoryOwner
 
 if TYPE_CHECKING:
@@ -61,6 +61,10 @@ class QueueCache:
         self._config = config
         self._state = state
         self._store = queue_cache_store
+        #: The engine's actuation scope, HELD rather than re-expressed here, so
+        #: that this cache and every other holder of the question answer it from
+        #: one definition (#304).
+        self._engine_scope = EngineIssueScope(config)
 
     def _history_owner(self) -> SessionHistoryOwner:
         """The owner of every question this cache asks of session history.
@@ -217,10 +221,14 @@ class QueueCache:
         Answers scope only. ``REJECTED_EXCLUDED`` means in scope but already
         claimed this run, which is a different question and stays with
         :meth:`evaluate_issue`.
+
+        Delegated to :class:`~.issue_scope.EngineIssueScope` rather than spelled
+        here, because this cache is no longer the only holder of the question:
+        the continuation's rework handoff must ask exactly this before it admits
+        work, and two spellings of "is this issue mine to act on?" is how #303's
+        cross-issue mutation would come back wearing a different name.
         """
-        return not evaluate_issue_scope(
-            self._config, issue, include_issue_number_filter=True
-        ).in_scope
+        return self._engine_scope.excludes(issue)
 
     def is_outside_single_issue_scope(self, issue: "Issue") -> bool:
         """Whether ``--issue N`` alone excludes the issue, asking nothing else.
