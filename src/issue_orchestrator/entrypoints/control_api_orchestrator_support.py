@@ -327,8 +327,15 @@ def resolve_engine_stop_response(
     retirement the process evidence contradicted. The supervisor is
     the component that watched the target, so its disposition — not a
     second observation made here — decides the answer (#326).
+
+    The question every caller is really asking is
+    ``disposition.stopped``: may this be presented as a clean stop?
+    Branching on the still-running list instead would answer 200 for a
+    disposition that reached a non-clean outcome yet named no engine —
+    presentation outrunning the evidence, which is the shape of the
+    bug.
     """
-    if disposition.still_running:
+    if not disposition.stopped:
         payload: EngineStillRunningPayload = {
             "error": ENGINE_STILL_RUNNING_ERROR,
             "detail": still_running_detail(

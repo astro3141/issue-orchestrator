@@ -13,6 +13,7 @@ from issue_orchestrator.entrypoints.control_api_orchestrator_routes import (
     RECONCILE_GRACEFUL_TIMEOUT_SECONDS,
 )
 from issue_orchestrator.entrypoints.control_api_orchestrator_support import (
+    ENGINE_STILL_RUNNING_ERROR,
     EngineLeftRunning,
     engines_left_running_payload,
     still_running_detail,
@@ -804,6 +805,129 @@ class TestEveryStopRouteGoesThroughTheOffLoopOwner:
         kwargs = mock_supervisor.stop.call_args.kwargs
         assert kwargs["force"] is False
         assert kwargs["force_if_graceful_fails"] is False
+
+
+class TestARepositoryIsNotDeregisteredWhileItsEngineRuns:
+    """De-registering a live engine is how it becomes unreachable.
+
+    Reconcile sweeps ``list_repos()`` and orchestrator detection probes
+    the configs under a *registered* root, so once the entry is dropped
+    no Control Center surface can reach the process, its port or its
+    lock. The removal route used to SIGTERM the process group on an
+    unconfirmed reply, so the engine was almost always gone by then;
+    now that an unforced stop sends no signal, the surviving-engine
+    case is reachable and the disposition has to decide (#326).
+    """
+
+    @pytest.fixture
+    def removals(self, monkeypatch: pytest.MonkeyPatch) -> list[str]:
+        """Record registry removals instead of performing them."""
+        removed: list[str] = []
+
+        def record_removal(repo_root: str) -> bool:
+            removed.append(repo_root)
+            return True
+
+        monkeypatch.setattr(
+            "issue_orchestrator.infra.repo_registry.remove_repo", record_removal
+        )
+        return removed
+
+    def _remove(self, client: TestClient, repo_root: Path) -> Any:
+        return client.request(
+            "DELETE",
+            "/control/repos",
+            json={"repo_root": str(repo_root), "stop_orchestrator": True},
+        )
+
+    def test_a_surviving_engine_refuses_the_removal(
+        self,
+        supervisor_client: TestClient,
+        tmp_path: Path,
+        mock_supervisor: MagicMock,
+        removals: list[str],
+    ) -> None:
+        mock_supervisor.stop.return_value = EngineStopDisposition.for_engine(
+            StopOutcome.TIMED_OUT,
+            RunningEngine(instance_id=None, pid=4242, port=19080),
+        )
+
+        response = self._remove(supervisor_client, tmp_path)
+
+        assert response.status_code == 409
+        assert removals == [], "a live engine was de-registered and orphaned"
+
+    def test_the_refusal_answers_with_the_stop_owner_s_reason(
+        self,
+        supervisor_client: TestClient,
+        tmp_path: Path,
+        mock_supervisor: MagicMock,
+        removals: list[str],
+    ) -> None:
+        """The route may not name a reason of its own (#326)."""
+        mock_supervisor.stop.return_value = EngineStopDisposition.for_engine(
+            StopOutcome.TIMED_OUT,
+            RunningEngine(instance_id="engine-1", pid=4242, port=19080),
+        )
+
+        payload = self._remove(supervisor_client, tmp_path).json()
+
+        assert payload["error"] == ENGINE_STILL_RUNNING_ERROR
+        assert payload["detail"] == still_running_detail(StopOutcome.TIMED_OUT, 1)
+        assert payload["still_running"] == [
+            {"instance_id": "engine-1", "pid": 4242, "port": 19080}
+        ]
+        assert "status" not in payload, "a refused removal claimed a clean stop"
+
+    def test_a_failed_escalation_is_not_called_unauthorized_here_either(
+        self,
+        supervisor_client: TestClient,
+        tmp_path: Path,
+        mock_supervisor: MagicMock,
+        removals: list[str],
+    ) -> None:
+        mock_supervisor.stop.return_value = EngineStopDisposition.for_engine(
+            StopOutcome.FORCE_FAILED,
+            RunningEngine(instance_id=None, pid=4242, port=19080),
+        )
+
+        detail = self._remove(supervisor_client, tmp_path).json()["detail"]
+
+        assert "No force escalation was authorized" not in detail
+        assert "Force escalation was authorized" in detail
+
+    def test_a_confirmed_stop_still_removes_the_repository(
+        self,
+        supervisor_client: TestClient,
+        tmp_path: Path,
+        mock_supervisor: MagicMock,
+        removals: list[str],
+    ) -> None:
+        mock_supervisor.stop.return_value = EngineStopDisposition.already_stopped()
+
+        response = self._remove(supervisor_client, tmp_path)
+
+        assert response.status_code == 200
+        assert response.json()["status"] == "removed"
+        assert removals == [str(tmp_path)]
+
+    def test_a_removal_that_was_not_asked_to_stop_is_unaffected(
+        self,
+        supervisor_client: TestClient,
+        tmp_path: Path,
+        mock_supervisor: MagicMock,
+        removals: list[str],
+    ) -> None:
+        """``stop_orchestrator=false`` never watched an engine at all."""
+        response = supervisor_client.request(
+            "DELETE",
+            "/control/repos",
+            json={"repo_root": str(tmp_path), "stop_orchestrator": False},
+        )
+
+        assert response.json()["status"] == "removed"
+        assert removals == [str(tmp_path)]
+        mock_supervisor.stop.assert_not_called()
 
 
 class TestReconcileIsASweepNotAnEngineShutdown:

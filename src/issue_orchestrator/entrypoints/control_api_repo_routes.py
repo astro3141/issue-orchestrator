@@ -21,7 +21,10 @@ from ..execution.control_center_runtime import (
     get_selected_launch_selection,
 )
 from ..infra.repo_identity import deserialize_repo_identity
-from .control_api_orchestrator_support import run_supervisor_stop
+from .control_api_orchestrator_support import (
+    resolve_engine_stop_response,
+    run_supervisor_stop,
+)
 from .control_api_repo_support import ControlApiRepoDependency
 
 logger = logging.getLogger(__name__)
@@ -124,6 +127,39 @@ async def add_repo_endpoint(
         )
 
 
+async def _retire_engine_or_refuse_removal(
+    deps: ControlApiRepoDependency,
+    repo_root: Path,
+) -> JSONResponse | None:
+    """Stop the repository's engine, or state why it may not be removed.
+
+    De-registering a repository whose engine is still up orphans that
+    engine. Reconcile sweeps ``list_repos()`` and orchestrator
+    detection probes the configs under a *registered* root, so once the
+    entry is gone no Control Center surface can reach the process, its
+    port or its lock — and the caller was told ``removed``.
+
+    That outcome only became reachable here when a non-force stop
+    stopped signalling on an unconfirmed graceful request: this route
+    used to SIGTERM the process group and the engine was almost always
+    gone by the time the entry was dropped. So the disposition decides,
+    answered by the same owner the stop endpoint uses, and the
+    repository stays registered so a sweep can still find it (#326).
+    """
+    disposition = await run_supervisor_stop(
+        deps.get_supervisor(),
+        repo_root,
+        reason="repo removed via /control/repos/remove",
+        actor="control-center.repos.remove",
+    )
+    if disposition.stopped:
+        return None
+    refusal = resolve_engine_stop_response(
+        repo_root=repo_root, disposition=disposition
+    )
+    return JSONResponse(dict(refusal.payload), status_code=refusal.status_code)
+
+
 @control_repo_router.delete("/control/repos")
 async def remove_repo_endpoint(
     request: Request,
@@ -149,12 +185,9 @@ async def remove_repo_endpoint(
     if body.get("stop_orchestrator", True):
         path = Path(normalized)
         if path.exists():
-            await run_supervisor_stop(
-                deps.get_supervisor(),
-                path,
-                reason="repo removed via /control/repos/remove",
-                actor="control-center.repos.remove",
-            )
+            refusal = await _retire_engine_or_refuse_removal(deps, path)
+            if refusal is not None:
+                return refusal
 
     if remove_repo(normalized):
         return JSONResponse({"status": "removed", "repo_root": normalized})
