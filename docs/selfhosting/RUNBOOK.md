@@ -19,3 +19,5 @@ What remains under `docs/selfhosting/` is executed, not narrated:
 
 `SELF_HOSTING_READY.md` is a dated milestone record of what was established on
 2026-08-12, not operating instructions.
+
+<!-- PROOF-ONLY #317: disposable EXHAUSTED poison fixture for the #307 replay; evidence only, do not merge -->
