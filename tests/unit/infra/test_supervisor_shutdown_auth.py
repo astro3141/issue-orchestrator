@@ -28,6 +28,9 @@ ENGINE_TOKEN = "supervisor-shutdown-admin-token"
 FILE_TOKEN = "supervisor-shutdown-token-from-file"
 STOP_REASON = "operator asked the repository engine to stop"
 STOP_ACTOR = "supervisor.stop_by_port"
+# Short enough to keep an unconfirmed stop quick, long enough that the
+# port is probed more than once before the budget expires.
+GRACEFUL_BUDGET_SECONDS = 0.3
 
 
 @pytest.fixture
@@ -148,7 +151,10 @@ def test_an_existing_token_file_is_used_when_the_env_is_unset(
     _write_token_file(FILE_TOKEN)
 
     supervisor.stop_by_port(
-        harness.endpoint.port, reason=STOP_REASON, actor=STOP_ACTOR
+        harness.endpoint.port,
+        reason=STOP_REASON,
+        actor=STOP_ACTOR,
+        graceful_timeout_seconds=GRACEFUL_BUDGET_SECONDS,
     )
 
     assert harness.endpoint.requests[0].authorization == f"Bearer {FILE_TOKEN}"
@@ -192,24 +198,27 @@ def test_no_credential_anywhere_sends_no_bearer_and_mints_nothing(
 def test_a_refused_credential_is_not_reclassified_as_a_graceful_stop(
     harness: StopByPortHarness, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The shape of the live failure: green result, ungraceful route.
+    """The shape of the live failure, now fail-closed (#326).
 
-    A wrong bearer is refused, the engine keeps running, and the port
-    kill is what stops it. ``stop_by_port`` returns True in both
-    directions, so the outcome alone cannot tell them apart — the
-    evidence has to be which path ran.
+    A wrong bearer is refused, so the request is unconfirmed. That is
+    not authority to signal: the engine is left running and the stop
+    reports failure, instead of a SIGTERM by port dressed up as a
+    successful non-force stop.
     """
     monkeypatch.setenv(TOKEN_ENV_VAR, "a-superseded-admin-token")
 
     stopped = supervisor.stop_by_port(
-        harness.endpoint.port, reason=STOP_REASON, actor=STOP_ACTOR
+        harness.endpoint.port,
+        reason=STOP_REASON,
+        actor=STOP_ACTOR,
+        graceful_timeout_seconds=GRACEFUL_BUDGET_SECONDS,
     )
 
-    assert stopped is True
+    assert stopped is False
     assert harness.endpoint.requests[0].status == 401
     assert harness.endpoint.accepted is False
-    assert harness.port_kills == [False], (
-        "a refused shutdown did not fall through to the port kill"
+    assert harness.port_kills == [], (
+        "an unconfirmed non-force shutdown signalled the port anyway"
     )
 
 
@@ -258,7 +267,10 @@ def test_the_bearer_never_reaches_the_logs(
     )
     monkeypatch.setenv(TOKEN_ENV_VAR, FILE_TOKEN)
     supervisor.stop_by_port(
-        harness.endpoint.port, reason=STOP_REASON, actor=STOP_ACTOR
+        harness.endpoint.port,
+        reason=STOP_REASON,
+        actor=STOP_ACTOR,
+        graceful_timeout_seconds=GRACEFUL_BUDGET_SECONDS,
     )
 
     assert harness.endpoint.requests[0].authorization == f"Bearer {ENGINE_TOKEN}"

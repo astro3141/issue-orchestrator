@@ -274,6 +274,182 @@ class TestSupervisorStop:
         assert payload["error"] == "global_shutdown_in_progress"
 
 
+class TestStopResponseMatchesTheEngineEvidence:
+    """A stop answer is observed, never assumed (#326).
+
+    #324 reported ``status=stopped, stopped_count=1`` for a retirement
+    the process and lock evidence contradicted. Presentation now comes
+    from what the supervisor still observes running afterwards, so a
+    stop that left the engine up cannot be read as either a clean stop
+    or an "it was already stopped".
+    """
+
+    def test_an_engine_left_running_is_not_reported_as_stopped(
+        self,
+        supervisor_client: TestClient,
+        tmp_path: Path,
+        mock_supervisor: MagicMock,
+    ) -> None:
+        mock_supervisor.status.return_value = SupervisorStatus(
+            state="running", pid=4242, port=19080
+        )
+        mock_supervisor.stop_all_instances.return_value = 0
+        mock_supervisor.status_all_instances.return_value = MultiInstanceStatus(
+            repo_root=str(tmp_path),
+            expected_count=1,
+            instances=[SupervisorStatus(state="running", pid=4242, port=19080)],
+        )
+
+        response = supervisor_client.post(
+            "/control/orchestrator/stop",
+            json={
+                "repo_root": str(tmp_path),
+                "reason": "test graceful stop that times out",
+                "force": False,
+                "force_if_timeout": False,
+            },
+        )
+
+        assert response.status_code == 409
+        payload = response.json()
+        assert payload["error"] == "engine_still_running"
+        assert "status" not in payload, "a running engine was labelled stopped"
+        assert payload["stopped_count"] == 0
+        assert payload["still_running"] == [
+            {"instance_id": None, "pid": 4242, "port": 19080}
+        ]
+
+    def test_a_partial_stop_does_not_claim_the_repository_is_stopped(
+        self,
+        supervisor_client: TestClient,
+        tmp_path: Path,
+        mock_supervisor: MagicMock,
+    ) -> None:
+        """One instance down and one still up is not a stopped repository."""
+        mock_supervisor.status.return_value = SupervisorStatus(
+            state="running", pid=4242, port=19080
+        )
+        mock_supervisor.stop_all_instances.return_value = 1
+        mock_supervisor.status_all_instances.return_value = MultiInstanceStatus(
+            repo_root=str(tmp_path),
+            expected_count=2,
+            instances=[
+                SupervisorStatus(state="stopped", instance_id="orchestrator-1"),
+                SupervisorStatus(
+                    state="running",
+                    pid=4343,
+                    port=19081,
+                    instance_id="orchestrator-2",
+                ),
+            ],
+        )
+
+        response = supervisor_client.post(
+            "/control/orchestrator/stop",
+            json={
+                "repo_root": str(tmp_path),
+                "reason": "test partial stop",
+                "force_if_timeout": False,
+            },
+        )
+
+        assert response.status_code == 409
+        payload = response.json()
+        assert payload["error"] == "engine_still_running"
+        assert payload["stopped_count"] == 1
+        assert payload["still_running"] == [
+            {"instance_id": "orchestrator-2", "pid": 4343, "port": 19081}
+        ]
+
+    def test_a_stop_with_nothing_left_running_reports_stopped(
+        self,
+        supervisor_client: TestClient,
+        tmp_path: Path,
+        mock_supervisor: MagicMock,
+    ) -> None:
+        mock_supervisor.status.return_value = SupervisorStatus(
+            state="running", pid=4242, port=19080
+        )
+        mock_supervisor.stop_all_instances.return_value = 1
+        mock_supervisor.status_all_instances.return_value = MultiInstanceStatus(
+            repo_root=str(tmp_path),
+            expected_count=1,
+            instances=[SupervisorStatus(state="stopped")],
+        )
+
+        response = supervisor_client.post(
+            "/control/orchestrator/stop",
+            json={"repo_root": str(tmp_path), "reason": "test graceful stop"},
+        )
+
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["status"] == "stopped"
+        assert payload["stopped_count"] == 1
+
+    def test_an_unconfirmed_port_stop_is_not_reported_as_not_running(
+        self,
+        supervisor_client: TestClient,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        mock_supervisor: MagicMock,
+    ) -> None:
+        """The port branch has no lock to re-read, so its own answer rules."""
+        from issue_orchestrator.entrypoints import control_api_orchestrator_routes
+
+        mock_supervisor.status.return_value = SupervisorStatus(state="stopped")
+        mock_supervisor.stop_by_port.return_value = False
+        monkeypatch.setattr(
+            control_api_orchestrator_routes,
+            "confirm_orchestrator_at_port",
+            lambda *_, **__: True,
+        )
+
+        response = supervisor_client.post(
+            "/control/orchestrator/stop",
+            json={
+                "repo_root": str(tmp_path),
+                "reason": "test orphaned graceful stop",
+                "port": 19080,
+                "force_if_timeout": False,
+                "graceful_timeout_seconds": 30,
+            },
+        )
+
+        assert response.status_code == 409
+        payload = response.json()
+        assert payload["error"] == "engine_still_running"
+        assert payload["still_running"] == [
+            {"instance_id": None, "pid": None, "port": 19080}
+        ]
+        assert (
+            mock_supervisor.stop_by_port.call_args.kwargs["graceful_timeout_seconds"]
+            == 30
+        )
+
+    def test_nothing_running_still_reports_not_running(
+        self,
+        supervisor_client: TestClient,
+        tmp_path: Path,
+        mock_supervisor: MagicMock,
+    ) -> None:
+        mock_supervisor.status.return_value = SupervisorStatus(state="running")
+        mock_supervisor.stop_all_instances.return_value = 0
+        mock_supervisor.status_all_instances.return_value = MultiInstanceStatus(
+            repo_root=str(tmp_path),
+            expected_count=1,
+            instances=[],
+        )
+
+        response = supervisor_client.post(
+            "/control/orchestrator/stop",
+            json={"repo_root": str(tmp_path), "reason": "test stop"},
+        )
+
+        assert response.status_code == 200
+        assert response.json()["status"] == "not_running"
+
+
 class TestSupervisorReconcile:
     """Tests for POST /control/orchestrator/reconcile endpoint."""
 

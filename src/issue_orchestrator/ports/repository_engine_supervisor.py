@@ -128,6 +128,7 @@ class SupervisorOps(Protocol):
         reason: str,
         actor: str = "supervisor.stop_by_port",
         force: bool = False,
+        graceful_timeout_seconds: float = 120,
     ) -> bool: ...
 
     def status(

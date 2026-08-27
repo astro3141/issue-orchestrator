@@ -37,9 +37,12 @@ from ..infra.supervisor import (
 from ..ports.repository_engine_supervisor import SupervisorOps
 from .control_api_orchestrator_support import (
     ControlApiOrchestratorDependency,
+    RunningEngine,
+    observe_running_engines,
+    port_stop_evidence,
     read_last_n_lines,
+    resolve_engine_stop_response,
     serialize_guardrails_result,
-    stopped_engine_payload,
 )
 from .shutdown_reason_support import parse_shutdown_reason
 
@@ -199,8 +202,13 @@ async def control_stop(
                 force=force,
                 reason=reason,
                 actor=actor,
+                graceful_timeout_seconds=graceful_timeout_seconds,
             )
             stopped_count = 1 if stopped else 0
+            still_running: tuple[RunningEngine, ...] = port_stop_evidence(
+                port=port_override,
+                stopped=stopped,
+            )
         else:
             stopped_count = sv.stop_all_instances(
                 repo_root,
@@ -210,14 +218,22 @@ async def control_stop(
                 graceful_timeout_seconds=graceful_timeout_seconds,
                 force_if_graceful_fails=force_if_timeout or force,
             )
-            stopped = stopped_count > 0
+            still_running = observe_running_engines(sv, repo_root)
         logger.info(
-            "[control_stop] supervisor.stop_all_instances returned: %d", stopped_count
+            "[control_stop] stopped_count=%d still_running=%d",
+            stopped_count,
+            len(still_running),
         )
 
-        if stopped:
-            return JSONResponse(stopped_engine_payload(repo_root, stopped_count))
-        return JSONResponse({"status": "not_running", "repo_root": str(repo_root)})
+        response = resolve_engine_stop_response(
+            repo_root=repo_root,
+            stopped_count=stopped_count,
+            still_running=still_running,
+        )
+        return JSONResponse(
+            dict(response.payload),
+            status_code=response.status_code,
+        )
     finally:
         deps.finish_engine_shutdown_operation(repo_root)
 

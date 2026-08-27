@@ -90,15 +90,21 @@ def test_start_rejects_config_changed_after_preflight_before_spawn(
     spawn.assert_not_called()
 
 
-def test_stop_controller_consumes_one_budget_across_request_and_signal() -> None:
+def test_stop_controller_consumes_one_budget_before_authorized_force() -> None:
+    """The request's own cost comes out of the one shared budget.
+
+    An unconfirmed request does not shorten the wait and does not buy
+    a signal: the escalation an operator authorized on timeout still
+    happens only once the whole budget is spent.
+    """
     from issue_orchestrator.infra.shutdown_timing import (
         InterruptibleStopController,
         StaticStopPolicy,
+        StopOutcome,
     )
 
     now = 0.0
-    terminated = False
-    forced = False
+    forced_at: float | None = None
 
     def monotonic() -> float:
         return now
@@ -111,33 +117,26 @@ def test_stop_controller_consumes_one_budget_across_request_and_signal() -> None
         advance(4.0)
         return False
 
-    def terminate() -> None:
-        nonlocal terminated
-        terminated = True
-
     def force_stop() -> bool:
-        nonlocal forced
-        forced = True
+        nonlocal forced_at
+        forced_at = now
         return True
 
     controller = InterruptibleStopController(
         StaticStopPolicy(graceful_timeout_seconds=5),
-        pid=4242,
+        target_alive=lambda: True,
         force_requested=False,
         force_on_timeout=True,
         request_graceful=request_shutdown,
-        terminate=terminate,
         force_stop=force_stop,
         on_stopped=lambda: None,
         clock=monotonic,
         sleeper=advance,
-        process_probe=lambda _pid: True,
     )
 
-    assert controller.stop() is True
+    assert controller.stop() is StopOutcome.STOPPED
     assert now == pytest.approx(5.0)
-    assert terminated is True
-    assert forced is True
+    assert forced_at == pytest.approx(5.0)
 
 
 def test_stop_controller_observes_abort_during_current_wait() -> None:
@@ -155,7 +154,7 @@ def test_stop_controller_observes_abort_during_current_wait() -> None:
 
     policy = MutablePolicy()
 
-    def process_probe(_pid: int) -> bool:
+    def target_alive() -> bool:
         policy.current = StopPolicySnapshot(
             graceful_timeout_seconds=120,
             abort=True,
@@ -164,16 +163,14 @@ def test_stop_controller_observes_abort_during_current_wait() -> None:
 
     controller = InterruptibleStopController(
         policy,
-        pid=4242,
+        target_alive=target_alive,
         force_requested=False,
         force_on_timeout=True,
         request_graceful=lambda: True,
-        terminate=lambda: None,
         force_stop=lambda: True,
         on_stopped=lambda: None,
         clock=lambda: 0.0,
         sleeper=lambda _seconds: None,
-        process_probe=process_probe,
     )
 
     with pytest.raises(StopAborted):

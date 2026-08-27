@@ -19,6 +19,27 @@ The Control Center is a client surface. Repository engines are the long-lived ru
 3. Global controls are only app-level or bulk actions.
 4. Left navigation remains a stable set of view selectors and does not add/remove entries based on runtime state.
 
+## Stop Disposition
+
+A non-force stop is a request plus an observation, never a signal.
+
+1. **Failure to confirm a graceful shutdown request is not authority to signal
+   the engine.** Whether the request succeeds or comes back unconfirmed, the
+   target is observed over the same graceful budget.
+2. If the budget expires while the engine is still alive and no force
+   escalation is authorized, the stop reports a non-success outcome and leaves
+   the engine running — no `SIGTERM`, `SIGKILL`, process-group kill or port
+   kill.
+3. Explicit force, and an explicitly-authorized force-on-timeout policy, keep
+   their existing authority; force-on-timeout escalates only after the budget
+   is spent.
+4. This rule is identical for the tracked-lock stop and the port-only stop:
+   both run through the one disposition owner,
+   `infra/shutdown_timing.py::InterruptibleStopController`.
+5. A stop response states what was observed. A stop that left the engine
+   running is reported as such, and is never presented as a clean stop or as
+   "already stopped". Process and lock evidence outrank presentation.
+
 ## UI Placement Rules
 
 1. Global header contains app-level actions and aggregate status only.
