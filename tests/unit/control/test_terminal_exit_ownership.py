@@ -52,6 +52,7 @@ from typing import Iterator
 import pytest
 
 from issue_orchestrator.control.shutdown_manager import (
+    FollowerOutcome,
     ShutdownManager,
     ShutdownState,
     TerminalExit,
@@ -107,6 +108,23 @@ def manager() -> Iterator[ShutdownManager]:
 
 
 @pytest.fixture
+def manager_with_an_expired_follower_bound(
+    manager: ShutdownManager,
+) -> ShutdownManager:
+    """A manager whose follower gives up the instant it starts waiting.
+
+    A zero-length bound is how "the owner was still inside cleanup when
+    the bound expired" becomes an answer rather than a race. The follower
+    reads a flag the test provably has not let the owner set yet, so the
+    expiry is deterministic, costs no wall-clock time, and puts the
+    follower past its bound in the one state that matters: cleanup
+    unfinished.
+    """
+    manager.reset(follower_wait_seconds=0.0)
+    return manager
+
+
+@pytest.fixture
 def recorded_termination(
     monkeypatch: pytest.MonkeyPatch,
 ) -> Iterator[ExitTimeline]:
@@ -149,30 +167,42 @@ class TestTheTerminalExitProtocol:
         """The release is the owner's report, not the passage of time.
 
         A zero-length bound states that as an answer rather than a race:
-        before the owner reports, the wait can only fail; afterwards it
-        can only succeed.
+        before the owner reports, the wait can only expire; afterwards it
+        can only find the report.
         """
         terminal_exit = TerminalExit(follower_wait_seconds=0.0)
         assert terminal_exit.claim(0) is True
 
-        assert terminal_exit.wait_for_cleanup() is False
+        assert (
+            terminal_exit.await_owner_cleanup()
+            is FollowerOutcome.OWNER_CLEANUP_UNFINISHED
+        )
 
         terminal_exit.report_cleanup_finished()
 
-        assert terminal_exit.wait_for_cleanup() is True
+        assert (
+            terminal_exit.await_owner_cleanup()
+            is FollowerOutcome.OWNER_CLEANUP_FINISHED
+        )
 
-    def test_a_follower_gives_up_rather_than_waiting_forever(self) -> None:
-        """A cleanup that never finishes must not make the process unkillable.
+    def test_a_follower_stops_waiting_but_is_told_what_it_stopped_on(self) -> None:
+        """The bound ends the waiting, and says nothing about the cleanup.
 
-        The bound is what keeps an explicit force request from becoming
-        an unbounded wait, so it is stated as a value the caller can see
-        and a result the caller is told about.
+        A follower that gives up learns that the owner's cleanup is
+        *unfinished* — which is the one thing that decides what it may do
+        next. The bound is stated as a value the caller can see and an
+        outcome the caller is told about, so nothing downstream has to
+        infer "finished" from "stopped waiting".
         """
         terminal_exit = TerminalExit(follower_wait_seconds=0.0)
         terminal_exit.claim(0)
 
         assert terminal_exit.follower_wait_seconds == 0.0
-        assert terminal_exit.wait_for_cleanup() is False
+        assert (
+            terminal_exit.await_owner_cleanup()
+            is FollowerOutcome.OWNER_CLEANUP_UNFINISHED
+        )
+        assert terminal_exit.cleanup_reported is False
 
     def test_a_follower_exits_with_the_owners_code(self) -> None:
         """One exit sequence means one exit code, the owner's."""
@@ -280,6 +310,80 @@ class TestExactlyOneExitOwner:
         # Requirement 4: the in-flight state says "cleanup/exit in
         # progress", and is not EXITED overwritten by SHUTTING_DOWN.
         assert state_during_cleanup == [ShutdownState.SHUTTING_DOWN]
+        assert manager.state is ShutdownState.EXITED
+
+    def test_a_follower_that_gives_up_waiting_still_does_not_terminate(
+        self,
+        manager_with_an_expired_follower_bound: ShutdownManager,
+        recorded_termination: ExitTimeline,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """The bound ends the waiting. It does not confer exit authority.
+
+        The follower's wait is a liveness mechanism — it stops a caller
+        being parked forever on a cleanup that never finishes. It is not
+        a timer after which a competing exit request may end the process
+        anyway: that would be the #330 defect back again, delayed rather
+        than removed, and #326 already settled that being unable to
+        complete a graceful retirement is not authority to manufacture a
+        forced one.
+
+        So the owner is held inside cleanup for the whole of the
+        follower's bound and past it, the follower is let time out, and
+        the termination count has to stay at zero until the owner itself
+        finishes. If a cleanup genuinely never finishes, the truthful
+        outcome is a shutdown that failed, reported at ERROR — not a
+        process death a non-owner invented.
+        """
+        caplog.set_level(logging.ERROR, logger=SHUTDOWN_MANAGER_LOGGER)
+        manager = manager_with_an_expired_follower_bound
+        timeline = recorded_termination
+        cleanup_started = threading.Event()
+        release_cleanup = threading.Event()
+
+        def held_cleanup() -> None:
+            timeline.record(CLEANUP_STARTED)
+            cleanup_started.set()
+            assert release_cleanup.wait(CLEANUP_HOLD_TIMEOUT_SECONDS), (
+                "the exit owner's cleanup was never released"
+            )
+            timeline.record(CLEANUP_FINISHED)
+
+        manager.add_cleanup_callback(held_cleanup)
+        manager.request_shutdown(reason="API /api/shutdown")
+
+        owner, owner_result = run_in_thread(manager.exit, 0)
+        wait_for_event(
+            cleanup_started, JOIN_TIMEOUT_SECONDS, label="the exit owner's cleanup"
+        )
+
+        follower, follower_result = run_in_thread(manager.exit, 0)
+        # Not a settling window: the follower's bound is already spent
+        # when it starts waiting, so joining it means it has done
+        # everything exit() gives it to do — with the owner demonstrably
+        # still inside cleanup, because only this test releases it.
+        join_or_fail(follower, JOIN_TIMEOUT_SECONDS, label="second exit caller")
+        follower_result.unwrap()
+
+        assert timeline.count(TERMINATED) == 0, (
+            "a follower whose wait expired terminated the process while the "
+            f"exit owner's cleanup was still running: {timeline.entries}"
+        )
+        # And it left the shutdown truthfully mid-flight rather than
+        # advancing the machine to a terminal state it did not reach.
+        assert manager.state is ShutdownState.SHUTTING_DOWN
+        assert any(
+            "returning without terminating" in record.getMessage()
+            for record in caplog.records
+        ), "the follower did not report the shutdown as incomplete"
+
+        release_cleanup.set()
+        join_or_fail(owner, JOIN_TIMEOUT_SECONDS, label="exit owner")
+        owner_result.unwrap()
+
+        # The process dies once, at the hand of the owner, after its
+        # cleanup finished.
+        assert timeline.entries == [CLEANUP_STARTED, CLEANUP_FINISHED, TERMINATED]
         assert manager.state is ShutdownState.EXITED
 
     def test_the_shutdown_state_only_ever_moves_forward(

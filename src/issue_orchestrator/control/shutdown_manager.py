@@ -64,16 +64,37 @@ _STATE_ORDER: dict[ShutdownState, int] = {
     ShutdownState.EXITED: 3,
 }
 
-# How long a second exit() caller waits for the exit owner's cleanup before
-# terminating the process anyway. Chosen to sit between the two real numbers
-# around it: a cleanup that is still making progress may legitimately take up
-# to the 60 s background-job drain in ``Orchestrator._drain_background_jobs``,
-# and a cleanup that has hung must still leave a dead process inside the
-# supervisor's 120 s graceful budget
-# (``infra.shutdown_timing.DEFAULT_ENGINE_GRACEFUL_TIMEOUT_SECONDS``) — a
-# non-force stop is not authority to signal the engine (#326), so an engine
-# that never exits on its own is an engine the operator cannot stop.
+# How long a non-owner exit() caller parks on the exit owner's cleanup report
+# before it stops waiting for one. It bounds the *observation*, never the
+# cleanup: expiry is returned as ``FollowerOutcome.OWNER_CLEANUP_UNFINISHED``
+# and is not authority to terminate the process (#330).
+#
+# Chosen above the 60 s background-job drain in
+# ``Orchestrator._drain_background_jobs``, so a cleanup that is still making
+# progress is never reported as stalled, and below the supervisor's 120 s
+# graceful budget
+# (``infra.shutdown_timing.DEFAULT_ENGINE_GRACEFUL_TIMEOUT_SECONDS``), so the
+# report lands in the log while this shutdown is still the one being watched.
 DEFAULT_FOLLOWER_CLEANUP_WAIT_SECONDS = 90.0
+
+
+class FollowerOutcome(Enum):
+    """What a non-owner ``exit()`` caller found when it stopped waiting.
+
+    The two outcomes carry different authority, which is why this is a
+    named result rather than a bare bool:
+
+    - ``OWNER_CLEANUP_FINISHED`` — the owner reported. The follower may
+      follow the terminal outcome that owner already owns.
+    - ``OWNER_CLEANUP_UNFINISHED`` — the bound expired with the owner's
+      cleanup still in flight. The follower may report that, and nothing
+      else. A concurrent exit request is not authority to end the process
+      ahead of the owner's cleanup (#330), and an incomplete graceful
+      retirement is not authority to manufacture a forced one (#326).
+    """
+
+    OWNER_CLEANUP_FINISHED = "owner_cleanup_finished"
+    OWNER_CLEANUP_UNFINISHED = "owner_cleanup_unfinished"
 
 
 class TerminalExit:
@@ -89,12 +110,14 @@ class TerminalExit:
     So the claim is taken once, for the life of the process:
 
     - exactly one caller wins :meth:`claim` and owns cleanup + termination;
-    - every other caller loses it and calls :meth:`wait_for_cleanup`, which
-      blocks until the owner reports cleanup finished. It can therefore never
-      terminate the process ahead of that cleanup;
-    - the wait is bounded, so a cleanup that never finishes cannot make the
-      process unkillable. Expiry is reported to the caller rather than
-      swallowed.
+    - every other caller loses it and calls :meth:`await_owner_cleanup`,
+      which blocks until the owner reports cleanup finished. It can
+      therefore never terminate the process ahead of that cleanup;
+    - the *waiting* is bounded, so a follower's thread is not parked
+      forever on a cleanup that never finishes. The bound governs only how
+      long the follower observes: expiry comes back as a
+      :class:`FollowerOutcome` to be reported, never as a licence to
+      terminate.
     """
 
     def __init__(
@@ -162,13 +185,15 @@ class TerminalExit:
         """Announce that the owner's cleanup has run to completion."""
         self._cleanup_finished.set()
 
-    def wait_for_cleanup(self) -> bool:
-        """Block until the owner reports cleanup finished.
+    def await_owner_cleanup(self) -> FollowerOutcome:
+        """Block, bounded, until the owner reports cleanup finished.
 
         Returns:
-            True if cleanup finished, False if the bound expired first.
+            Which of the two outcomes the caller is entitled to act on.
         """
-        return self._cleanup_finished.wait(self._follower_wait_seconds)
+        if self._cleanup_finished.wait(self._follower_wait_seconds):
+            return FollowerOutcome.OWNER_CLEANUP_FINISHED
+        return FollowerOutcome.OWNER_CLEANUP_UNFINISHED
 
 
 @dataclass
@@ -331,9 +356,11 @@ class ShutdownManager:
 
         Exactly one caller owns the terminal sequence — logging the exit,
         running cleanup to completion, then terminating. A concurrent caller
-        never becomes a second owner: it waits for that cleanup and only then
-        terminates, so cleanup can never be cut short by a competing exit
-        (#330).
+        never becomes a second owner and never terminates ahead of that
+        cleanup: it follows the owner's terminal outcome once the owner has
+        reported one, and if no report ever comes it says so and returns
+        rather than ending the process itself. Cleanup can therefore never
+        be cut short by a competing exit (#330).
 
         Args:
             code: Exit code (default 0)
@@ -371,14 +398,30 @@ class ShutdownManager:
         self._terminate(code)
 
     def _follow_the_terminal_exit(self) -> None:
-        """Second exit request: wait out the owner's cleanup, then terminate."""
-        if not self._terminal_exit.wait_for_cleanup():
+        """Second exit request: follow the owner's outcome, never outrun it.
+
+        A follower terminates only on the strength of the owner's own
+        report, and then only to follow a terminal outcome the owner
+        already owns. If that report never comes, the truthful outcome is
+        a shutdown that did not complete — not a process death this caller
+        invented. Terminating on the bound instead would reinstate exactly
+        the direction #330 exists to remove, merely delayed; and #326
+        already settled that being unable to complete a graceful
+        retirement is not authority to manufacture a forced one. That
+        authority stays where it already lives, with the explicit force
+        owner.
+        """
+        outcome = self._terminal_exit.await_owner_cleanup()
+        if outcome is FollowerOutcome.OWNER_CLEANUP_UNFINISHED:
             logger.error(
-                "[shutdown] The exit owner did not finish cleanup within "
-                "%.0fs; terminating anyway so the process cannot become "
-                "unkillable",
+                "[shutdown] The exit owner has not reported its cleanup "
+                "finished after %.0fs. This exit request does not own the "
+                "process's exit, so it is returning without terminating; the "
+                "shutdown has not completed",
                 self._terminal_exit.follower_wait_seconds,
             )
+            return
+
         self._terminate(self._terminal_exit.exit_code)
 
     def _terminate(self, code: int) -> None:
@@ -415,12 +458,19 @@ class ShutdownManager:
         signal.signal(signal.SIGINT, signal_handler)
         logger.debug("[shutdown] Signal handlers installed")
 
-    def reset(self) -> None:
+    def reset(
+        self,
+        *,
+        follower_wait_seconds: float = DEFAULT_FOLLOWER_CLEANUP_WAIT_SECONDS,
+    ) -> None:
         """Reset state for testing. DO NOT use in production.
 
         This is the one place the state machine goes backwards, and the one
         place the terminal exit claim is given up — both only because a test
-        process outlives the shutdowns it exercises.
+        process outlives the shutdowns it exercises. ``follower_wait_seconds``
+        is here for the same reason: a test that has to observe what a
+        follower does when the bound expires cannot spend the production
+        bound getting there.
         """
         with self._state_lock:
             self._state = ShutdownState.RUNNING
@@ -428,7 +478,9 @@ class ShutdownManager:
             self._shutdown_reason = None
             self._callbacks.clear()
             self._repo_root = None
-            self._terminal_exit = TerminalExit()
+            self._terminal_exit = TerminalExit(
+                follower_wait_seconds=follower_wait_seconds
+            )
 
 
 # Global singleton instance
