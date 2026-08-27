@@ -31,11 +31,11 @@ from ..domain.tech_lead_manifest import TechLeadManifest
 from ..domain.board_snapshot import BOARD_SNAPSHOT_FILENAME, BoardSnapshot
 from ..domain.tech_lead_session import (
     HEALTH_REVIEW_MARKER_LABEL,
-    TECH_LEAD_ASSIGNMENT_FILENAME,
     TechLeadAssignment,
     TechLeadLaunchAuthority,
     TechLeadLaunchScope,
     TechLeadSessionFlavor,
+    tech_lead_assignment_path,
 )
 from ..ports.planning_command_guard import (
     GUARDABLE_PLANNING_PROVIDERS,
@@ -225,7 +225,7 @@ def read_tech_lead_assignment(run_dir: Path) -> TechLeadAssignment | None:
     Returns None when the assignment file is absent (pre-upgrade sessions).
     Malformed content raises ValueError - callers decide the fail-safe.
     """
-    path = run_dir / "tech-lead-data" / TECH_LEAD_ASSIGNMENT_FILENAME
+    path = tech_lead_assignment_path(run_dir)
     if not path.exists():
         return None
     return TechLeadAssignment.read(path)
@@ -499,7 +499,7 @@ def prepare_tech_lead_session_data(
         focus_issue_number=issue.number if focused else None,
         focus_reason=issue.title if focused else "",
     )
-    assignment_path = run_dir / "tech-lead-data" / TECH_LEAD_ASSIGNMENT_FILENAME
+    assignment_path = tech_lead_assignment_path(run_dir)
     assignment.write(assignment_path)
     ctx.update_manifest({"tech_lead_assignment": str(assignment_path)})
     focus_issue = issue.number if focused else None

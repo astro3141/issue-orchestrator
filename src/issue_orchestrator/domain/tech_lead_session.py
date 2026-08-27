@@ -28,6 +28,21 @@ from .tech_lead_artifacts import ACT_LEVEL_TECH_LEAD_ACTIONS
 
 TECH_LEAD_ASSIGNMENT_FILENAME = "tech-lead-assignment.json"
 
+# The run-scoped directory a tech_lead session's launch inputs are staged in.
+TECH_LEAD_DATA_DIRNAME = "tech-lead-data"
+
+
+def tech_lead_assignment_path(run_dir: Path) -> Path:
+    """Where *run_dir*'s launch-time assignment copy lives.
+
+    One owner for the location, asked by the launcher that writes it and by
+    every reader that later asks what variant a run was launched as. A reader
+    that computed the path itself could look somewhere the launcher never
+    writes — and "no assignment here" is indistinguishable from "this run is
+    not a tech_lead run", so the drift would be silent rather than loud.
+    """
+    return run_dir / TECH_LEAD_DATA_DIRNAME / TECH_LEAD_ASSIGNMENT_FILENAME
+
 # Marker label carried by health-review anchor issues (ADR-0031 §4).
 # Labels are crash-safe truth (ADR-0013): the marker is both how the launcher
 # derives the HEALTH_REVIEW flavor and how the fact gatherer deduplicates an

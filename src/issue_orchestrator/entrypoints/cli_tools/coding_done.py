@@ -14,7 +14,9 @@ import os
 import subprocess
 import sys
 import traceback
+from dataclasses import dataclass
 from pathlib import Path
+from typing import NoReturn
 
 from .agent_done import (
     AgentStatus,
@@ -43,8 +45,17 @@ from .dirty_retry_budget import (
     reset_rejection_counter,
 )
 from .orchestrator_resume import trigger_orchestrator_resume
-from .orchestrator_run_assets import require_orchestrator_run_assets_for_session
+from .orchestrator_run_assets import (
+    require_orchestrator_run_assets_for_session,
+    resolve_orchestrator_run_assets_for_session,
+)
 
+from ...control.agent_gate import AgentGateResult
+from ...control.completion_gate_routing import (
+    CompletionGateRouting,
+    route_completion_gate,
+)
+from ...domain.session_run import SessionRunAssets
 from ...execution.git_planted_paths import local_repo_owns_planted_cli_tools
 from ...infra.env import get_env
 from ...infra.logging_config import issue_log
@@ -264,6 +275,141 @@ def _handle_dirty_files_rejection(
     sys.exit(1)
 
 
+def resolve_completion_gate_routing(
+    worktree_root: Path,
+    session_id: str,
+    *,
+    managed: bool,
+) -> CompletionGateRouting:
+    """Which gate this completion takes, decided from owner-injected context.
+
+    Asked BEFORE the candidate quick contract is read, because reading that
+    contract is the first half of running it: a planning run that got as far
+    as ``load_validation_cmd`` has already been handed the command it must not
+    execute, and a config error in a gate it will never run would fail it.
+
+    The only run directory the routing owner is shown is one this session's
+    own manifest proved — a standalone invocation, and a managed run whose
+    injected context does not prove out, are both routed as ordinary. Nothing
+    is searched for: an assignment found somewhere other than *this* run's
+    directory is not evidence about this run.
+    """
+    if not managed or not session_id:
+        return route_completion_gate(None)
+    return route_completion_gate(
+        resolve_orchestrator_run_assets_for_session(worktree_root, session_id).run_dir
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class QuickGateRun:
+    """What the candidate quick-gate phase produced.
+
+    Both fields absent means the phase ran and found no quick gate configured
+    — the long-standing "no ``validation.quick.cmd``" case, which is a
+    completion with nothing to record, not a skipped gate.
+    """
+
+    result: AgentGateResult | None = None
+    assets: SessionRunAssets | None = None
+
+    def __post_init__(self) -> None:
+        if self.result is not None and self.assets is None:
+            raise ValueError(
+                "a quick gate that ran has the run assets it wrote its "
+                "evidence into"
+            )
+
+
+def run_candidate_quick_gate(
+    worktree_root: Path,
+    *,
+    session_id: str,
+    managed: bool,
+    verbose: bool,
+) -> QuickGateRun:
+    """Read the candidate quick contract and run it, if one is configured.
+
+    The immediate feedback path for coding agents; deeper publish validation
+    runs later through the orchestrator-controlled pre-push/pre-publish gate.
+    Reached only when :func:`resolve_completion_gate_routing` says this
+    completion has a code candidate to validate.
+    """
+    selection = load_validation_cmd(worktree_root)
+    if not selection.cmd:
+        return QuickGateRun()
+    if not session_id:
+        logger.error("[coding-done] Validation requires session_id but none found")
+        sys.exit(1)
+    if managed:
+        assets = require_orchestrator_run_assets_for_session(worktree_root, session_id)
+    else:
+        assets = FileSystemSessionOutput().start_run(
+            worktree_root,
+            session_id,
+            # Unmanaged run: the orchestrator never allocated one, so the
+            # profile this session actually resolved is the only honest thing
+            # to freeze onto it (#7059).
+            validation_profile=selection.profile,
+        )
+    result = run_validation(
+        worktree_root,
+        session_output_dir=assets.run_dir,
+        verbose=verbose,
+    )
+    if result is None:
+        return QuickGateRun()
+    return QuickGateRun(result=result, assets=assets)
+
+
+def _report_validation_failure(
+    validation_result: AgentGateResult,
+    *,
+    issue_number: int | None,
+    status: str,
+) -> NoReturn:
+    """Print what failed and exit non-zero."""
+    print(f"\n{'='*60}")
+    print("❌ VALIDATION FAILED — coding-done cannot complete")
+    print(f"{'='*60}")
+    print(f"\nReason: {validation_result.reason}")
+
+    record = validation_result.record
+    if record and record.stderr_path:
+        _print_gate_log(Path(record.stderr_path), "STDERR (what failed)", tail=50)
+    if record and record.stdout_path:
+        _print_gate_log(Path(record.stdout_path), "STDOUT", tail=30)
+
+    print(f"\n{'='*60}")
+    print("TO FIX: Read the errors above, fix them, then run coding-done again.")
+    print("If you CANNOT fix after 2-3 attempts, use:")
+    print('  coding-done blocked --reason "Validation failing: <error>" --attempted "..."')
+    print(f"{'='*60}")
+
+    if issue_number:
+        logger.info(
+            issue_log(issue_number, "coding-done outcome: status=%s validation=FAILED"),
+            status,
+        )
+    sys.exit(1)
+
+
+def _print_gate_log(path: Path, heading: str, *, tail: int) -> None:
+    """Print the last *tail* lines of one gate log, if it has any."""
+    if not path.exists():
+        return
+    content = path.read_text()
+    if not content.strip():
+        return
+    print(f"\n--- {heading} ---")
+    lines = content.strip().split("\n")
+    if len(lines) > tail:
+        print(f"... ({len(lines) - tail} lines truncated)")
+        lines = lines[-tail:]
+    print("\n".join(lines))
+    print(f"--- END {heading.split(' ')[0]} ---")
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Build argument parser for coding-done."""
     parser = argparse.ArgumentParser(
@@ -408,37 +554,27 @@ def main() -> None:  # noqa: C901, PLR0912
     if managed:
         reset_rejection_counter(worktree_root, get_session_id())
 
-    # 3. Run quick validation if configured. This is the immediate feedback
-    #    path for coding agents; deeper publish validation runs later through
-    #    the orchestrator-controlled pre-push/pre-publish gate.
+    # 3. Route the completion BEFORE reading any candidate quick-validation
+    #    configuration: a planning_investigation run has no code candidate,
+    #    and the gate the quick contract names is one #289 refuses it outright.
+    routing = resolve_completion_gate_routing(
+        worktree_root, record.session_id, managed=managed
+    )
+
     validation_result = None
-    statuses_requiring_validation = {AgentStatus.COMPLETED}
     assets = None
-    if status in statuses_requiring_validation:
-        selection = load_validation_cmd(worktree_root)
-        if selection.cmd:
-            if not record.session_id:
-                logger.error("[coding-done] Validation requires session_id but none found")
-                sys.exit(1)
-            if managed:
-                assets = require_orchestrator_run_assets_for_session(
-                    worktree_root,
-                    record.session_id,
-                )
-            else:
-                assets = FileSystemSessionOutput().start_run(
-                    worktree_root,
-                    record.session_id,
-                    # Unmanaged run: the orchestrator never allocated one, so
-                    # the profile this session actually resolved is the only
-                    # honest thing to freeze onto it (#7059).
-                    validation_profile=selection.profile,
-                )
-            validation_result = run_validation(
-                worktree_root,
-                session_output_dir=assets.run_dir,
-                verbose=args.verbose,
-            )
+    statuses_requiring_validation = {AgentStatus.COMPLETED}
+    if status in statuses_requiring_validation and routing.runs_candidate_quick_gate:
+        gate_run = run_candidate_quick_gate(
+            worktree_root,
+            session_id=record.session_id,
+            managed=managed,
+            verbose=args.verbose,
+        )
+        validation_result = gate_run.result
+        assets = gate_run.assets
+    elif status in statuses_requiring_validation:
+        print(f"Note: Skipping code-candidate quick validation — {routing.reason}")
     elif status in {AgentStatus.BLOCKED, AgentStatus.NEEDS_HUMAN}:
         print(f"Note: Skipping validation for '{status}' status (agent is reporting a problem)")
 
@@ -452,46 +588,9 @@ def main() -> None:  # noqa: C901, PLR0912
             record.validation_record_path = str(validation_record_path)
 
     if validation_result and not validation_result.passed:
-        print(f"\n{'='*60}")
-        print("❌ VALIDATION FAILED — coding-done cannot complete")
-        print(f"{'='*60}")
-        print(f"\nReason: {validation_result.reason}")
-
-        if validation_result.record and validation_result.record.stderr_path:
-            stderr_path = Path(validation_result.record.stderr_path)
-            if stderr_path.exists():
-                stderr_content = stderr_path.read_text()
-                if stderr_content.strip():
-                    print(f"\n--- STDERR (what failed) ---")
-                    lines = stderr_content.strip().split('\n')
-                    if len(lines) > 50:
-                        print(f"... ({len(lines) - 50} lines truncated)")
-                        lines = lines[-50:]
-                    print('\n'.join(lines))
-                    print("--- END STDERR ---")
-
-        if validation_result.record and validation_result.record.stdout_path:
-            stdout_path = Path(validation_result.record.stdout_path)
-            if stdout_path.exists():
-                stdout_content = stdout_path.read_text()
-                if stdout_content.strip():
-                    print(f"\n--- STDOUT ---")
-                    lines = stdout_content.strip().split('\n')
-                    if len(lines) > 30:
-                        print(f"... ({len(lines) - 30} lines truncated)")
-                        lines = lines[-30:]
-                    print('\n'.join(lines))
-                    print("--- END STDOUT ---")
-
-        print(f"\n{'='*60}")
-        print("TO FIX: Read the errors above, fix them, then run coding-done again.")
-        print("If you CANNOT fix after 2-3 attempts, use:")
-        print('  coding-done blocked --reason "Validation failing: <error>" --attempted "..."')
-        print(f"{'='*60}")
-
-        if issue_number:
-            logger.info(issue_log(issue_number, "coding-done outcome: status=%s validation=FAILED"), status)
-        sys.exit(1)
+        _report_validation_failure(
+            validation_result, issue_number=issue_number, status=status
+        )
 
     # 3b. Re-check dirty tree AFTER validation. Closes the temporal
     #     variance with the orchestrator's publish gate: validate.sh can

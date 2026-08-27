@@ -1373,6 +1373,40 @@ Nothing else outside the worktree changes: no tracked file, no
 `.codex/rules` in the product checkout, no `~/.codex`, no trust, sandbox,
 approval or credential state.
 
+**The other way that gate could still have run.** The launch-scoped guard stops
+the *agent* from typing a gate command. It does not stop `coding-done` from
+running one on the agent's behalf: `coding-done completed` reads
+`validation.quick.cmd` and runs it as the agent gate, and a planning run that
+reached that point was handed the command the guard exists to refuse — inside
+a completion the agent could not then fail out of gracefully.
+
+So the completion command routes before it reads. `control/completion_gate_routing.py`
+is the single owner of one question — *given the owner-injected managed-run
+directory, does this completion have a code candidate to validate?* — and
+`coding-done` asks it **before** touching the quick contract, because reading
+that contract is the first half of running it. A `planning_investigation` run
+calls neither `load_validation_cmd` nor `run_validation`, writes no
+validation-record/stdout/stderr evidence, and claims no PASS; it writes the
+ordinary completion marker and record. Every other principal — an Actor, a
+rework agent, `batch_review`, `failure_investigation`, `health_review`, and any
+standalone invocation — keeps the quick gate exactly as before, and the
+pre-completion dirty-tree refusal runs ahead of success either way.
+
+The routing evidence is the launch-time `tech-lead-assignment.json` staged in
+that run's own directory, and it is a **routing hint only**. It lives in
+agent-writable space, so what an agent can buy by rewriting it is bounded to
+skipping its own fast-feedback gate: nothing from it enters the completion
+record, and zero-code publication, effect and settlement authority keep reading
+the orchestrator-owned `TechLeadLaunchAuthority` plus orchestrator-observed HEAD
+(#202/#257). Only the directory the session owner injected — and only after
+this session's own manifest proves it — is read at all; nothing is searched
+for. Every way of not knowing (no managed context, a run directory that does
+not prove out, no assignment, an assignment that will not parse, a flavor that
+is not planning) falls back to the ordinary candidate gate, including that
+path's own refusals. The unsafe error would be skipping a real candidate's
+validation; refusing to skip costs a planning run one wasted gate, which is
+what the product did before this existed.
+
 ## Configuration (YAML)
 
 ```yaml
