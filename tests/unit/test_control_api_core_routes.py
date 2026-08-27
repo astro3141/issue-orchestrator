@@ -1656,7 +1656,12 @@ class TestControlReposActiveSessionCount:
 
 
 class TestControlOrchestratorStatusActiveSessionCount:
-    """``/control/orchestrator/status`` shares the orphan-payload code path."""
+    """``/control/orchestrator/status`` shares the orphan-payload builder.
+
+    Both this route and ``/control/repos`` build their orphaned-engine status
+    through ``build_orphaned_engine_status``, so the count rule cannot drift
+    between the two seams.
+    """
 
     def test_status_accepts_the_int_shape_from_an_orphaned_engine(
         self,

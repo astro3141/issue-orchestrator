@@ -12,6 +12,7 @@ import pytest
 
 from issue_orchestrator.execution.repository_engine_status_payload import (
     ActiveSessionCount,
+    build_orphaned_engine_status,
     publish_active_session_count,
     read_active_session_count,
 )
@@ -92,6 +93,10 @@ class TestReadActiveSessionCount:
         with pytest.raises(ValueError, match="negative"):
             ActiveSessionCount.known(-1)
 
+    def test_direct_construction_also_rejects_a_negative_count(self) -> None:
+        with pytest.raises(ValueError, match="negative"):
+            ActiveSessionCount(-1)
+
 
 class TestPublishActiveSessionCount:
     """Publication never manufactures a count the engine did not state."""
@@ -125,3 +130,108 @@ class TestPublishActiveSessionCount:
         publish_active_session_count(status_payload, {})
 
         assert "active_session_count" not in status_payload
+
+
+def _detected_engine(**overrides: object) -> dict[str, object]:
+    """A ``detect_repository_orchestrators`` entry for a live engine."""
+    detected: dict[str, object] = {
+        "port": 8770,
+        "health": "healthy",
+        "tick_age_seconds": 12.5,
+        "status": {"shutdown_requested": False, "active_sessions": 2},
+        "info": {
+            "configuration_mode": "default",
+            "config_name": "selfhost.yaml",
+            "config_fingerprint": "abc123",
+        },
+    }
+    detected.update(overrides)
+    return detected
+
+
+class TestBuildOrphanedEngineStatus:
+    """One owner builds the orphaned-engine payload both seams publish."""
+
+    def test_builds_the_supervisor_shaped_payload_for_a_live_engine(self) -> None:
+        payload = build_orphaned_engine_status(_detected_engine())
+
+        assert payload == {
+            "state": "running",
+            "pid": None,
+            "port": 8770,
+            "started_at": None,
+            "recovered": False,
+            "error": None,
+            "orphaned": True,
+            "health": "healthy",
+            "tick_age_seconds": 12.5,
+            "shutdown_requested": False,
+            "active_session_count": 2,
+        }
+
+    def test_configuration_identity_is_omitted_by_default(self) -> None:
+        payload = build_orphaned_engine_status(_detected_engine())
+
+        assert "configuration_mode" not in payload
+        assert "config_name" not in payload
+        assert "config_fingerprint" not in payload
+
+    def test_configuration_identity_is_published_when_requested(self) -> None:
+        payload = build_orphaned_engine_status(
+            _detected_engine(), include_configuration_identity=True
+        )
+
+        assert payload["configuration_mode"] == "default"
+        assert payload["config_name"] == "selfhost.yaml"
+        assert payload["config_fingerprint"] == "abc123"
+
+    def test_missing_configuration_identity_reads_as_null(self) -> None:
+        payload = build_orphaned_engine_status(
+            _detected_engine(info={}), include_configuration_identity=True
+        )
+
+        assert payload["configuration_mode"] is None
+        assert payload["config_name"] is None
+        assert payload["config_fingerprint"] is None
+
+    def test_list_shape_active_sessions_is_counted(self) -> None:
+        payload = build_orphaned_engine_status(
+            _detected_engine(
+                status={"active_sessions": [{"issue_number": 41}], "x": 1}
+            )
+        )
+
+        assert payload["active_session_count"] == 1
+
+    def test_an_unstated_count_is_omitted_rather_than_zeroed(self) -> None:
+        payload = build_orphaned_engine_status(
+            _detected_engine(status={"shutdown_requested": True})
+        )
+
+        assert "active_session_count" not in payload
+        assert payload["shutdown_requested"] is True
+
+    def test_an_unprobeable_engine_status_still_yields_a_payload(self) -> None:
+        payload = build_orphaned_engine_status(
+            _detected_engine(status={}, health=None, tick_age_seconds=None)
+        )
+
+        assert payload["state"] == "running"
+        assert payload["orphaned"] is True
+        assert payload["shutdown_requested"] is False
+        assert "active_session_count" not in payload
+
+    def test_absent_health_reads_as_unknown(self) -> None:
+        detected = _detected_engine()
+        del detected["health"]
+
+        payload = build_orphaned_engine_status(detected)
+
+        assert payload["health"] == "unknown"
+
+    def test_a_probe_without_a_port_fails_loudly(self) -> None:
+        detected = _detected_engine()
+        del detected["port"]
+
+        with pytest.raises(KeyError):
+            build_orphaned_engine_status(detected)

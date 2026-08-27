@@ -13,6 +13,7 @@ from ..execution.control_center_runtime import (
 )
 from ..execution.orchestrator_http_api import probe_orchestrator_json
 from ..execution.repository_engine_status_payload import (
+    build_orphaned_engine_status,
     publish_active_session_count,
 )
 from ..ports.repository_engine_supervisor import (
@@ -300,20 +301,7 @@ def _populate_single_instance_status(
         detected_engines = detect_repository_orchestrators(repo_path)
         if detected_engines:
             detected = detected_engines[0]
-            status_data = detected.get("status", {})
-            orphaned_status = {
-                "state": "running",
-                "pid": None,
-                "port": detected["port"],
-                "started_at": None,
-                "recovered": False,
-                "error": None,
-                "orphaned": True,
-                "health": detected.get("health", "unknown"),
-                "tick_age_seconds": detected.get("tick_age_seconds"),
-                "shutdown_requested": status_data.get("shutdown_requested", False),
-            }
-            publish_active_session_count(orphaned_status, status_data)
+            orphaned_status = build_orphaned_engine_status(detected)
             repo_data["status"] = enrich_runtime_health(
                 repo_path,
                 orphaned_status,

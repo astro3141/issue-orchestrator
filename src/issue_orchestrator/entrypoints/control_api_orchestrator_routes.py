@@ -23,7 +23,7 @@ from ..execution.control_center_runtime import (
     get_selected_launch_selection,
 )
 from ..execution.repository_engine_status_payload import (
-    publish_active_session_count,
+    build_orphaned_engine_status,
 )
 from ..infra.config import Config, get_config_path
 from ..infra.repo_guardrails import (
@@ -567,25 +567,10 @@ async def control_status(
     if status_info.state != "running":
         detected_engines = detect_repository_orchestrators(path)
         if detected_engines:
-            detected = detected_engines[0]
-            status_data = detected.get("status", {})
-            info = detected.get("info", {})
-            orphaned_payload = {
-                "state": "running",
-                "pid": None,
-                "port": detected["port"],
-                "started_at": None,
-                "recovered": False,
-                "error": None,
-                "orphaned": True,
-                "health": detected.get("health", "unknown"),
-                "tick_age_seconds": detected.get("tick_age_seconds"),
-                "shutdown_requested": status_data.get("shutdown_requested", False),
-                "configuration_mode": info.get("configuration_mode"),
-                "config_name": info.get("config_name"),
-                "config_fingerprint": info.get("config_fingerprint"),
-            }
-            publish_active_session_count(orphaned_payload, status_data)
+            orphaned_payload = build_orphaned_engine_status(
+                detected_engines[0],
+                include_configuration_identity=True,
+            )
             return JSONResponse(
                 enrich_runtime_health(path, orphaned_payload, orphaned=True)
                 or orphaned_payload
