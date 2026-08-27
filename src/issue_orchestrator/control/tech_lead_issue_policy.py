@@ -145,6 +145,36 @@ def is_scheduler_projection_label(label: str, *, config: "Config") -> bool:
     return folded in configured
 
 
+def pending_proposal_protected_label_violations(
+    proposed: Iterable[str], *, config: "Config", labels: LabelManager
+) -> list[str]:
+    """Protected labels a PENDING-PROPOSAL creation would still project (#332).
+
+    The two predicates in this module answer different questions and both must
+    hold on every path: :func:`is_scheduler_projection_label` governs ADMISSION
+    ("does this admit an Actor?"), :func:`is_protected_tech_lead_label` governs
+    LABEL TRUTH ("does this touch orchestrator-owned state?"). A planning
+    proposal is exempt from the label-truth rule only where the creation
+    boundary provably withholds the name: :func:`_pending_proposal_labels`
+    filters out exactly the scheduler-projection labels, so those cannot reach
+    the issue and rejecting the whole decision over one would destroy the single
+    bounded proposal the run exists to produce (#261, #295 §4-5).
+
+    Every OTHER protected label is projected verbatim by that boundary, so it
+    stays fatal here exactly as it is for every other role — the owner's rule is
+    enforced once, on both paths, with no cross-path drift.
+    """
+    return protected_tech_lead_label_violations(
+        [
+            label
+            for label in proposed
+            if not is_scheduler_projection_label(label, config=config)
+        ],
+        config=config,
+        labels=labels,
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class TechLeadIssueAdmission:
     """How a tech-lead-created issue is admitted to the execution plane (#332).
@@ -467,11 +497,13 @@ def decision_issue_labels(
     * PENDING HUMAN APPROVAL — a planning proposal (#332). No destination agent
       is attached, and every scheduler-projection label is WITHHELD from the
       composed set no matter which source contributed it (model-proposed,
-      ``tech_lead.explicit_labels``, or inherited from the anchor). Protected
-      agent labels here are sanitized rather than fatal: a planning run's whole
-      purpose is to leave exactly one bounded proposal (#261, #295 §4-5), and a
-      pending proposal that projects nothing schedulable cannot corrupt label
-      truth by carrying an informational name the model chose badly.
+      ``tech_lead.explicit_labels``, or inherited from the anchor). Those, and
+      ONLY those, are sanitized rather than fatal — a planning run's whole
+      purpose is to leave exactly one bounded proposal (#261, #295 §4-5), and
+      the boundary was always going to withhold the label. Every other protected
+      agent label is still a contract violation upstream
+      (:func:`pending_proposal_protected_label_violations`), because this path
+      projects it verbatim just like the scheduled one.
     """
     if admission.pending_human_approval:
         return _pending_proposal_labels(
@@ -530,7 +562,10 @@ def _pending_proposal_labels(
     off the tech-lead anchor.
 
     Informational labels survive untouched; the gate is appended last and is the
-    only orchestrator-attached name a pending proposal carries.
+    only orchestrator-attached name a pending proposal carries. Any OTHER
+    protected label is projected verbatim from here, which is why it stays a
+    fatal contract violation upstream rather than being sanitized in this
+    function (:func:`pending_proposal_protected_label_violations`).
     """
     composed = _composed_decision_labels(config, anchor_labels=anchor_labels)
     candidates = _deduped((*composed, *agent_labels, *_area_labels(area)))

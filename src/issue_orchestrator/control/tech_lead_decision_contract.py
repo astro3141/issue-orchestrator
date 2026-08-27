@@ -36,7 +36,10 @@ from ..domain.tech_lead_artifacts import ACT_LEVEL_TECH_LEAD_ACTIONS
 from ..domain.tech_lead_capabilities import TECH_LEAD_ACTION_CAPABILITIES
 from ..domain.tech_lead_session import TechLeadLaunchAuthority, TechLeadSessionFlavor
 from .label_manager import LabelManager
-from .tech_lead_issue_policy import protected_tech_lead_label_violations
+from .tech_lead_issue_policy import (
+    pending_proposal_protected_label_violations,
+    protected_tech_lead_label_violations,
+)
 
 if TYPE_CHECKING:
     from ..domain.tech_lead_artifacts import TechLeadDecision
@@ -176,23 +179,25 @@ def _protected_label_violation(
     Checked here rather than in the domain contract so the artifact contract
     stays config-free.
 
-    Exempt for ``planning_investigation`` (#332). That role's create_issue does
-    not project the model's labels: its creation boundary files an UNSCHEDULED
-    proposal pending Human approval, withholding every scheduler-projection
-    label and sanitizing the rest, so a badly chosen name cannot reach label
-    truth. Rejecting the whole decision there would instead destroy the single
-    bounded proposal the run exists to produce (#261, #295 §4-5) over a label
-    the boundary was always going to withhold. Every other role still projects
-    what it proposes, so the violation stays fatal for them.
+    ``planning_investigation`` is exempt for exactly the labels its creation
+    boundary provably withholds, and no wider (#332). That role files an
+    UNSCHEDULED proposal pending Human approval, dropping every
+    scheduler-projection label from the composed set, so rejecting the whole
+    decision over one would destroy the single bounded proposal the run exists
+    to produce (#261, #295 §4-5) over a name that could never reach the issue.
+    Every other protected label IS projected verbatim by that boundary, so it
+    stays fatal for planning exactly as it is for every other role — the
+    label-truth owner in ``tech_lead_issue_policy`` decides in both cases.
     """
-    if authority.flavor is TechLeadSessionFlavor.PLANNING_INVESTIGATION:
-        return None
+    violations_for = (
+        pending_proposal_protected_label_violations
+        if authority.flavor is TechLeadSessionFlavor.PLANNING_INVESTIGATION
+        else protected_tech_lead_label_violations
+    )
     for action in decision.proposed_actions:
         if action.action_type != "create_issue":
             continue
-        violations = protected_tech_lead_label_violations(
-            action.labels, config=config, labels=labels
-        )
+        violations = violations_for(action.labels, config=config, labels=labels)
         if violations:
             return (
                 f"proposed action {action.id} (create_issue) carries protected"

@@ -300,10 +300,13 @@ Compact `tech-lead-decision.json` example:
   are rejected as a contract violation: anything like `in-progress`,
   `needs-*`, `*-reviewed`, `*-failed`, `publish-*`, `blocked*`, `agent:*`,
   or `tech_lead:*` corrupts orchestrator label truth (matching is
-  case-insensitive). In a `planning_investigation` the decision is not
-  rejected over this — the orchestrator files the proposal with the
-  offending labels **withheld** and records on the issue what you asked
-  for — but the rule is the same: prepare work, never schedule it.
+  case-insensitive). A `planning_investigation` is forgiven for exactly one
+  of these and no others: an `agent:*` or configured worker-agent label does
+  not reject the decision, because that proposal is filed UNSCHEDULED with
+  the label **withheld** and recorded on the issue as what you asked for.
+  Every other workflow label still rejects the whole decision, so do not
+  propose one. Either way the rule is the same: prepare work, never
+  schedule it.
 - Targets are scoped to what you were launched to audit, and the scope
   splits by action kind:
   - `post_comment` and `escalate_to_human` may only target the manifest

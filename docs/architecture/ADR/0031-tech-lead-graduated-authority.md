@@ -249,11 +249,17 @@ Properties:
   and peers are kept, and whatever was withheld is named in the issue body, so
   an erroneous or hostile planning label is visible to the approver instead of
   silently dropped.
-- **Planning's protected labels are sanitized, not fatal.** For every other
-  role a protected `create_issue` label still invalidates the whole decision
-  (§2a's fail-closed treatment of untrusted input). For planning it does not:
-  the run exists to leave exactly one bounded proposal, and the creation
-  boundary was always going to withhold the label anyway.
+- **Planning's scheduler labels are sanitized, not fatal — and only those.**
+  A protected `create_issue` label invalidates the whole decision for every
+  role (§2a's fail-closed treatment of untrusted input). Planning is forgiven
+  for exactly the subset the creation boundary provably withholds, the
+  scheduler-projection labels: the run exists to leave exactly one bounded
+  proposal, and that label was never going to reach the issue. Every other
+  protected label IS projected verbatim by the same boundary, so it stays
+  fatal for planning too. The two predicates hold on every path —
+  `is_scheduler_projection_label` governs admission, `is_protected_tech_lead_label`
+  governs label truth — and the pairing lives with them in
+  `tech_lead_issue_policy`, so neither rule drifts by flavor.
 - **Approval is two explicit Human acts.** Remove the gate, then route the issue
   to a worker agent. Discovery queries per configured agent label, so an
   unrouted proposal is unreachable by every Actor lane — and the gate's

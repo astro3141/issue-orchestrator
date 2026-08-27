@@ -314,6 +314,117 @@ class TestPlanningProposalWithSchedulerLabel:
         assert detail is not None
         assert WORKER in detail
 
+    @pytest.mark.parametrize(
+        "label",
+        [
+            "blocked",
+            "needs-human",
+            "needs-rework",
+            "publish-pending",
+            "code-reviewed",
+            "validation-failed",
+            "tech_lead:observed",
+            "proposed-tech-lead",
+            "tech-lead-observation",
+            "in-progress",
+        ],
+    )
+    def test_planning_is_forgiven_only_for_labels_the_boundary_withholds(
+        self, label: str
+    ) -> None:
+        """The exemption is exactly as wide as the sanitizer, and no wider.
+
+        ``_pending_proposal_labels`` withholds SCHEDULER-projection labels and
+        projects everything else verbatim, so any other protected label reaches
+        orchestrator label truth. A ``blocked`` proposal, for instance, would be
+        filed unschedulable forever — the Human's two-part approval act would
+        silently do nothing. Those stay a fatal contract violation for planning
+        exactly as they are for every other role.
+        """
+        config = _config()
+
+        detail = validate_decision_for_authority(
+            _decision(("bug", label)),
+            TechLeadLaunchAuthority(
+                flavor=TechLeadSessionFlavor.PLANNING_INVESTIGATION,
+                anchor_issue_number=ANCHOR,
+                focus_issue_number=ANCHOR,
+            ),
+            config=config,
+            labels=LabelManager(config),
+        )
+
+        assert detail is not None
+        assert label in detail
+
+    def test_a_case_flipped_non_scheduler_protected_label_is_still_fatal(
+        self,
+    ) -> None:
+        """GitHub label names are case-insensitive; the exemption must not be
+        escapable by spelling the protected name differently."""
+        config = _config()
+
+        detail = validate_decision_for_authority(
+            _decision(("bug", "NEEDS-Human")),
+            TechLeadLaunchAuthority(
+                flavor=TechLeadSessionFlavor.PLANNING_INVESTIGATION,
+                anchor_issue_number=ANCHOR,
+                focus_issue_number=ANCHOR,
+            ),
+            config=config,
+            labels=LabelManager(config),
+        )
+
+        assert detail is not None
+        assert "NEEDS-Human" in detail
+
+    def test_the_configured_scope_label_is_not_reported_as_a_violation(
+        self,
+    ) -> None:
+        """``config.filtering.label`` is protected as agent-proposed input, and
+        the planning exemption must not quietly widen to cover it either: the
+        orchestrator attaches it itself from config, so a model that proposes it
+        is still making an untrusted claim on label truth."""
+        config = _config()
+        config.filtering.label = "test-data"
+
+        detail = validate_decision_for_authority(
+            _decision(("bug", "test-data")),
+            TechLeadLaunchAuthority(
+                flavor=TechLeadSessionFlavor.PLANNING_INVESTIGATION,
+                anchor_issue_number=ANCHOR,
+                focus_issue_number=ANCHOR,
+            ),
+            config=config,
+            labels=LabelManager(config),
+        )
+
+        assert detail is not None
+        assert "test-data" in detail
+
+    def test_the_scheduler_exemption_still_covers_a_configured_agent_name(
+        self,
+    ) -> None:
+        """A deployment whose worker labels carry no ``agent:`` prefix gets the
+        same forgiveness, because the sanitizer withholds those names too."""
+        config = Config()
+        config.agents = {"backend": Mock()}
+        config.tech_lead_follow_up_agent = "backend"
+        config.tech_lead_review_agent = "agent:tech-lead"
+
+        detail = validate_decision_for_authority(
+            _decision(("bug", "backend")),
+            TechLeadLaunchAuthority(
+                flavor=TechLeadSessionFlavor.PLANNING_INVESTIGATION,
+                anchor_issue_number=ANCHOR,
+                focus_issue_number=ANCHOR,
+            ),
+            config=config,
+            labels=LabelManager(config),
+        )
+
+        assert detail is None
+
 
 # --------------------------------------------------------------------------- #
 # The effect boundary: what actually reaches the repository host               #
