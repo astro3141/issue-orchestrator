@@ -10,6 +10,11 @@ from issue_orchestrator.entrypoints.control_api_orchestrator_routes import (
     RECONCILE_ACTOR,
     RECONCILE_GRACEFUL_TIMEOUT_SECONDS,
 )
+from issue_orchestrator.entrypoints.control_api_orchestrator_support import (
+    EngineLeftRunning,
+    engines_left_running_payload,
+    still_running_detail,
+)
 from issue_orchestrator.ports.repository_engine_supervisor import (
     EngineStopDisposition,
     RunningEngine,
@@ -517,7 +522,7 @@ class TestAStopAnswersWithTheReasonItObserved:
         detail = response.json()["detail"]
         assert "No force escalation was authorized" not in detail
         assert "Force escalation was authorized" in detail
-        assert "Stop it again with force to terminate it" not in detail
+        assert "Stop again with force to terminate" not in detail
 
     def test_a_failed_escalation_after_timeout_is_reported_as_one(
         self,
@@ -767,11 +772,13 @@ class TestReconcileIsASweepNotAnEngineShutdown:
         assert data["still_running"] == [
             {
                 "repo_root": str(one_orphaned_repo),
+                "outcome": "timed_out",
                 "instance_id": None,
                 "pid": None,
                 "port": 19080,
             }
         ]
+        assert "No force escalation was authorized" in data["still_running_detail"]
 
     def test_a_confirmed_reconcile_leaves_nothing_running(
         self,
@@ -790,6 +797,40 @@ class TestReconcileIsASweepNotAnEngineShutdown:
         data = response.json()
         assert data["stopped_orphaned"] == [str(one_orphaned_repo)]
         assert data["still_running"] == []
+        assert data["still_running_detail"] is None
+
+    def test_a_failed_reconcile_escalation_is_not_called_unauthorized(
+        self,
+        supervisor_client: TestClient,
+        one_orphaned_repo: Path,
+        mock_supervisor: MagicMock,
+    ) -> None:
+        """The sweep may not name a reason its own evidence contradicts.
+
+        The reconcile toast hard-coded "because no force escalation was
+        authorized" for every still-running engine. ``force: true`` is
+        threaded straight through to ``stop_by_port``, so an escalation
+        that ran and lost reaches this response — and the operator was
+        told nothing had been signalled on a machine where SIGKILL had
+        already failed (#326).
+        """
+        mock_supervisor.stop_by_port.return_value = (
+            EngineStopDisposition.for_engine(
+                StopOutcome.FORCE_FAILED,
+                RunningEngine(instance_id=None, pid=None, port=19080),
+            )
+        )
+
+        response = supervisor_client.post(
+            "/control/orchestrator/reconcile",
+            json={"stop_orphaned": True, "force": True},
+        )
+
+        data = response.json()
+        assert data["still_running"][0]["outcome"] == "force_failed"
+        detail = data["still_running_detail"]
+        assert "No force escalation was authorized" not in detail
+        assert "Force escalation was authorized" in detail
 
     def test_reconcile_never_blocks_the_control_center_event_loop(
         self,
@@ -808,6 +849,48 @@ class TestReconcileIsASweepNotAnEngineShutdown:
         )
 
         assert observed == [False], "reconcile ran on the event loop"
+
+
+class TestOneOwnerStatesWhyAnEngineIsStillRunning:
+    """The reason an engine is still up has exactly one enforcement.
+
+    The stop endpoint derives its 409 sentence from the outcome; the
+    reconcile sweep used to restate a reason of its own in JS. Both now
+    read the same mapping, so a sweep cannot claim "no force escalation
+    was authorized" for a stop that escalated and lost (#326).
+    """
+
+    def test_a_sweep_answers_with_its_worst_outcome(self) -> None:
+        payload = engines_left_running_payload([
+            EngineLeftRunning(
+                repo_root="/repo-a",
+                engine=RunningEngine(instance_id=None, pid=None, port=19080),
+                outcome=StopOutcome.TIMED_OUT,
+            ),
+            EngineLeftRunning(
+                repo_root="/repo-b",
+                engine=RunningEngine(instance_id=None, pid=None, port=19081),
+                outcome=StopOutcome.FORCE_FAILED,
+            ),
+        ])
+
+        detail = payload["still_running_detail"]
+        assert detail is not None
+        assert detail == still_running_detail(StopOutcome.FORCE_FAILED, 2)
+        assert "2 repository engine(s) left running" in detail
+        assert "No force escalation was authorized" not in detail
+
+    def test_an_empty_sweep_states_no_reason_at_all(self) -> None:
+        """Nothing left running means there is nothing to explain."""
+        assert engines_left_running_payload([]) == {
+            "still_running": [],
+            "still_running_detail": None,
+        }
+
+    def test_a_clean_stop_cannot_describe_a_running_engine(self) -> None:
+        """Fail loudly rather than invent a reason for a contradiction."""
+        with pytest.raises(ValueError, match="contradicts its own evidence"):
+            still_running_detail(StopOutcome.STOPPED, 1)
 
 
 class TestSupervisorReconcile:

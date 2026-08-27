@@ -38,16 +38,17 @@ from ..infra.supervisor import (
 )
 from ..ports.repository_engine_supervisor import (
     RUNNING_SUPERVISOR_STATE,
-    RunningEngine,
+    EngineStopDisposition,
     SupervisorOps,
 )
 from .control_api_orchestrator_support import (
     ControlApiOrchestratorDependency,
+    EngineLeftRunning,
     EngineStopRequest,
     OrphanedEnginePayload,
+    engines_left_running_payload,
     perform_engine_stop,
     read_last_n_lines,
-    running_engine_payload,
     serialize_guardrails_result,
 )
 from .shutdown_reason_support import parse_shutdown_reason
@@ -76,9 +77,13 @@ class OrphanedEngine:
     def from_detection(
         cls, repo_path: Path, detected: Mapping[str, Any]
     ) -> OrphanedEngine:
+        # ``detected`` is an untyped probe result. The port is the only
+        # handle a stop has on an untracked engine, so it is narrowed
+        # here rather than carried as ``Any`` to ``stop_by_port``.
+        port = detected.get("port")
         return cls(
             repo_root=str(repo_path),
-            port=detected.get("port"),
+            port=port if isinstance(port, int) else None,
             active_selection=detected.get("active_selection")
             or detected.get("probed_selection"),
         )
@@ -93,14 +98,32 @@ class OrphanedEngine:
 
 @dataclass(frozen=True)
 class RepoReconciliation:
-    """What reconciling one repository observed, changed, and left running."""
+    """What reconciling one repository observed, changed, and left running.
+
+    It keeps the supervisor's own dispositions rather than a bare list
+    of surviving engines, because the reason an engine is still up is
+    part of the answer and only the stop that watched it knows it
+    (#326).
+    """
 
     reconciled_stale_lock: bool = False
     orphaned_detected: tuple[OrphanedEngine, ...] = ()
     stopped_orphaned: bool = False
     unresponsive_detected: tuple[dict[str, Any], ...] = ()
     stopped_unresponsive: bool = False
-    still_running: tuple[RunningEngine, ...] = ()
+    stop_dispositions: tuple[EngineStopDisposition, ...] = ()
+
+    def engines_left_running(self, repo_root: str) -> tuple[EngineLeftRunning, ...]:
+        """Every engine this repository's stops could not confirm gone."""
+        return tuple(
+            EngineLeftRunning(
+                repo_root=repo_root,
+                engine=engine,
+                outcome=disposition.outcome,
+            )
+            for disposition in self.stop_dispositions
+            for engine in disposition.still_running
+        )
 
 
 def _normalize_config_name(raw: object) -> str | None:
@@ -285,7 +308,7 @@ async def control_reconcile(
     stopped_orphaned: list[str] = []
     unresponsive_detected: list[dict[str, Any]] = []
     stopped_unresponsive: list[str] = []
-    still_running: list[dict[str, Any]] = []
+    left_running: list[EngineLeftRunning] = []
 
     for repo in list_repos():
         selection = repo.launch_selection
@@ -315,10 +338,7 @@ async def control_reconcile(
         unresponsive_detected.extend(reconciliation.unresponsive_detected)
         if reconciliation.stopped_unresponsive:
             stopped_unresponsive.append(repo.path)
-        still_running.extend(
-            {"repo_root": repo.path, **running_engine_payload(engine)}
-            for engine in reconciliation.still_running
-        )
+        left_running.extend(reconciliation.engines_left_running(repo.path))
 
     return JSONResponse(
         {
@@ -329,9 +349,11 @@ async def control_reconcile(
             "unresponsive_detected": unresponsive_detected,
             "stopped_unresponsive": stopped_unresponsive,
             # An engine reconcile asked to stop and could not confirm gone is
-            # reported here so the surface cannot render a clean success for a
-            # sweep that left engines running (#326).
-            "still_running": still_running,
+            # reported here — with the outcome of the stop that left it there
+            # and the one sentence the stop owner derives from it — so the
+            # surface can neither render a clean success nor name a reason of
+            # its own for a sweep that left engines running (#326).
+            **engines_left_running_payload(left_running),
         }
     )
 
@@ -358,7 +380,7 @@ def _reconcile_stop(
     force: bool,
     reason: str,
     instance_id: str | None = None,
-) -> bool:
+) -> EngineStopDisposition:
     """Stop one tracked engine under reconcile's own stop policy.
 
     Reconcile sweeps every registered repository, so it cannot inherit
@@ -374,19 +396,6 @@ def _reconcile_stop(
         actor=RECONCILE_ACTOR,
         graceful_timeout_seconds=RECONCILE_GRACEFUL_TIMEOUT_SECONDS,
         force_if_graceful_fails=False,
-    ).stopped
-
-
-def _detected_engine(
-    payload: Mapping[str, Any], *, instance_id: str | None
-) -> RunningEngine:
-    """Identify an engine reconcile detected and could not confirm stopped."""
-    pid = payload.get("pid")
-    port = payload.get("port")
-    return RunningEngine(
-        instance_id=instance_id,
-        pid=pid if isinstance(pid, int) else None,
-        port=port if isinstance(port, int) else None,
     )
 
 
@@ -401,7 +410,7 @@ def _stop_orphaned_engines(
     if not stop_orphaned:
         return RepoReconciliation(orphaned_detected=detected)
 
-    dispositions = [
+    dispositions = tuple(
         sv.stop_by_port(
             orphan.port,
             force=force,
@@ -412,16 +421,12 @@ def _stop_orphaned_engines(
         )
         for orphan in detected
         if orphan.port
-    ]
+    )
     return RepoReconciliation(
         orphaned_detected=detected,
         stopped_orphaned=bool(dispositions)
         and all(disposition.stopped for disposition in dispositions),
-        still_running=tuple(
-            engine
-            for disposition in dispositions
-            for engine in disposition.still_running
-        ),
+        stop_dispositions=dispositions,
     )
 
 
@@ -479,7 +484,7 @@ def _reconcile_repo_runtime(
         tracked,
         orphaned_detected=orphans.orphaned_detected,
         stopped_orphaned=orphans.stopped_orphaned,
-        still_running=orphans.still_running + tracked.still_running,
+        stop_dispositions=orphans.stop_dispositions + tracked.stop_dispositions,
     )
 
 
@@ -493,13 +498,15 @@ def _reconcile_single_instance_repo_runtime(
     """Reconcile the single tracked engine of one repository."""
     status_info = sv.status(repo_path)
     if status_info.state == "failed":
+        disposition = _reconcile_stop(
+            sv,
+            repo_path,
+            force=False,
+            reason="reconcile-runtime: stale lock for failed orchestrator",
+        )
         return RepoReconciliation(
-            reconciled_stale_lock=_reconcile_stop(
-                sv,
-                repo_path,
-                force=False,
-                reason="reconcile-runtime: stale lock for failed orchestrator",
-            ),
+            reconciled_stale_lock=disposition.stopped,
+            stop_dispositions=(disposition,),
         )
     if status_info.state != RUNNING_SUPERVISOR_STATE:
         return RepoReconciliation()
@@ -520,7 +527,7 @@ def _reconcile_single_instance_repo_runtime(
     if not stop_unresponsive:
         return RepoReconciliation(unresponsive_detected=unresponsive_detected)
 
-    stopped = _reconcile_stop(
+    disposition = _reconcile_stop(
         sv,
         repo_path,
         force=force,
@@ -528,10 +535,8 @@ def _reconcile_single_instance_repo_runtime(
     )
     return RepoReconciliation(
         unresponsive_detected=unresponsive_detected,
-        stopped_unresponsive=stopped,
-        still_running=()
-        if stopped
-        else (_detected_engine(payload, instance_id=None),),
+        stopped_unresponsive=disposition.stopped,
+        stop_dispositions=(disposition,),
     )
 
 
@@ -567,12 +572,12 @@ def _stop_unresponsive_instance(
     payload: Mapping[str, Any],
     instance_id: str | None,
     force: bool,
-) -> tuple[bool, tuple[RunningEngine, ...]]:
-    """Stop one unresponsive instance and report what it left behind."""
+) -> EngineStopDisposition:
+    """Stop one unresponsive instance and state what happened to it."""
     reason = "reconcile-runtime: stop unresponsive multi-instance orchestrator"
     port = payload.get("port")
     if isinstance(port, int):
-        disposition = sv.stop_by_port(
+        return sv.stop_by_port(
             port,
             force=force,
             reason=reason,
@@ -580,17 +585,13 @@ def _stop_unresponsive_instance(
             graceful_timeout_seconds=RECONCILE_GRACEFUL_TIMEOUT_SECONDS,
             force_if_graceful_fails=False,
         )
-        return disposition.stopped, disposition.still_running
-    stopped = _reconcile_stop(
+    return _reconcile_stop(
         sv,
         repo_path,
         force=force,
         instance_id=instance_id,
         reason=reason,
     )
-    if stopped:
-        return True, ()
-    return False, (_detected_engine(payload, instance_id=instance_id),)
 
 
 def _reconcile_multi_instance_repo_runtime(
@@ -605,12 +606,12 @@ def _reconcile_multi_instance_repo_runtime(
     reconciled_stale_lock = False
     unresponsive_detected: list[dict[str, Any]] = []
     stopped_unresponsive = False
-    still_running: list[RunningEngine] = []
+    dispositions: list[EngineStopDisposition] = []
 
     for instance_id in _reconcile_instance_ids(multi_status):
         status_info = sv.status(repo_path, instance_id=instance_id)
         if status_info.state == "failed":
-            if _reconcile_stop(
+            stale = _reconcile_stop(
                 sv,
                 repo_path,
                 force=False,
@@ -619,7 +620,9 @@ def _reconcile_multi_instance_repo_runtime(
                     "reconcile-runtime: stale lock for failed "
                     "multi-instance orchestrator"
                 ),
-            ):
+            )
+            dispositions.append(stale)
+            if stale.stopped:
                 reconciled_stale_lock = True
             continue
 
@@ -647,21 +650,21 @@ def _reconcile_multi_instance_repo_runtime(
         if not stop_unresponsive:
             continue
 
-        stopped, left_running = _stop_unresponsive_instance(
+        disposition = _stop_unresponsive_instance(
             sv=sv,
             repo_path=repo_path,
             payload=payload,
             instance_id=instance_id,
             force=force,
         )
-        stopped_unresponsive = stopped_unresponsive or stopped
-        still_running.extend(left_running)
+        dispositions.append(disposition)
+        stopped_unresponsive = stopped_unresponsive or disposition.stopped
 
     return RepoReconciliation(
         reconciled_stale_lock=reconciled_stale_lock,
         unresponsive_detected=tuple(unresponsive_detected),
         stopped_unresponsive=stopped_unresponsive,
-        still_running=tuple(still_running),
+        stop_dispositions=tuple(dispositions),
     )
 
 

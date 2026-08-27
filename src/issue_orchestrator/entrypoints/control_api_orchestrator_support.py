@@ -5,7 +5,15 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
-from typing import TYPE_CHECKING, Annotated, Any, Callable, Mapping, TypedDict
+from typing import (
+    TYPE_CHECKING,
+    Annotated,
+    Any,
+    Callable,
+    Mapping,
+    Sequence,
+    TypedDict,
+)
 
 from fastapi import Depends, FastAPI, Request
 
@@ -102,6 +110,20 @@ class RunningEnginePayload(TypedDict):
     instance_id: str | None
     pid: int | None
     port: int | None
+
+
+class ReconcileRunningEnginePayload(RunningEnginePayload):
+    """One engine a reconcile sweep left running, and the stop that did it."""
+
+    repo_root: str
+    outcome: StopOutcome
+
+
+class EnginesLeftRunningPayload(TypedDict):
+    """The engines a sweep left running and the reason it may state."""
+
+    still_running: list[ReconcileRunningEnginePayload]
+    still_running_detail: str | None
 
 
 class EngineStillRunningPayload(TypedDict):
@@ -201,7 +223,7 @@ def stopped_engine_payload(repo_root: Path, stopped_count: int) -> EngineStopPay
     }
 
 
-def running_engine_payload(engine: RunningEngine) -> RunningEnginePayload:
+def _running_engine_payload(engine: RunningEngine) -> RunningEnginePayload:
     """Serialize one still-running engine for the stop response."""
     return {
         "instance_id": engine.instance_id,
@@ -212,27 +234,33 @@ def running_engine_payload(engine: RunningEngine) -> RunningEnginePayload:
 
 _STILL_RUNNING_DETAILS: Mapping[StopOutcome, str] = {
     StopOutcome.TIMED_OUT: (
-        "The repository engine did not stop within the graceful timeout and "
-        "is still running. No force escalation was authorized, so it was "
-        "left running and no signal was sent. Stop it again with force to "
-        "terminate it."
+        "{count} repository engine(s) left running. The graceful timeout "
+        "expired while they were still alive. No force escalation was "
+        "authorized, so no signal was sent. Stop again with force to "
+        "terminate."
     ),
     StopOutcome.FORCE_FAILED: (
-        "The repository engine did not stop. Force escalation was authorized "
-        "and a kill signal was sent, but the engine is still running. "
-        "Stopping it again with force is unlikely to help; inspect the "
-        "process directly."
+        "{count} repository engine(s) left running. Force escalation was "
+        "authorized and a kill signal was sent, but they survived it. "
+        "Stopping again with force is unlikely to help; inspect the "
+        "processes directly."
     ),
 }
 
 
-def _still_running_detail(outcome: StopOutcome) -> str:
-    """Explain a still-running engine from what the stop actually did.
+def still_running_detail(outcome: StopOutcome, count: int) -> str:
+    """Explain still-running engines from what the stop actually did.
 
     One hard-coded sentence claimed "no force escalation was
     authorized" for every still-running answer, which is false the
     moment force — or the Control Center's default force-on-timeout —
     was authorized and the escalation itself failed (#326).
+
+    Every surface that has to say *why* an engine is still up reads
+    this one mapping. Restating the reason anywhere else — a second
+    Python call site, a literal in the Control Center's JS — is the
+    cross-path drift that produced the false sentence in the first
+    place.
     """
     detail = _STILL_RUNNING_DETAILS.get(outcome)
     if detail is None:
@@ -240,7 +268,49 @@ def _still_running_detail(outcome: StopOutcome) -> str:
             f"outcome {outcome} cannot describe an engine that is still "
             "running; the disposition contradicts its own evidence",
         )
-    return detail
+    return detail.format(count=count)
+
+
+@dataclass(frozen=True)
+class EngineLeftRunning:
+    """One engine a sweep asked to stop and could not confirm gone.
+
+    It carries the outcome of the stop that left it there, because
+    the engine's identity alone cannot say why it is still up.
+    """
+
+    repo_root: str
+    engine: RunningEngine
+    outcome: StopOutcome
+
+    def to_payload(self) -> ReconcileRunningEnginePayload:
+        return {
+            "repo_root": self.repo_root,
+            "outcome": self.outcome,
+            **_running_engine_payload(self.engine),
+        }
+
+
+def engines_left_running_payload(
+    engines: Sequence[EngineLeftRunning],
+) -> EnginesLeftRunningPayload:
+    """State what a sweep left running, and the one reason it may give.
+
+    The reconcile surface used to name the reason itself — "because no
+    force escalation was authorized" — which is false for every sweep
+    that *did* escalate and lost. The sweep's worst outcome and the
+    sentence for it both come from the owners that already hold them
+    (#326).
+    """
+    if not engines:
+        return {"still_running": [], "still_running_detail": None}
+    return {
+        "still_running": [engine.to_payload() for engine in engines],
+        "still_running_detail": still_running_detail(
+            StopOutcome.worst(engine.outcome for engine in engines),
+            len(engines),
+        ),
+    }
 
 
 def resolve_engine_stop_response(
@@ -260,11 +330,13 @@ def resolve_engine_stop_response(
     if disposition.still_running:
         payload: EngineStillRunningPayload = {
             "error": ENGINE_STILL_RUNNING_ERROR,
-            "detail": _still_running_detail(disposition.outcome),
+            "detail": still_running_detail(
+                disposition.outcome, len(disposition.still_running)
+            ),
             "repo_root": str(repo_root),
             "stopped_count": disposition.stopped_count,
             "still_running": [
-                running_engine_payload(engine)
+                _running_engine_payload(engine)
                 for engine in disposition.still_running
             ],
         }
@@ -274,6 +346,9 @@ def resolve_engine_stop_response(
             payload=stopped_engine_payload(repo_root, disposition.stopped_count),
             status_code=200,
         )
+    # Unreachable while ``EngineStopDisposition.already_stopped`` reports a
+    # count of 1 for a repository with no lock; see its docstring for why
+    # that count and this branch are one deferred change.
     not_running: EngineNotRunningPayload = {
         "status": EngineStopStatus.NOT_RUNNING,
         "repo_root": str(repo_root),
@@ -355,15 +430,18 @@ __all__ = [
     "ENGINE_STILL_RUNNING_ERROR",
     "ControlApiOrchestratorDependencies",
     "ControlApiOrchestratorDependency",
+    "EngineLeftRunning",
     "EngineStopRequest",
-    "OrphanedEnginePayload",
     "EngineStopResponse",
+    "EnginesLeftRunningPayload",
+    "OrphanedEnginePayload",
+    "engines_left_running_payload",
     "get_control_api_orchestrator_dependencies",
     "install_control_api_orchestrator_dependencies",
     "perform_engine_stop",
     "read_last_n_lines",
     "resolve_engine_stop_response",
-    "running_engine_payload",
     "serialize_guardrails_result",
+    "still_running_detail",
     "stopped_engine_payload",
 ]

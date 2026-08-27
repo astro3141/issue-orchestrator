@@ -55,18 +55,47 @@ function loadControlCenter(response) {
     return { context, toasts };
 }
 
-test('a reconcile that left engines running is not reported as success', async () => {
-    const { context, toasts } = loadControlCenter({
+// The route derives these sentences from `StopOutcome`; this surface only
+// renders whichever one it was handed. Restating the reason here is the
+// defect the tests below pin closed.
+const TIMED_OUT_DETAIL =
+    '1 repository engine(s) left running. The graceful timeout expired while '
+    + 'they were still alive. No force escalation was authorized, so no signal '
+    + 'was sent. Stop again with force to terminate.';
+
+const FORCE_FAILED_DETAIL =
+    '1 repository engine(s) left running. Force escalation was authorized and '
+    + 'a kill signal was sent, but they survived it. Stopping again with force '
+    + 'is unlikely to help; inspect the processes directly.';
+
+const SUMMARY =
+    'Reconciled 0 stale lock(s), stopped 0 orphaned, stopped 0 unresponsive';
+
+function sweep(overrides) {
+    return {
         status: 'ok',
         reconciled_stale_locks: [],
         orphaned_detected: [],
         stopped_orphaned: [],
         unresponsive_detected: [],
         stopped_unresponsive: [],
-        still_running: [
-            { repo_root: '/repo', instance_id: null, pid: null, port: 19080 },
-        ],
-    });
+        still_running: [],
+        still_running_detail: null,
+        ...overrides,
+    };
+}
+
+test('a reconcile that left engines running is not reported as success', async () => {
+    const { context, toasts } = loadControlCenter(sweep({
+        still_running: [{
+            repo_root: '/repo',
+            outcome: 'timed_out',
+            instance_id: null,
+            pid: null,
+            port: 19080,
+        }],
+        still_running_detail: TIMED_OUT_DETAIL,
+    }));
 
     await context.cleanRecoveryState();
 
@@ -74,20 +103,42 @@ test('a reconcile that left engines running is not reported as success', async (
     const [severity, message] = toasts[0];
     assert.notEqual(severity, 'success', 'a sweep that stopped nothing claimed success');
     assert.equal(severity, 'warning');
-    assert.match(message, /1 engine\(s\) left running/);
-    assert.match(message, /no force escalation was authorized/);
+    assert.equal(message, `${SUMMARY}; ${TIMED_OUT_DETAIL}`);
+});
+
+test('a failed reconcile escalation is not called an unauthorized one', async () => {
+    // `force: true` reaches `stop_by_port`, so a SIGKILL that lost reaches
+    // this toast. The surface used to hard-code "because no force escalation
+    // was authorized" for it — false on a machine where the kill already ran.
+    const { context, toasts } = loadControlCenter(sweep({
+        still_running: [{
+            repo_root: '/repo',
+            outcome: 'force_failed',
+            instance_id: null,
+            pid: 4242,
+            port: 19080,
+        }],
+        still_running_detail: FORCE_FAILED_DETAIL,
+    }));
+
+    await context.cleanRecoveryState();
+
+    assert.equal(toasts.length, 1);
+    const [severity, message] = toasts[0];
+    assert.equal(severity, 'warning');
+    // Exact, so any reason this surface adds of its own fails here.
+    assert.equal(message, `${SUMMARY}; ${FORCE_FAILED_DETAIL}`);
+    assert.equal(
+        /no force escalation was authorized/i.test(message),
+        false,
+        'a failed escalation was reported as an unauthorized one',
+    );
 });
 
 test('a reconcile that left nothing running still reports success', async () => {
-    const { context, toasts } = loadControlCenter({
-        status: 'ok',
+    const { context, toasts } = loadControlCenter(sweep({
         reconciled_stale_locks: ['/repo'],
-        orphaned_detected: [],
-        stopped_orphaned: [],
-        unresponsive_detected: [],
-        stopped_unresponsive: [],
-        still_running: [],
-    });
+    }));
 
     await context.cleanRecoveryState();
 

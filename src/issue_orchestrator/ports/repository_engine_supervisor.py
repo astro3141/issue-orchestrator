@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
-from typing import Any, Literal, Protocol, Sequence, runtime_checkable
+from typing import Any, Iterable, Literal, Protocol, Sequence, runtime_checkable
 
 RUNNING_SUPERVISOR_STATE = "running"
 
@@ -13,11 +13,14 @@ RUNNING_SUPERVISOR_STATE = "running"
 class StopOutcome(StrEnum):
     """Truthful disposition of one completed Repository Engine stop.
 
-    ``TIMED_OUT`` is the outcome a non-force stop reaches when the
-    graceful budget expires while the target is still alive and no
-    force escalation is authorized. It is *not* a failure to act: it
-    is the recorded fact that the engine was left running, and callers
-    must not present it as a clean stop.
+    ``TIMED_OUT`` is the outcome a non-force stop reaches when it
+    spent everything it was authorized to spend and the target is
+    still alive: the graceful budget expired with no force escalation
+    authorized, or the supervisor refused the request outright because
+    the tracked identity did not match the engine holding the lock.
+    Either way it is *not* a failure to act — it is the recorded fact
+    that the engine was left running, and callers must not present it
+    as a clean stop.
 
     ``FORCE_FAILED`` is the opposite case: an escalation *was*
     authorized and *did* run, and the engine survived it. Telling that
@@ -27,6 +30,22 @@ class StopOutcome(StrEnum):
     STOPPED = "stopped"
     TIMED_OUT = "timed_out"
     FORCE_FAILED = "force_failed"
+
+    @classmethod
+    def worst(cls, outcomes: Iterable[StopOutcome]) -> StopOutcome:
+        """The outcome a set of stops has to be answered as.
+
+        Severity order lives here because every surface that
+        summarises more than one stop — a multi-instance stop, a
+        reconcile sweep — has to rank the same way or the two will
+        eventually disagree about what a mixed sweep means (#326).
+        """
+        collected = set(outcomes)
+        if cls.FORCE_FAILED in collected:
+            return cls.FORCE_FAILED
+        if cls.TIMED_OUT in collected:
+            return cls.TIMED_OUT
+        return cls.STOPPED
 
 
 @dataclass(frozen=True)
@@ -77,6 +96,14 @@ class EngineStopDisposition:
         lock reports ``stopped_count=1``). It is carried forward
         deliberately rather than changed under #326; correcting it is
         the same family of work as #324 and belongs in its own change.
+
+        It is also why the stop endpoint's ``not_running`` answer is
+        unreachable today: every production disposition contributes
+        either this count of 1 or a still-running engine, so nothing
+        can produce "zero stopped and nothing left running". The
+        branch is kept rather than deleted because it becomes the
+        correct answer the moment this count is corrected — the two
+        are one change, not two.
         """
         return cls(outcome=StopOutcome.STOPPED, stopped_count=1)
 
@@ -85,15 +112,8 @@ class EngineStopDisposition:
         cls, parts: Sequence[EngineStopDisposition]
     ) -> EngineStopDisposition:
         """Aggregate per-instance dispositions without losing the worst."""
-        outcomes = {part.outcome for part in parts}
-        if StopOutcome.FORCE_FAILED in outcomes:
-            outcome = StopOutcome.FORCE_FAILED
-        elif StopOutcome.TIMED_OUT in outcomes:
-            outcome = StopOutcome.TIMED_OUT
-        else:
-            outcome = StopOutcome.STOPPED
         return cls(
-            outcome=outcome,
+            outcome=StopOutcome.worst(part.outcome for part in parts),
             stopped_count=sum(part.stopped_count for part in parts),
             still_running=tuple(
                 engine for part in parts for engine in part.still_running

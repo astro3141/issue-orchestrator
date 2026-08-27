@@ -47,11 +47,19 @@ A non-force stop is a request plus an observation, never a signal.
    stopped", and distinguishes "no escalation was authorized, so nothing was
    signalled" from "the authorized escalation ran and the engine survived it".
    Process and lock evidence outrank presentation.
-6. Reconcile is a sweep across every registered repository, so it carries its
+6. **That distinction has exactly one owner.** `StopOutcome` →
+   `entrypoints/control_api_orchestrator_support.py::still_running_detail` is
+   the only place that says *why* an engine is still running, and it raises
+   rather than guess when an outcome cannot describe one. No surface — a second
+   Python call site, a literal in `static/js/control_center.js` — may restate
+   the reason: a hard-coded "no force escalation was authorized" is false for
+   every stop that did escalate and lost.
+7. Reconcile is a sweep across every registered repository, so it carries its
    own bounded graceful budget rather than the per-engine shutdown default, it
    never escalates on its own authority, and its result reports the engines it
-   left running so the surface cannot render a clean success for a sweep that
-   stopped nothing.
+   left running — each with the outcome of the stop that left it there, plus
+   the sweep's one derived sentence — so the surface can neither render a clean
+   success for a sweep that stopped nothing nor name a reason of its own.
 
 ## UI Placement Rules
 

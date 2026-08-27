@@ -12,16 +12,16 @@ const path = require('node:path');
 const vm = require('node:vm');
 
 const STILL_RUNNING_DETAIL =
-    'The repository engine did not stop within the graceful timeout and is '
-    + 'still running. No force escalation was authorized, so it was left '
-    + 'running and no signal was sent. Stop it again with force to terminate it.';
+    '1 repository engine(s) left running. The graceful timeout expired while '
+    + 'they were still alive. No force escalation was authorized, so no signal '
+    + 'was sent. Stop again with force to terminate.';
 
 // The other reachable still-running case: the escalation the operator did
 // authorize ran, and the engine survived it (#326).
 const FORCE_FAILED_DETAIL =
-    'The repository engine did not stop. Force escalation was authorized and '
-    + 'a kill signal was sent, but the engine is still running. Stopping it '
-    + 'again with force is unlikely to help; inspect the process directly.';
+    '1 repository engine(s) left running. Force escalation was authorized and '
+    + 'a kill signal was sent, but they survived it. Stopping again with force '
+    + 'is unlikely to help; inspect the processes directly.';
 
 function loadControlCenter(response) {
     const toasts = [];
