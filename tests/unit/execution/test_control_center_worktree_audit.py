@@ -110,3 +110,34 @@ def test_activity_reader_fails_closed_when_startup_status_is_missing(
     ).read(tmp_path, RepositoryLaunchSelection.default())
 
     assert evidence.active_paths is None
+
+
+def test_activity_reader_fails_closed_on_the_int_active_sessions_shape(
+    tmp_path: Path,
+) -> None:
+    """A bare count is not evidence about individual worktrees.
+
+    ``/api/status`` also ships ``active_sessions`` as an int count. Count-only
+    consumers normalize that shape (see
+    ``execution/repository_engine_status_payload``), but path-level activity
+    needs the session rows themselves, so the int form must stay unknown here.
+    """
+    supervisor = MagicMock()
+    supervisor.status_all_instances.return_value = MultiInstanceStatus(
+        repo_root=str(tmp_path),
+        instances=[SupervisorStatus(state="running", port=18080)],
+    )
+    status_reader = SimpleNamespace(
+        read_status=lambda _port: {
+            "startup_status": "complete",
+            "active_sessions": 0,
+            "sessions": [],
+        }
+    )
+
+    evidence = RepositoryEngineWorktreeActivityReader(
+        supervisor,
+        status_reader,
+    ).read(tmp_path, RepositoryLaunchSelection.default())
+
+    assert evidence.active_paths is None
