@@ -66,6 +66,17 @@ TERMINATED = "process.terminated"
 SHUTDOWN_MANAGER_LOGGER = "issue_orchestrator.control.shutdown_manager"
 TERMINAL_EXIT_LOG = "Exiting with code"
 
+# A deliberate, named exception to the root guide's "tests must not parse
+# logs", not drift. ``ShutdownManager`` is a process singleton in
+# ``control/`` with no ``EventSink``: wiring one in is the generic
+# process-management redesign #330 puts out of scope, and Control's own
+# #328 PASS criterion is literally the target's log tail — so the log is
+# the observation this defect is judged by. It is kept to the two facts
+# that have no other channel (how many callers announced the terminal
+# exit, and whether a follower reported the shutdown incomplete); every
+# load-bearing assertion here — timeline ordering, cleanup count,
+# lock-release count, state — is made against recorded values instead.
+
 # Bounded waits. The positive ones are generous — they only decide how
 # long a broken run takes to fail. The negative one is the window in
 # which a second caller admitted as a fresh exit owner would have
@@ -161,7 +172,6 @@ class TestTheTerminalExitProtocol:
 
         assert claims.count(True) == 1
         assert claims.count(False) == CONCURRENT_EXIT_CALLERS - 1
-        assert terminal_exit.claimed is True
 
     def test_a_follower_is_not_released_until_cleanup_is_reported(self) -> None:
         """The release is the owner's report, not the passage of time.

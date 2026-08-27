@@ -22,6 +22,13 @@ deployed termination pressures aimed at the same window. What the parent
 reads back is what Control read: the exit code, the log tail, and
 whether the lock file was *released* rather than merely abandoned.
 
+Reading that log tail is a deliberate, named exception to the root
+guide's "tests must not parse logs". There is no event bus across a
+process boundary, the child is gone by the time the parent looks, and
+Control's own #328 PASS criterion is that same tail — so here the log is
+the artifact under test, not a substitute for one. The lock file, read
+from the filesystem, is the corroborating non-log fact.
+
 The child is ``disposable_engine_exit.py``; it owns nothing but a
 throwaway ``tmp_path`` and its own lifetime.
 """
@@ -48,9 +55,13 @@ CHILD_TIMEOUT_SECONDS = 60.0
 # ``PYTHONPATH`` resolves ``issue_orchestrator`` to — a trusted runtime
 # is normally ahead of a candidate on an agent's path, and a proof that
 # ran the runtime's shutdown manager would look exactly like a passing
-# one. Pinned from the module the test process itself imported.
+# one. Pinned from the module the test process itself imported, and
+# checked against the checkout below: agreement between parent and child
+# is only worth something once the parent is known to have imported the
+# code under review rather than an installed copy of it.
+CHECKOUT_SRC_ROOT = Path(__file__).resolve().parents[2] / "src"
 CANDIDATE_SRC_ROOT = Path(issue_orchestrator.__file__).resolve().parents[1]
-CODE_UNDER_TEST = str(Path(shutdown_manager_module.__file__).resolve())
+CODE_UNDER_TEST = Path(shutdown_manager_module.__file__).resolve()
 
 TERMINAL_EXIT_LINE = "Exiting with code 0"
 CLEANUP_STARTED_LINE = "Running cleanup..."
@@ -76,10 +87,32 @@ class EngineRetirement:
                 return index
         raise AssertionError(f"{line!r} never appeared:\n{self.log}")
 
+    def code_under_test(self) -> Path:
+        """Which shutdown manager the child reported having loaded.
+
+        Resolved, because the child reports its raw ``__file__`` and a
+        checkout reached through a symlink (anything under macOS
+        ``/tmp`` -> ``/private/tmp``, say) spells the same file two ways.
+        The guard is about which file ran, not which spelling of it.
+        """
+        for entry in self.log.splitlines():
+            if CODE_UNDER_TEST_PREFIX in entry:
+                _, _, reported = entry.partition(CODE_UNDER_TEST_PREFIX)
+                return Path(reported.strip()).resolve()
+        raise AssertionError(
+            f"the disposable engine never reported its shutdown manager:\n{self.log}"
+        )
+
 
 @pytest.fixture
 def retirement(tmp_path: Path) -> EngineRetirement:
     """Run the disposable engine to completion and collect its receipt."""
+    assert CANDIDATE_SRC_ROOT == CHECKOUT_SRC_ROOT, (
+        "this test process imported issue_orchestrator from "
+        f"{CANDIDATE_SRC_ROOT}, not from the checkout under review "
+        f"({CHECKOUT_SRC_ROOT}); pinning the child to it would only prove "
+        "that both halves ran the same wrong code"
+    )
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
     completed = subprocess.run(  # noqa: S603 — fixed argv, no shell
@@ -93,7 +126,7 @@ def retirement(tmp_path: Path) -> EngineRetirement:
     retirement = EngineRetirement(
         returncode=completed.returncode, log=completed.stderr
     )
-    assert f"{CODE_UNDER_TEST_PREFIX}{CODE_UNDER_TEST}" in retirement.log, (
+    assert retirement.code_under_test() == CODE_UNDER_TEST, (
         "the disposable engine did not run this checkout's shutdown manager:\n"
         f"{retirement.log}"
     )

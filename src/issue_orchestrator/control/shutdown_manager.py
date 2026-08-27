@@ -70,9 +70,13 @@ _STATE_ORDER: dict[ShutdownState, int] = {
 # and is not authority to terminate the process (#330).
 #
 # Chosen above the 60 s background-job drain in
-# ``Orchestrator._drain_background_jobs``, so a cleanup that is still making
-# progress is never reported as stalled, and below the supervisor's 120 s
-# graceful budget
+# ``Orchestrator._drain_background_jobs``, which is the longest single step a
+# cleanup blocks on. It is not the whole of ``Orchestrator.close``, which also
+# runs the e2e-runner cleanup, the runtime owners and the goal-pilot store — so
+# a cleanup that is still making legitimate progress can outlast this bound and
+# draw the report below. That costs a false line in the log and nothing else,
+# which is precisely why the bound governs the observation rather than the
+# cleanup. Kept below the supervisor's 120 s graceful budget
 # (``infra.shutdown_timing.DEFAULT_ENGINE_GRACEFUL_TIMEOUT_SECONDS``), so the
 # report lands in the log while this shutdown is still the one being watched.
 DEFAULT_FOLLOWER_CLEANUP_WAIT_SECONDS = 90.0
@@ -140,12 +144,6 @@ class TerminalExit:
     def exit_code(self) -> int:
         """The code the exit owner claimed the process with."""
         return self._exit_code
-
-    @property
-    def claimed(self) -> bool:
-        """Whether the terminal exit sequence already has an owner."""
-        with self._claim_lock:
-            return self._owner_thread is not None
 
     @property
     def owned_by_current_thread(self) -> bool:
