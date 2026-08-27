@@ -165,13 +165,28 @@ def _diagnosis_duty_violation(
 
 
 def _protected_label_violation(
-    decision: "TechLeadDecision", *, config: "Config", labels: LabelManager
+    decision: "TechLeadDecision",
+    authority: TechLeadLaunchAuthority,
+    *,
+    config: "Config",
+    labels: LabelManager,
 ) -> str | None:
     """``create_issue`` proposals may not touch orchestrator label truth (#6761 F4).
 
     Checked here rather than in the domain contract so the artifact contract
     stays config-free.
+
+    Exempt for ``planning_investigation`` (#332). That role's create_issue does
+    not project the model's labels: its creation boundary files an UNSCHEDULED
+    proposal pending Human approval, withholding every scheduler-projection
+    label and sanitizing the rest, so a badly chosen name cannot reach label
+    truth. Rejecting the whole decision there would instead destroy the single
+    bounded proposal the run exists to produce (#261, #295 §4-5) over a label
+    the boundary was always going to withhold. Every other role still projects
+    what it proposes, so the violation stays fatal for them.
     """
+    if authority.flavor is TechLeadSessionFlavor.PLANNING_INVESTIGATION:
+        return None
     for action in decision.proposed_actions:
         if action.action_type != "create_issue":
             continue
@@ -204,5 +219,7 @@ def validate_decision_for_authority(
         _capability_violation(decision, authority)
         or _target_scope_violation(decision, authority)
         or _diagnosis_duty_violation(decision, authority)
-        or _protected_label_violation(decision, config=config, labels=labels)
+        or _protected_label_violation(
+            decision, authority, config=config, labels=labels
+        )
     )

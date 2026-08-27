@@ -12,7 +12,7 @@ ever lost (#6883 review).
 
 from __future__ import annotations
 
-from typing import assert_never
+from typing import Sequence, assert_never
 
 from .proposal_dedup_gate import (
     CommentExisting,
@@ -124,6 +124,45 @@ def outcome_gate_note(outcome: DedupOutcome, *, execute: bool) -> str | None:
             return _rejected_note(outcome)
         case _:
             assert_never(outcome)
+
+
+def pending_human_approval_note(
+    *, withheld: Sequence[str], suggested_agent: str
+) -> str:
+    """The operator-facing note for an UNSCHEDULED planning proposal (#332).
+
+    A planning proposal is prepared, not scheduled: it carries the gate and no
+    scheduler label, so approving it is two explicit acts by the Human, not one.
+    Saying so here is the difference between "approved" and "approved and
+    dispatched" — which the label projection can no longer conflate.
+
+    ``withheld`` names any scheduler label the proposal ASKED for and did not
+    get, so an erroneous or hostile planning label is visible to the approver
+    instead of silently dropped. ``suggested_agent`` is
+    ``review.tech_lead_follow_up_agent`` when configured, named only as guidance
+    — planning holds no authority to route work, so this is a sentence, not an
+    attached label.
+    """
+    dispatch = (
+        f"add the worker agent label (`{suggested_agent}`)"
+        if suggested_agent
+        else "add the worker agent label for the lane that should implement it"
+    )
+    note = (
+        "Prepared by a planning investigation and gated with the"
+        " proposed-tech-lead label: it is a PROPOSAL pending Human approval, and"
+        " it is deliberately UNSCHEDULED — no agent label was attached, so no"
+        " Actor can pick it up (#23 Phase 1.5, #295 §4-5). To approve and"
+        f" dispatch it, remove the proposed-tech-lead label and {dispatch};"
+        " scheduling authority is that Human act, never the planning run's."
+    )
+    if withheld:
+        note += (
+            "\n>\n> The planning run requested scheduler label(s)"
+            f" {', '.join(f'`{label}`' for label in withheld)}; they were"
+            " withheld — planning may prepare work, not schedule it."
+        )
+    return note
 
 
 def compose_gate_note(batch_note: str, typed_note: str | None) -> str:
