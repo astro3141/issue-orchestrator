@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from enum import Enum, StrEnum
+from enum import Enum
 import logging
 import os
 import time
 from typing import Callable, Protocol
+
+from ..ports.repository_engine_supervisor import StopOutcome
 
 logger = logging.getLogger(__name__)
 
@@ -24,21 +26,6 @@ class StopAction(Enum):
     TIMED_OUT = "timed_out"
     FORCE = "force"
     ABORT = "abort"
-
-
-class StopOutcome(StrEnum):
-    """Truthful disposition of one completed Repository Engine stop.
-
-    ``TIMED_OUT`` is the outcome a non-force stop reaches when the
-    graceful budget expires while the target is still alive and no
-    force escalation is authorized. It is *not* a failure to act: it
-    is the recorded fact that the engine was left running, and callers
-    must not present it as a clean stop.
-    """
-
-    STOPPED = "stopped"
-    TIMED_OUT = "timed_out"
-    FORCE_FAILED = "force_failed"
 
 
 @dataclass(frozen=True)

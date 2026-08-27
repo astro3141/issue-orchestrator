@@ -566,7 +566,7 @@ async def stop_repo_orchestrator(repo_id: str, request: Request) -> JSONResponse
 
     stopped = _supervisor.stop(
         path, force=force, reason=parsed.reason, actor=parsed.actor
-    )
+    ).stopped
     return JSONResponse({"status": "stopped" if stopped else "failed"})
 
 

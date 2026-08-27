@@ -3,10 +3,102 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from enum import StrEnum
 from pathlib import Path
 from typing import Any, Literal, Protocol, Sequence, runtime_checkable
 
 RUNNING_SUPERVISOR_STATE = "running"
+
+
+class StopOutcome(StrEnum):
+    """Truthful disposition of one completed Repository Engine stop.
+
+    ``TIMED_OUT`` is the outcome a non-force stop reaches when the
+    graceful budget expires while the target is still alive and no
+    force escalation is authorized. It is *not* a failure to act: it
+    is the recorded fact that the engine was left running, and callers
+    must not present it as a clean stop.
+
+    ``FORCE_FAILED`` is the opposite case: an escalation *was*
+    authorized and *did* run, and the engine survived it. Telling that
+    operator to "stop it again with force" would be false (#326).
+    """
+
+    STOPPED = "stopped"
+    TIMED_OUT = "timed_out"
+    FORCE_FAILED = "force_failed"
+
+
+@dataclass(frozen=True)
+class RunningEngine:
+    """One Repository Engine observed alive after a stop attempt."""
+
+    instance_id: str | None
+    pid: int | None
+    port: int | None
+
+
+@dataclass(frozen=True)
+class EngineStopDisposition:
+    """What one stop request did, stated by the owner that watched it.
+
+    The supervisor is the only component that observes the target
+    across a stop, so it is the only component that can say what
+    happened to it. Collapsing that to a ``bool``/``int`` at the port
+    forced entrypoints to re-observe the engine afterwards and then
+    guess at the reason — a second, race-prone observation of a fact
+    the owner already held (#326).
+    """
+
+    outcome: StopOutcome
+    stopped_count: int
+    still_running: tuple[RunningEngine, ...] = ()
+
+    @property
+    def stopped(self) -> bool:
+        """Whether every engine this stop targeted is confirmed gone."""
+        return self.outcome is StopOutcome.STOPPED and not self.still_running
+
+    @classmethod
+    def for_engine(
+        cls, outcome: StopOutcome, engine: RunningEngine
+    ) -> EngineStopDisposition:
+        """State the disposition of the one engine the owner watched."""
+        if outcome is StopOutcome.STOPPED:
+            return cls(outcome=outcome, stopped_count=1)
+        return cls(outcome=outcome, stopped_count=0, still_running=(engine,))
+
+    @classmethod
+    def already_stopped(cls) -> EngineStopDisposition:
+        """No live engine was found, so the caller's goal already holds.
+
+        The count of 1 here is the pre-existing "count that nothing
+        corroborates" behaviour of the tracked path (a repo with no
+        lock reports ``stopped_count=1``). It is carried forward
+        deliberately rather than changed under #326; correcting it is
+        the same family of work as #324 and belongs in its own change.
+        """
+        return cls(outcome=StopOutcome.STOPPED, stopped_count=1)
+
+    @classmethod
+    def combined(
+        cls, parts: Sequence[EngineStopDisposition]
+    ) -> EngineStopDisposition:
+        """Aggregate per-instance dispositions without losing the worst."""
+        outcomes = {part.outcome for part in parts}
+        if StopOutcome.FORCE_FAILED in outcomes:
+            outcome = StopOutcome.FORCE_FAILED
+        elif StopOutcome.TIMED_OUT in outcomes:
+            outcome = StopOutcome.TIMED_OUT
+        else:
+            outcome = StopOutcome.STOPPED
+        return cls(
+            outcome=outcome,
+            stopped_count=sum(part.stopped_count for part in parts),
+            still_running=tuple(
+                engine for part in parts for engine in part.still_running
+            ),
+        )
 
 
 class RepositoryEngineLock(Protocol):
@@ -108,7 +200,7 @@ class SupervisorOps(Protocol):
         graceful_timeout_seconds: float = 120,
         force_if_graceful_fails: bool = True,
         stop_policy: RepositoryEngineStopPolicy | None = None,
-    ) -> bool: ...
+    ) -> EngineStopDisposition: ...
 
     def stop_tracked_instance(
         self,
@@ -129,7 +221,8 @@ class SupervisorOps(Protocol):
         actor: str = "supervisor.stop_by_port",
         force: bool = False,
         graceful_timeout_seconds: float = 120,
-    ) -> bool: ...
+        force_if_graceful_fails: bool = False,
+    ) -> EngineStopDisposition: ...
 
     def status(
         self,
@@ -160,7 +253,7 @@ class SupervisorOps(Protocol):
         graceful_timeout_seconds: float = 120,
         force_if_graceful_fails: bool = True,
         stop_policy: RepositoryEngineStopPolicy | None = None,
-    ) -> int: ...
+    ) -> EngineStopDisposition: ...
 
     def status_all_instances(
         self,
@@ -172,9 +265,12 @@ class SupervisorOps(Protocol):
 
 
 __all__ = [
+    "EngineStopDisposition",
     "MultiInstanceStatus",
     "RUNNING_SUPERVISOR_STATE",
     "RepositoryEngineLock",
+    "RunningEngine",
+    "StopOutcome",
     "SupervisorOps",
     "SupervisorStatus",
 ]

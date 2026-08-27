@@ -40,6 +40,11 @@ from .repo_lock import (
     release_lock,
 )
 from .supervisor_models import MultiInstanceStatus, SupervisorStatus
+from ..ports.repository_engine_supervisor import (
+    EngineStopDisposition,
+    RunningEngine,
+    StopOutcome,
+)
 from . import shutdown_timing
 
 DEFAULT_ENGINE_GRACEFUL_TIMEOUT_SECONDS = (
@@ -411,7 +416,8 @@ def stop_by_port(
     actor: str = "supervisor.stop_by_port",
     force: bool = False,
     graceful_timeout_seconds: float = DEFAULT_ENGINE_GRACEFUL_TIMEOUT_SECONDS,
-) -> bool:
+    force_if_graceful_fails: bool = False,
+) -> EngineStopDisposition:
     """Stop an orchestrator by port when no lock file is available.
 
     ``reason`` is required by the orchestrator's HTTP shutdown
@@ -426,9 +432,18 @@ def stop_by_port(
     second way to signal an engine nobody authorized signalling
     (#326). The target being alive is now the *reason to keep
     waiting*, never permission to kill.
+
+    ``force_if_graceful_fails`` carries the operator's *escalation*
+    authority, and it means the same thing here too. The port branch
+    used to hard-code it off, so the same request body escalated on
+    the tracked path and silently did not here — the operator's
+    authorization accepted by the endpoint and dropped on the floor.
     """
     if not port:
-        return False
+        raise ValueError(
+            "stop_by_port requires the port the engine is holding; "
+            "there is no engine to observe without one",
+        )
 
     if not reason or not reason.strip():
         raise ValueError(
@@ -443,7 +458,7 @@ def stop_by_port(
         ),
         target_alive=lambda: _is_port_in_use(port),
         force_requested=force,
-        force_on_timeout=False,
+        force_on_timeout=force_if_graceful_fails,
         request_graceful=lambda: _request_graceful_shutdown(
             port, reason=reason, actor=actor
         ),
@@ -457,7 +472,9 @@ def stop_by_port(
         port,
         outcome,
     )
-    return outcome is shutdown_timing.StopOutcome.STOPPED
+    return EngineStopDisposition.for_engine(
+        outcome, RunningEngine(None, None, port)
+    )
 
 
 def _force_stop_by_port(port: int) -> bool:
@@ -506,8 +523,14 @@ def stop(
     force_if_graceful_fails: bool = True,
     stop_policy: shutdown_timing.StopPolicy | None = None,
     expected_pid: int | None = None,
-) -> bool:
-    """Stop the orchestrator; ``reason`` records the caller's intent."""
+) -> EngineStopDisposition:
+    """Stop one tracked engine and state what happened to it.
+
+    ``reason`` records the caller's intent. The answer is the
+    disposition this stop observed, never a bare success flag: callers
+    that must tell an operator what happened would otherwise have to
+    re-observe the engine and guess at the reason (#326).
+    """
     if not reason or not reason.strip():
         raise ValueError(
             "supervisor.stop requires a non-empty reason; "
@@ -519,7 +542,7 @@ def stop(
     info = read_lock(repo_root, instance_id)
     if info is None:
         logger.debug("No lock file found for %s (already stopped)", repo_root)
-        return True
+        return EngineStopDisposition.already_stopped()
 
     if expected_pid is not None and info.pid != expected_pid:
         logger.warning(
@@ -528,14 +551,17 @@ def stop(
             info.pid,
             expected_pid,
         )
-        return False
+        return EngineStopDisposition.for_engine(
+            StopOutcome.TIMED_OUT,
+            RunningEngine(instance_id, info.pid, info.http_port),
+        )
 
     pid, port = info.pid, info.http_port
 
     if not shutdown_timing.process_is_alive(pid):
         release_lock(repo_root, pid, instance_id)
         logger.info("Cleaned up stale lock for %s (pid %d not running)", repo_root, pid)
-        return True
+        return EngineStopDisposition.already_stopped()
 
     controller = shutdown_timing.InterruptibleStopController(
         stop_policy
@@ -556,7 +582,9 @@ def stop(
     logger.info(
         "Orchestrator stop attempt completed pid=%d outcome=%s", pid, outcome
     )
-    return outcome is shutdown_timing.StopOutcome.STOPPED
+    return EngineStopDisposition.for_engine(
+        outcome, RunningEngine(instance_id, pid, port)
+    )
 
 
 def stop_tracked_instance(
@@ -576,7 +604,7 @@ def stop_tracked_instance(
         reason=reason,
         actor=actor,
         expected_pid=tracked.pid,
-    )
+    ).stopped
     return stopped and not shutdown_timing.process_is_alive(tracked.pid)
 
 
@@ -863,7 +891,7 @@ def stop_all_instances(
     graceful_timeout_seconds: float = DEFAULT_ENGINE_GRACEFUL_TIMEOUT_SECONDS,
     force_if_graceful_fails: bool = True,
     stop_policy: shutdown_timing.StopPolicy | None = None,
-) -> int:
+) -> EngineStopDisposition:
     """Stop all orchestrator instances for a repository.
 
     Args:
@@ -876,7 +904,10 @@ def stop_all_instances(
             for log-aggregation grouping.
 
     Returns:
-        Number of instances successfully stopped
+        The combined disposition: how many instances stopped, which
+        ones were left running, and the worst outcome any of them
+        reached. Callers answer operators from this rather than
+        re-observing the repository afterwards (#326).
     """
     if not reason or not reason.strip():
         raise ValueError(
@@ -886,34 +917,21 @@ def stop_all_instances(
 
     repo_root = normalize_repo_root(repo_root)
 
-    stopped_count = 0
-    if stop(
-        repo_root,
-        force=force,
-        instance_id=None,
-        reason=reason,
-        actor=actor,
-        graceful_timeout_seconds=graceful_timeout_seconds,
-        force_if_graceful_fails=force_if_graceful_fails,
-        stop_policy=stop_policy,
-    ):
-        stopped_count += 1
-
-    active_locks = list_instance_locks(repo_root)
-    for lock_info in active_locks:
-        if stop(
+    def stop_one(instance_id: str | None) -> EngineStopDisposition:
+        return stop(
             repo_root,
             force=force,
-            instance_id=lock_info.instance_id,
+            instance_id=instance_id,
             reason=reason,
             actor=actor,
             graceful_timeout_seconds=graceful_timeout_seconds,
             force_if_graceful_fails=force_if_graceful_fails,
             stop_policy=stop_policy,
-        ):
-            stopped_count += 1
+        )
 
-    return stopped_count
+    parts = [stop_one(None)]
+    parts.extend(stop_one(lock.instance_id) for lock in list_instance_locks(repo_root))
+    return EngineStopDisposition.combined(parts)
 
 
 def status_all_instances(

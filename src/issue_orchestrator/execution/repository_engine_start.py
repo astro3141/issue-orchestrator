@@ -459,13 +459,13 @@ class StartRepositoryEngineCommand:
                     500,
                 )
         for detected in ownership.orphan_matching + ownership.orphan_conflicting:
-            stopped = self._supervisor.stop_by_port(
+            disposition = self._supervisor.stop_by_port(
                 detected["port"],
                 force=True,
                 reason="force_restart=true on repository engine start",
                 actor=request.actor,
             )
-            if not stopped:
+            if not disposition.stopped:
                 return RepositoryEngineStartResult(
                     {
                         "error": "stop_failed",
@@ -500,7 +500,7 @@ class StartRepositoryEngineCommand:
                 instance_id=status.instance_id,
                 reason="engine identity mismatch detected on repository start",
                 actor=request.actor,
-            )
+            ).stopped
             if not stopped:
                 return (
                     (),
@@ -581,13 +581,13 @@ class StartRepositoryEngineCommand:
             if not detected.get("identity_mismatch"):
                 healthy.append(detected)
                 continue
-            stopped = self._supervisor.stop_by_port(
+            disposition = self._supervisor.stop_by_port(
                 detected["port"],
                 force=True,
                 reason="engine identity mismatch detected on repository start",
                 actor=request.actor,
             )
-            if not stopped:
+            if not disposition.stopped:
                 return RepositoryEngineStartResult(
                     {
                         "error": "engine_identity_mismatch",

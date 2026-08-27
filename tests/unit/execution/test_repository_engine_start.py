@@ -25,7 +25,10 @@ from issue_orchestrator.execution.repository_engine_start import (
     StartRepositoryEngineCommand,
 )
 from issue_orchestrator.ports.repository_engine_supervisor import (
+    EngineStopDisposition,
     MultiInstanceStatus,
+    RunningEngine,
+    StopOutcome,
     SupervisorStatus,
 )
 
@@ -219,7 +222,7 @@ def test_start_owner_restarts_tracked_engine_with_repo_identity_drift(
             )
         ],
     )
-    supervisor.stop.return_value = True
+    supervisor.stop.return_value = EngineStopDisposition.already_stopped()
     _prepare_successful_start(monkeypatch, selection, launch)
     inspect = Mock(return_value={"port": 24601, "identity_mismatch": {"branch": {}}})
     monkeypatch.setattr(
@@ -263,7 +266,10 @@ def test_start_owner_rejects_tracked_repo_identity_drift_when_stop_fails(
             )
         ],
     )
-    supervisor.stop.return_value = False
+    supervisor.stop.return_value = EngineStopDisposition.for_engine(
+        StopOutcome.FORCE_FAILED,
+        RunningEngine(instance_id=None, pid=4242, port=19080),
+    )
     _prepare_successful_start(monkeypatch, selection, launch)
     monkeypatch.setattr(
         "issue_orchestrator.execution.repository_engine_start."
@@ -371,7 +377,7 @@ def test_start_owner_replenishes_after_stopping_one_stale_tracked_instance(
             ),
         ],
     )
-    supervisor.stop.return_value = True
+    supervisor.stop.return_value = EngineStopDisposition.already_stopped()
     _prepare_successful_start(monkeypatch, selection, launch)
     monkeypatch.setattr(
         "issue_orchestrator.execution.repository_engine_start."

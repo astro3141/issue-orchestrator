@@ -542,7 +542,9 @@ class McpApp:
         intent passed in via tool args).
         """
         path = Path(repo_path)
-        stopped = supervisor.stop(path, force=force, reason=reason, actor="mcp")
+        stopped = supervisor.stop(
+            path, force=force, reason=reason, actor="mcp"
+        ).stopped
         return {"status": "stopped" if stopped else "failed"}
 
     async def status(self) -> dict[str, Any]:
@@ -588,7 +590,7 @@ class McpApp:
             force=force,
             reason=reason,
             actor="mcp",
-        )
+        ).stopped
         return {"stopped": stopped}
 
     async def pause(self) -> dict[str, Any]:

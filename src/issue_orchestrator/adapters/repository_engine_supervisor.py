@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any, Sequence
 
 from ..ports.repository_engine_supervisor import (
+    EngineStopDisposition,
     MultiInstanceStatus,
     RepositoryEngineLock,
     SupervisorStatus,
@@ -19,7 +20,7 @@ class DefaultSupervisorOps:
 
         return supervisor.start(*args, **kwargs)
 
-    def stop(self, *args: Any, **kwargs: Any) -> bool:
+    def stop(self, *args: Any, **kwargs: Any) -> EngineStopDisposition:
         from ..infra import supervisor
 
         return supervisor.stop(*args, **kwargs)
@@ -41,7 +42,7 @@ class DefaultSupervisorOps:
             actor=actor,
         )
 
-    def stop_by_port(self, *args: Any, **kwargs: Any) -> bool:
+    def stop_by_port(self, *args: Any, **kwargs: Any) -> EngineStopDisposition:
         from ..infra import supervisor
 
         return supervisor.stop_by_port(*args, **kwargs)
@@ -58,7 +59,9 @@ class DefaultSupervisorOps:
 
         return supervisor.start_instances(*args, **kwargs)
 
-    def stop_all_instances(self, *args: Any, **kwargs: Any) -> int:
+    def stop_all_instances(
+        self, *args: Any, **kwargs: Any
+    ) -> EngineStopDisposition:
         from ..infra import supervisor
 
         return supervisor.stop_all_instances(*args, **kwargs)

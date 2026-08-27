@@ -22,6 +22,10 @@ import pytest
 
 from issue_orchestrator.infra import supervisor
 from issue_orchestrator.infra.api_token import TOKEN_ENV_VAR, default_token_path
+from issue_orchestrator.ports.repository_engine_supervisor import (
+    RunningEngine,
+    StopOutcome,
+)
 from tests.shutdown_endpoint_server import AuthRequiringShutdownEndpoint
 
 ENGINE_TOKEN = "supervisor-shutdown-admin-token"
@@ -102,11 +106,11 @@ def test_stop_by_port_presents_the_existing_admin_bearer(
     """
     _write_token_file(ENGINE_TOKEN)
 
-    stopped = supervisor.stop_by_port(
+    disposition = supervisor.stop_by_port(
         harness.endpoint.port, reason=STOP_REASON, actor=STOP_ACTOR
     )
 
-    assert stopped is True
+    assert disposition.stopped is True
     assert len(harness.endpoint.requests) == 1
     request = harness.endpoint.requests[0]
     assert request.authorization == f"Bearer {ENGINE_TOKEN}"
@@ -180,13 +184,13 @@ def test_no_credential_anywhere_sends_no_bearer_and_mints_nothing(
         "issue_orchestrator.infra.supervisor._is_port_in_use", live.port_in_use
     )
     try:
-        stopped = supervisor.stop_by_port(
+        disposition = supervisor.stop_by_port(
             endpoint.port, reason=STOP_REASON, actor=STOP_ACTOR
         )
     finally:
         endpoint.stop()
 
-    assert stopped is True
+    assert disposition.stopped is True
     assert endpoint.requests[0].authorization is None
     assert endpoint.requests[0].status == 200
     assert live.port_kills == []
@@ -207,14 +211,18 @@ def test_a_refused_credential_is_not_reclassified_as_a_graceful_stop(
     """
     monkeypatch.setenv(TOKEN_ENV_VAR, "a-superseded-admin-token")
 
-    stopped = supervisor.stop_by_port(
+    disposition = supervisor.stop_by_port(
         harness.endpoint.port,
         reason=STOP_REASON,
         actor=STOP_ACTOR,
         graceful_timeout_seconds=GRACEFUL_BUDGET_SECONDS,
     )
 
-    assert stopped is False
+    assert disposition.stopped is False
+    assert disposition.outcome is StopOutcome.TIMED_OUT
+    assert disposition.still_running == (
+        RunningEngine(instance_id=None, pid=None, port=harness.endpoint.port),
+    )
     assert harness.endpoint.requests[0].status == 401
     assert harness.endpoint.accepted is False
     assert harness.port_kills == [], (
@@ -228,11 +236,11 @@ def test_a_forced_stop_still_skips_the_graceful_request(
     """Escalation policy is untouched: force never asks first."""
     _write_token_file(ENGINE_TOKEN)
 
-    stopped = supervisor.stop_by_port(
+    disposition = supervisor.stop_by_port(
         harness.endpoint.port, reason=STOP_REASON, actor=STOP_ACTOR, force=True
     )
 
-    assert stopped is True
+    assert disposition.stopped is True
     assert harness.endpoint.requests == []
     assert harness.port_kills == [True]
 

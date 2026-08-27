@@ -456,7 +456,7 @@ def test_the_supported_stop_completes_without_any_signal_fallback(
             reason=STOP_REASON,
             actor=STOP_ACTOR,
             graceful_timeout_seconds=GRACEFUL_TIMEOUT_SECONDS,
-        )
+        ).stopped
     finally:
         dashboard.teardown.release()
         exit_watcher.join(timeout=PROCESS_EXIT_TIMEOUT_SECONDS)

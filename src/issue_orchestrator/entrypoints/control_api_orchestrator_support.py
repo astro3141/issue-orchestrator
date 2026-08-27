@@ -5,12 +5,17 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
-from typing import TYPE_CHECKING, Annotated, Callable, Mapping, TypedDict
+from typing import TYPE_CHECKING, Annotated, Any, Callable, Mapping, TypedDict
 
 from fastapi import Depends, FastAPI, Request
 
 from ..infra.repo_guardrails import RepoGuardrailsInstallResult
-from ..ports.repository_engine_supervisor import RUNNING_SUPERVISOR_STATE
+from ..ports.repository_engine_supervisor import (
+    RUNNING_SUPERVISOR_STATE,
+    EngineStopDisposition,
+    RunningEngine,
+    StopOutcome,
+)
 
 _ORCHESTRATOR_DEPENDENCIES_STATE_KEY = "control_api_orchestrator_dependencies"
 _GUARDRAILS_REPAIRED_STATUS = "repaired"
@@ -107,28 +112,51 @@ class EngineStillRunningPayload(TypedDict):
     still_running: list[RunningEnginePayload]
 
 
-@dataclass(frozen=True)
-class RunningEngine:
-    """One Repository Engine observed alive after a stop attempt."""
+class EnginePortMismatchPayload(TypedDict):
+    error: str
+    detail: str
 
-    instance_id: str | None
-    pid: int | None
+
+class OrphanedEnginePayload(TypedDict):
+    repo_root: str
     port: int | None
-
-    def to_payload(self) -> RunningEnginePayload:
-        return {
-            "instance_id": self.instance_id,
-            "pid": self.pid,
-            "port": self.port,
-        }
+    active_selection: Any
 
 
 @dataclass(frozen=True)
 class EngineStopResponse:
     """The one truthful answer a stop request is allowed to return."""
 
-    payload: EngineStopPayload | EngineNotRunningPayload | EngineStillRunningPayload
+    payload: (
+        EngineStopPayload
+        | EngineNotRunningPayload
+        | EngineStillRunningPayload
+        | EnginePortMismatchPayload
+    )
     status_code: int
+
+
+@dataclass(frozen=True)
+class EngineStopRequest:
+    """One parsed Control Center stop request, ready for the supervisor."""
+
+    repo_root: Path
+    reason: str
+    actor: str
+    force: bool
+    force_if_timeout: bool
+    graceful_timeout_seconds: int
+    port_override: int | None
+
+    @property
+    def escalation_authorized(self) -> bool:
+        """Whether the operator authorized escalating past the budget.
+
+        Both stop paths read this. The port branch used to drop it,
+        so the same request body escalated when the engine happened to
+        hold a lock and silently did not when it did not (#326).
+        """
+        return self.force_if_timeout or self.force
 
 
 def _repo_relative_path(repo_root: Path, path: Path) -> str:
@@ -173,67 +201,77 @@ def stopped_engine_payload(repo_root: Path, stopped_count: int) -> EngineStopPay
     }
 
 
-def observe_running_engines(
-    sv: SupervisorOps,
-    repo_root: Path,
-) -> tuple[RunningEngine, ...]:
-    """Observe which tracked engines for ``repo_root`` are still alive."""
-    multi_status = sv.status_all_instances(repo_root)
-    return tuple(
-        RunningEngine(
-            instance_id=instance.instance_id,
-            pid=instance.pid,
-            port=instance.port,
-        )
-        for instance in multi_status.instances
-        if instance.state == RUNNING_SUPERVISOR_STATE
-    )
+def running_engine_payload(engine: RunningEngine) -> RunningEnginePayload:
+    """Serialize one still-running engine for the stop response."""
+    return {
+        "instance_id": engine.instance_id,
+        "pid": engine.pid,
+        "port": engine.port,
+    }
 
 
-def port_stop_evidence(*, port: int, stopped: bool) -> tuple[RunningEngine, ...]:
-    """Evidence left by a port-only stop, which no lock can corroborate.
+_STILL_RUNNING_DETAILS: Mapping[StopOutcome, str] = {
+    StopOutcome.TIMED_OUT: (
+        "The repository engine did not stop within the graceful timeout and "
+        "is still running. No force escalation was authorized, so it was "
+        "left running and no signal was sent. Stop it again with force to "
+        "terminate it."
+    ),
+    StopOutcome.FORCE_FAILED: (
+        "The repository engine did not stop. Force escalation was authorized "
+        "and a kill signal was sent, but the engine is still running. "
+        "Stopping it again with force is unlikely to help; inspect the "
+        "process directly."
+    ),
+}
 
-    A stop by port targets an engine the supervisor does not track, so
-    the only observation available is the one the stop itself made of
-    that port. An unconfirmed stop therefore means "still running",
-    never "was not running".
+
+def _still_running_detail(outcome: StopOutcome) -> str:
+    """Explain a still-running engine from what the stop actually did.
+
+    One hard-coded sentence claimed "no force escalation was
+    authorized" for every still-running answer, which is false the
+    moment force — or the Control Center's default force-on-timeout —
+    was authorized and the escalation itself failed (#326).
     """
-    if stopped:
-        return ()
-    return (RunningEngine(instance_id=None, pid=None, port=port),)
+    detail = _STILL_RUNNING_DETAILS.get(outcome)
+    if detail is None:
+        raise ValueError(
+            f"outcome {outcome} cannot describe an engine that is still "
+            "running; the disposition contradicts its own evidence",
+        )
+    return detail
 
 
 def resolve_engine_stop_response(
     *,
     repo_root: Path,
-    stopped_count: int,
-    still_running: tuple[RunningEngine, ...],
+    disposition: EngineStopDisposition,
 ) -> EngineStopResponse:
-    """Answer a stop request from observed evidence, not from intent.
+    """Answer a stop request from the owner's own statement of the stop.
 
     A stop that left the engine running must not be presented as a
     clean stop, and must not be presented as "already stopped"
     either: #324 reported ``status=stopped, stopped_count=1`` for a
-    retirement the process evidence contradicted. Process and lock
-    evidence outranks what the stop attempt hoped for (#326).
+    retirement the process evidence contradicted. The supervisor is
+    the component that watched the target, so its disposition — not a
+    second observation made here — decides the answer (#326).
     """
-    if still_running:
+    if disposition.still_running:
         payload: EngineStillRunningPayload = {
             "error": ENGINE_STILL_RUNNING_ERROR,
-            "detail": (
-                "The repository engine did not stop within the graceful "
-                "timeout and is still running. No force escalation was "
-                "authorized, so it was left running and no signal was sent. "
-                "Stop it again with force to terminate it."
-            ),
+            "detail": _still_running_detail(disposition.outcome),
             "repo_root": str(repo_root),
-            "stopped_count": stopped_count,
-            "still_running": [engine.to_payload() for engine in still_running],
+            "stopped_count": disposition.stopped_count,
+            "still_running": [
+                running_engine_payload(engine)
+                for engine in disposition.still_running
+            ],
         }
         return EngineStopResponse(payload=payload, status_code=409)
-    if stopped_count > 0:
+    if disposition.stopped_count > 0:
         return EngineStopResponse(
-            payload=stopped_engine_payload(repo_root, stopped_count),
+            payload=stopped_engine_payload(repo_root, disposition.stopped_count),
             status_code=200,
         )
     not_running: EngineNotRunningPayload = {
@@ -241,6 +279,52 @@ def resolve_engine_stop_response(
         "repo_root": str(repo_root),
     }
     return EngineStopResponse(payload=not_running, status_code=200)
+
+
+def perform_engine_stop(
+    sv: SupervisorOps,
+    request: EngineStopRequest,
+    *,
+    confirm_port: Callable[[Path, int], bool],
+) -> EngineStopResponse:
+    """Run one blocking engine stop and answer from its disposition.
+
+    Every supervisor call a stop needs lives here, so the caller can
+    hand the whole thing to a worker thread instead of blocking the
+    Control Center's event loop on a graceful budget (#326).
+    """
+    status_info = sv.status(request.repo_root)
+    if (
+        status_info.state != RUNNING_SUPERVISOR_STATE
+        and request.port_override is not None
+    ):
+        if not confirm_port(request.repo_root, request.port_override):
+            mismatch: EnginePortMismatchPayload = {
+                "error": "port_mismatch",
+                "detail": "No matching orchestrator found on the provided port.",
+            }
+            return EngineStopResponse(payload=mismatch, status_code=409)
+        disposition = sv.stop_by_port(
+            request.port_override,
+            force=request.force,
+            reason=request.reason,
+            actor=request.actor,
+            graceful_timeout_seconds=request.graceful_timeout_seconds,
+            force_if_graceful_fails=request.escalation_authorized,
+        )
+    else:
+        disposition = sv.stop_all_instances(
+            request.repo_root,
+            force=request.force,
+            reason=request.reason,
+            actor=request.actor,
+            graceful_timeout_seconds=request.graceful_timeout_seconds,
+            force_if_graceful_fails=request.escalation_authorized,
+        )
+    return resolve_engine_stop_response(
+        repo_root=request.repo_root,
+        disposition=disposition,
+    )
 
 
 def read_last_n_lines(log_path: Path, n: int) -> tuple[list[str], int]:
@@ -271,14 +355,15 @@ __all__ = [
     "ENGINE_STILL_RUNNING_ERROR",
     "ControlApiOrchestratorDependencies",
     "ControlApiOrchestratorDependency",
+    "EngineStopRequest",
+    "OrphanedEnginePayload",
     "EngineStopResponse",
-    "RunningEngine",
     "get_control_api_orchestrator_dependencies",
     "install_control_api_orchestrator_dependencies",
-    "observe_running_engines",
-    "port_stop_evidence",
+    "perform_engine_stop",
     "read_last_n_lines",
     "resolve_engine_stop_response",
+    "running_engine_payload",
     "serialize_guardrails_result",
     "stopped_engine_payload",
 ]

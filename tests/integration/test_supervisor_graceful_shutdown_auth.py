@@ -50,6 +50,9 @@ from issue_orchestrator.infra import browser_session, shutdown_timing, superviso
 from issue_orchestrator.infra.api_token import TOKEN_ENV_VAR, default_token_path
 from issue_orchestrator.infra.repo_identity import lock_file, state_dir
 from issue_orchestrator.infra.repo_lock import LockInfo
+from issue_orchestrator.ports.repository_engine_supervisor import (
+    EngineStopDisposition,
+)
 from tests.integration.live_dashboard_server import LiveDashboardServer
 from tests.shutdown_endpoint_server import AuthRequiringShutdownEndpoint
 
@@ -145,7 +148,7 @@ class StoppableEngine:
         *,
         graceful_timeout_seconds: float = GRACEFUL_TIMEOUT_SECONDS,
         force_if_graceful_fails: bool = True,
-    ) -> bool:
+    ) -> EngineStopDisposition:
         return supervisor.stop(
             self.repo_root,
             reason=STOP_REASON,
@@ -256,7 +259,7 @@ def test_an_authenticated_stop_completes_without_any_signal(
     port = endpoint.start()
     engine = engine_factory(port)
     try:
-        stopped = engine.stop()
+        stopped = engine.stop().stopped
     finally:
         endpoint.stop()
 
@@ -294,7 +297,7 @@ def test_a_refused_bearer_no_longer_buys_a_signal(
         stopped = engine.stop(
             graceful_timeout_seconds=UNAUTHORIZED_BUDGET_SECONDS,
             force_if_graceful_fails=False,
-        )
+        ).stopped
     finally:
         endpoint.stop()
 
@@ -328,7 +331,7 @@ def test_a_refused_bearer_escalates_only_where_force_was_authorized(
         stopped = engine.stop(
             graceful_timeout_seconds=UNAUTHORIZED_BUDGET_SECONDS,
             force_if_graceful_fails=True,
-        )
+        ).stopped
     finally:
         endpoint.stop()
 
@@ -363,7 +366,7 @@ def test_an_unconfirmed_request_still_finishes_when_the_engine_retires(
     port = endpoint.start()
     engine = engine_factory(port)
     try:
-        stopped = engine.stop(force_if_graceful_fails=False)
+        stopped = engine.stop(force_if_graceful_fails=False).stopped
     finally:
         endpoint.stop()
 
@@ -395,7 +398,7 @@ def test_an_engine_with_no_admin_token_still_stops_gracefully(
     port = endpoint.start()
     engine = engine_factory(port)
     try:
-        stopped = engine.stop()
+        stopped = engine.stop().stopped
     finally:
         endpoint.stop()
 
@@ -469,7 +472,7 @@ def test_the_mounted_dashboard_accepts_the_supervisors_bearer(
     assert port is not None
     engine = engine_factory(port)
     try:
-        stopped = engine.stop()
+        stopped = engine.stop().stopped
     finally:
         web.set_orchestrator(None)
 

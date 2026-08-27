@@ -22,6 +22,11 @@ from issue_orchestrator.infra import supervisor
 from issue_orchestrator.infra.config import Config
 from issue_orchestrator.infra.doctor.types import DoctorResult
 from issue_orchestrator.infra.launcher import LaunchResult, LaunchStatus
+from issue_orchestrator.ports.repository_engine_supervisor import (
+    EngineStopDisposition,
+    RunningEngine,
+    StopOutcome,
+)
 
 
 def _settings(*, host: str = "127.0.0.1") -> McpSettings:
@@ -561,7 +566,10 @@ def test_repos_stop_reports_status_not_a_plain_string_error(
     app = McpApp(_settings())
     monkeypatch.setattr(
         "issue_orchestrator.entrypoints.mcp_server.supervisor.stop",
-        lambda path, force=False, reason="", actor="": False,
+        lambda path, force=False, reason="", actor="": EngineStopDisposition.for_engine(
+            StopOutcome.TIMED_OUT,
+            RunningEngine(instance_id=None, pid=4242, port=19080),
+        ),
     )
 
     result = asyncio.run(app.tool_repos_stop(str(tmp_path)))

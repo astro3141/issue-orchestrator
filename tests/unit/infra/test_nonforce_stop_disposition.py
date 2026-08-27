@@ -37,6 +37,7 @@ from issue_orchestrator.infra.shutdown_timing import (
     StaticStopPolicy,
     StopOutcome,
 )
+from issue_orchestrator.ports.repository_engine_supervisor import RunningEngine
 
 BUDGET_SECONDS = 5.0
 ENGINE_PORT = 19080
@@ -256,7 +257,7 @@ class TestTrackedStopSendsNoSignal:
         live_engine: Path,
         signal_recorder: list[tuple[int, int]],
     ) -> None:
-        stopped = supervisor.stop(
+        disposition = supervisor.stop(
             live_engine,
             force=False,
             reason=STOP_REASON,
@@ -264,7 +265,11 @@ class TestTrackedStopSendsNoSignal:
             force_if_graceful_fails=False,
         )
 
-        assert stopped is False
+        assert disposition.stopped is False
+        assert disposition.outcome is StopOutcome.TIMED_OUT
+        assert disposition.still_running == (
+            RunningEngine(instance_id=None, pid=4242, port=ENGINE_PORT),
+        )
         assert signal_recorder == [], "a non-force stop signalled the engine"
         assert lock_file(live_engine).exists(), (
             "the lock was released for an engine that never exited"
@@ -285,7 +290,7 @@ class TestTrackedStopSendsNoSignal:
             lambda _pid: False,
         )
 
-        stopped = supervisor.stop(
+        disposition = supervisor.stop(
             repo_root,
             force=False,
             reason=STOP_REASON,
@@ -293,7 +298,7 @@ class TestTrackedStopSendsNoSignal:
             force_if_graceful_fails=False,
         )
 
-        assert stopped is True
+        assert disposition.stopped is True
         assert signal_recorder == []
         assert not lock_file(repo_root).exists()
 
@@ -327,16 +332,69 @@ class TestPortStopSendsNoSignal:
         self,
         port_kills: list[bool],
     ) -> None:
-        stopped = supervisor.stop_by_port(
+        disposition = supervisor.stop_by_port(
             ENGINE_PORT,
             reason=STOP_REASON,
             graceful_timeout_seconds=0.2,
         )
 
-        assert stopped is False
+        assert disposition.stopped is False
+        assert disposition.outcome is StopOutcome.TIMED_OUT
         assert port_kills == [], (
             "a non-force port stop killed the process holding the port"
         )
+
+    def test_an_authorized_escalation_reaches_the_port_branch_too(
+        self,
+        port_kills: list[bool],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Requirement: the port branch honours ``force_if_graceful_fails``.
+
+        The tracked path escalated after the budget and the port path
+        hard-coded the policy off, so the same operator authorization
+        meant two different things depending on whether the engine
+        happened to hold a lock.
+        """
+        monkeypatch.setattr(supervisor.time, "sleep", lambda _seconds: None)
+        alive = iter([True, True, False])
+        monkeypatch.setattr(
+            "issue_orchestrator.infra.supervisor._is_port_in_use",
+            lambda _port: next(alive, False),
+        )
+
+        disposition = supervisor.stop_by_port(
+            ENGINE_PORT,
+            reason=STOP_REASON,
+            graceful_timeout_seconds=0.2,
+            force_if_graceful_fails=True,
+        )
+
+        assert disposition.stopped is True
+        assert port_kills == [True], (
+            "an authorized escalation was dropped by the port branch"
+        )
+
+    def test_an_unauthorized_stop_still_reports_the_port_it_left_running(
+        self,
+        port_kills: list[bool],
+    ) -> None:
+        disposition = supervisor.stop_by_port(
+            ENGINE_PORT,
+            reason=STOP_REASON,
+            graceful_timeout_seconds=0.2,
+        )
+
+        assert disposition.still_running == (
+            RunningEngine(instance_id=None, pid=None, port=ENGINE_PORT),
+        )
+        assert disposition.stopped_count == 0
+        assert port_kills == []
+
+    def test_a_port_is_required_to_observe_anything(self) -> None:
+        """A stop with no target fails loudly rather than answering."""
+        with pytest.raises(ValueError, match="requires the port"):
+            supervisor.stop_by_port(0, reason=STOP_REASON)
 
     def test_explicit_force_still_kills_by_port(
         self,
@@ -349,12 +407,12 @@ class TestPortStopSendsNoSignal:
             lambda _port: False,
         )
 
-        stopped = supervisor.stop_by_port(
+        disposition = supervisor.stop_by_port(
             ENGINE_PORT,
             reason=STOP_REASON,
             force=True,
             graceful_timeout_seconds=0.2,
         )
 
-        assert stopped is True
+        assert disposition.stopped is True
         assert port_kills == [True]

@@ -35,10 +35,23 @@ A non-force stop is a request plus an observation, never a signal.
    is spent.
 4. This rule is identical for the tracked-lock stop and the port-only stop:
    both run through the one disposition owner,
-   `infra/shutdown_timing.py::InterruptibleStopController`.
-5. A stop response states what was observed. A stop that left the engine
-   running is reported as such, and is never presented as a clean stop or as
-   "already stopped". Process and lock evidence outrank presentation.
+   `infra/shutdown_timing.py::InterruptibleStopController`, and both accept the
+   same `force` and `force_if_graceful_fails` authority from the caller. An
+   escalation the endpoint accepted is never silently dropped by whichever
+   branch happens to identify the target.
+5. A stop response states what was observed, and states *why*. The disposition
+   owner returns `EngineStopDisposition` — outcome, stopped count, and the
+   engines still running — and the response is derived from it rather than from
+   a second observation made by the caller. A stop that left the engine running
+   is reported as such, is never presented as a clean stop or as "already
+   stopped", and distinguishes "no escalation was authorized, so nothing was
+   signalled" from "the authorized escalation ran and the engine survived it".
+   Process and lock evidence outrank presentation.
+6. Reconcile is a sweep across every registered repository, so it carries its
+   own bounded graceful budget rather than the per-engine shutdown default, it
+   never escalates on its own authority, and its result reports the engines it
+   left running so the surface cannot render a clean success for a sweep that
+   stopped nothing.
 
 ## UI Placement Rules
 

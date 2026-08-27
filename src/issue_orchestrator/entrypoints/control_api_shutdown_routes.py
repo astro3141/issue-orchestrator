@@ -211,7 +211,7 @@ def _process_shutdown_repo(*, operation_id: str, repo_path: str, supervisor: Sup
         return "skipped"
     logger.info("Stopping orchestrator for %s before shutdown", repo_path)
     try:
-        stopped_count = supervisor.stop_all_instances(
+        disposition = supervisor.stop_all_instances(
             path,
             force=initial_policy.force,
             reason="control-center global shutdown",
@@ -222,7 +222,7 @@ def _process_shutdown_repo(*, operation_id: str, repo_path: str, supervisor: Sup
         )
     except StopAborted:
         return "aborted"
-    return "stopped" if stopped_count > 0 else "failed"
+    return "stopped" if disposition.stopped_count > 0 else "failed"
 
 
 @control_shutdown_router.get("/control/shutdown/state")

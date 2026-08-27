@@ -4,6 +4,11 @@
 
 from tests.unit import test_control_api as _support
 from tests.unit.test_control_api import *  # noqa: F403
+from issue_orchestrator.ports.repository_engine_supervisor import (
+    EngineStopDisposition,
+    RunningEngine,
+    StopOutcome,
+)
 
 globals().update(
     {name: value for name, value in vars(_support).items() if not name.startswith("__")}
@@ -65,7 +70,9 @@ class TestControlCenterShutdownEndpoint:
 
         mock_supervisor = MagicMock()
         mock_supervisor.status.return_value = SimpleNamespace(state="running")
-        mock_supervisor.stop_all_instances.return_value = 1
+        mock_supervisor.stop_all_instances.return_value = (
+            EngineStopDisposition.already_stopped()
+        )
         set_supervisor(mock_supervisor)
         repos = [SimpleNamespace(path="/tmp/repo-a")]
         try:
@@ -110,7 +117,12 @@ class TestControlCenterShutdownEndpoint:
 
         mock_supervisor = MagicMock()
         mock_supervisor.status.return_value = SimpleNamespace(state="running")
-        mock_supervisor.stop_all_instances.return_value = 0
+        mock_supervisor.stop_all_instances.return_value = (
+            EngineStopDisposition.for_engine(
+                StopOutcome.FORCE_FAILED,
+                RunningEngine(instance_id=None, pid=4242, port=19080),
+            )
+        )
         set_supervisor(mock_supervisor)
         repos = [SimpleNamespace(path="/tmp/repo-a")]
         try:
@@ -201,7 +213,10 @@ class TestControlCenterShutdownEndpoint:
                 clock=lambda: 0.0,
                 sleeper=lambda _seconds: None,
             )
-            return 1 if controller.stop() is StopOutcome.STOPPED else 0
+            return EngineStopDisposition.for_engine(
+                controller.stop(),
+                RunningEngine(instance_id=None, pid=4242, port=19080),
+            )
 
         fake_supervisor = MagicMock()
         fake_supervisor.status.return_value = SimpleNamespace(state="running")

@@ -16,6 +16,13 @@ const STILL_RUNNING_DETAIL =
     + 'still running. No force escalation was authorized, so it was left '
     + 'running and no signal was sent. Stop it again with force to terminate it.';
 
+// The other reachable still-running case: the escalation the operator did
+// authorize ran, and the engine survived it (#326).
+const FORCE_FAILED_DETAIL =
+    'The repository engine did not stop. Force escalation was authorized and '
+    + 'a kill signal was sent, but the engine is still running. Stopping it '
+    + 'again with force is unlikely to help; inspect the process directly.';
+
 function loadControlCenter(response) {
     const toasts = [];
     const values = new Map();
@@ -98,4 +105,18 @@ test('nothing running is still reported as already stopped', async () => {
     await context.stopRepo('/repo', { force: false });
 
     assert.deepEqual(toasts, [['info', 'Repository engine was already stopped']]);
+});
+
+test('a failed force escalation is surfaced as its own reason', async () => {
+    const { context, toasts } = loadControlCenter(jsonResponse(409, {
+        error: 'engine_still_running',
+        detail: FORCE_FAILED_DETAIL,
+        repo_root: '/repo',
+        stopped_count: 0,
+        still_running: [{ instance_id: null, pid: 4242, port: 19080 }],
+    }));
+
+    await context.stopRepo('/repo', { force: true });
+
+    assert.deepEqual(toasts, [['error', FORCE_FAILED_DETAIL]]);
 });
