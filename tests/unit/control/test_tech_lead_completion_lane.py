@@ -329,3 +329,54 @@ class TestWhatABlockedRunIsAndIsNotAskedFor:
         assert lane.zero_code is False
         assert lane.requested_actions == BLOCKED_INTENTS
         assert "launch-authority" in lane.detail
+
+
+class TestTheSettlementNamesWhatSurvivesDownstream:
+    """One owner decides zero-code, and one owner shapes the fact it hands on.
+
+    ``SessionController`` must not re-derive "is there a code candidate here?"
+    from a role name, a ``TaskKind`` or a session prefix (#328). It reads
+    :attr:`TechLeadCompletionLane.code_candidate` instead, so these pin that the
+    downstream fact is this settlement's own answer and nothing else.
+    """
+
+    def test_a_proven_zero_code_run_offers_no_candidate_and_says_why(
+        self, tmp_path: Path
+    ) -> None:
+        run = arm(tmp_path, TechLeadSessionFlavor.PLANNING_INVESTIGATION)
+
+        lane = run.settle()
+
+        assert lane.zero_code is True
+        assert lane.code_candidate.offers_code_candidate is False
+        assert lane.code_candidate.detail == lane.detail
+
+    @pytest.mark.parametrize(
+        "flavor",
+        [f for f in TechLeadSessionFlavor if f is not TechLeadSessionFlavor.PLANNING_INVESTIGATION],
+    )
+    def test_every_settlement_that_is_not_zero_code_still_offers_a_candidate(
+        self, tmp_path: Path, flavor: TechLeadSessionFlavor
+    ) -> None:
+        """Including the flavors the zero-code lane never applies to."""
+        run = arm(tmp_path, flavor)
+
+        lane = run.settle()
+
+        assert lane.zero_code is False
+        assert lane.code_candidate.offers_code_candidate is True
+
+    def test_an_unproven_planning_run_still_offers_a_candidate(
+        self, tmp_path: Path
+    ) -> None:
+        """Fail-safe: a missing launch base is never read as zero code."""
+        run = arm(
+            tmp_path,
+            TechLeadSessionFlavor.PLANNING_INVESTIGATION,
+            launch_base_sha="",
+        )
+
+        lane = run.settle()
+
+        assert lane.zero_code is False
+        assert lane.code_candidate.offers_code_candidate is True

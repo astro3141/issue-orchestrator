@@ -1,7 +1,7 @@
 """Shared completion-processing result types."""
 
 from collections.abc import Callable
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 
 from ..domain.review_exchange_run import ReviewExchangeRunAssets
 
@@ -25,6 +25,56 @@ ERROR_PREFIX_TECH_LEAD_AUTHORITY = "tech_lead_authority"
 # that was dropped can never be reported as a success.
 ERROR_PREFIX_GOVERNED_LABEL = "governed_label"
 REVIEW_EXCHANGE_ERROR_PREFIX = "review_exchange:"
+
+
+@dataclass(frozen=True, slots=True)
+class CodeCandidateSettlement:
+    """Whether a settled completion still offers a code candidate to validate.
+
+    A code-candidate validation gate may run only when the trusted completion
+    settlement still presents a code candidate. The seam that KNOWS that — the
+    tech_lead completion owner, which proved a planning run left its checkout
+    at the commit it was launched on (#202) — is not the seam that decides
+    whether to run the gate. This is the fact that carries the answer between
+    them.
+
+    Before #328 the answer was logged and dropped: ``SessionController`` saw
+    only a ``COMPLETED`` status, ran the ordinary quick gate over an unchanged
+    base commit, and wrote candidate-shaped PASS evidence for a run that had
+    offered no candidate. Downstream code must CARRY this settlement; it must
+    never re-derive it from a role name, a task kind, a session-name prefix, or
+    the shape of the actions the completion asked for.
+
+    ``offers_code_candidate`` is True for every completion no owner has settled
+    out of the code lane. That is the ordinary Actor/Rework case, and it is also
+    the only fail-safe direction: a missing, malformed, ambiguous, or refused
+    settlement keeps today's gate. ``detail`` is the settling owner's own
+    sentence, so the log of a skipped gate says which run proved what.
+    """
+
+    offers_code_candidate: bool
+    detail: str
+
+    @classmethod
+    def presented(cls) -> "CodeCandidateSettlement":
+        """The ordinary lane: nothing has settled this completion out of it."""
+        return cls(offers_code_candidate=True, detail="")
+
+    @classmethod
+    def settled_zero_code(cls, detail: str) -> "CodeCandidateSettlement":
+        """A trusted owner PROVED this completion offers no code candidate."""
+        return cls(offers_code_candidate=False, detail=detail)
+
+    def carried_by(self, result: "ProcessingResult") -> "ProcessingResult":
+        """``result``, naming this settlement for its downstream readers.
+
+        Applied at every terminal exit of completion processing rather than at
+        the one that happens to be the common case, for the same reason
+        :meth:`ActionExecutionOutcome.of` re-stamps its early result: a fact
+        that only ONE exit carries is the easiest thing in the pipeline to drop
+        silently.
+        """
+        return replace(result, code_candidate=self)
 
 
 @dataclass
@@ -65,6 +115,13 @@ class ProcessingResult:
     # required, one is still running in the background, or the exchange halted
     # before a run existed.
     review_exchange_run: ReviewExchangeRunAssets | None = None
+    # What the trusted completion settlement leaves for a downstream code gate
+    # to judge (#328). Defaulted to the ordinary lane so every producer that
+    # never met a settling owner — and every refusal, which proves nothing
+    # about a checkout — keeps the gate exactly as it is today.
+    code_candidate: CodeCandidateSettlement = field(
+        default_factory=CodeCandidateSettlement.presented
+    )
 
     @classmethod
     def for_review_exchange_deferred(cls) -> "ProcessingResult":

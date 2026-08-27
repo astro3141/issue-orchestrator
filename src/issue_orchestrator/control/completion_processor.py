@@ -111,6 +111,7 @@ from .completion_ports import (
     MissingTechLeadAuthorityStore,
     PRAdapter,
 )
+from .completion_pre_action import PreActionOutcome, settle_tech_lead_pre_action
 from .completion_pr_labels import apply_pr_labels, reserved_pr_label_error
 from .completion_types import (
     ActionExecutionOutcome,
@@ -131,7 +132,6 @@ from .review_exchange_pr_comment import (
 )
 from .test_skip_guard import added_test_paths, scan_added_test_skip_guards
 from .tech_lead_approval_gate import build_tech_lead_decision_approval_gate
-from .tech_lead_completion import settle_tech_lead_completion
 from .tech_lead_session_policy import is_benign_tech_lead_no_commits, is_tech_lead_session, shape_requested_actions_for_tech_lead
 from .worktree_head import current_worktree_head_sha
 from ..ports.pull_request_tracker import PRInfo
@@ -765,7 +765,7 @@ class CompletionProcessor:
             )
             return ProcessingResult.for_review_exchange_deferred()
 
-        pre_action_failure = self._check_pre_action_policies(
+        pre_action = self._check_pre_action_policies(
             worktree,
             record,
             session_name,
@@ -774,8 +774,9 @@ class CompletionProcessor:
             agent_label=agent_label,
             issue_key=issue_key,
         )
-        if pre_action_failure:
-            return pre_action_failure
+        if pre_action.refusal is not None:
+            return pre_action.refusal
+        code_candidate = pre_action.code_candidate
 
         # Get branch name for PR operations
         branch = self.git_adapter.get_current_branch(worktree)
@@ -818,12 +819,15 @@ class CompletionProcessor:
             rework=rework,
         )
         if executed.early_result is not None:
-            return executed.early_result
+            return code_candidate.carried_by(executed.early_result)
 
         if executed.deferred:
             # Review exchange is running in the background. Leave the completion
             # record on disk so the next observation re-enters this pipeline,
             # and skip result artifacts / cleanup that would imply completion.
+            # The candidate settlement is deliberately NOT carried: this result
+            # is non-terminal, the pass that finishes the record settles it
+            # again from the same owner, and no validation decision reads it.
             logger.info(
                 "Completion deferred (review exchange running): issue=%d session=%s",
                 issue_number,
@@ -842,7 +846,7 @@ class CompletionProcessor:
 
         # Build and return result
         total_duration = time.monotonic() - start_time
-        return build_processing_result(
+        result = build_processing_result(
             session_output=self.session_output,
             worktree=worktree,
             record=record,
@@ -865,67 +869,7 @@ class CompletionProcessor:
             post_issue_comment=self._add_issue_comment,
             cleanup_completion_record_fn=self._cleanup_completion_record,
         )
-
-    def _settle_tech_lead_completion(
-        self,
-        *,
-        worktree: Path,
-        record: CompletionRecord,
-        agent_label: str | None,
-        issue_number: int,
-        run_assets: SessionRunAssets,
-    ) -> ProcessingResult | None:
-        """Ask the tech_lead owner what this completion may still do (ADR-0031).
-
-        Running here — in the pre-action policy phase, before the completion
-        record is preserved and before ANY requested action executes (#6769
-        finding 1) — is what makes the owner's answer the boundary rather than
-        a suggestion: a rejection produces ZERO push/PR/comment calls and a
-        failed processing result whose tagged error is classified critical, so
-        history records FAILED for every flavor and the tech_lead failure
-        labeling path fires downstream; and a shaped action tuple is the only
-        one the generic executor below ever sees.
-
-        Which completions are held to the admission contract, which policies
-        shape the survivors, and in what order, all belong to
-        ``settle_tech_lead_completion`` (#202 publication intent, #182/#136
-        recovery intent, for BLOCKED as well as COMPLETED — #257). This seam
-        only supplies the run's identity and the two worktree reads, and
-        records the lane it settled into.
-        """
-        if self._config is None or not self._is_tech_lead_session(agent_label):
-            return None
-        lane = settle_tech_lead_completion(
-            self._config,
-            tech_lead_authority=self._tech_lead_authority,
-            run_dir=run_assets.run_dir,
-            run_id=run_assets.run_id,
-            session_name=run_assets.session_name,
-            outcome=record.outcome,
-            requested_actions=tuple(record.requested_actions),
-            worktree=worktree,
-            worktree_reader=self.git_adapter,
-        )
-        if lane.rejection is not None:
-            logger.warning(
-                "Tech Lead completion rejected before any action for issue #%d: %s",
-                issue_number,
-                lane.rejection,
-            )
-            return ProcessingResult(
-                success=False,
-                message=f"Tech Lead completion rejected: {lane.rejection}",
-                errors=[lane.rejection],
-            )
-        record.requested_actions = list(lane.requested_actions)
-        logger.info(
-            "Tech Lead completion lane for issue #%d: outcome=%s zero_code=%s (%s)",
-            issue_number,
-            record.outcome.value,
-            lane.zero_code,
-            lane.detail,
-        )
-        return None
+        return code_candidate.carried_by(result)
 
     def _review_exchange_approval_gate(
         self,
@@ -956,8 +900,12 @@ class CompletionProcessor:
         *,
         agent_label: str | None,
         issue_key: "IssueKey | None",
-    ) -> ProcessingResult | None:
-        """Run completion policies that must pass before any action executes."""
+    ) -> PreActionOutcome:
+        """Run completion policies that must pass before any action executes.
+
+        Returns the phase's whole answer: the refusal when there is one, and
+        what the admitted completion still offers a downstream code gate (#328).
+        """
         # First: tech_lead scope/decision authority (#6769 finding 1). Checked
         # ahead of the worktree policies because a rejected tech_lead completion
         # must produce zero GitHub calls — the worktree handlers below post
@@ -965,19 +913,22 @@ class CompletionProcessor:
         # publication intent belongs to (#202) and strips the recovery requests
         # its role may not make (#182/#136), which is why it runs before every
         # publish precondition below and before any action executes (#257).
-        tech_lead_rejection = self._settle_tech_lead_completion(
+        settled = settle_tech_lead_pre_action(
+            self._config,
+            tech_lead_authority=self._tech_lead_authority,
             worktree=worktree,
             record=record,
             agent_label=agent_label,
             issue_number=issue_number,
             run_assets=run_assets,
+            worktree_reader=self.git_adapter,
         )
-        if tech_lead_rejection is not None:
-            return tech_lead_rejection
+        if settled.refusal is not None:
+            return settled
 
         worktree_state = self.validate_worktree_state(worktree, record)
         if not worktree_state.ok:
-            return self._handle_invalid_worktree_state(
+            invalid_worktree = self._handle_invalid_worktree_state(
                 worktree,
                 record,
                 session_name,
@@ -985,6 +936,7 @@ class CompletionProcessor:
                 worktree_state,
                 run_assets,
             )
+            return PreActionOutcome.refused(invalid_worktree)
 
         test_skip_error = self._check_test_skip_guard_if_required(
             worktree,
@@ -994,7 +946,7 @@ class CompletionProcessor:
             run_assets,
         )
         if test_skip_error:
-            return test_skip_error
+            return PreActionOutcome.refused(test_skip_error)
 
         runtime_artifact_error = self._check_runtime_artifact_guard_if_required(
             worktree,
@@ -1004,7 +956,7 @@ class CompletionProcessor:
             run_assets,
         )
         if runtime_artifact_error:
-            return runtime_artifact_error
+            return PreActionOutcome.refused(runtime_artifact_error)
 
         gate_failure = self._check_publish_gate_if_required(
             worktree,
@@ -1014,7 +966,7 @@ class CompletionProcessor:
             issue_key,
         )
         if gate_failure is not None:
-            return gate_failure
+            return PreActionOutcome.refused(gate_failure)
 
         # This candidate cleared every publication precondition, so a refusal
         # recorded against an earlier one no longer describes what is offered.
@@ -1023,7 +975,7 @@ class CompletionProcessor:
         # would hold a later, genuinely validated candidate out forever (#45).
         if record.offers_a_change_for_review:
             self._publication_authority.grant(issue_number)
-        return None
+        return settled
 
     def _read_and_validate_record(
         self,

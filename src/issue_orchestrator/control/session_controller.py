@@ -71,7 +71,7 @@ from ..ports.run_evidence import (
     ValidationEvidenceRecorder,
 )
 from ..ports.session_output import SessionOutput, ValidationRecord, ValidationState
-from .completion_types import REVIEW_EXCHANGE_ERROR_PREFIX
+from .completion_types import CodeCandidateSettlement, REVIEW_EXCHANGE_ERROR_PREFIX
 from .completion_lookup_report import report_completion_lookup
 from .completion_record_validation import CompletionRecordLoadResult
 from .absent_completion_record import (
@@ -262,7 +262,10 @@ class SessionController:
 
         ``task_kind`` is the originating session's task. Review-only tasks make
         no commits and publish nothing, so the code validation-retry gate does
-        not apply to them (see ``_run_validation_phase_if_needed``).
+        not apply to them (see ``_run_validation_phase_if_needed``). Whether an
+        admitted completion still offers a code candidate at all is a separate
+        question, and not one this layer answers: it arrives on the processing
+        result, settled by the owner that judged it (#328).
         """
         # If still running, nothing to decide
         if observation.observation == SessionObservation.RUNNING:
@@ -405,6 +408,7 @@ class SessionController:
             repo_root=repo_root,
             issue_key=issue_key,
             task_kind=task_kind,
+            code_candidate=result.code_candidate,
         )
         if validation_decision is not None:
             status = validation_decision.status
@@ -796,9 +800,24 @@ class SessionController:
         retry_prompt_template: str | None,
         repo_root: Path | None,
         issue_key: "IssueKey | None",
+        code_candidate: CodeCandidateSettlement,
         task_kind: "TaskKind | None" = None,
     ) -> ValidationGateDecision | None:
         if status != SessionStatus.COMPLETED or not self._command_runner:
+            return None
+        # A code-candidate gate may run only while the trusted completion
+        # settlement still presents a code candidate to validate (#328). The
+        # settlement is CARRIED here from the owner that judged it — the
+        # tech_lead completion authority, which proved a planning run left its
+        # checkout at the commit it was launched on (#202). Nothing in this
+        # method re-derives it: a role name, a TaskKind, or a session-name
+        # prefix would be a second policy, and a blanket TaskKind.TECH_LEAD skip
+        # would strip the gate from tech_lead runs that DID write code.
+        if not code_candidate.offers_code_candidate:
+            logger.info(
+                issue_log(issue_number, "Skipping code validation gate: %s"),
+                code_candidate.detail,
+            )
             return None
         profile = self._profile_for_run(run_dir)
         if not profile.quick.cmd:
