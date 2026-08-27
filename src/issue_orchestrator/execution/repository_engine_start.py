@@ -228,10 +228,16 @@ class StartRepositoryEngineCommand:
             and launch_result.supervisor
             and is_shutdown_complete(launch_result.supervisor.get("port"))
         ):
+            # The engine already reported shutdown complete and a
+            # replacement is about to take its port, so this restart
+            # does authorize the escalation the graceful budget may
+            # need. It is stated here rather than inherited from a
+            # default, which is nobody's authorization (#326).
             self._supervisor.stop(
                 request.repo_root,
                 reason="restart after shutdown-complete repository engine",
                 actor=request.actor,
+                force_if_graceful_fails=True,
             )
             time.sleep(0.5)
             launch_result = launch_subprocess(

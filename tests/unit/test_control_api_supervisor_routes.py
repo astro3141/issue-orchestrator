@@ -2,6 +2,8 @@
 
 # ruff: noqa: F403,F405
 
+from urllib.parse import quote
+
 from tests.unit import test_control_api as _support
 from tests.unit.test_control_api import *  # noqa: F403
 from issue_orchestrator.domain.repository_launch_selection import RepositoryLaunchSelection
@@ -690,6 +692,118 @@ def _record_event_loop_presence(
 
     getattr(mock_supervisor, method).side_effect = record
     return observed
+
+
+class TestEveryStopRouteGoesThroughTheOffLoopOwner:
+    """The off-loop rule has one owner, not one discipline per route.
+
+    An unconfirmed graceful request no longer shortcuts to a signal,
+    so the worst case of any engine stop is now the whole graceful
+    budget — minutes of blocking supervisor work. Two live routes
+    still ran that inline on the event loop that also serves
+    ``control_center.html``, ``/static``, SSE and status polling, so
+    the #324 shape (the engine's ``/api/shutdown`` refuses the
+    supervisor's bearer) froze the entire Control Center (#326).
+
+    These routes take no ``force_if_timeout``, so they also carry no
+    escalation authority: neither may signal an engine on a
+    ``force=false`` request.
+    """
+
+    def test_the_repo_stop_route_stays_off_the_event_loop(
+        self,
+        supervisor_client: TestClient,
+        tmp_path: Path,
+        mock_supervisor: MagicMock,
+    ) -> None:
+        observed = _record_event_loop_presence(
+            mock_supervisor, "stop", EngineStopDisposition.already_stopped()
+        )
+
+        supervisor_client.post(
+            f"/api/repos/{quote(str(tmp_path), safe='')}/stop",
+            json={"reason": "test off-loop repo stop", "force": False},
+        )
+
+        assert observed == [False], "the repo stop ran on the event loop"
+
+    def test_the_repo_stop_route_authorizes_no_escalation(
+        self,
+        supervisor_client: TestClient,
+        tmp_path: Path,
+        mock_supervisor: MagicMock,
+    ) -> None:
+        supervisor_client.post(
+            f"/api/repos/{quote(str(tmp_path), safe='')}/stop",
+            json={"reason": "test unforced repo stop", "force": False},
+        )
+
+        kwargs = mock_supervisor.stop.call_args.kwargs
+        assert kwargs["force"] is False
+        assert kwargs["force_if_graceful_fails"] is False
+
+    def test_a_repo_stop_that_left_the_engine_running_is_not_reported_stopped(
+        self,
+        supervisor_client: TestClient,
+        tmp_path: Path,
+        mock_supervisor: MagicMock,
+    ) -> None:
+        mock_supervisor.stop.return_value = EngineStopDisposition.for_engine(
+            StopOutcome.TIMED_OUT,
+            RunningEngine(instance_id=None, pid=4242, port=19080),
+        )
+
+        response = supervisor_client.post(
+            f"/api/repos/{quote(str(tmp_path), safe='')}/stop",
+            json={"reason": "test unconfirmed repo stop", "force": False},
+        )
+
+        assert response.json()["status"] == "failed"
+
+    def test_the_repo_removal_route_stays_off_the_event_loop(
+        self,
+        supervisor_client: TestClient,
+        tmp_path: Path,
+        mock_supervisor: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(
+            "issue_orchestrator.infra.repo_registry.remove_repo",
+            lambda _root: True,
+        )
+        observed = _record_event_loop_presence(
+            mock_supervisor, "stop", EngineStopDisposition.already_stopped()
+        )
+
+        supervisor_client.request(
+            "DELETE",
+            "/control/repos",
+            json={"repo_root": str(tmp_path), "stop_orchestrator": True},
+        )
+
+        assert observed == [False], "the repo removal stop ran on the event loop"
+
+    def test_the_repo_removal_route_authorizes_no_escalation(
+        self,
+        supervisor_client: TestClient,
+        tmp_path: Path,
+        mock_supervisor: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(
+            "issue_orchestrator.infra.repo_registry.remove_repo",
+            lambda _root: True,
+        )
+
+        supervisor_client.request(
+            "DELETE",
+            "/control/repos",
+            json={"repo_root": str(tmp_path), "stop_orchestrator": True},
+        )
+
+        kwargs = mock_supervisor.stop.call_args.kwargs
+        assert kwargs["force"] is False
+        assert kwargs["force_if_graceful_fails"] is False
 
 
 class TestReconcileIsASweepNotAnEngineShutdown:

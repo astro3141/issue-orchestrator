@@ -193,7 +193,19 @@ class RepositoryEngineStopPolicy(Protocol):
 
 @runtime_checkable
 class SupervisorOps(Protocol):
-    """Behavior required by launch and Control Center owners."""
+    """Behavior required by launch and Control Center owners.
+
+    Every stop on this port takes ``force_if_graceful_fails``, and it
+    means one thing everywhere: whether the caller *authorized* an
+    escalation past the graceful budget. It defaults to ``False`` on
+    all three stop methods because a default kwarg is nobody's
+    authorization — a caller that inherits it never said "kill this".
+    The tracked path used to default it to ``True`` while the port
+    path defaulted it to ``False``, so the same ``force=false``
+    request escalated to SIGKILL when the engine happened to hold a
+    lock and left it running when it did not (#326). Callers that
+    genuinely want the escalation say so at the call site.
+    """
 
     def start(
         self,
@@ -218,7 +230,7 @@ class SupervisorOps(Protocol):
         reason: str,
         actor: str = "supervisor.stop",
         graceful_timeout_seconds: float = 120,
-        force_if_graceful_fails: bool = True,
+        force_if_graceful_fails: bool = False,
         stop_policy: RepositoryEngineStopPolicy | None = None,
     ) -> EngineStopDisposition: ...
 
@@ -271,7 +283,7 @@ class SupervisorOps(Protocol):
         reason: str,
         actor: str = "supervisor.stop_all_instances",
         graceful_timeout_seconds: float = 120,
-        force_if_graceful_fails: bool = True,
+        force_if_graceful_fails: bool = False,
         stop_policy: RepositoryEngineStopPolicy | None = None,
     ) -> EngineStopDisposition: ...
 

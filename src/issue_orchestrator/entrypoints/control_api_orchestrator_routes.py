@@ -47,8 +47,8 @@ from .control_api_orchestrator_support import (
     EngineStopRequest,
     OrphanedEnginePayload,
     engines_left_running_payload,
-    perform_engine_stop,
     read_last_n_lines,
+    run_engine_stop,
     serialize_guardrails_result,
 )
 from .shutdown_reason_support import parse_shutdown_reason
@@ -262,11 +262,7 @@ async def control_stop(
     )
 
     try:
-        # A graceful budget is minutes of blocking supervisor work; running
-        # it inline would freeze status polling, SSE and the spinner that is
-        # showing the operator this very stop (#326).
-        response = await asyncio.to_thread(
-            perform_engine_stop,
+        response = await run_engine_stop(
             sv,
             EngineStopRequest(
                 repo_root=repo_root,

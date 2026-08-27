@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
@@ -356,7 +357,7 @@ def resolve_engine_stop_response(
     return EngineStopResponse(payload=not_running, status_code=200)
 
 
-def perform_engine_stop(
+def _perform_engine_stop(
     sv: SupervisorOps,
     request: EngineStopRequest,
     *,
@@ -364,9 +365,11 @@ def perform_engine_stop(
 ) -> EngineStopResponse:
     """Run one blocking engine stop and answer from its disposition.
 
-    Every supervisor call a stop needs lives here, so the caller can
-    hand the whole thing to a worker thread instead of blocking the
-    Control Center's event loop on a graceful budget (#326).
+    Private on purpose: an engine stop spends a graceful budget
+    watching the target, so it is only ever reached through
+    ``run_engine_stop``, which owns the worker-thread hand-off. Making
+    it callable from a route is what let two of the four stop paths
+    drift back onto the Control Center's event loop (#326).
     """
     status_info = sv.status(request.repo_root)
     if (
@@ -400,6 +403,55 @@ def perform_engine_stop(
         repo_root=request.repo_root,
         disposition=disposition,
     )
+
+
+async def run_engine_stop(
+    sv: SupervisorOps,
+    request: EngineStopRequest,
+    *,
+    confirm_port: Callable[[Path, int], bool],
+) -> EngineStopResponse:
+    """Stop a repository's engines off the loop and answer the request.
+
+    A graceful budget is minutes of blocking supervisor work — since
+    an unconfirmed request no longer shortcuts to a signal, the worst
+    case is the whole budget (#326). Running that inline would freeze
+    status polling, SSE and the spinner showing the operator this very
+    stop, so the hand-off belongs to the one owner every stop route
+    goes through rather than to each route's own discipline.
+    """
+    return await asyncio.to_thread(
+        _perform_engine_stop, sv, request, confirm_port=confirm_port
+    )
+
+
+async def run_supervisor_stop(
+    sv: SupervisorOps,
+    repo_root: Path,
+    *,
+    reason: str,
+    actor: str,
+    force: bool = False,
+    force_if_graceful_fails: bool = False,
+) -> EngineStopDisposition:
+    """Stop one repository's tracked engine off the Control Center loop.
+
+    The narrow form of :func:`run_engine_stop` for the routes that
+    need only the disposition and have no port fallback to confirm.
+    They get the same off-loop guarantee from the same owner, so no
+    stop route has to remember to arrange it (#326).
+    """
+
+    def stop_engine() -> EngineStopDisposition:
+        return sv.stop(
+            repo_root,
+            force=force,
+            reason=reason,
+            actor=actor,
+            force_if_graceful_fails=force_if_graceful_fails,
+        )
+
+    return await asyncio.to_thread(stop_engine)
 
 
 def read_last_n_lines(log_path: Path, n: int) -> tuple[list[str], int]:
@@ -438,9 +490,10 @@ __all__ = [
     "engines_left_running_payload",
     "get_control_api_orchestrator_dependencies",
     "install_control_api_orchestrator_dependencies",
-    "perform_engine_stop",
     "read_last_n_lines",
     "resolve_engine_stop_response",
+    "run_engine_stop",
+    "run_supervisor_stop",
     "serialize_guardrails_result",
     "still_running_detail",
     "stopped_engine_payload",

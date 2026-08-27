@@ -23,6 +23,7 @@ SIGTERM fails these tests.
 
 from __future__ import annotations
 
+import inspect
 import json
 from datetime import datetime, timezone
 from pathlib import Path
@@ -37,7 +38,10 @@ from issue_orchestrator.infra.shutdown_timing import (
     StaticStopPolicy,
     StopOutcome,
 )
-from issue_orchestrator.ports.repository_engine_supervisor import RunningEngine
+from issue_orchestrator.ports.repository_engine_supervisor import (
+    RunningEngine,
+    SupervisorOps,
+)
 
 BUDGET_SECONDS = 5.0
 ENGINE_PORT = 19080
@@ -275,6 +279,73 @@ class TestTrackedStopSendsNoSignal:
             "the lock was released for an engine that never exited"
         )
 
+    def test_an_inherited_default_is_not_authority_to_escalate(
+        self,
+        live_engine: Path,
+        signal_recorder: list[tuple[int, int]],
+    ) -> None:
+        """The same ``force=false`` request, both stop paths, one meaning.
+
+        ``force_if_graceful_fails`` defaulted to ``True`` on the
+        tracked path and ``False`` on ``stop_by_port``, so a caller
+        that named neither escalated to a process-group SIGTERM and
+        then SIGKILL when the engine happened to hold a lock, and left
+        it alone when it did not. A default kwarg is nobody's
+        authorization (#326).
+        """
+        disposition = supervisor.stop(
+            live_engine,
+            force=False,
+            reason=STOP_REASON,
+            graceful_timeout_seconds=0.2,
+        )
+
+        assert disposition.stopped is False
+        assert disposition.outcome is StopOutcome.TIMED_OUT
+        assert signal_recorder == [], (
+            "an inherited escalation default signalled an engine nobody "
+            "authorized signalling"
+        )
+        assert lock_file(live_engine).exists()
+
+    def test_the_multi_instance_stop_inherits_the_same_refusal(
+        self,
+        live_engine: Path,
+        signal_recorder: list[tuple[int, int]],
+    ) -> None:
+        """``stop_all_instances`` threads the flag, so it drifted too."""
+        disposition = supervisor.stop_all_instances(
+            live_engine,
+            force=False,
+            reason=STOP_REASON,
+            graceful_timeout_seconds=0.2,
+        )
+
+        assert disposition.stopped is False
+        assert disposition.outcome is StopOutcome.TIMED_OUT
+        assert signal_recorder == []
+
+    def test_an_authorized_escalation_still_reaches_the_tracked_path(
+        self,
+        live_engine: Path,
+        signal_recorder: list[tuple[int, int]],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Opt-in is the only change: saying so still escalates."""
+        monkeypatch.setattr(supervisor.time, "sleep", lambda _seconds: None)
+
+        supervisor.stop(
+            live_engine,
+            force=False,
+            reason=STOP_REASON,
+            graceful_timeout_seconds=0.2,
+            force_if_graceful_fails=True,
+        )
+
+        assert signal_recorder != [], (
+            "an authorized escalation was dropped by the tracked path"
+        )
+
     def test_a_stale_lock_is_still_reconciled(
         self,
         monkeypatch: pytest.MonkeyPatch,
@@ -301,6 +372,40 @@ class TestTrackedStopSendsNoSignal:
         assert disposition.stopped is True
         assert signal_recorder == []
         assert not lock_file(repo_root).exists()
+
+
+class TestEscalationAuthorityMeansOneThingOnThePort:
+    """One parameter, one default, on every stop the port declares.
+
+    The tracked and port signatures carried opposite defaults for
+    ``force_if_graceful_fails``, which is how ``force=false`` came to
+    mean "leave it running" on one path and "SIGKILL it after the
+    budget" on the other (#326).
+    """
+
+    @pytest.mark.parametrize(
+        "method_name", ["stop", "stop_by_port", "stop_all_instances"]
+    )
+    def test_escalation_is_opt_in_on_every_stop(self, method_name: str) -> None:
+        parameters = inspect.signature(
+            getattr(SupervisorOps, method_name)
+        ).parameters
+
+        assert parameters["force_if_graceful_fails"].default is False, (
+            f"SupervisorOps.{method_name} escalates without being asked to"
+        )
+
+    @pytest.mark.parametrize(
+        "method_name", ["stop", "stop_by_port", "stop_all_instances"]
+    )
+    def test_the_implementation_matches_the_port(self, method_name: str) -> None:
+        parameters = inspect.signature(
+            getattr(supervisor, method_name)
+        ).parameters
+
+        assert parameters["force_if_graceful_fails"].default is False, (
+            f"supervisor.{method_name} escalates without being asked to"
+        )
 
 
 class TestPortStopSendsNoSignal:

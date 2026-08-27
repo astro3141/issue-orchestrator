@@ -21,6 +21,7 @@ from ..execution.control_center_runtime import (
     get_selected_launch_selection,
 )
 from ..infra.repo_identity import deserialize_repo_identity
+from .control_api_orchestrator_support import run_supervisor_stop
 from .control_api_repo_support import ControlApiRepoDependency
 
 logger = logging.getLogger(__name__)
@@ -148,7 +149,8 @@ async def remove_repo_endpoint(
     if body.get("stop_orchestrator", True):
         path = Path(normalized)
         if path.exists():
-            deps.get_supervisor().stop(
+            await run_supervisor_stop(
+                deps.get_supervisor(),
                 path,
                 reason="repo removed via /control/repos/remove",
                 actor="control-center.repos.remove",

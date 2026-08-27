@@ -433,11 +433,9 @@ def stop_by_port(
     (#326). The target being alive is now the *reason to keep
     waiting*, never permission to kill.
 
-    ``force_if_graceful_fails`` carries the operator's *escalation*
-    authority, and it means the same thing here too. The port branch
-    used to hard-code it off, so the same request body escalated on
-    the tracked path and silently did not here — the operator's
-    authorization accepted by the endpoint and dropped on the floor.
+    ``force_if_graceful_fails`` is the operator's *escalation*
+    authority; ``SupervisorOps`` owns what it means and why every stop
+    it declares makes it opt-in (#326).
     """
     if not port:
         raise ValueError(
@@ -520,7 +518,7 @@ def stop(
     reason: str,
     actor: str = "supervisor.stop",
     graceful_timeout_seconds: float = DEFAULT_ENGINE_GRACEFUL_TIMEOUT_SECONDS,
-    force_if_graceful_fails: bool = True,
+    force_if_graceful_fails: bool = False,
     stop_policy: shutdown_timing.StopPolicy | None = None,
     expected_pid: int | None = None,
 ) -> EngineStopDisposition:
@@ -530,6 +528,10 @@ def stop(
     disposition this stop observed, never a bare success flag: callers
     that must tell an operator what happened would otherwise have to
     re-observe the engine and guess at the reason (#326).
+
+    ``force_if_graceful_fails`` is opt-in here, per ``SupervisorOps``:
+    it used to default on, so an unforced stop of a lock-holding
+    engine ran ``_force_stop`` with nobody having authorized it (#326).
     """
     if not reason or not reason.strip():
         raise ValueError(
@@ -679,8 +681,6 @@ def _force_kill_by_port_last_resort(
     """Last-resort SIGKILL by port; verify the process actually exited."""
     if not port:
         return False
-
-    import time
 
     logger.warning("Force killing by port %d", port)
     _kill_by_port(port, use_sigkill=True)
@@ -889,7 +889,7 @@ def stop_all_instances(
     reason: str,
     actor: str = "supervisor.stop_all_instances",
     graceful_timeout_seconds: float = DEFAULT_ENGINE_GRACEFUL_TIMEOUT_SECONDS,
-    force_if_graceful_fails: bool = True,
+    force_if_graceful_fails: bool = False,
     stop_policy: shutdown_timing.StopPolicy | None = None,
 ) -> EngineStopDisposition:
     """Stop all orchestrator instances for a repository.
@@ -902,6 +902,8 @@ def stop_all_instances(
             records the calling intent.
         actor: Source identifier (cc, cli, test-harness, ...). Used
             for log-aggregation grouping.
+        force_if_graceful_fails: Escalation authority, threaded to
+            every instance and opt-in per ``SupervisorOps`` (#326).
 
     Returns:
         The combined disposition: how many instances stopped, which
