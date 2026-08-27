@@ -1422,10 +1422,18 @@ async function cleanRecoveryState() {
         const reconciled = (data.reconciled_stale_locks || []).length;
         const stoppedOrphaned = (data.stopped_orphaned || []).length;
         const stoppedUnresponsive = (data.stopped_unresponsive || []).length;
-        showToast(
-            `Reconciled ${reconciled} stale lock(s), stopped ${stoppedOrphaned} orphaned, stopped ${stoppedUnresponsive} unresponsive`,
-            'success',
-        );
+        const stillRunning = (data.still_running || []).length;
+        const summary = `Reconciled ${reconciled} stale lock(s), stopped ${stoppedOrphaned} orphaned, stopped ${stoppedUnresponsive} unresponsive`;
+        // A sweep that left engines running is not a clean reconcile, and
+        // must not be rendered as one (#326). The reason is never restated
+        // here: this surface once hard-coded "because no force escalation
+        // was authorized", which is false for every sweep that did
+        // escalate and lost. Only the stop that watched the engine knows.
+        if (stillRunning > 0) {
+            showToast(`${summary}; ${data.still_running_detail}`, 'warning');
+        } else {
+            showToast(summary, 'success');
+        }
         await loadRepos();
     } catch (error) {
         showToast(`Recovery cleanup failed: ${error.message}`, 'error');

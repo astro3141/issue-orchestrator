@@ -2,10 +2,27 @@
 
 # ruff: noqa: F403,F405
 
+from urllib.parse import quote
+
 from tests.unit import test_control_api as _support
 from tests.unit.test_control_api import *  # noqa: F403
 from issue_orchestrator.domain.repository_launch_selection import RepositoryLaunchSelection
 from issue_orchestrator.infra.repo_registry import RegisteredRepo
+from issue_orchestrator.entrypoints.control_api_orchestrator_routes import (
+    RECONCILE_ACTOR,
+    RECONCILE_GRACEFUL_TIMEOUT_SECONDS,
+)
+from issue_orchestrator.entrypoints.control_api_orchestrator_support import (
+    ENGINE_STILL_RUNNING_ERROR,
+    EngineLeftRunning,
+    engines_left_running_payload,
+    still_running_detail,
+)
+from issue_orchestrator.ports.repository_engine_supervisor import (
+    EngineStopDisposition,
+    RunningEngine,
+    StopOutcome,
+)
 
 globals().update(
     {name: value for name, value in vars(_support).items() if not name.startswith("__")}
@@ -146,7 +163,9 @@ class TestSupervisorStop:
         mock_supervisor: MagicMock,
     ) -> None:
         mock_supervisor.status.return_value = SupervisorStatus(state="running")
-        mock_supervisor.stop_all_instances.return_value = 1
+        mock_supervisor.stop_all_instances.return_value = (
+            EngineStopDisposition.already_stopped()
+        )
 
         response = supervisor_client.post(
             "/control/orchestrator/stop",
@@ -272,6 +291,844 @@ class TestSupervisorStop:
         assert response.status_code == 409
         payload = response.json()
         assert payload["error"] == "global_shutdown_in_progress"
+
+
+class TestStopResponseMatchesTheEngineEvidence:
+    """A stop answer is observed, never assumed (#326).
+
+    #324 reported ``status=stopped, stopped_count=1`` for a retirement
+    the process and lock evidence contradicted. Presentation now comes
+    from what the supervisor still observes running afterwards, so a
+    stop that left the engine up cannot be read as either a clean stop
+    or an "it was already stopped".
+    """
+
+    def test_an_engine_left_running_is_not_reported_as_stopped(
+        self,
+        supervisor_client: TestClient,
+        tmp_path: Path,
+        mock_supervisor: MagicMock,
+    ) -> None:
+        mock_supervisor.status.return_value = SupervisorStatus(
+            state="running", pid=4242, port=19080
+        )
+        mock_supervisor.stop_all_instances.return_value = (
+            EngineStopDisposition.for_engine(
+                StopOutcome.TIMED_OUT,
+                RunningEngine(instance_id=None, pid=4242, port=19080),
+            )
+        )
+
+        response = supervisor_client.post(
+            "/control/orchestrator/stop",
+            json={
+                "repo_root": str(tmp_path),
+                "reason": "test graceful stop that times out",
+                "force": False,
+                "force_if_timeout": False,
+            },
+        )
+
+        assert response.status_code == 409
+        payload = response.json()
+        assert payload["error"] == "engine_still_running"
+        assert "status" not in payload, "a running engine was labelled stopped"
+        assert payload["stopped_count"] == 0
+        assert payload["still_running"] == [
+            {"instance_id": None, "pid": 4242, "port": 19080}
+        ]
+        assert "No force escalation was authorized" in payload["detail"]
+        mock_supervisor.status_all_instances.assert_not_called()
+
+    def test_a_partial_stop_does_not_claim_the_repository_is_stopped(
+        self,
+        supervisor_client: TestClient,
+        tmp_path: Path,
+        mock_supervisor: MagicMock,
+    ) -> None:
+        """One instance down and one still up is not a stopped repository."""
+        mock_supervisor.status.return_value = SupervisorStatus(
+            state="running", pid=4242, port=19080
+        )
+        mock_supervisor.stop_all_instances.return_value = (
+            EngineStopDisposition.combined([
+                EngineStopDisposition.for_engine(
+                    StopOutcome.STOPPED,
+                    RunningEngine(
+                        instance_id="orchestrator-1", pid=4242, port=19080
+                    ),
+                ),
+                EngineStopDisposition.for_engine(
+                    StopOutcome.TIMED_OUT,
+                    RunningEngine(
+                        instance_id="orchestrator-2", pid=4343, port=19081
+                    ),
+                ),
+            ])
+        )
+
+        response = supervisor_client.post(
+            "/control/orchestrator/stop",
+            json={
+                "repo_root": str(tmp_path),
+                "reason": "test partial stop",
+                "force_if_timeout": False,
+            },
+        )
+
+        assert response.status_code == 409
+        payload = response.json()
+        assert payload["error"] == "engine_still_running"
+        assert payload["stopped_count"] == 1
+        assert payload["still_running"] == [
+            {"instance_id": "orchestrator-2", "pid": 4343, "port": 19081}
+        ]
+
+    def test_a_stop_with_nothing_left_running_reports_stopped(
+        self,
+        supervisor_client: TestClient,
+        tmp_path: Path,
+        mock_supervisor: MagicMock,
+    ) -> None:
+        mock_supervisor.status.return_value = SupervisorStatus(
+            state="running", pid=4242, port=19080
+        )
+        mock_supervisor.stop_all_instances.return_value = (
+            EngineStopDisposition.for_engine(
+                StopOutcome.STOPPED,
+                RunningEngine(instance_id=None, pid=4242, port=19080),
+            )
+        )
+
+        response = supervisor_client.post(
+            "/control/orchestrator/stop",
+            json={"repo_root": str(tmp_path), "reason": "test graceful stop"},
+        )
+
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["status"] == "stopped"
+        assert payload["stopped_count"] == 1
+
+    def test_an_unconfirmed_port_stop_is_not_reported_as_not_running(
+        self,
+        supervisor_client: TestClient,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        mock_supervisor: MagicMock,
+    ) -> None:
+        """The port branch has no lock to re-read, so its own answer rules."""
+        from issue_orchestrator.entrypoints import control_api_orchestrator_routes
+
+        mock_supervisor.status.return_value = SupervisorStatus(state="stopped")
+        mock_supervisor.stop_by_port.return_value = (
+            EngineStopDisposition.for_engine(
+                StopOutcome.TIMED_OUT,
+                RunningEngine(instance_id=None, pid=None, port=19080),
+            )
+        )
+        monkeypatch.setattr(
+            control_api_orchestrator_routes,
+            "confirm_orchestrator_at_port",
+            lambda *_, **__: True,
+        )
+
+        response = supervisor_client.post(
+            "/control/orchestrator/stop",
+            json={
+                "repo_root": str(tmp_path),
+                "reason": "test orphaned graceful stop",
+                "port": 19080,
+                "force_if_timeout": False,
+                "graceful_timeout_seconds": 30,
+            },
+        )
+
+        assert response.status_code == 409
+        payload = response.json()
+        assert payload["error"] == "engine_still_running"
+        assert payload["still_running"] == [
+            {"instance_id": None, "pid": None, "port": 19080}
+        ]
+        assert (
+            mock_supervisor.stop_by_port.call_args.kwargs["graceful_timeout_seconds"]
+            == 30
+        )
+
+    def test_nothing_running_still_reports_not_running(
+        self,
+        supervisor_client: TestClient,
+        tmp_path: Path,
+        mock_supervisor: MagicMock,
+    ) -> None:
+        mock_supervisor.status.return_value = SupervisorStatus(state="running")
+        mock_supervisor.stop_all_instances.return_value = EngineStopDisposition(
+            outcome=StopOutcome.STOPPED, stopped_count=0
+        )
+
+        response = supervisor_client.post(
+            "/control/orchestrator/stop",
+            json={"repo_root": str(tmp_path), "reason": "test stop"},
+        )
+
+        assert response.status_code == 200
+        assert response.json()["status"] == "not_running"
+
+
+class TestAStopAnswersWithTheReasonItObserved:
+    """Requirement 8 applied to the failure message, not only the success.
+
+    One hard-coded 409 sentence claimed "no force escalation was
+    authorized" for every still-running answer. That is false the
+    moment the operator *did* authorize force — or the Control
+    Center's default force-on-timeout — and the escalation itself
+    failed: it tells them to retry with force on a machine where
+    SIGKILL already lost (#326).
+    """
+
+    def _running_engine_stop(
+        self,
+        mock_supervisor: MagicMock,
+        tmp_path: Path,
+        outcome: StopOutcome,
+    ) -> None:
+        mock_supervisor.status.return_value = SupervisorStatus(
+            state="running", pid=4242, port=19080
+        )
+        mock_supervisor.stop_all_instances.return_value = (
+            EngineStopDisposition.for_engine(
+                outcome,
+                RunningEngine(instance_id=None, pid=4242, port=19080),
+            )
+        )
+
+    def test_a_failed_force_is_not_reported_as_an_unauthorized_one(
+        self,
+        supervisor_client: TestClient,
+        tmp_path: Path,
+        mock_supervisor: MagicMock,
+    ) -> None:
+        self._running_engine_stop(
+            mock_supervisor, tmp_path, StopOutcome.FORCE_FAILED
+        )
+
+        response = supervisor_client.post(
+            "/control/orchestrator/stop",
+            json={
+                "repo_root": str(tmp_path),
+                "reason": "test force that failed",
+                "force": True,
+            },
+        )
+
+        assert response.status_code == 409
+        detail = response.json()["detail"]
+        assert "No force escalation was authorized" not in detail
+        assert "Force escalation was authorized" in detail
+        assert "Stop again with force to terminate" not in detail
+
+    def test_a_failed_escalation_after_timeout_is_reported_as_one(
+        self,
+        supervisor_client: TestClient,
+        tmp_path: Path,
+        mock_supervisor: MagicMock,
+    ) -> None:
+        """``force_if_timeout`` is the Control Center default."""
+        self._running_engine_stop(
+            mock_supervisor, tmp_path, StopOutcome.FORCE_FAILED
+        )
+
+        response = supervisor_client.post(
+            "/control/orchestrator/stop",
+            json={
+                "repo_root": str(tmp_path),
+                "reason": "test escalation that failed",
+                "force_if_timeout": True,
+            },
+        )
+
+        assert response.status_code == 409
+        detail = response.json()["detail"]
+        assert "No force escalation was authorized" not in detail
+        assert "Force escalation was authorized" in detail
+
+    def test_an_unauthorized_timeout_still_says_no_signal_was_sent(
+        self,
+        supervisor_client: TestClient,
+        tmp_path: Path,
+        mock_supervisor: MagicMock,
+    ) -> None:
+        self._running_engine_stop(mock_supervisor, tmp_path, StopOutcome.TIMED_OUT)
+
+        response = supervisor_client.post(
+            "/control/orchestrator/stop",
+            json={
+                "repo_root": str(tmp_path),
+                "reason": "test graceful stop that timed out",
+                "force_if_timeout": False,
+            },
+        )
+
+        assert response.status_code == 409
+        detail = response.json()["detail"]
+        assert "No force escalation was authorized" in detail
+        assert "no signal was sent" in detail
+
+
+class TestBothStopPathsCarryTheSameEscalationAuthority:
+    """Requirement: the port branch must not drop ``force_if_timeout``.
+
+    The endpoint accepted the operator's escalation authorization and
+    the port branch hard-coded it off, so the same request body
+    escalated when the engine held a lock and silently did not when it
+    did not — and then told the operator they had never authorized it
+    (#326).
+    """
+
+    def _port_only_stop(
+        self,
+        mock_supervisor: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from issue_orchestrator.entrypoints import control_api_orchestrator_routes
+
+        mock_supervisor.status.return_value = SupervisorStatus(state="stopped")
+        mock_supervisor.stop_by_port.return_value = (
+            EngineStopDisposition.already_stopped()
+        )
+        monkeypatch.setattr(
+            control_api_orchestrator_routes,
+            "confirm_orchestrator_at_port",
+            lambda *_, **__: True,
+        )
+
+    def test_the_port_branch_receives_the_authorized_escalation(
+        self,
+        supervisor_client: TestClient,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        mock_supervisor: MagicMock,
+    ) -> None:
+        self._port_only_stop(mock_supervisor, monkeypatch)
+
+        supervisor_client.post(
+            "/control/orchestrator/stop",
+            json={
+                "repo_root": str(tmp_path),
+                "reason": "test orphaned stop with escalation authorized",
+                "port": 19080,
+                "force_if_timeout": True,
+            },
+        )
+
+        assert (
+            mock_supervisor.stop_by_port.call_args.kwargs["force_if_graceful_fails"]
+            is True
+        )
+
+    def test_the_port_branch_refuses_an_unauthorized_escalation(
+        self,
+        supervisor_client: TestClient,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        mock_supervisor: MagicMock,
+    ) -> None:
+        self._port_only_stop(mock_supervisor, monkeypatch)
+
+        supervisor_client.post(
+            "/control/orchestrator/stop",
+            json={
+                "repo_root": str(tmp_path),
+                "reason": "test orphaned stop with no escalation authorized",
+                "port": 19080,
+                "force_if_timeout": False,
+            },
+        )
+
+        assert (
+            mock_supervisor.stop_by_port.call_args.kwargs["force_if_graceful_fails"]
+            is False
+        )
+
+    def test_the_stop_never_blocks_the_control_center_event_loop(
+        self,
+        supervisor_client: TestClient,
+        tmp_path: Path,
+        mock_supervisor: MagicMock,
+    ) -> None:
+        """A graceful budget is minutes of blocking work per engine."""
+        observed = _record_event_loop_presence(
+            mock_supervisor,
+            "stop_all_instances",
+            EngineStopDisposition.already_stopped(),
+        )
+        mock_supervisor.status.return_value = SupervisorStatus(state="running")
+
+        supervisor_client.post(
+            "/control/orchestrator/stop",
+            json={"repo_root": str(tmp_path), "reason": "test off-loop stop"},
+        )
+
+        assert observed == [False], "the stop ran on the event loop"
+
+
+def _record_event_loop_presence(
+    mock_supervisor: MagicMock,
+    method: str,
+    result: object,
+) -> list[bool]:
+    """Record whether each call to ``method`` ran on an event loop."""
+    import asyncio
+
+    observed: list[bool] = []
+
+    def record(*_args: object, **_kwargs: object) -> object:
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            observed.append(False)
+        else:
+            observed.append(True)
+        return result
+
+    getattr(mock_supervisor, method).side_effect = record
+    return observed
+
+
+class TestEveryStopRouteGoesThroughTheOffLoopOwner:
+    """The off-loop rule has one owner, not one discipline per route.
+
+    An unconfirmed graceful request no longer shortcuts to a signal,
+    so the worst case of any engine stop is now the whole graceful
+    budget — minutes of blocking supervisor work. Two live routes
+    still ran that inline on the event loop that also serves
+    ``control_center.html``, ``/static``, SSE and status polling, so
+    the #324 shape (the engine's ``/api/shutdown`` refuses the
+    supervisor's bearer) froze the entire Control Center (#326).
+
+    These routes take no ``force_if_timeout``, so they also carry no
+    escalation authority: neither may signal an engine on a
+    ``force=false`` request.
+    """
+
+    def test_the_repo_stop_route_stays_off_the_event_loop(
+        self,
+        supervisor_client: TestClient,
+        tmp_path: Path,
+        mock_supervisor: MagicMock,
+    ) -> None:
+        observed = _record_event_loop_presence(
+            mock_supervisor, "stop", EngineStopDisposition.already_stopped()
+        )
+
+        supervisor_client.post(
+            f"/api/repos/{quote(str(tmp_path), safe='')}/stop",
+            json={"reason": "test off-loop repo stop", "force": False},
+        )
+
+        assert observed == [False], "the repo stop ran on the event loop"
+
+    def test_the_repo_stop_route_authorizes_no_escalation(
+        self,
+        supervisor_client: TestClient,
+        tmp_path: Path,
+        mock_supervisor: MagicMock,
+    ) -> None:
+        supervisor_client.post(
+            f"/api/repos/{quote(str(tmp_path), safe='')}/stop",
+            json={"reason": "test unforced repo stop", "force": False},
+        )
+
+        kwargs = mock_supervisor.stop.call_args.kwargs
+        assert kwargs["force"] is False
+        assert kwargs["force_if_graceful_fails"] is False
+
+    def test_a_repo_stop_that_left_the_engine_running_is_not_reported_stopped(
+        self,
+        supervisor_client: TestClient,
+        tmp_path: Path,
+        mock_supervisor: MagicMock,
+    ) -> None:
+        mock_supervisor.stop.return_value = EngineStopDisposition.for_engine(
+            StopOutcome.TIMED_OUT,
+            RunningEngine(instance_id=None, pid=4242, port=19080),
+        )
+
+        response = supervisor_client.post(
+            f"/api/repos/{quote(str(tmp_path), safe='')}/stop",
+            json={"reason": "test unconfirmed repo stop", "force": False},
+        )
+
+        assert response.json()["status"] == "failed"
+
+    def test_the_repo_removal_route_stays_off_the_event_loop(
+        self,
+        supervisor_client: TestClient,
+        tmp_path: Path,
+        mock_supervisor: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(
+            "issue_orchestrator.infra.repo_registry.remove_repo",
+            lambda _root: True,
+        )
+        observed = _record_event_loop_presence(
+            mock_supervisor, "stop", EngineStopDisposition.already_stopped()
+        )
+
+        supervisor_client.request(
+            "DELETE",
+            "/control/repos",
+            json={"repo_root": str(tmp_path), "stop_orchestrator": True},
+        )
+
+        assert observed == [False], "the repo removal stop ran on the event loop"
+
+    def test_the_repo_removal_route_authorizes_no_escalation(
+        self,
+        supervisor_client: TestClient,
+        tmp_path: Path,
+        mock_supervisor: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(
+            "issue_orchestrator.infra.repo_registry.remove_repo",
+            lambda _root: True,
+        )
+
+        supervisor_client.request(
+            "DELETE",
+            "/control/repos",
+            json={"repo_root": str(tmp_path), "stop_orchestrator": True},
+        )
+
+        kwargs = mock_supervisor.stop.call_args.kwargs
+        assert kwargs["force"] is False
+        assert kwargs["force_if_graceful_fails"] is False
+
+
+class TestARepositoryIsNotDeregisteredWhileItsEngineRuns:
+    """De-registering a live engine is how it becomes unreachable.
+
+    Reconcile sweeps ``list_repos()`` and orchestrator detection probes
+    the configs under a *registered* root, so once the entry is dropped
+    no Control Center surface can reach the process, its port or its
+    lock. The removal route used to SIGTERM the process group on an
+    unconfirmed reply, so the engine was almost always gone by then;
+    now that an unforced stop sends no signal, the surviving-engine
+    case is reachable and the disposition has to decide (#326).
+    """
+
+    @pytest.fixture
+    def removals(self, monkeypatch: pytest.MonkeyPatch) -> list[str]:
+        """Record registry removals instead of performing them."""
+        removed: list[str] = []
+
+        def record_removal(repo_root: str) -> bool:
+            removed.append(repo_root)
+            return True
+
+        monkeypatch.setattr(
+            "issue_orchestrator.infra.repo_registry.remove_repo", record_removal
+        )
+        return removed
+
+    def _remove(self, client: TestClient, repo_root: Path) -> Any:
+        return client.request(
+            "DELETE",
+            "/control/repos",
+            json={"repo_root": str(repo_root), "stop_orchestrator": True},
+        )
+
+    def test_a_surviving_engine_refuses_the_removal(
+        self,
+        supervisor_client: TestClient,
+        tmp_path: Path,
+        mock_supervisor: MagicMock,
+        removals: list[str],
+    ) -> None:
+        mock_supervisor.stop.return_value = EngineStopDisposition.for_engine(
+            StopOutcome.TIMED_OUT,
+            RunningEngine(instance_id=None, pid=4242, port=19080),
+        )
+
+        response = self._remove(supervisor_client, tmp_path)
+
+        assert response.status_code == 409
+        assert removals == [], "a live engine was de-registered and orphaned"
+
+    def test_the_refusal_answers_with_the_stop_owner_s_reason(
+        self,
+        supervisor_client: TestClient,
+        tmp_path: Path,
+        mock_supervisor: MagicMock,
+        removals: list[str],
+    ) -> None:
+        """The route may not name a reason of its own (#326)."""
+        mock_supervisor.stop.return_value = EngineStopDisposition.for_engine(
+            StopOutcome.TIMED_OUT,
+            RunningEngine(instance_id="engine-1", pid=4242, port=19080),
+        )
+
+        payload = self._remove(supervisor_client, tmp_path).json()
+
+        assert payload["error"] == ENGINE_STILL_RUNNING_ERROR
+        assert payload["detail"] == still_running_detail(StopOutcome.TIMED_OUT, 1)
+        assert payload["still_running"] == [
+            {"instance_id": "engine-1", "pid": 4242, "port": 19080}
+        ]
+        assert "status" not in payload, "a refused removal claimed a clean stop"
+
+    def test_a_failed_escalation_is_not_called_unauthorized_here_either(
+        self,
+        supervisor_client: TestClient,
+        tmp_path: Path,
+        mock_supervisor: MagicMock,
+        removals: list[str],
+    ) -> None:
+        mock_supervisor.stop.return_value = EngineStopDisposition.for_engine(
+            StopOutcome.FORCE_FAILED,
+            RunningEngine(instance_id=None, pid=4242, port=19080),
+        )
+
+        detail = self._remove(supervisor_client, tmp_path).json()["detail"]
+
+        assert "No force escalation was authorized" not in detail
+        assert "Force escalation was authorized" in detail
+
+    def test_a_confirmed_stop_still_removes_the_repository(
+        self,
+        supervisor_client: TestClient,
+        tmp_path: Path,
+        mock_supervisor: MagicMock,
+        removals: list[str],
+    ) -> None:
+        mock_supervisor.stop.return_value = EngineStopDisposition.already_stopped()
+
+        response = self._remove(supervisor_client, tmp_path)
+
+        assert response.status_code == 200
+        assert response.json()["status"] == "removed"
+        assert removals == [str(tmp_path)]
+
+    def test_a_removal_that_was_not_asked_to_stop_is_unaffected(
+        self,
+        supervisor_client: TestClient,
+        tmp_path: Path,
+        mock_supervisor: MagicMock,
+        removals: list[str],
+    ) -> None:
+        """``stop_orchestrator=false`` never watched an engine at all."""
+        response = supervisor_client.request(
+            "DELETE",
+            "/control/repos",
+            json={"repo_root": str(tmp_path), "stop_orchestrator": False},
+        )
+
+        assert response.json()["status"] == "removed"
+        assert removals == [str(tmp_path)]
+        mock_supervisor.stop.assert_not_called()
+
+
+class TestReconcileIsASweepNotAnEngineShutdown:
+    """Reconcile touches every registered repository in one request.
+
+    Inheriting the 120 s per-engine shutdown budget froze the whole
+    control API for minutes per orphan and — with no force
+    authorization — stopped nothing, then rendered a success toast
+    (#326).
+    """
+
+    @pytest.fixture
+    def one_orphaned_repo(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        mock_supervisor: MagicMock,
+    ) -> Path:
+        from issue_orchestrator.entrypoints import control_api_orchestrator_routes
+
+        mock_supervisor.status_all_instances.return_value = MultiInstanceStatus(
+            repo_root=str(tmp_path),
+            expected_count=1,
+            instances=[],
+        )
+        mock_supervisor.status.return_value = SupervisorStatus(state="stopped")
+        monkeypatch.setattr(
+            "issue_orchestrator.infra.repo_registry.list_repos",
+            lambda: [
+                RegisteredRepo(
+                    path=str(tmp_path),
+                    selected_config="default.yaml",
+                    selected_mode="default",
+                )
+            ],
+        )
+        monkeypatch.setattr(
+            control_api_orchestrator_routes,
+            "detect_repository_orchestrators",
+            lambda *_: [{"port": 19080, "status": {}}],
+        )
+        return tmp_path
+
+    def test_reconcile_does_not_inherit_the_engine_shutdown_budget(
+        self,
+        supervisor_client: TestClient,
+        one_orphaned_repo: Path,
+        mock_supervisor: MagicMock,
+    ) -> None:
+        supervisor_client.post(
+            "/control/orchestrator/reconcile", json={"stop_orphaned": True}
+        )
+
+        kwargs = mock_supervisor.stop_by_port.call_args.kwargs
+        assert kwargs["graceful_timeout_seconds"] == (
+            RECONCILE_GRACEFUL_TIMEOUT_SECONDS
+        )
+        assert kwargs["graceful_timeout_seconds"] < 120
+        assert kwargs["force_if_graceful_fails"] is False
+
+    def test_reconcile_reports_the_engines_it_left_running(
+        self,
+        supervisor_client: TestClient,
+        one_orphaned_repo: Path,
+        mock_supervisor: MagicMock,
+    ) -> None:
+        mock_supervisor.stop_by_port.return_value = (
+            EngineStopDisposition.for_engine(
+                StopOutcome.TIMED_OUT,
+                RunningEngine(instance_id=None, pid=None, port=19080),
+            )
+        )
+
+        response = supervisor_client.post(
+            "/control/orchestrator/reconcile", json={"stop_orphaned": True}
+        )
+
+        data = response.json()
+        assert data["stopped_orphaned"] == []
+        assert data["still_running"] == [
+            {
+                "repo_root": str(one_orphaned_repo),
+                "outcome": "timed_out",
+                "instance_id": None,
+                "pid": None,
+                "port": 19080,
+            }
+        ]
+        assert "No force escalation was authorized" in data["still_running_detail"]
+
+    def test_a_confirmed_reconcile_leaves_nothing_running(
+        self,
+        supervisor_client: TestClient,
+        one_orphaned_repo: Path,
+        mock_supervisor: MagicMock,
+    ) -> None:
+        mock_supervisor.stop_by_port.return_value = (
+            EngineStopDisposition.already_stopped()
+        )
+
+        response = supervisor_client.post(
+            "/control/orchestrator/reconcile", json={"stop_orphaned": True}
+        )
+
+        data = response.json()
+        assert data["stopped_orphaned"] == [str(one_orphaned_repo)]
+        assert data["still_running"] == []
+        assert data["still_running_detail"] is None
+
+    def test_a_failed_reconcile_escalation_is_not_called_unauthorized(
+        self,
+        supervisor_client: TestClient,
+        one_orphaned_repo: Path,
+        mock_supervisor: MagicMock,
+    ) -> None:
+        """The sweep may not name a reason its own evidence contradicts.
+
+        The reconcile toast hard-coded "because no force escalation was
+        authorized" for every still-running engine. ``force: true`` is
+        threaded straight through to ``stop_by_port``, so an escalation
+        that ran and lost reaches this response — and the operator was
+        told nothing had been signalled on a machine where SIGKILL had
+        already failed (#326).
+        """
+        mock_supervisor.stop_by_port.return_value = (
+            EngineStopDisposition.for_engine(
+                StopOutcome.FORCE_FAILED,
+                RunningEngine(instance_id=None, pid=None, port=19080),
+            )
+        )
+
+        response = supervisor_client.post(
+            "/control/orchestrator/reconcile",
+            json={"stop_orphaned": True, "force": True},
+        )
+
+        data = response.json()
+        assert data["still_running"][0]["outcome"] == "force_failed"
+        detail = data["still_running_detail"]
+        assert "No force escalation was authorized" not in detail
+        assert "Force escalation was authorized" in detail
+
+    def test_reconcile_never_blocks_the_control_center_event_loop(
+        self,
+        supervisor_client: TestClient,
+        one_orphaned_repo: Path,
+        mock_supervisor: MagicMock,
+    ) -> None:
+        observed = _record_event_loop_presence(
+            mock_supervisor,
+            "stop_by_port",
+            EngineStopDisposition.already_stopped(),
+        )
+
+        supervisor_client.post(
+            "/control/orchestrator/reconcile", json={"stop_orphaned": True}
+        )
+
+        assert observed == [False], "reconcile ran on the event loop"
+
+
+class TestOneOwnerStatesWhyAnEngineIsStillRunning:
+    """The reason an engine is still up has exactly one enforcement.
+
+    The stop endpoint derives its 409 sentence from the outcome; the
+    reconcile sweep used to restate a reason of its own in JS. Both now
+    read the same mapping, so a sweep cannot claim "no force escalation
+    was authorized" for a stop that escalated and lost (#326).
+    """
+
+    def test_a_sweep_answers_with_its_worst_outcome(self) -> None:
+        payload = engines_left_running_payload([
+            EngineLeftRunning(
+                repo_root="/repo-a",
+                engine=RunningEngine(instance_id=None, pid=None, port=19080),
+                outcome=StopOutcome.TIMED_OUT,
+            ),
+            EngineLeftRunning(
+                repo_root="/repo-b",
+                engine=RunningEngine(instance_id=None, pid=None, port=19081),
+                outcome=StopOutcome.FORCE_FAILED,
+            ),
+        ])
+
+        detail = payload["still_running_detail"]
+        assert detail is not None
+        assert detail == still_running_detail(StopOutcome.FORCE_FAILED, 2)
+        assert "2 repository engine(s) left running" in detail
+        assert "No force escalation was authorized" not in detail
+
+    def test_an_empty_sweep_states_no_reason_at_all(self) -> None:
+        """Nothing left running means there is nothing to explain."""
+        assert engines_left_running_payload([]) == {
+            "still_running": [],
+            "still_running_detail": None,
+        }
+
+    def test_a_clean_stop_cannot_describe_a_running_engine(self) -> None:
+        """Fail loudly rather than invent a reason for a contradiction."""
+        with pytest.raises(ValueError, match="contradicts its own evidence"):
+            still_running_detail(StopOutcome.STOPPED, 1)
 
 
 class TestSupervisorReconcile:
@@ -766,13 +1623,17 @@ class TestSupervisorReconcileMultiInstance:
             force=False,
             instance_id="orchestrator-3",
             reason="reconcile-runtime: stale lock for failed multi-instance orchestrator",
-            actor="control-center.reconcile",
+            actor=RECONCILE_ACTOR,
+            graceful_timeout_seconds=RECONCILE_GRACEFUL_TIMEOUT_SECONDS,
+            force_if_graceful_fails=False,
         )
         mock_supervisor.stop_by_port.assert_any_call(
             19102,
             force=False,
             reason="reconcile-runtime: stop unresponsive multi-instance orchestrator",
-            actor="control-center.reconcile",
+            actor=RECONCILE_ACTOR,
+            graceful_timeout_seconds=RECONCILE_GRACEFUL_TIMEOUT_SECONDS,
+            force_if_graceful_fails=False,
         )
 
 
@@ -1138,7 +1999,12 @@ class TestSupervisorStart:
         config_dir.mkdir(parents=True)
         (config_dir / "default.yaml").write_text("agents: {}\n")
 
-        mock_supervisor.stop_by_port.return_value = False
+        mock_supervisor.stop_by_port.return_value = (
+            EngineStopDisposition.for_engine(
+                StopOutcome.FORCE_FAILED,
+                RunningEngine(instance_id=None, pid=None, port=19080),
+            )
+        )
         from issue_orchestrator.execution.control_center_runtime import (
             RepositoryOrchestratorOwnership,
         )
@@ -1217,7 +2083,9 @@ class TestSupervisorStart:
                 conflicting=(),
             ),
         )
-        mock_supervisor.stop_by_port.return_value = True
+        mock_supervisor.stop_by_port.return_value = (
+            EngineStopDisposition.already_stopped()
+        )
         mock_supervisor.start.return_value = LockInfo(
             repo_root=str(tmp_path),
             pid=123,

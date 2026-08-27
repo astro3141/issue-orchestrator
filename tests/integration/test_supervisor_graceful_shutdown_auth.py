@@ -46,10 +46,13 @@ from issue_orchestrator.entrypoints.control_api import (
     get_configured_agent_callback_token,
     get_configured_api_token,
 )
-from issue_orchestrator.infra import browser_session, supervisor
+from issue_orchestrator.infra import browser_session, shutdown_timing, supervisor
 from issue_orchestrator.infra.api_token import TOKEN_ENV_VAR, default_token_path
 from issue_orchestrator.infra.repo_identity import lock_file, state_dir
 from issue_orchestrator.infra.repo_lock import LockInfo
+from issue_orchestrator.ports.repository_engine_supervisor import (
+    EngineStopDisposition,
+)
 from tests.integration.live_dashboard_server import LiveDashboardServer
 from tests.shutdown_endpoint_server import AuthRequiringShutdownEndpoint
 
@@ -57,6 +60,8 @@ ENGINE_TOKEN = "graceful-stop-admin-token"
 STOP_REASON = "operator stopped the repository engine"
 STOP_ACTOR = "supervisor.stop"
 GRACEFUL_TIMEOUT_SECONDS = 20.0
+# Spent in full whenever nothing may be signalled, so keep it short.
+UNAUTHORIZED_BUDGET_SECONDS = 1.0
 ENGINE_EXIT_TIMEOUT_SECONDS = 10.0
 
 
@@ -138,13 +143,22 @@ class StoppableEngine:
     process: EngineProcess
     escalation: RecordedEscalation
 
-    def stop(self) -> bool:
+    def stop(
+        self,
+        *,
+        graceful_timeout_seconds: float = GRACEFUL_TIMEOUT_SECONDS,
+        force_if_graceful_fails: bool = True,
+    ) -> EngineStopDisposition:
         return supervisor.stop(
             self.repo_root,
             reason=STOP_REASON,
             actor=STOP_ACTOR,
-            graceful_timeout_seconds=GRACEFUL_TIMEOUT_SECONDS,
+            graceful_timeout_seconds=graceful_timeout_seconds,
+            force_if_graceful_fails=force_if_graceful_fails,
         )
+
+    def is_alive(self) -> bool:
+        return shutdown_timing.process_is_alive(self.process.pid)
 
     def lock_exists(self) -> bool:
         return lock_file(self.repo_root).exists()
@@ -245,7 +259,7 @@ def test_an_authenticated_stop_completes_without_any_signal(
     port = endpoint.start()
     engine = engine_factory(port)
     try:
-        stopped = engine.stop()
+        stopped = engine.stop().stopped
     finally:
         endpoint.stop()
 
@@ -260,32 +274,107 @@ def test_an_authenticated_stop_completes_without_any_signal(
 
 
 @pytest.mark.integration
-def test_a_refused_bearer_leaves_the_stop_visibly_ungraceful(
+def test_a_refused_bearer_no_longer_buys_a_signal(
     private_home: Path,
     engine_factory: Callable[[int], StoppableEngine],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The live failure, reproduced: green result, signal fallback.
+    """The #324 failure, fail-closed (#326).
 
-    A superseded credential is refused, the engine keeps running, and
-    SIGTERM is what stops it. ``stop`` returns True either way — so the
-    HTTP verdict and the escalation record, not the return value, are
-    what tell an operator which one they got.
+    A superseded credential is refused, so the request is unconfirmed.
+    Under the old disposition that was permission to SIGTERM the
+    engine's process group immediately, and the stop still reported
+    success. Now the budget is spent observing a target nobody
+    authorized signalling: no signal, no force, no port kill, the
+    engine still running, its lock still published, and a truthful
+    False.
     """
     monkeypatch.setenv(TOKEN_ENV_VAR, "a-superseded-admin-token")
     endpoint = AuthRequiringShutdownEndpoint(token=ENGINE_TOKEN)
     port = endpoint.start()
     engine = engine_factory(port)
     try:
-        stopped = engine.stop()
+        stopped = engine.stop(
+            graceful_timeout_seconds=UNAUTHORIZED_BUDGET_SECONDS,
+            force_if_graceful_fails=False,
+        ).stopped
+    finally:
+        endpoint.stop()
+
+    assert stopped is False
+    assert [request.status for request in endpoint.requests] == [401]
+    assert engine.escalation.escalated is False, (
+        f"an unauthorized stop still escalated: {engine.escalation}"
+    )
+    assert engine.is_alive() is True
+    assert engine.lock_exists() is True
+
+
+@pytest.mark.integration
+def test_a_refused_bearer_escalates_only_where_force_was_authorized(
+    private_home: Path,
+    engine_factory: Callable[[int], StoppableEngine],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Authorized escalation keeps its authority — after the budget.
+
+    ``force_if_graceful_fails`` is the operator's standing permission
+    to force on timeout. It still runs, and it still runs through the
+    force path; what no longer happens is the bare SIGTERM the moment
+    the request came back unconfirmed.
+    """
+    monkeypatch.setenv(TOKEN_ENV_VAR, "a-superseded-admin-token")
+    endpoint = AuthRequiringShutdownEndpoint(token=ENGINE_TOKEN)
+    port = endpoint.start()
+    engine = engine_factory(port)
+    try:
+        stopped = engine.stop(
+            graceful_timeout_seconds=UNAUTHORIZED_BUDGET_SECONDS,
+            force_if_graceful_fails=True,
+        ).stopped
     finally:
         endpoint.stop()
 
     assert stopped is True
     assert [request.status for request in endpoint.requests] == [401]
-    assert endpoint.accepted is False
-    assert engine.escalation.signals == [(engine.process.pid, False)]
-    assert engine.escalation.force_stops == []
+    assert engine.escalation.signals == []
+    assert engine.escalation.force_stops == [engine.process.pid]
+
+
+@pytest.mark.integration
+def test_an_unconfirmed_request_still_finishes_when_the_engine_retires(
+    private_home: Path,
+    engine_factory: Callable[[int], StoppableEngine],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unconfirmed answer says nothing about the engine's intent.
+
+    Here the engine retires itself while the caller's request is being
+    refused. The stop must notice the real exit, report success, and
+    release the lock exactly once — without any escalation having run.
+    """
+    monkeypatch.setenv(TOKEN_ENV_VAR, "a-superseded-admin-token")
+    engine: StoppableEngine | None = None
+
+    def engine_retires_anyway() -> None:
+        assert engine is not None
+        engine.process.exit()
+
+    endpoint = AuthRequiringShutdownEndpoint(
+        token=ENGINE_TOKEN, on_refused=engine_retires_anyway
+    )
+    port = endpoint.start()
+    engine = engine_factory(port)
+    try:
+        stopped = engine.stop(force_if_graceful_fails=False).stopped
+    finally:
+        endpoint.stop()
+
+    assert stopped is True
+    assert [request.status for request in endpoint.requests] == [401]
+    assert engine.escalation.escalated is False
+    assert engine.is_alive() is False
+    assert engine.lock_exists() is False
 
 
 @pytest.mark.integration
@@ -309,7 +398,7 @@ def test_an_engine_with_no_admin_token_still_stops_gracefully(
     port = endpoint.start()
     engine = engine_factory(port)
     try:
-        stopped = engine.stop()
+        stopped = engine.stop().stopped
     finally:
         endpoint.stop()
 
@@ -383,7 +472,7 @@ def test_the_mounted_dashboard_accepts_the_supervisors_bearer(
     assert port is not None
     engine = engine_factory(port)
     try:
-        stopped = engine.stop()
+        stopped = engine.stop().stopped
     finally:
         web.set_orchestrator(None)
 

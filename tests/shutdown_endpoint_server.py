@@ -48,10 +48,17 @@ class RecordedShutdownRequest:
 
 @dataclass
 class ShutdownEndpointState:
-    """The gate's rules and everything it has been asked so far."""
+    """The gate's rules and everything it has been asked so far.
+
+    ``on_refused`` is the counterpart of ``on_accepted``: it lets a
+    test model an engine that retires on its own even though the
+    caller's request was never confirmed — the #326 case where the
+    supervisor must observe the exit rather than assume the failure.
+    """
 
     token: str | None
     on_accepted: Callable[[], None] = lambda: None
+    on_refused: Callable[[], None] = lambda: None
     requests: list[RecordedShutdownRequest] = field(default_factory=list)
     accepted: bool = False
 
@@ -75,6 +82,8 @@ class ShutdownEndpointState:
         if status == 200:
             self.accepted = True
             self.on_accepted()
+        else:
+            self.on_refused()
         return status, body
 
     def _verdict(
@@ -127,8 +136,13 @@ class AuthRequiringShutdownEndpoint:
         *,
         token: str | None,
         on_accepted: Callable[[], None] = lambda: None,
+        on_refused: Callable[[], None] = lambda: None,
     ) -> None:
-        self.state = ShutdownEndpointState(token=token, on_accepted=on_accepted)
+        self.state = ShutdownEndpointState(
+            token=token,
+            on_accepted=on_accepted,
+            on_refused=on_refused,
+        )
         self._server: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
 

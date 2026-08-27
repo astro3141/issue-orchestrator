@@ -1,0 +1,523 @@
+"""A non-force engine stop may not signal an engine it failed to ask (#326).
+
+#324's post-merge cleanup ran the supported standalone Control Center
+route against a scoped engine with every force flag false. The response
+said ``status=stopped, stopped_count=1``; the evidence said something
+else — ``Sending SIGTERM to orchestrator process group`` in the same
+second as the shutdown request, exit code 143, no shutdown-manager
+lines, and a ``repo.lock`` left behind. The operator issued no signal.
+The supervisor did, because a graceful request that came back
+unconfirmed was treated as permission to escalate.
+
+The rule these tests pin is fail-closed and has one owner:
+
+    **Failure to confirm a graceful shutdown request is not authority
+    to signal the engine.**
+
+Both non-force surfaces are covered here — the tracked-lock ``stop``
+and the port-only ``stop_by_port`` — because both now run through
+``InterruptibleStopController``. Restoring either the immediate
+``terminate()`` on an unconfirmed request or the half-second port
+SIGTERM fails these tests.
+"""
+
+from __future__ import annotations
+
+import inspect
+import json
+from datetime import datetime, timezone
+from pathlib import Path
+
+import pytest
+
+from issue_orchestrator.infra import supervisor
+from issue_orchestrator.infra.repo_identity import lock_file, state_dir
+from issue_orchestrator.infra.repo_lock import LockInfo
+from issue_orchestrator.infra.shutdown_timing import (
+    InterruptibleStopController,
+    StaticStopPolicy,
+    StopOutcome,
+)
+from issue_orchestrator.ports.repository_engine_supervisor import (
+    RunningEngine,
+    SupervisorOps,
+)
+
+BUDGET_SECONDS = 5.0
+ENGINE_PORT = 19080
+STOP_REASON = "operator stopped the repository engine"
+
+
+class FakeClock:
+    """A clock the test advances, so no test waits on a real one."""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.now += seconds
+
+
+class Escalations:
+    """Every route out of the graceful phase, recorded rather than run."""
+
+    def __init__(self) -> None:
+        self.force_stops: list[float] = []
+
+    def force_stop(self, at: float) -> bool:
+        self.force_stops.append(at)
+        return True
+
+
+def _publish_lock(repo_root: Path, *, pid: int, port: int) -> None:
+    """Advertise a running engine the way ``acquire_lock`` does."""
+    info = LockInfo(
+        repo_root=str(repo_root),
+        pid=pid,
+        started_at=datetime.now(timezone.utc).isoformat(),
+        http_port=port,
+        state_dir=str(state_dir(repo_root)),
+    )
+    path = lock_file(repo_root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(info.to_dict()), encoding="utf-8")
+
+
+class TestUnconfirmedGracefulRequest:
+    """Requirement 1: an unconfirmed request buys observation, not a signal."""
+
+    def test_unconfirmed_request_spends_the_budget_without_signalling(self) -> None:
+        clock = FakeClock()
+        escalations = Escalations()
+
+        controller = InterruptibleStopController(
+            StaticStopPolicy(graceful_timeout_seconds=BUDGET_SECONDS),
+            target_alive=lambda: True,
+            force_requested=False,
+            force_on_timeout=False,
+            request_graceful=lambda: False,
+            force_stop=lambda: escalations.force_stop(clock.now),
+            on_stopped=lambda: pytest.fail("a running engine was reported stopped"),
+            clock=clock.monotonic,
+            sleeper=clock.sleep,
+        )
+
+        outcome = controller.stop()
+
+        assert outcome is StopOutcome.TIMED_OUT
+        assert escalations.force_stops == []
+        assert clock.now == pytest.approx(BUDGET_SECONDS)
+
+    def test_unconfirmed_request_still_notices_a_natural_exit(self) -> None:
+        """Requirement 4: exit observed, cleanup run exactly once, no force."""
+        clock = FakeClock()
+        escalations = Escalations()
+        cleanups: list[float] = []
+        probes = iter([True, True, False])
+
+        controller = InterruptibleStopController(
+            StaticStopPolicy(graceful_timeout_seconds=BUDGET_SECONDS),
+            target_alive=lambda: next(probes),
+            force_requested=False,
+            force_on_timeout=False,
+            request_graceful=lambda: False,
+            force_stop=lambda: escalations.force_stop(clock.now),
+            on_stopped=lambda: cleanups.append(clock.now),
+            clock=clock.monotonic,
+            sleeper=clock.sleep,
+        )
+
+        outcome = controller.stop()
+
+        assert outcome is StopOutcome.STOPPED
+        assert cleanups == [pytest.approx(0.2)]
+        assert escalations.force_stops == []
+
+    def test_a_confirmed_request_is_also_observed_not_assumed(self) -> None:
+        """A 200 is not proof of exit either; the same budget is observed."""
+        clock = FakeClock()
+        escalations = Escalations()
+
+        controller = InterruptibleStopController(
+            StaticStopPolicy(graceful_timeout_seconds=BUDGET_SECONDS),
+            target_alive=lambda: True,
+            force_requested=False,
+            force_on_timeout=False,
+            request_graceful=lambda: True,
+            force_stop=lambda: escalations.force_stop(clock.now),
+            on_stopped=lambda: pytest.fail("a running engine was reported stopped"),
+            clock=clock.monotonic,
+            sleeper=clock.sleep,
+        )
+
+        assert controller.stop() is StopOutcome.TIMED_OUT
+        assert escalations.force_stops == []
+
+
+class TestAuthorizedForceIsUntouched:
+    """Requirements 3 and 5: force keeps exactly the authority it had."""
+
+    def test_force_on_timeout_escalates_only_after_the_budget(self) -> None:
+        clock = FakeClock()
+        escalations = Escalations()
+
+        controller = InterruptibleStopController(
+            StaticStopPolicy(graceful_timeout_seconds=BUDGET_SECONDS),
+            target_alive=lambda: True,
+            force_requested=False,
+            force_on_timeout=True,
+            request_graceful=lambda: False,
+            force_stop=lambda: escalations.force_stop(clock.now),
+            on_stopped=lambda: None,
+            clock=clock.monotonic,
+            sleeper=clock.sleep,
+        )
+
+        assert controller.stop() is StopOutcome.STOPPED
+        assert escalations.force_stops == [pytest.approx(BUDGET_SECONDS)]
+
+    def test_explicit_force_still_skips_the_graceful_request(self) -> None:
+        clock = FakeClock()
+        escalations = Escalations()
+        requests: list[str] = []
+
+        controller = InterruptibleStopController(
+            StaticStopPolicy(graceful_timeout_seconds=BUDGET_SECONDS, force=True),
+            target_alive=lambda: True,
+            force_requested=True,
+            force_on_timeout=False,
+            request_graceful=lambda: requests.append("asked") is None,
+            force_stop=lambda: escalations.force_stop(clock.now),
+            on_stopped=lambda: None,
+            clock=clock.monotonic,
+            sleeper=clock.sleep,
+        )
+
+        assert controller.stop() is StopOutcome.STOPPED
+        assert requests == []
+        assert escalations.force_stops == [pytest.approx(0.0)]
+
+    def test_a_failed_force_is_not_reported_as_a_stop(self) -> None:
+        controller = InterruptibleStopController(
+            StaticStopPolicy(graceful_timeout_seconds=BUDGET_SECONDS, force=True),
+            target_alive=lambda: True,
+            force_requested=True,
+            force_on_timeout=False,
+            request_graceful=lambda: False,
+            force_stop=lambda: False,
+            on_stopped=lambda: None,
+            clock=lambda: 0.0,
+            sleeper=lambda _seconds: None,
+        )
+
+        assert controller.stop() is StopOutcome.FORCE_FAILED
+
+
+class TestTrackedStopSendsNoSignal:
+    """The seam #324 measured: ``supervisor.stop`` with every flag false."""
+
+    @pytest.fixture
+    def signal_recorder(self, monkeypatch: pytest.MonkeyPatch) -> list[tuple[int, int]]:
+        """Record any real signal delivery instead of performing it.
+
+        ``os.kill(pid, 0)`` is a liveness probe, not a signal, so it is
+        allowed through unrecorded — everything else is the failure this
+        test exists to catch.
+        """
+        delivered: list[tuple[int, int]] = []
+
+        def record_kill(pid: int, sig: int) -> None:
+            if sig != 0:
+                delivered.append((pid, sig))
+
+        def record_killpg(pgid: int, sig: int) -> None:
+            delivered.append((pgid, sig))
+
+        monkeypatch.setattr(supervisor.os, "kill", record_kill)
+        monkeypatch.setattr(supervisor.os, "killpg", record_killpg)
+        return delivered
+
+    @pytest.fixture
+    def live_engine(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
+        """A tracked engine that stays alive for the whole budget."""
+        repo_root = tmp_path / "repo"
+        repo_root.mkdir()
+        _publish_lock(repo_root, pid=4242, port=ENGINE_PORT)
+        monkeypatch.setattr(
+            "issue_orchestrator.infra.supervisor.shutdown_timing.process_is_alive",
+            lambda _pid: True,
+        )
+        monkeypatch.setattr(
+            "issue_orchestrator.infra.supervisor._request_graceful_shutdown",
+            lambda *_args, **_kwargs: False,
+        )
+        return repo_root
+
+    def test_timeout_without_force_authority_leaves_the_engine_running(
+        self,
+        live_engine: Path,
+        signal_recorder: list[tuple[int, int]],
+    ) -> None:
+        disposition = supervisor.stop(
+            live_engine,
+            force=False,
+            reason=STOP_REASON,
+            graceful_timeout_seconds=0.2,
+            force_if_graceful_fails=False,
+        )
+
+        assert disposition.stopped is False
+        assert disposition.outcome is StopOutcome.TIMED_OUT
+        assert disposition.still_running == (
+            RunningEngine(instance_id=None, pid=4242, port=ENGINE_PORT),
+        )
+        assert signal_recorder == [], "a non-force stop signalled the engine"
+        assert lock_file(live_engine).exists(), (
+            "the lock was released for an engine that never exited"
+        )
+
+    def test_an_inherited_default_is_not_authority_to_escalate(
+        self,
+        live_engine: Path,
+        signal_recorder: list[tuple[int, int]],
+    ) -> None:
+        """The same ``force=false`` request, both stop paths, one meaning.
+
+        ``force_if_graceful_fails`` defaulted to ``True`` on the
+        tracked path and ``False`` on ``stop_by_port``, so a caller
+        that named neither escalated to a process-group SIGTERM and
+        then SIGKILL when the engine happened to hold a lock, and left
+        it alone when it did not. A default kwarg is nobody's
+        authorization (#326).
+        """
+        disposition = supervisor.stop(
+            live_engine,
+            force=False,
+            reason=STOP_REASON,
+            graceful_timeout_seconds=0.2,
+        )
+
+        assert disposition.stopped is False
+        assert disposition.outcome is StopOutcome.TIMED_OUT
+        assert signal_recorder == [], (
+            "an inherited escalation default signalled an engine nobody "
+            "authorized signalling"
+        )
+        assert lock_file(live_engine).exists()
+
+    def test_the_multi_instance_stop_inherits_the_same_refusal(
+        self,
+        live_engine: Path,
+        signal_recorder: list[tuple[int, int]],
+    ) -> None:
+        """``stop_all_instances`` threads the flag, so it drifted too."""
+        disposition = supervisor.stop_all_instances(
+            live_engine,
+            force=False,
+            reason=STOP_REASON,
+            graceful_timeout_seconds=0.2,
+        )
+
+        assert disposition.stopped is False
+        assert disposition.outcome is StopOutcome.TIMED_OUT
+        assert signal_recorder == []
+
+    def test_an_authorized_escalation_still_reaches_the_tracked_path(
+        self,
+        live_engine: Path,
+        signal_recorder: list[tuple[int, int]],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Opt-in is the only change: saying so still escalates."""
+        monkeypatch.setattr(supervisor.time, "sleep", lambda _seconds: None)
+
+        supervisor.stop(
+            live_engine,
+            force=False,
+            reason=STOP_REASON,
+            graceful_timeout_seconds=0.2,
+            force_if_graceful_fails=True,
+        )
+
+        assert signal_recorder != [], (
+            "an authorized escalation was dropped by the tracked path"
+        )
+
+    def test_a_stale_lock_is_still_reconciled(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        signal_recorder: list[tuple[int, int]],
+        tmp_path: Path,
+    ) -> None:
+        """Ordinary stale-lock reconciliation is unchanged by the invariant."""
+        repo_root = tmp_path / "repo"
+        repo_root.mkdir()
+        _publish_lock(repo_root, pid=4242, port=ENGINE_PORT)
+        monkeypatch.setattr(
+            "issue_orchestrator.infra.supervisor.shutdown_timing.process_is_alive",
+            lambda _pid: False,
+        )
+
+        disposition = supervisor.stop(
+            repo_root,
+            force=False,
+            reason=STOP_REASON,
+            graceful_timeout_seconds=0.2,
+            force_if_graceful_fails=False,
+        )
+
+        assert disposition.stopped is True
+        assert signal_recorder == []
+        assert not lock_file(repo_root).exists()
+
+
+class TestEscalationAuthorityMeansOneThingOnThePort:
+    """One parameter, one default, on every stop the port declares.
+
+    The tracked and port signatures carried opposite defaults for
+    ``force_if_graceful_fails``, which is how ``force=false`` came to
+    mean "leave it running" on one path and "SIGKILL it after the
+    budget" on the other (#326).
+    """
+
+    @pytest.mark.parametrize(
+        "method_name", ["stop", "stop_by_port", "stop_all_instances"]
+    )
+    def test_escalation_is_opt_in_on_every_stop(self, method_name: str) -> None:
+        parameters = inspect.signature(
+            getattr(SupervisorOps, method_name)
+        ).parameters
+
+        assert parameters["force_if_graceful_fails"].default is False, (
+            f"SupervisorOps.{method_name} escalates without being asked to"
+        )
+
+    @pytest.mark.parametrize(
+        "method_name", ["stop", "stop_by_port", "stop_all_instances"]
+    )
+    def test_the_implementation_matches_the_port(self, method_name: str) -> None:
+        parameters = inspect.signature(
+            getattr(supervisor, method_name)
+        ).parameters
+
+        assert parameters["force_if_graceful_fails"].default is False, (
+            f"supervisor.{method_name} escalates without being asked to"
+        )
+
+
+class TestPortStopSendsNoSignal:
+    """Requirement 5: the port path carries the same non-force meaning."""
+
+    @pytest.fixture
+    def port_kills(self, monkeypatch: pytest.MonkeyPatch) -> list[bool]:
+        kills: list[bool] = []
+
+        def record_kill_by_port(port: int, use_sigkill: bool = False) -> bool:
+            kills.append(use_sigkill)
+            return True
+
+        monkeypatch.setattr(
+            "issue_orchestrator.infra.supervisor._kill_by_port",
+            record_kill_by_port,
+        )
+        monkeypatch.setattr(
+            "issue_orchestrator.infra.supervisor._is_port_in_use",
+            lambda _port: True,
+        )
+        monkeypatch.setattr(
+            "issue_orchestrator.infra.supervisor._request_graceful_shutdown",
+            lambda *_args, **_kwargs: False,
+        )
+        return kills
+
+    def test_a_port_still_in_use_is_not_a_licence_to_kill(
+        self,
+        port_kills: list[bool],
+    ) -> None:
+        disposition = supervisor.stop_by_port(
+            ENGINE_PORT,
+            reason=STOP_REASON,
+            graceful_timeout_seconds=0.2,
+        )
+
+        assert disposition.stopped is False
+        assert disposition.outcome is StopOutcome.TIMED_OUT
+        assert port_kills == [], (
+            "a non-force port stop killed the process holding the port"
+        )
+
+    def test_an_authorized_escalation_reaches_the_port_branch_too(
+        self,
+        port_kills: list[bool],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Requirement: the port branch honours ``force_if_graceful_fails``.
+
+        The tracked path escalated after the budget and the port path
+        hard-coded the policy off, so the same operator authorization
+        meant two different things depending on whether the engine
+        happened to hold a lock.
+        """
+        monkeypatch.setattr(supervisor.time, "sleep", lambda _seconds: None)
+        alive = iter([True, True, False])
+        monkeypatch.setattr(
+            "issue_orchestrator.infra.supervisor._is_port_in_use",
+            lambda _port: next(alive, False),
+        )
+
+        disposition = supervisor.stop_by_port(
+            ENGINE_PORT,
+            reason=STOP_REASON,
+            graceful_timeout_seconds=0.2,
+            force_if_graceful_fails=True,
+        )
+
+        assert disposition.stopped is True
+        assert port_kills == [True], (
+            "an authorized escalation was dropped by the port branch"
+        )
+
+    def test_an_unauthorized_stop_still_reports_the_port_it_left_running(
+        self,
+        port_kills: list[bool],
+    ) -> None:
+        disposition = supervisor.stop_by_port(
+            ENGINE_PORT,
+            reason=STOP_REASON,
+            graceful_timeout_seconds=0.2,
+        )
+
+        assert disposition.still_running == (
+            RunningEngine(instance_id=None, pid=None, port=ENGINE_PORT),
+        )
+        assert disposition.stopped_count == 0
+        assert port_kills == []
+
+    def test_a_port_is_required_to_observe_anything(self) -> None:
+        """A stop with no target fails loudly rather than answering."""
+        with pytest.raises(ValueError, match="requires the port"):
+            supervisor.stop_by_port(0, reason=STOP_REASON)
+
+    def test_explicit_force_still_kills_by_port(
+        self,
+        port_kills: list[bool],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(supervisor.time, "sleep", lambda _seconds: None)
+        monkeypatch.setattr(
+            "issue_orchestrator.infra.supervisor._is_port_in_use",
+            lambda _port: False,
+        )
+
+        disposition = supervisor.stop_by_port(
+            ENGINE_PORT,
+            reason=STOP_REASON,
+            force=True,
+            graceful_timeout_seconds=0.2,
+        )
+
+        assert disposition.stopped is True
+        assert port_kills == [True]

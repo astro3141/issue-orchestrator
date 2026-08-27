@@ -4,6 +4,11 @@
 
 from tests.unit import test_control_api as _support
 from tests.unit.test_control_api import *  # noqa: F403
+from issue_orchestrator.ports.repository_engine_supervisor import (
+    EngineStopDisposition,
+    RunningEngine,
+    StopOutcome,
+)
 
 globals().update(
     {name: value for name, value in vars(_support).items() if not name.startswith("__")}
@@ -65,7 +70,9 @@ class TestControlCenterShutdownEndpoint:
 
         mock_supervisor = MagicMock()
         mock_supervisor.status.return_value = SimpleNamespace(state="running")
-        mock_supervisor.stop_all_instances.return_value = 1
+        mock_supervisor.stop_all_instances.return_value = (
+            EngineStopDisposition.already_stopped()
+        )
         set_supervisor(mock_supervisor)
         repos = [SimpleNamespace(path="/tmp/repo-a")]
         try:
@@ -110,7 +117,12 @@ class TestControlCenterShutdownEndpoint:
 
         mock_supervisor = MagicMock()
         mock_supervisor.status.return_value = SimpleNamespace(state="running")
-        mock_supervisor.stop_all_instances.return_value = 0
+        mock_supervisor.stop_all_instances.return_value = (
+            EngineStopDisposition.for_engine(
+                StopOutcome.FORCE_FAILED,
+                RunningEngine(instance_id=None, pid=4242, port=19080),
+            )
+        )
         set_supervisor(mock_supervisor)
         repos = [SimpleNamespace(path="/tmp/repo-a")]
         try:
@@ -160,6 +172,7 @@ class TestControlCenterShutdownEndpoint:
         from issue_orchestrator.infra import repo_registry
         from issue_orchestrator.infra.shutdown_timing import (
             InterruptibleStopController,
+            StopOutcome,
             StopPolicySnapshot,
         )
         from tests.unit.threading_helpers import wait_for_event
@@ -179,7 +192,7 @@ class TestControlCenterShutdownEndpoint:
                 observed_policies.append(current)
                 return current
 
-        def process_probe(_pid: int) -> bool:
+        def target_alive() -> bool:
             wait_started.set()
             wait_for_event(resume_probe, 2, label="resume stop probe")
             return True
@@ -191,18 +204,19 @@ class TestControlCenterShutdownEndpoint:
         def stop_all_instances(*args, stop_policy, **kwargs):  # noqa: ANN002, ANN003, ANN202, ARG001
             controller = InterruptibleStopController(
                 RecordingPolicy(stop_policy),
-                pid=4242,
+                target_alive=target_alive,
                 force_requested=False,
                 force_on_timeout=True,
                 request_graceful=lambda: True,
-                terminate=lambda: None,
                 force_stop=force_stop,
                 on_stopped=lambda: None,
                 clock=lambda: 0.0,
                 sleeper=lambda _seconds: None,
-                process_probe=process_probe,
             )
-            return 1 if controller.stop() else 0
+            return EngineStopDisposition.for_engine(
+                controller.stop(),
+                RunningEngine(instance_id=None, pid=4242, port=19080),
+            )
 
         fake_supervisor = MagicMock()
         fake_supervisor.status.return_value = SimpleNamespace(state="running")

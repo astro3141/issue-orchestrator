@@ -250,7 +250,7 @@ def _existing_engine_blocks_cli_start(config: "Config") -> bool:
         force=True,
         reason="cli start: replacing existing orchestrator at user prompt",
         actor="cli.start",
-    )
+    ).stopped
     if not stopped:
         console.print("[red]Failed to stop existing orchestrator.[/red]")
     return not stopped

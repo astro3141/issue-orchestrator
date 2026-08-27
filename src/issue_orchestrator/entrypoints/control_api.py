@@ -49,6 +49,7 @@ import os
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Mapping
+from urllib.parse import unquote
 
 from fastapi import FastAPI, Request, Query
 from fastapi.responses import JSONResponse, HTMLResponse, Response
@@ -86,6 +87,7 @@ from .control_api_orchestrator_routes import control_orchestrator_router
 from .control_api_orchestrator_support import (
     ControlApiOrchestratorDependencies,
     install_control_api_orchestrator_dependencies,
+    run_supervisor_stop,
 )
 from .control_api_e2e_support import (
     ControlApiE2EDependencies,
@@ -484,8 +486,6 @@ async def start_repo_orchestrator(repo_id: str, request: Request) -> JSONRespons
     JSON body (optional):
         config_name: str - Config file to use (default: default.yaml)
     """
-    from urllib.parse import unquote
-
     repo_path = unquote(repo_id)
     path = Path(repo_path)
 
@@ -545,8 +545,6 @@ async def stop_repo_orchestrator(repo_id: str, request: Request) -> JSONResponse
         force: bool (optional, default false) - Force kill if
             graceful shutdown fails.
     """
-    from urllib.parse import unquote
-
     repo_path = unquote(repo_id)
     path = Path(repo_path)
 
@@ -564,10 +562,10 @@ async def stop_repo_orchestrator(repo_id: str, request: Request) -> JSONResponse
 
     force = bool(body.get("force", False)) if isinstance(body, dict) else False
 
-    stopped = _supervisor.stop(
-        path, force=force, reason=parsed.reason, actor=parsed.actor
+    disposition = await run_supervisor_stop(
+        _supervisor, path, force=force, reason=parsed.reason, actor=parsed.actor
     )
-    return JSONResponse({"status": "stopped" if stopped else "failed"})
+    return JSONResponse({"status": "stopped" if disposition.stopped else "failed"})
 
 
 @control_app.get("/api/repos/{repo_id:path}/status")
@@ -576,7 +574,6 @@ async def get_repo_status(repo_id: str) -> JSONResponse:
 
     The repo_id is the URL-encoded absolute path to the repo.
     """
-    from urllib.parse import unquote
     from ..observation.instance_detector import (
         _get_config_status,
         get_orchestrator_details,

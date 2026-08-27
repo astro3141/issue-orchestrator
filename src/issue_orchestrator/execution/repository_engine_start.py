@@ -228,10 +228,16 @@ class StartRepositoryEngineCommand:
             and launch_result.supervisor
             and is_shutdown_complete(launch_result.supervisor.get("port"))
         ):
+            # The engine already reported shutdown complete and a
+            # replacement is about to take its port, so this restart
+            # does authorize the escalation the graceful budget may
+            # need. It is stated here rather than inherited from a
+            # default, which is nobody's authorization (#326).
             self._supervisor.stop(
                 request.repo_root,
                 reason="restart after shutdown-complete repository engine",
                 actor=request.actor,
+                force_if_graceful_fails=True,
             )
             time.sleep(0.5)
             launch_result = launch_subprocess(
@@ -459,13 +465,13 @@ class StartRepositoryEngineCommand:
                     500,
                 )
         for detected in ownership.orphan_matching + ownership.orphan_conflicting:
-            stopped = self._supervisor.stop_by_port(
+            disposition = self._supervisor.stop_by_port(
                 detected["port"],
                 force=True,
                 reason="force_restart=true on repository engine start",
                 actor=request.actor,
             )
-            if not stopped:
+            if not disposition.stopped:
                 return RepositoryEngineStartResult(
                     {
                         "error": "stop_failed",
@@ -500,7 +506,7 @@ class StartRepositoryEngineCommand:
                 instance_id=status.instance_id,
                 reason="engine identity mismatch detected on repository start",
                 actor=request.actor,
-            )
+            ).stopped
             if not stopped:
                 return (
                     (),
@@ -581,13 +587,13 @@ class StartRepositoryEngineCommand:
             if not detected.get("identity_mismatch"):
                 healthy.append(detected)
                 continue
-            stopped = self._supervisor.stop_by_port(
+            disposition = self._supervisor.stop_by_port(
                 detected["port"],
                 force=True,
                 reason="engine identity mismatch detected on repository start",
                 actor=request.actor,
             )
-            if not stopped:
+            if not disposition.stopped:
                 return RepositoryEngineStartResult(
                     {
                         "error": "engine_identity_mismatch",

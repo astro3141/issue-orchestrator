@@ -45,7 +45,10 @@ from issue_orchestrator.infra.supervisor import (
 from issue_orchestrator.execution.repository_engine_supervisor import (
     build_default_supervisor_ops,
 )
-from issue_orchestrator.ports.repository_engine_supervisor import SupervisorOps
+from issue_orchestrator.ports.repository_engine_supervisor import (
+    EngineStopDisposition,
+    SupervisorOps,
+)
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -215,8 +218,9 @@ def mock_supervisor():
     mock = MagicMock(spec=SupervisorOps)
     mock.status.return_value = SupervisorStatus(state="stopped")
     mock.status_all_instances.return_value = MultiInstanceStatus(repo_root="", expected_count=1, instances=[])
-    mock.stop.return_value = True
-    mock.stop_by_port.return_value = True
+    mock.stop.return_value = EngineStopDisposition.already_stopped()
+    mock.stop_by_port.return_value = EngineStopDisposition.already_stopped()
+    mock.stop_all_instances.return_value = EngineStopDisposition.already_stopped()
     set_supervisor(mock)
     yield mock
     set_supervisor(build_default_supervisor_ops())
