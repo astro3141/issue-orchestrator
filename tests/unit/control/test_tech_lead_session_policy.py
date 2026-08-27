@@ -14,13 +14,10 @@ from issue_orchestrator.control.tech_lead_session_policy import (
     _stage_evidence_map,
     is_benign_tech_lead_no_commits,
     is_tech_lead_session,
-    read_tech_lead_assignment,
     shape_requested_actions_for_tech_lead,
 )
 from issue_orchestrator.domain.models import RequestedAction
 from issue_orchestrator.domain.tech_lead_session import (
-    TECH_LEAD_ASSIGNMENT_FILENAME,
-    TechLeadAssignment,
     TechLeadSessionFlavor,
 )
 
@@ -99,29 +96,6 @@ class TestIsBenignTechLeadNoCommits:
             )
             is False
         )
-
-
-class TestReadTechLeadAssignment:
-    def test_none_when_absent(self, tmp_path: Path) -> None:
-        assert read_tech_lead_assignment(tmp_path) is None
-
-    def test_reads_assignment_from_tech_lead_data(self, tmp_path: Path) -> None:
-        assignment = TechLeadAssignment(
-            flavor=TechLeadSessionFlavor.FAILURE_INVESTIGATION,
-            focus_issue_number=99,
-            focus_reason="hang",
-        )
-        assignment.write(tmp_path / "tech-lead-data" / TECH_LEAD_ASSIGNMENT_FILENAME)
-
-        assert read_tech_lead_assignment(tmp_path) == assignment
-
-    def test_malformed_content_raises_value_error(self, tmp_path: Path) -> None:
-        path = tmp_path / "tech-lead-data" / TECH_LEAD_ASSIGNMENT_FILENAME
-        path.parent.mkdir(parents=True)
-        path.write_text('{"schema_version": 1, "flavor": "bogus"}')
-
-        with pytest.raises(ValueError, match="flavor"):
-            read_tech_lead_assignment(tmp_path)
 
 
 class TestDiscardTechLeadAuthorityAfterCompletion:

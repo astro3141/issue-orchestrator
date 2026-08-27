@@ -7,8 +7,6 @@ session's name distinguishes them. This module is the single owner for:
 - **identity**: what makes a session a tech_lead session (the config-declared
   tech lead agent), consolidating the checks previously duplicated in
   ``SessionLauncher`` and ``CompletionActionPlanner``;
-- **flavor**: reading the launch-time :class:`TechLeadAssignment` that says
-  which variant a session was given (manifest selection keys off it);
 - **launch preparation**: per-flavor session inputs (PR manifest download,
   the agent-visible assignment copy) plus the orchestrator-owned
   :class:`TechLeadLaunchAuthority` record that completion later trusts
@@ -217,18 +215,6 @@ def is_benign_tech_lead_no_commits(
     return action is RequestedAction.CREATE_PR and isinstance(
         error, NoCommitsBetweenError
     )
-
-
-def read_tech_lead_assignment(run_dir: Path) -> TechLeadAssignment | None:
-    """Read the launch-time tech_lead assignment from a session run directory.
-
-    Returns None when the assignment file is absent (pre-upgrade sessions).
-    Malformed content raises ValueError - callers decide the fail-safe.
-    """
-    path = tech_lead_assignment_path(run_dir)
-    if not path.exists():
-        return None
-    return TechLeadAssignment.read(path)
 
 
 def prepare_tech_lead_manifest(

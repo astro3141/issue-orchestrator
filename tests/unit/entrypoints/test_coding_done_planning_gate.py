@@ -29,9 +29,10 @@ from issue_orchestrator.domain.tech_lead_session import (
 )
 from issue_orchestrator.entrypoints.cli_tools.coding_done import main as coding_done_main
 from issue_orchestrator.execution.session_output_adapter import FileSystemSessionOutput
-from issue_orchestrator.infra.env import ENV_PREFIX
+from issue_orchestrator.infra.env import ENV_PREFIX, get_env
 
 _MODULE = "issue_orchestrator.entrypoints.cli_tools.coding_done"
+_ASSETS_MODULE = "issue_orchestrator.entrypoints.cli_tools.orchestrator_run_assets"
 _SESSION = "test-planning-1"
 
 
@@ -263,6 +264,30 @@ class TestEveryOtherPrincipalKeepsTheCandidateQuickGate:
             validation_record
         )
 
+    def test_the_managed_run_is_proven_once_for_the_whole_completion(
+        self, _dirty, managed_worktree
+    ):
+        """One proof, two phases: the router reads it, the gate spends it.
+
+        Routing and the gate ask the same question of the same unchanging
+        inputs — the injected env var, the run directory, its manifest — so
+        two proofs could not disagree, only cost.
+        """
+        worktree, run_dir = managed_worktree
+
+        with patch.dict(os.environ, _managed_env(run_dir)):
+            with patch(
+                f"{_ASSETS_MODULE}.get_env", wraps=get_env
+            ) as injected_context_read:
+                _complete()
+
+        # The proof starts by reading the owner's injected RUN_DIR, so one
+        # read is one proof — and the gate still got its assets.
+        assert [
+            call.args for call in injected_context_read.call_args_list
+        ] == [("RUN_DIR",)]
+        assert (run_dir / "validation-record.json").exists()
+
     @pytest.mark.parametrize(
         "flavor,focus",
         [
@@ -318,6 +343,28 @@ class TestPlanningEvidenceFailsSafe:
             _complete()
 
         assert (run_dir / "validation-record.json").exists()
+
+    def test_a_non_object_assignment_falls_back_instead_of_crashing(
+        self, _dirty, managed_worktree
+    ):
+        """A corrupted hint must not become an internal error (#319 F1).
+
+        ``[]`` is valid JSON, so the read succeeds and only the parser can
+        refuse it. While that refusal was an ``AttributeError`` rather than a
+        ValueError it escaped the routing owner and propagated out of ``main``
+        — ``safe_main`` then wrote an ERROR completion record and exited 1,
+        which is the same "cannot fail out of the completion gracefully" class
+        this change exists to close, reached through the agent-writable file.
+        The completion here runs to a normal end, on the ordinary gate.
+        """
+        worktree, run_dir = managed_worktree
+        _stage_raw_assignment(run_dir, "[]")
+
+        with patch.dict(os.environ, _managed_env(run_dir)):
+            _complete()
+
+        assert (run_dir / "validation-record.json").exists()
+        assert _completion_record(worktree)["outcome"] == "completed"
 
     def test_planning_flavor_without_its_focus_issue_falls_back(
         self, _dirty, managed_worktree

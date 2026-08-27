@@ -10,7 +10,6 @@ import pytest
 
 from issue_orchestrator.entrypoints.cli_tools.orchestrator_run_assets import (
     ManagedRunAssets,
-    require_orchestrator_run_assets_for_session,
     resolve_orchestrator_run_assets_for_session,
 )
 
@@ -36,7 +35,7 @@ def _valid_manifest(worktree: Path, run_dir: Path) -> dict[str, str]:
     }
 
 
-def test_require_orchestrator_run_assets_reports_manifest_read_errors(
+def test_requiring_run_assets_reports_manifest_read_errors(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -47,13 +46,15 @@ def test_require_orchestrator_run_assets_reports_manifest_read_errors(
 
     with patch("pathlib.Path.read_text", side_effect=OSError("pruned")):
         with pytest.raises(SystemExit) as exc_info:
-            require_orchestrator_run_assets_for_session(tmp_path, "test-123")
+            resolve_orchestrator_run_assets_for_session(
+                tmp_path, "test-123"
+            ).require()
 
     assert exc_info.value.code == 1
     assert "manifest cannot be read" in capsys.readouterr().err
 
 
-def test_require_orchestrator_run_assets_rejects_non_object_manifest(
+def test_requiring_run_assets_rejects_non_object_manifest(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -63,13 +64,13 @@ def test_require_orchestrator_run_assets_rejects_non_object_manifest(
     monkeypatch.setenv("ISSUE_ORCHESTRATOR_RUN_DIR", str(run_dir))
 
     with pytest.raises(SystemExit) as exc_info:
-        require_orchestrator_run_assets_for_session(tmp_path, "test-123")
+        resolve_orchestrator_run_assets_for_session(tmp_path, "test-123").require()
 
     assert exc_info.value.code == 1
     assert "manifest must be a JSON object" in capsys.readouterr().err
 
 
-def test_require_orchestrator_run_assets_reports_invalid_manifest_fields(
+def test_requiring_run_assets_reports_invalid_manifest_fields(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -81,7 +82,7 @@ def test_require_orchestrator_run_assets_reports_invalid_manifest_fields(
     monkeypatch.setenv("ISSUE_ORCHESTRATOR_RUN_DIR", str(run_dir))
 
     with pytest.raises(SystemExit) as exc_info:
-        require_orchestrator_run_assets_for_session(tmp_path, "test-123")
+        resolve_orchestrator_run_assets_for_session(tmp_path, "test-123").require()
 
     assert exc_info.value.code == 1
     assert "manifest is invalid" in capsys.readouterr().err
@@ -108,8 +109,9 @@ def test_resolve_reports_a_refusal_instead_of_exiting(
 ) -> None:
     """A caller whose behaviour merely varies with the run must not be exited.
 
-    Same proof, two dispositions: ``require_*`` exits, ``resolve_*`` hands
-    back the reason so a routing question can fall back to ordinary behaviour.
+    One proof, two dispositions: :meth:`ManagedRunAssets.require` exits,
+    reading :attr:`~ManagedRunAssets.run_dir` hands back the answer so a
+    routing question can fall back to ordinary behaviour.
     """
     run_dir = _run_dir(tmp_path)
     _write_manifest(run_dir, _valid_manifest(tmp_path, run_dir))

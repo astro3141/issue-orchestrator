@@ -22,10 +22,12 @@ class ManagedRunAssets:
     """What the owner-injected run context proved, or why it did not.
 
     Exactly one of the two is set. Callers that cannot continue without the
-    run assets use :func:`require_orchestrator_run_assets_for_session`, which
-    prints ``refusal`` and exits; callers whose behaviour merely *varies* with
-    the managed run — routing questions, which must fail safe rather than fail
-    the session — ask for this and read :attr:`run_dir`.
+    run assets call :meth:`require`, which prints ``refusal`` and exits;
+    callers whose behaviour merely *varies* with the managed run — routing
+    questions, which must fail safe rather than fail the session — read
+    :attr:`run_dir`. One proof serves both: nothing about the injected context
+    changes between the two questions, so proving it twice from the same
+    environment and the same manifest buys nothing.
     """
 
     assets: SessionRunAssets | None = None
@@ -42,6 +44,17 @@ class ManagedRunAssets:
     def run_dir(self) -> Path | None:
         """The proven run directory, or ``None`` when nothing proved out."""
         return None if self.assets is None else self.assets.run_dir
+
+    def require(self) -> SessionRunAssets:
+        """The proven assets, or exit non-zero saying why they are not.
+
+        The second disposition of the one proof: a caller that cannot
+        continue without the run assets spends the proof here rather than
+        re-deriving it from the environment and the manifest a second time.
+        """
+        if self.assets is None:
+            _die(self.refusal)
+        return self.assets
 
 
 def resolve_orchestrator_run_assets_for_session(
@@ -62,17 +75,6 @@ def resolve_orchestrator_run_assets_for_session(
         return ManagedRunAssets(assets=_proven_assets(worktree_root, session_id))
     except _RunAssetsRefused as refusal:
         return ManagedRunAssets(refusal=str(refusal))
-
-
-def require_orchestrator_run_assets_for_session(
-    worktree_root: Path,
-    session_id: str,
-) -> SessionRunAssets:
-    """Load the owner-injected run assets, or exit non-zero saying why not."""
-    resolved = resolve_orchestrator_run_assets_for_session(worktree_root, session_id)
-    if resolved.assets is None:
-        _die(resolved.refusal)
-    return resolved.assets
 
 
 def _proven_assets(worktree_root: Path, session_id: str) -> SessionRunAssets:

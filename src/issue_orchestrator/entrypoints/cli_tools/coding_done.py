@@ -46,7 +46,7 @@ from .dirty_retry_budget import (
 )
 from .orchestrator_resume import trigger_orchestrator_resume
 from .orchestrator_run_assets import (
-    require_orchestrator_run_assets_for_session,
+    ManagedRunAssets,
     resolve_orchestrator_run_assets_for_session,
 )
 
@@ -275,11 +275,32 @@ def _handle_dirty_files_rejection(
     sys.exit(1)
 
 
-def resolve_completion_gate_routing(
+def resolve_managed_run(
     worktree_root: Path,
     session_id: str,
     *,
     managed: bool,
+) -> ManagedRunAssets | None:
+    """Prove the owner-injected run context ONCE, for every phase that needs it.
+
+    ``None`` is a standalone invocation: no owner injected a run, so there is
+    nothing to prove and nothing to refuse. A managed session always yields
+    either the proof or the reason it failed — what a phase then does about it
+    is that phase's business, and the two phases differ. The routing question
+    falls back to ordinary behaviour; the gate exits.
+
+    One call, because nothing about the injected context changes while this
+    command runs: the environment variable, the run directory and its manifest
+    are the same inputs a second proof would read, so a second proof could not
+    disagree with the first.
+    """
+    if not managed or not session_id:
+        return None
+    return resolve_orchestrator_run_assets_for_session(worktree_root, session_id)
+
+
+def resolve_completion_gate_routing(
+    managed_run: ManagedRunAssets | None,
 ) -> CompletionGateRouting:
     """Which gate this completion takes, decided from owner-injected context.
 
@@ -290,14 +311,12 @@ def resolve_completion_gate_routing(
 
     The only run directory the routing owner is shown is one this session's
     own manifest proved — a standalone invocation, and a managed run whose
-    injected context does not prove out, are both routed as ordinary. Nothing
+    injected context did not prove out, are both routed as ordinary. Nothing
     is searched for: an assignment found somewhere other than *this* run's
     directory is not evidence about this run.
     """
-    if not managed or not session_id:
-        return route_completion_gate(None)
     return route_completion_gate(
-        resolve_orchestrator_run_assets_for_session(worktree_root, session_id).run_dir
+        managed_run.run_dir if managed_run is not None else None
     )
 
 
@@ -325,7 +344,7 @@ def run_candidate_quick_gate(
     worktree_root: Path,
     *,
     session_id: str,
-    managed: bool,
+    managed_run: ManagedRunAssets | None,
     verbose: bool,
 ) -> QuickGateRun:
     """Read the candidate quick contract and run it, if one is configured.
@@ -334,6 +353,10 @@ def run_candidate_quick_gate(
     runs later through the orchestrator-controlled pre-push/pre-publish gate.
     Reached only when :func:`resolve_completion_gate_routing` says this
     completion has a code candidate to validate.
+
+    *managed_run* is the proof :func:`resolve_managed_run` already took. This
+    is the phase that cannot continue without it, so this is where a refusal
+    exits.
     """
     selection = load_validation_cmd(worktree_root)
     if not selection.cmd:
@@ -341,8 +364,8 @@ def run_candidate_quick_gate(
     if not session_id:
         logger.error("[coding-done] Validation requires session_id but none found")
         sys.exit(1)
-    if managed:
-        assets = require_orchestrator_run_assets_for_session(worktree_root, session_id)
+    if managed_run is not None:
+        assets = managed_run.require()
     else:
         assets = FileSystemSessionOutput().start_run(
             worktree_root,
@@ -554,12 +577,14 @@ def main() -> None:  # noqa: C901, PLR0912
     if managed:
         reset_rejection_counter(worktree_root, get_session_id())
 
-    # 3. Route the completion BEFORE reading any candidate quick-validation
-    #    configuration: a planning_investigation run has no code candidate,
-    #    and the gate the quick contract names is one #289 refuses it outright.
-    routing = resolve_completion_gate_routing(
+    # 3. Prove the owner-injected run context once, then route the completion
+    #    BEFORE reading any candidate quick-validation configuration: a
+    #    planning_investigation run has no code candidate, and the gate the
+    #    quick contract names is one #289 refuses it outright.
+    managed_run = resolve_managed_run(
         worktree_root, record.session_id, managed=managed
     )
+    routing = resolve_completion_gate_routing(managed_run)
 
     validation_result = None
     assets = None
@@ -568,7 +593,7 @@ def main() -> None:  # noqa: C901, PLR0912
         gate_run = run_candidate_quick_gate(
             worktree_root,
             session_id=record.session_id,
-            managed=managed,
+            managed_run=managed_run,
             verbose=args.verbose,
         )
         validation_result = gate_run.result

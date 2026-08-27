@@ -147,6 +147,22 @@ class TestFailSafe:
 
         assert route_completion_gate(run_dir).runs_candidate_quick_gate is True
 
+    @pytest.mark.parametrize("payload", ["[]", "null", "3", '"planning_investigation"'])
+    def test_a_valid_json_non_object_routes_to_the_candidate_gate(
+        self, tmp_path, payload
+    ):
+        """The one shape of "will not parse" that used to escape the fallback.
+
+        ``json.loads`` succeeds on all of these, so the parser is the only
+        thing that can refuse them — and it must refuse as ValueError. An
+        ``AttributeError`` out of ``data.get`` would pass straight through
+        this owner's ``except`` and crash the completion instead of falling
+        back to the gate.
+        """
+        run_dir = _stage_raw(tmp_path, payload)
+
+        assert route_completion_gate(run_dir).runs_candidate_quick_gate is True
+
     def test_an_assignment_shaped_directory_is_not_an_assignment(self, tmp_path):
         """A directory where the file should be must not read as planning."""
         tech_lead_assignment_path(tmp_path).mkdir(parents=True)

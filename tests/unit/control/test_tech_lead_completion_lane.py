@@ -17,6 +17,7 @@ from pathlib import Path
 import pytest
 
 from issue_orchestrator.control.completion_types import (
+    ERROR_PREFIX_TECH_LEAD_AUTHORITY,
     ERROR_PREFIX_TECH_LEAD_DECISION,
 )
 from issue_orchestrator.control.subject_recovery_authority import (
@@ -290,6 +291,30 @@ class TestWhatABlockedRunIsAndIsNotAskedFor:
 
         assert lane.rejection is None
         assert RequestedAction.ADD_BLOCKED_LABEL not in lane.requested_actions
+
+    def test_a_corrupted_worktree_copy_is_tamper_evidence_not_a_crash(
+        self, tmp_path: Path
+    ) -> None:
+        """The other caller that leans on the parser's ValueError (#319 F1).
+
+        ``resolve_tech_lead_launch_authority`` catches ValueError precisely so
+        a malformed worktree copy becomes *evidence* — fatal for a COMPLETED
+        run, non-fatal for a BLOCKED one. A valid-JSON non-object made the
+        parser raise ``AttributeError`` instead, so that designed refusal
+        became an uncaught crash on the completion path.
+        """
+        run = arm(tmp_path, TechLeadSessionFlavor.PLANNING_INVESTIGATION)
+        run.assignment_path.write_text("[]")
+
+        blocked = run.settle()
+        completed = run.settle(outcome=CompletionOutcome.COMPLETED)
+
+        assert blocked.rejection is None
+        assert RequestedAction.ADD_BLOCKED_LABEL not in blocked.requested_actions
+        assert completed.rejection is not None
+        assert completed.rejection.startswith(ERROR_PREFIX_TECH_LEAD_AUTHORITY)
+        assert "scope_tampered" in completed.rejection
+        assert "malformed" in completed.rejection
 
     def test_an_unrecorded_run_is_governed_by_neither_policy(
         self, tmp_path: Path

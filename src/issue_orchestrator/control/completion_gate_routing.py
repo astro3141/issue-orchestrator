@@ -41,9 +41,8 @@ from enum import Enum
 from pathlib import Path
 
 from ..domain.tech_lead_session import (
-    TechLeadAssignment,
     TechLeadSessionFlavor,
-    tech_lead_assignment_path,
+    read_run_assignment,
 )
 
 logger = logging.getLogger(__name__)
@@ -101,21 +100,23 @@ def route_completion_gate(run_dir: Path | None) -> CompletionGateRouting:
     """
     if run_dir is None:
         return _ordinary("no owner-injected managed-run context")
-    assignment_path = tech_lead_assignment_path(run_dir)
-    if not assignment_path.is_file():
-        return _ordinary("managed run carries no tech_lead assignment")
     try:
-        assignment = TechLeadAssignment.read(assignment_path)
+        assignment = read_run_assignment(run_dir)
     except (OSError, ValueError) as exc:
-        # Malformed, truncated, or internally inconsistent (a focused flavor
-        # with no focus issue is rejected by the assignment's own contract).
+        # Malformed, truncated, not even a JSON object, or internally
+        # inconsistent (a focused flavor with no focus issue is rejected by
+        # the assignment's own contract). ValueError is the parser's total
+        # contract for bad content, which is what makes this catch a
+        # guarantee rather than a hope.
         logger.warning(
-            "[completion-routing] tech_lead assignment at %s is unusable (%s); "
-            "routing to the ordinary code-candidate quick gate",
-            assignment_path,
+            "[completion-routing] the tech_lead assignment staged in run %s is "
+            "unusable (%s); routing to the ordinary code-candidate quick gate",
+            run_dir,
             exc,
         )
         return _ordinary("tech_lead assignment is unreadable")
+    if assignment is None:
+        return _ordinary("managed run carries no tech_lead assignment")
     if assignment.flavor is not TechLeadSessionFlavor.PLANNING_INVESTIGATION:
         return _ordinary(
             f"tech_lead flavor {assignment.flavor.value} produces a code candidate"
