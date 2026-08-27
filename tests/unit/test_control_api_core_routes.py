@@ -1474,3 +1474,254 @@ class TestControlAPIServer:
 
         # Should not raise
         await server.stop()
+
+
+class TestControlReposActiveSessionCount:
+    """``/control/repos`` must accept both shipped ``active_sessions`` shapes.
+
+    ``entrypoints/control_api.py`` publishes ``active_sessions`` as an int
+    count while ``entrypoints/web_status_routes.py`` publishes the list of
+    session rows. Assuming the list form made the int form raise ``TypeError``
+    inside the handler, which surfaced as an HTTP 500 for a logged-in browser
+    (issue #324, observed on the #319 canary).
+    """
+
+    @staticmethod
+    def _register_running_repo(
+        repo: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        mock_supervisor: MagicMock,
+    ) -> None:
+        from issue_orchestrator.entrypoints import control_api
+        from issue_orchestrator.execution import control_center_repo_status
+        from issue_orchestrator.infra import repo_registry
+
+        repo.mkdir(exist_ok=True)
+        monkeypatch.setattr(
+            repo_registry,
+            "list_repos",
+            lambda: [
+                RegisteredRepo(
+                    path=str(repo),
+                    selected_mode="default",
+                    selected_config="main.yaml",
+                )
+            ],
+        )
+        monkeypatch.setattr(repo_registry, "add_repo", lambda path: None)
+        monkeypatch.setattr(control_api, "_preferred_repo_root", lambda: None)
+        monkeypatch.setattr(
+            control_center_repo_status,
+            "enrich_runtime_health",
+            lambda _path, payload, **_kwargs: payload,
+        )
+        mock_supervisor.status_all_instances.return_value = MultiInstanceStatus(
+            repo_root=str(repo),
+            instances=[SupervisorStatus(state="running", pid=101, port=19090)],
+        )
+
+    @staticmethod
+    def _serve_internal_status(
+        monkeypatch: pytest.MonkeyPatch, payload: dict[str, object]
+    ) -> None:
+        from issue_orchestrator.execution import control_center_repo_status
+
+        monkeypatch.setattr(
+            control_center_repo_status,
+            "probe_orchestrator_json",
+            lambda _url, **_kwargs: payload,
+        )
+
+    def test_control_repos_accepts_the_control_api_int_shape(
+        self,
+        supervisor_client: TestClient,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        mock_supervisor: MagicMock,
+    ) -> None:
+        self._register_running_repo(tmp_path / "repo", monkeypatch, mock_supervisor)
+        self._serve_internal_status(
+            monkeypatch,
+            {
+                "paused": False,
+                "shutdown_requested": False,
+                "active_sessions": 2,
+                "sessions": [{"issue_number": 41}, {"issue_number": 42}],
+                "startup_status": "complete",
+            },
+        )
+
+        response = supervisor_client.get("/control/repos")
+
+        assert response.status_code == 200
+        status = response.json()["repos"][0]["status"]
+        assert status["active_session_count"] == 2
+
+    def test_control_repos_accepts_the_web_status_list_shape(
+        self,
+        supervisor_client: TestClient,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        mock_supervisor: MagicMock,
+    ) -> None:
+        self._register_running_repo(tmp_path / "repo", monkeypatch, mock_supervisor)
+        self._serve_internal_status(
+            monkeypatch,
+            {
+                "paused": False,
+                "shutdown_requested": False,
+                "active_sessions": [{"issue_number": 41}],
+                "startup_status": "complete",
+            },
+        )
+
+        response = supervisor_client.get("/control/repos")
+
+        assert response.status_code == 200
+        status = response.json()["repos"][0]["status"]
+        assert status["active_session_count"] == 1
+
+    def test_control_repos_omits_the_count_for_an_uninterpretable_shape(
+        self,
+        supervisor_client: TestClient,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        mock_supervisor: MagicMock,
+    ) -> None:
+        self._register_running_repo(tmp_path / "repo", monkeypatch, mock_supervisor)
+        self._serve_internal_status(
+            monkeypatch,
+            {
+                "paused": False,
+                "shutdown_requested": False,
+                "active_sessions": "two",
+                "startup_status": "complete",
+            },
+        )
+
+        response = supervisor_client.get("/control/repos")
+
+        assert response.status_code == 200
+        status = response.json()["repos"][0]["status"]
+        assert "active_session_count" not in status
+
+    def test_control_repos_accepts_the_int_shape_from_an_orphaned_engine(
+        self,
+        supervisor_client: TestClient,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        mock_supervisor: MagicMock,
+    ) -> None:
+        from issue_orchestrator.entrypoints import control_api
+        from issue_orchestrator.execution import control_center_repo_status
+        from issue_orchestrator.infra import repo_registry
+
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        monkeypatch.setattr(
+            repo_registry,
+            "list_repos",
+            lambda: [
+                RegisteredRepo(
+                    path=str(repo),
+                    selected_mode="default",
+                    selected_config="main.yaml",
+                )
+            ],
+        )
+        monkeypatch.setattr(repo_registry, "add_repo", lambda path: None)
+        monkeypatch.setattr(control_api, "_preferred_repo_root", lambda: None)
+        monkeypatch.setattr(
+            control_center_repo_status,
+            "detect_repository_orchestrators",
+            lambda _repo: [
+                {
+                    "port": 19090,
+                    "info": {},
+                    "status": {"active_sessions": 3, "shutdown_requested": False},
+                }
+            ],
+        )
+        mock_supervisor.status.return_value = SupervisorStatus(state="stopped")
+        mock_supervisor.status_all_instances.return_value = MultiInstanceStatus(
+            repo_root=str(repo)
+        )
+
+        response = supervisor_client.get("/control/repos")
+
+        assert response.status_code == 200
+        status = response.json()["repos"][0]["status"]
+        assert status["orphaned"] is True
+        assert status["active_session_count"] == 3
+
+
+class TestControlOrchestratorStatusActiveSessionCount:
+    """``/control/orchestrator/status`` shares the orphan-payload code path."""
+
+    def test_status_accepts_the_int_shape_from_an_orphaned_engine(
+        self,
+        supervisor_client: TestClient,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        mock_supervisor: MagicMock,
+    ) -> None:
+        from issue_orchestrator.entrypoints import control_api_orchestrator_routes
+
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        monkeypatch.setattr(
+            control_api_orchestrator_routes,
+            "detect_repository_orchestrators",
+            lambda _repo: [
+                {
+                    "port": 19090,
+                    "info": {},
+                    "status": {"active_sessions": 2, "shutdown_requested": False},
+                }
+            ],
+        )
+        mock_supervisor.status.return_value = SupervisorStatus(state="stopped")
+        mock_supervisor.status_all_instances.return_value = MultiInstanceStatus(
+            repo_root=str(repo)
+        )
+
+        response = supervisor_client.get(
+            "/control/orchestrator/status", params={"repo_root": str(repo)}
+        )
+
+        assert response.status_code == 200
+        assert response.json()["active_session_count"] == 2
+
+    def test_status_omits_the_count_for_an_uninterpretable_shape(
+        self,
+        supervisor_client: TestClient,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        mock_supervisor: MagicMock,
+    ) -> None:
+        from issue_orchestrator.entrypoints import control_api_orchestrator_routes
+
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        monkeypatch.setattr(
+            control_api_orchestrator_routes,
+            "detect_repository_orchestrators",
+            lambda _repo: [
+                {
+                    "port": 19090,
+                    "info": {},
+                    "status": {"active_sessions": {"count": 2}},
+                }
+            ],
+        )
+        mock_supervisor.status.return_value = SupervisorStatus(state="stopped")
+        mock_supervisor.status_all_instances.return_value = MultiInstanceStatus(
+            repo_root=str(repo)
+        )
+
+        response = supervisor_client.get(
+            "/control/orchestrator/status", params={"repo_root": str(repo)}
+        )
+
+        assert response.status_code == 200
+        assert "active_session_count" not in response.json()

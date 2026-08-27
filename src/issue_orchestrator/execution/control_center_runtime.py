@@ -18,6 +18,7 @@ from ..infra.repo_identity import (
     diff_repo_identity,
 )
 from .repo_identity_resolution import build_repo_identity
+from .repository_engine_status_payload import read_active_session_count
 
 LOCK_HEARTBEAT_UNRESPONSIVE_SECONDS = 45
 
@@ -394,9 +395,11 @@ def is_shutdown_complete(port: int | None) -> bool:
     data = _read_json(f"http://127.0.0.1:{port}/api/status", timeout=2.0)
     if data is None:
         return False
-    shutdown_requested = data.get("shutdown_requested", False)
-    active_sessions = data.get("active_sessions", [])
-    return shutdown_requested and len(active_sessions) == 0
+    if not data.get("shutdown_requested", False):
+        return False
+    active_sessions = read_active_session_count(data)
+    # An unknown count is not proof of quiescence: fail closed.
+    return active_sessions.is_known and active_sessions.count == 0
 
 
 def _read_json(url: str, *, timeout: float) -> dict[str, Any] | None:

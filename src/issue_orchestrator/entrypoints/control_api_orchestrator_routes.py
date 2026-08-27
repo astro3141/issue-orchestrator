@@ -22,6 +22,9 @@ from ..execution.control_center_runtime import (
     enrich_runtime_health,
     get_selected_launch_selection,
 )
+from ..execution.repository_engine_status_payload import (
+    publish_active_session_count,
+)
 from ..infra.config import Config, get_config_path
 from ..infra.repo_guardrails import (
     RepoGuardrailsError,
@@ -578,11 +581,11 @@ async def control_status(
                 "health": detected.get("health", "unknown"),
                 "tick_age_seconds": detected.get("tick_age_seconds"),
                 "shutdown_requested": status_data.get("shutdown_requested", False),
-                "active_session_count": len(status_data.get("active_sessions", [])),
                 "configuration_mode": info.get("configuration_mode"),
                 "config_name": info.get("config_name"),
                 "config_fingerprint": info.get("config_fingerprint"),
             }
+            publish_active_session_count(orphaned_payload, status_data)
             return JSONResponse(
                 enrich_runtime_health(path, orphaned_payload, orphaned=True)
                 or orphaned_payload

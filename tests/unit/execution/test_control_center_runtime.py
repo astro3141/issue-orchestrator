@@ -21,6 +21,8 @@ from __future__ import annotations
 from pathlib import Path
 from unittest.mock import MagicMock
 
+import pytest
+
 from issue_orchestrator.domain.repository_launch_selection import (
     RepositoryLaunchSelection,
 )
@@ -141,3 +143,96 @@ def test_effective_selection_does_not_load_a_stopped_repositories_config(
     )
 
     assert ccr.get_effective_launch_selection(tmp_path, supervisor) == selection
+
+
+class TestIsShutdownComplete:
+    """Shutdown-complete requires a *known* zero active-session count.
+
+    ``/api/status`` ships two legitimate ``active_sessions`` shapes - the
+    control API publishes an int count, the web status route publishes the
+    list of session rows. Restarting a repository engine is gated on this
+    answer, so an uninterpretable payload must fail closed rather than read
+    as quiescent.
+    """
+
+    def test_list_shape_with_no_sessions_is_complete(self, monkeypatch) -> None:
+        monkeypatch.setattr(
+            ccr,
+            "_read_json",
+            lambda _url, **_: {"shutdown_requested": True, "active_sessions": []},
+        )
+
+        assert ccr.is_shutdown_complete(18080) is True
+
+    def test_int_shape_with_zero_sessions_is_complete(self, monkeypatch) -> None:
+        monkeypatch.setattr(
+            ccr,
+            "_read_json",
+            lambda _url, **_: {"shutdown_requested": True, "active_sessions": 0},
+        )
+
+        assert ccr.is_shutdown_complete(18080) is True
+
+    def test_list_shape_with_live_sessions_is_not_complete(self, monkeypatch) -> None:
+        monkeypatch.setattr(
+            ccr,
+            "_read_json",
+            lambda _url, **_: {
+                "shutdown_requested": True,
+                "active_sessions": [{"issue_number": 41}],
+            },
+        )
+
+        assert ccr.is_shutdown_complete(18080) is False
+
+    def test_int_shape_with_live_sessions_is_not_complete(self, monkeypatch) -> None:
+        monkeypatch.setattr(
+            ccr,
+            "_read_json",
+            lambda _url, **_: {"shutdown_requested": True, "active_sessions": 2},
+        )
+
+        assert ccr.is_shutdown_complete(18080) is False
+
+    def test_shutdown_not_requested_is_not_complete(self, monkeypatch) -> None:
+        monkeypatch.setattr(
+            ccr,
+            "_read_json",
+            lambda _url, **_: {"shutdown_requested": False, "active_sessions": 0},
+        )
+
+        assert ccr.is_shutdown_complete(18080) is False
+
+    @pytest.mark.parametrize(
+        "active_sessions",
+        [True, -1, "0", {"count": 0}, None],
+        ids=["true", "negative-int", "string", "mapping", "null"],
+    )
+    def test_malformed_count_fails_closed(
+        self, monkeypatch, active_sessions: object
+    ) -> None:
+        monkeypatch.setattr(
+            ccr,
+            "_read_json",
+            lambda _url, **_: {
+                "shutdown_requested": True,
+                "active_sessions": active_sessions,
+            },
+        )
+
+        assert ccr.is_shutdown_complete(18080) is False
+
+    def test_missing_count_fails_closed(self, monkeypatch) -> None:
+        monkeypatch.setattr(
+            ccr, "_read_json", lambda _url, **_: {"shutdown_requested": True}
+        )
+
+        assert ccr.is_shutdown_complete(18080) is False
+
+    def test_unreachable_engine_is_not_complete(self, monkeypatch) -> None:
+        monkeypatch.setattr(ccr, "_read_json", lambda _url, **_: None)
+
+        assert ccr.is_shutdown_complete(18080) is False
+
+    def test_no_port_is_not_complete(self) -> None:
+        assert ccr.is_shutdown_complete(None) is False

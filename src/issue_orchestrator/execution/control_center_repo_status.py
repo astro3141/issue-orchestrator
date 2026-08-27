@@ -12,6 +12,9 @@ from ..execution.control_center_runtime import (
     enrich_runtime_health,
 )
 from ..execution.orchestrator_http_api import probe_orchestrator_json
+from ..execution.repository_engine_status_payload import (
+    publish_active_session_count,
+)
 from ..ports.repository_engine_supervisor import (
     MultiInstanceStatus,
     SupervisorOps,
@@ -309,8 +312,8 @@ def _populate_single_instance_status(
                 "health": detected.get("health", "unknown"),
                 "tick_age_seconds": detected.get("tick_age_seconds"),
                 "shutdown_requested": status_data.get("shutdown_requested", False),
-                "active_session_count": len(status_data.get("active_sessions", [])),
             }
+            publish_active_session_count(orphaned_status, status_data)
             repo_data["status"] = enrich_runtime_health(
                 repo_path,
                 orphaned_status,
@@ -349,8 +352,7 @@ def _apply_internal_runtime_state(status_payload: dict[str, Any], port: int) -> 
 
     status_payload["paused"] = internal.get("paused", False)
     status_payload["shutdown_requested"] = internal.get("shutdown_requested", False)
-    active_sessions = internal.get("active_sessions", [])
-    status_payload["active_session_count"] = len(active_sessions)
+    publish_active_session_count(status_payload, internal)
     status_payload["e2e_role"] = internal.get("e2e_role")
     # The CC frontend uses startup_status to keep the Open button in an
     # "Initializing…" state until the engine has finished its first
