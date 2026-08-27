@@ -352,6 +352,23 @@ class TestGuardedIsEstablishedNotAssumed:
         assert "git log --oneline -20" in guard.allowances()
         assert "cat AGENTS.md" in guard.allowances()
 
+    def test_the_runs_own_way_out_is_verified_still_possible(
+        self, worktree: Path
+    ) -> None:
+        """``coding-done`` stays allowed, and that composition still matters.
+
+        A planning run records its work through ``coding-done``, which no
+        longer runs the code-candidate quick gate for it
+        (``control/completion_gate_routing.py``). A guard that refused the
+        completion command would turn the barrier into a run with no exit.
+        """
+        guard = _installer().establish(worktree, provider=CODEX)
+
+        assert any(
+            command.startswith("coding-done completed")
+            for command in guard.allowances()
+        )
+
     def test_a_policy_that_refuses_nothing_does_not_establish(
         self, worktree: Path
     ) -> None:

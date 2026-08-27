@@ -28,6 +28,24 @@ from .tech_lead_artifacts import ACT_LEVEL_TECH_LEAD_ACTIONS
 
 TECH_LEAD_ASSIGNMENT_FILENAME = "tech-lead-assignment.json"
 
+# The run-scoped directory a tech_lead session's launch inputs are staged in.
+TECH_LEAD_DATA_DIRNAME = "tech-lead-data"
+
+
+def tech_lead_assignment_path(run_dir: Path) -> Path:
+    """Where *run_dir*'s launch-time assignment copy lives.
+
+    One owner for the location, asked by the launcher that writes it and by
+    every reader that later asks what variant a run was launched as. A reader
+    that computed the path itself could look somewhere the launcher never
+    writes — and "no assignment here" is indistinguishable from "this run is
+    not a tech_lead run", so the drift would be silent rather than loud.
+
+    Readers ask :func:`read_run_assignment`, which owns the presence rule as
+    well as the location; this is the writer's half of the pair.
+    """
+    return run_dir / TECH_LEAD_DATA_DIRNAME / TECH_LEAD_ASSIGNMENT_FILENAME
+
 # Marker label carried by health-review anchor issues (ADR-0031 §4).
 # Labels are crash-safe truth (ADR-0013): the marker is both how the launcher
 # derives the HEALTH_REVIEW flavor and how the fact gatherer deduplicates an
@@ -294,21 +312,41 @@ class TechLeadAssignment:
         }
 
     @classmethod
-    def from_dict(cls, data: dict[str, object]) -> "TechLeadAssignment":
-        """Parse from dict; malformed content fails loudly with ValueError."""
-        raw_flavor = data.get("flavor")
+    def from_dict(cls, data: object) -> "TechLeadAssignment":
+        """Parse an untrusted payload; malformed content fails with ValueError.
+
+        ``data`` is typed ``object`` rather than ``dict[str, object]`` because
+        the payload arrives from :meth:`read` via ``json.loads``, whose return
+        is ``Any`` — an annotation promising a mapping would have the type
+        checker enforce nothing while telling readers the shape was already
+        proven. It is not: a valid-JSON non-object (``[]``, ``null``, ``3``)
+        is exactly what an agent-writable file can contain.
+
+        ValueError is the ONLY malformed-content failure mode, and callers
+        depend on that being total: the completion gate router (#319) turns it
+        into a fail-safe route to the ordinary candidate gate, and tech_lead
+        completion turns it into tamper evidence. An ``AttributeError`` from
+        ``.get`` on a list escapes both of those dispositions.
+        """
+        if not isinstance(data, dict):
+            raise ValueError(
+                "tech_lead assignment must be a JSON object, got "
+                f"{type(data).__name__}"
+            )
+        payload = cast(dict[str, object], data)
+        raw_flavor = payload.get("flavor")
         try:
             flavor = TechLeadSessionFlavor(raw_flavor)
         except ValueError:
             raise ValueError(
                 f"Unknown tech_lead assignment flavor: {raw_flavor!r}"
             ) from None
-        raw_schema = data.get("schema_version")
+        raw_schema = payload.get("schema_version")
         if isinstance(raw_schema, bool) or not isinstance(raw_schema, int):
             raise ValueError(
                 f"tech_lead assignment schema_version must be an int, got {raw_schema!r}"
             )
-        focus_issue_number = data.get("focus_issue_number")
+        focus_issue_number = payload.get("focus_issue_number")
         if focus_issue_number is not None and (
             isinstance(focus_issue_number, bool)
             or not isinstance(focus_issue_number, int)
@@ -317,7 +355,7 @@ class TechLeadAssignment:
                 "tech_lead assignment focus_issue_number must be an int or null, "
                 f"got {focus_issue_number!r}"
             )
-        focus_reason = data.get("focus_reason", "")
+        focus_reason = payload.get("focus_reason", "")
         if not isinstance(focus_reason, str):
             raise ValueError(
                 f"tech_lead assignment focus_reason must be a string, got {focus_reason!r}"
@@ -338,6 +376,29 @@ class TechLeadAssignment:
     def read(cls, path: Path) -> "TechLeadAssignment":
         """Read assignment from file; malformed content raises ValueError."""
         return cls.from_dict(json.loads(path.read_text()))
+
+
+def read_run_assignment(run_dir: Path) -> TechLeadAssignment | None:
+    """*run_dir*'s launch-time assignment, or ``None`` when it carries none.
+
+    One owner for presence-and-read, beside the one owner for the location.
+    Two readers that each spelled "is there an assignment here?" for
+    themselves had already drifted — ``is_file()`` in one, ``exists()`` in the
+    other — so a directory standing where the file belongs was *absent* to one
+    caller and an ``IsADirectoryError`` to the next. The rule, stated once:
+    anything that is not a readable regular file means this run carries no
+    assignment.
+
+    Malformed *content* raises ValueError, and that is deliberately not
+    resolved here — the two callers dispose of it differently on purpose. The
+    completion gate router falls back to the ordinary candidate gate (#319);
+    tech_lead completion treats it as tamper evidence. A reader that picked
+    one would have to lie to the other.
+    """
+    path = tech_lead_assignment_path(run_dir)
+    if not path.is_file():
+        return None
+    return TechLeadAssignment.read(path)
 
 
 @dataclass(frozen=True, slots=True)

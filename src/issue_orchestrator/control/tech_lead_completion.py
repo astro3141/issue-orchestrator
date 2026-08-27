@@ -69,7 +69,11 @@ from ..domain.models import (
 )
 from ..domain.board_snapshot import BOARD_SNAPSHOT_FILENAME, BoardSnapshot
 from ..domain.tech_lead_manifest import TechLeadManifest
-from ..domain.tech_lead_session import TechLeadLaunchAuthority, TechLeadSessionFlavor
+from ..domain.tech_lead_session import (
+    TechLeadLaunchAuthority,
+    TechLeadSessionFlavor,
+    read_run_assignment,
+)
 from .actions import (
     Action,
     AddLabelAction,
@@ -95,7 +99,7 @@ from .subject_recovery_authority import SubjectRecoveryAuthority
 from .tech_lead_case_files import build_pattern_ledger
 from .tech_lead_decision_contract import validate_decision_for_authority
 from .tech_lead_proposals import build_op_ledger
-from .tech_lead_session_policy import is_tech_lead_session, read_tech_lead_assignment
+from .tech_lead_session_policy import is_tech_lead_session
 from .tech_lead_zero_code import (
     ZeroCodeWorktreeReader,
     settle_zero_code_planning_completion,
@@ -198,7 +202,7 @@ def resolve_tech_lead_launch_authority(
             " be trusted"
         )
     try:
-        assignment = read_tech_lead_assignment(run_dir)
+        assignment = read_run_assignment(run_dir)
     except ValueError as exc:
         return authority, f"worktree tech-lead-assignment.json is malformed: {exc}"
     if assignment is None:

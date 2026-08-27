@@ -9,7 +9,8 @@ from unittest.mock import patch
 import pytest
 
 from issue_orchestrator.entrypoints.cli_tools.orchestrator_run_assets import (
-    require_orchestrator_run_assets_for_session,
+    ManagedRunAssets,
+    resolve_orchestrator_run_assets_for_session,
 )
 
 
@@ -34,7 +35,7 @@ def _valid_manifest(worktree: Path, run_dir: Path) -> dict[str, str]:
     }
 
 
-def test_require_orchestrator_run_assets_reports_manifest_read_errors(
+def test_requiring_run_assets_reports_manifest_read_errors(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -45,13 +46,15 @@ def test_require_orchestrator_run_assets_reports_manifest_read_errors(
 
     with patch("pathlib.Path.read_text", side_effect=OSError("pruned")):
         with pytest.raises(SystemExit) as exc_info:
-            require_orchestrator_run_assets_for_session(tmp_path, "test-123")
+            resolve_orchestrator_run_assets_for_session(
+                tmp_path, "test-123"
+            ).require()
 
     assert exc_info.value.code == 1
     assert "manifest cannot be read" in capsys.readouterr().err
 
 
-def test_require_orchestrator_run_assets_rejects_non_object_manifest(
+def test_requiring_run_assets_rejects_non_object_manifest(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -61,13 +64,13 @@ def test_require_orchestrator_run_assets_rejects_non_object_manifest(
     monkeypatch.setenv("ISSUE_ORCHESTRATOR_RUN_DIR", str(run_dir))
 
     with pytest.raises(SystemExit) as exc_info:
-        require_orchestrator_run_assets_for_session(tmp_path, "test-123")
+        resolve_orchestrator_run_assets_for_session(tmp_path, "test-123").require()
 
     assert exc_info.value.code == 1
     assert "manifest must be a JSON object" in capsys.readouterr().err
 
 
-def test_require_orchestrator_run_assets_reports_invalid_manifest_fields(
+def test_requiring_run_assets_reports_invalid_manifest_fields(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -79,7 +82,60 @@ def test_require_orchestrator_run_assets_reports_invalid_manifest_fields(
     monkeypatch.setenv("ISSUE_ORCHESTRATOR_RUN_DIR", str(run_dir))
 
     with pytest.raises(SystemExit) as exc_info:
-        require_orchestrator_run_assets_for_session(tmp_path, "test-123")
+        resolve_orchestrator_run_assets_for_session(tmp_path, "test-123").require()
 
     assert exc_info.value.code == 1
     assert "manifest is invalid" in capsys.readouterr().err
+
+
+def test_resolve_returns_the_proven_run_dir(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_dir = _run_dir(tmp_path)
+    _write_manifest(run_dir, _valid_manifest(tmp_path, run_dir))
+    monkeypatch.setenv("ISSUE_ORCHESTRATOR_RUN_DIR", str(run_dir))
+
+    resolved = resolve_orchestrator_run_assets_for_session(tmp_path, "test-123")
+
+    assert resolved.assets is not None
+    assert resolved.run_dir == run_dir
+
+
+def test_resolve_reports_a_refusal_instead_of_exiting(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A caller whose behaviour merely varies with the run must not be exited.
+
+    One proof, two dispositions: :meth:`ManagedRunAssets.require` exits,
+    reading :attr:`~ManagedRunAssets.run_dir` hands back the answer so a
+    routing question can fall back to ordinary behaviour.
+    """
+    run_dir = _run_dir(tmp_path)
+    _write_manifest(run_dir, _valid_manifest(tmp_path, run_dir))
+    monkeypatch.setenv("ISSUE_ORCHESTRATOR_RUN_DIR", str(run_dir))
+
+    resolved = resolve_orchestrator_run_assets_for_session(tmp_path, "someone-else")
+
+    assert resolved.run_dir is None
+    assert "belongs to 'test-123'" in resolved.refusal
+    assert capsys.readouterr().err == ""
+
+
+def test_resolve_refuses_a_missing_run_dir_env(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("ISSUE_ORCHESTRATOR_RUN_DIR", raising=False)
+
+    resolved = resolve_orchestrator_run_assets_for_session(tmp_path, "test-123")
+
+    assert resolved.run_dir is None
+    assert "RUN_DIR is required" in resolved.refusal
+
+
+def test_managed_run_assets_is_either_proven_or_refused() -> None:
+    with pytest.raises(ValueError, match="never both and never neither"):
+        ManagedRunAssets()

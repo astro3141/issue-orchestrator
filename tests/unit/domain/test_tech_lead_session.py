@@ -12,7 +12,9 @@ from issue_orchestrator.domain.tech_lead_session import (
     TechLeadCreationKind,
     TechLeadCreationOrigin,
     TechLeadSessionFlavor,
+    read_run_assignment,
     require_case_file_observation_label,
+    tech_lead_assignment_path,
 )
 
 
@@ -149,6 +151,95 @@ class TestTechLeadAssignmentValidation:
 
         with pytest.raises(json.JSONDecodeError):
             TechLeadAssignment.read(path)
+
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            [],
+            [{"schema_version": 1, "flavor": "planning_investigation"}],
+            None,
+            3,
+            "planning_investigation",
+            True,
+        ],
+    )
+    def test_a_non_object_payload_fails_as_a_value_error(self, payload: object) -> None:
+        """ValueError is the parser's TOTAL contract for bad content (#319).
+
+        Every caller catches ValueError to reach a designed disposition — the
+        completion gate router falls back to the ordinary candidate gate, and
+        tech_lead completion reports tamper evidence. A payload that made
+        ``data.get`` raise ``AttributeError`` instead would escape both and
+        crash the completion, so "not even a mapping" must fail the same way
+        every other malformed field does.
+        """
+        with pytest.raises(ValueError, match="must be a JSON object"):
+            TechLeadAssignment.from_dict(payload)
+
+    def test_valid_json_that_is_not_an_object_raises_from_read(
+        self, tmp_path: Path
+    ) -> None:
+        """``json.loads`` succeeds on ``[]``; the parser is what must refuse."""
+        path = tmp_path / TECH_LEAD_ASSIGNMENT_FILENAME
+        path.write_text("[]")
+
+        with pytest.raises(ValueError, match="must be a JSON object"):
+            TechLeadAssignment.read(path)
+
+
+class TestReadRunAssignment:
+    """One owner for "does this run carry an assignment, and what is it?" (#319).
+
+    The routing owner and the tamper-detection path used to ask this question
+    in their own words and disagree about the answer; both now come here.
+    """
+
+    def test_none_when_the_run_carries_no_assignment(self, tmp_path: Path) -> None:
+        assert read_run_assignment(tmp_path) is None
+
+    def test_reads_the_assignment_the_launcher_wrote(self, tmp_path: Path) -> None:
+        """Written through the location owner, read through the reader."""
+        assignment = TechLeadAssignment(
+            flavor=TechLeadSessionFlavor.FAILURE_INVESTIGATION,
+            focus_issue_number=99,
+            focus_reason="hang",
+        )
+        assignment.write(tech_lead_assignment_path(tmp_path))
+
+        assert read_run_assignment(tmp_path) == assignment
+
+    def test_a_directory_where_the_file_belongs_is_no_assignment(
+        self, tmp_path: Path
+    ) -> None:
+        """The presence rule, stated once so callers cannot drift on it.
+
+        ``exists()`` would call this present and then raise
+        ``IsADirectoryError`` out of the read — an OSError no caller's
+        malformed-content handling is written for.
+        """
+        tech_lead_assignment_path(tmp_path).mkdir(parents=True)
+
+        assert read_run_assignment(tmp_path) is None
+
+    def test_malformed_content_raises_for_the_caller_to_dispose_of(
+        self, tmp_path: Path
+    ) -> None:
+        path = tech_lead_assignment_path(tmp_path)
+        path.parent.mkdir(parents=True)
+        path.write_text('{"schema_version": 1, "flavor": "bogus"}')
+
+        with pytest.raises(ValueError, match="flavor"):
+            read_run_assignment(tmp_path)
+
+    def test_a_non_object_payload_raises_rather_than_escaping_as_attribute_error(
+        self, tmp_path: Path
+    ) -> None:
+        path = tech_lead_assignment_path(tmp_path)
+        path.parent.mkdir(parents=True)
+        path.write_text("[]")
+
+        with pytest.raises(ValueError, match="must be a JSON object"):
+            read_run_assignment(tmp_path)
 
 
 class TestCreationOriginHasExactlyTwoValidStates:
