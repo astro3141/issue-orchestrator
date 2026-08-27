@@ -80,6 +80,7 @@ from .actions import (
     CloseIssueAction,
 )
 from .completion_types import (
+    CodeCandidateSettlement,
     ERROR_PREFIX_TECH_LEAD_AUTHORITY,
     ERROR_PREFIX_TECH_LEAD_DECISION,
 )
@@ -347,6 +348,20 @@ class TechLeadCompletionLane:
     requested_actions: tuple[RequestedAction, ...]
     zero_code: bool
     detail: str
+
+    @property
+    def code_candidate(self) -> CodeCandidateSettlement:
+        """What this settlement leaves for a downstream code gate (#328).
+
+        The owner that judged ``zero_code`` is the owner that names the fact
+        downstream reads, so there is exactly one place the zero-code answer is
+        decided and exactly one shape it travels in. A caller that re-derived
+        "is this a candidate?" from the run's role, task kind, or requested
+        actions would be a second policy able to disagree with this one.
+        """
+        if self.zero_code:
+            return CodeCandidateSettlement.settled_zero_code(self.detail)
+        return CodeCandidateSettlement.presented()
 
 
 def settle_tech_lead_completion(
