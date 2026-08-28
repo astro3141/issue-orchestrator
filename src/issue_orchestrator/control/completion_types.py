@@ -24,6 +24,20 @@ ERROR_PREFIX_TECH_LEAD_AUTHORITY = "tech_lead_authority"
 # must do instead is force the completion to FAIL, so an untrusted block request
 # that was dropped can never be reported as a success.
 ERROR_PREFIX_GOVERNED_LABEL = "governed_label"
+# A run settled onto the zero-code lane whose issue comment — the ONLY thing it
+# had to deliver — did not reach the issue (#337 round 2). Critical, because on
+# that lane the comment IS the publication: the branch write was dropped, so
+# nothing else carries the result, and a quiet success would close a work item
+# whose deliverable never arrived.
+#
+# Its own prefix, and deliberately NOT one of the publish prefixes
+# ``PublishRecoveryService`` reads: those arm durable retry locators for a
+# Retry Publish that pushes a branch and opens a PR, and this run has no commit
+# to push — offering that retry would send the operator back to the exact
+# create_pr refusal #336 measured. What this prefix must do instead is route the
+# completion to the bounded publish-failure owner, which counts the failures and
+# escalates to needs-human.
+ERROR_PREFIX_RESULT_UNDELIVERED = "result_undelivered"
 REVIEW_EXCHANGE_ERROR_PREFIX = "review_exchange:"
 
 
@@ -50,6 +64,13 @@ class CodeCandidateSettlement:
     the only fail-safe direction: a missing, malformed, ambiguous, or refused
     settlement keeps today's gate. ``detail`` is the settling owner's own
     sentence, so the log of a skipped gate says which run proved what.
+
+    There are TWO producers, not one: the tech_lead completion owner at the
+    pre-action seam, and the ordinary zero-code publication settler downstream
+    of the review exchange (#337), which proves the same fact from stronger
+    evidence — clean tracked content AND zero commits over the base a pull
+    request would target. They are combined with :meth:`narrowed_by` rather
+    than by letting a later phase overwrite an earlier one.
     """
 
     offers_code_candidate: bool
@@ -65,6 +86,125 @@ class CodeCandidateSettlement:
         """A trusted owner PROVED this completion offers no code candidate."""
         return cls(offers_code_candidate=False, detail=detail)
 
+    def narrowed_by(
+        self, later: "CodeCandidateSettlement"
+    ) -> "CodeCandidateSettlement":
+        """This settlement, or ``later`` when this one proved nothing.
+
+        Combining rather than assigning is what keeps the direction fail-safe
+        in BOTH orders: a phase that proved nothing returns
+        :meth:`presented`, and that neutral answer must never erase a proof an
+        earlier owner already made — nor may an earlier neutral answer suppress
+        a later proof.
+        """
+        return later if self.offers_code_candidate else self
+
+
+@dataclass(frozen=True, slots=True)
+class ResultOnlyDelivery:
+    """Whether the comment a finished run posted is its WHOLE delivery.
+
+    An ordinary completion delivers through a pull request, and that chain is
+    what gives its success a terminal disposition: the branch is pushed, the PR
+    is opened, ``pr-pending`` takes over the ownership claim — which is
+    precisely why the completion planner may RELEASE ``in-progress`` — and
+    merging the PR closes the issue.
+
+    A run PROVEN to offer no code candidate (#337) has no such carrier. Its
+    result IS the issue comment: no PR url exists, so no ``pr-pending`` is
+    stamped and no merge will ever arrive to close the issue. Without this
+    fact the planner would release the claim label and leave a finished work
+    item with no label at all — open, unclaimed, and immediately schedulable
+    again — so the next tick would launch the same measurement, run the same
+    review exchange, and post a second RESULT, unbounded.
+
+    ``delivered`` is a fact about what LANDED, not about what the run had to
+    give. Those are two different statements and the difference is the whole
+    finding of #337 round 2: the settler decides the lane BEFORE the actions
+    run — it has to, it shapes them — so at that moment it can only prove "this
+    run has nothing but a comment to deliver". Consuming that as "the comment
+    was delivered" closes an issue whose ``add_comment`` was rejected by the
+    forge, or whose record carried no comment body at all: the RESULT never
+    arrives and the work item is closed anyway, which is the exact inverse of
+    what this lane exists to fix. So the claim is withdrawn unless the posting
+    is confirmed, and the run takes the bounded publish-failure routing
+    instead.
+
+    False for every completion no owner settled this way, which is the
+    fail-safe direction: exactly today's behaviour, including every refusal,
+    which proves nothing about a checkout. ``detail`` is the settling owner's
+    own sentence, so the record of a terminal disposition says which run proved
+    what.
+    """
+
+    delivered: bool
+    detail: str
+
+    @classmethod
+    def none(cls) -> "ResultOnlyDelivery":
+        """Nothing settled this completion as result-only."""
+        return cls(delivered=False, detail="")
+
+    @classmethod
+    def settled(cls, detail: str) -> "ResultOnlyDelivery":
+        """A trusted owner PROVED the posted result is the whole delivery."""
+        return cls(delivered=True, detail=detail)
+
+    def narrowed_by(self, later: "ResultOnlyDelivery") -> "ResultOnlyDelivery":
+        """This delivery, or ``later`` when this one settled nothing."""
+        return later if not self.delivered else self
+
+
+@dataclass(frozen=True, slots=True)
+class CompletionSettlement:
+    """Everything the completion phases PROVED about one finished run.
+
+    One value rather than two loose arguments because both facts come out of
+    the SAME proof and travel to two different readers — the code-validation
+    gate (:class:`CodeCandidateSettlement`, #328) and the completion action
+    planner (:class:`ResultOnlyDelivery`, #337). Split apart, a newly added
+    exit carries whichever of the two it happens to remember; that is the
+    silent drop :class:`ActionExecutionOutcome` already exists to prevent, one
+    fact further in.
+    """
+
+    code_candidate: CodeCandidateSettlement
+    result_only: ResultOnlyDelivery
+
+    @classmethod
+    def unsettled(cls) -> "CompletionSettlement":
+        """No owner proved anything: today's ordinary behaviour, fail-safe."""
+        return cls(
+            code_candidate=CodeCandidateSettlement.presented(),
+            result_only=ResultOnlyDelivery.none(),
+        )
+
+    def narrowed_by(self, later: "CompletionSettlement") -> "CompletionSettlement":
+        """Both halves of this settlement, narrowed by a later phase's proof.
+
+        Completion processing has two settling seams — the pre-action owner and
+        the publication settler downstream of the review exchange — and they
+        never both fire for one run. Narrowing rather than assigning means
+        neither seam's neutral answer can erase the other's proof.
+        """
+        return CompletionSettlement(
+            code_candidate=self.code_candidate.narrowed_by(later.code_candidate),
+            result_only=self.result_only.narrowed_by(later.result_only),
+        )
+
+    def undelivered(self) -> "CompletionSettlement":
+        """This settlement with its result-only half withdrawn.
+
+        Only that half. The two are proven by different evidence at different
+        times: ``code_candidate`` is proven by reads of the checkout before the
+        actions run and is untouched by what they did — a comment that failed
+        to post does not put commits on the branch — while ``result_only``
+        claims a delivery landed, which only executing the plan can establish.
+        Withdrawing both would hand the quick gate back a run with nothing to
+        validate, reopening the #328 drift on a failure path.
+        """
+        return replace(self, result_only=ResultOnlyDelivery.none())
+
     def carried_by(self, result: "ProcessingResult") -> "ProcessingResult":
         """``result``, naming this settlement for its downstream readers.
 
@@ -74,7 +214,11 @@ class CodeCandidateSettlement:
         that only ONE exit carries is the easiest thing in the pipeline to drop
         silently.
         """
-        return replace(result, code_candidate=self)
+        return replace(
+            result,
+            code_candidate=self.code_candidate,
+            result_only=self.result_only,
+        )
 
 
 @dataclass
@@ -122,6 +266,11 @@ class ProcessingResult:
     code_candidate: CodeCandidateSettlement = field(
         default_factory=CodeCandidateSettlement.presented
     )
+    # Whether this run's posted comment is the whole delivery, so no pull
+    # request will ever arrive to give the issue a terminal state (#337).
+    # Defaulted to "nothing settled it", so every producer that never met a
+    # settling owner keeps the ordinary PR-carried lifecycle exactly as it is.
+    result_only: ResultOnlyDelivery = field(default_factory=ResultOnlyDelivery.none)
 
     @classmethod
     def for_review_exchange_deferred(cls) -> "ProcessingResult":
@@ -149,6 +298,26 @@ class ProcessingResult:
         return self.review_exchange_deferred or self.validation_failed_rerouted
 
 
+@dataclass(frozen=True, slots=True)
+class ExecutedActions:
+    """What running one completion's ordered actions actually produced.
+
+    Named rather than returned as a tuple because ``result_delivered`` is the
+    kind of fact a positional slot loses: it is the POSITIVE evidence that the
+    issue comment reached the issue, recorded by the action that posted it, and
+    it is what a terminal disposition may be planned from. Derived from the
+    absence of an error instead, it would be wrong in both directions — an
+    absent ``comment_body`` posts nothing and raises nothing, and an error from
+    a later action says nothing about an earlier comment that did land.
+    """
+
+    branch: str | None
+    pr_url: str | None
+    review_exchange_completed: bool
+    early_result: "ProcessingResult | None"
+    result_delivered: bool
+
+
 @dataclass(frozen=True)
 class ActionExecutionOutcome:
     """What executing one completion record's requested actions produced.
@@ -163,6 +332,26 @@ class ActionExecutionOutcome:
     without having finished the record: the exchange is running in the
     background, or an action produced a result the caller must return as-is.
 
+    ``settlement`` is what this phase PROVED about the run on its way through —
+    the publication settler that decides the zero-code lane sits inside it, and
+    both of its answers are read after it returns (#337). It is a required
+    argument, not a defaulted one, so an exit that settled nothing has to say
+    so with :meth:`CompletionSettlement.unsettled` rather than by omission.
+
+    The discipline is deliberately strictest HERE and defaulted on the hops
+    that follow (``handle_session_completion``,
+    ``CompletionHandler.process_completion``,
+    ``CompletionActionPlanner.generate_completion_actions``), and the asymmetry
+    is about who can forget what. This type has ONE producer — the phase that
+    holds the settler — and several exits out of it, so omission is the live
+    risk and requiring the argument is what closes it. The hops downstream have
+    a single live caller each and many test callers; requiring the argument
+    there would buy no protection this constructor does not already give and
+    would make every existing caller restate a fail-safe default. If a second
+    production caller of any of those hops ever appears, the argument should
+    become required at that hop too — its failure mode is silent (the finished
+    issue simply reappears in the schedulable pool).
+
     Build one with :meth:`of`, never by calling this constructor: an
     ``early_result`` is returned to the caller VERBATIM and never passes the
     place the outcome's own ``review_exchange_run`` is read, so a result that
@@ -176,6 +365,7 @@ class ActionExecutionOutcome:
     deferred: bool
     early_result: "ProcessingResult | None"
     review_exchange_run: ReviewExchangeRunAssets | None
+    settlement: CompletionSettlement
 
     @classmethod
     def of(
@@ -185,6 +375,7 @@ class ActionExecutionOutcome:
         pr_url: str | None,
         review_exchange_completed: bool,
         review_exchange_run: ReviewExchangeRunAssets | None,
+        settlement: CompletionSettlement,
         deferred: bool = False,
         early_result: "ProcessingResult | None" = None,
     ) -> "ActionExecutionOutcome":
@@ -208,6 +399,7 @@ class ActionExecutionOutcome:
             deferred=deferred,
             early_result=early_result,
             review_exchange_run=review_exchange_run,
+            settlement=settlement,
         )
 
 

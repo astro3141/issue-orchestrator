@@ -32,11 +32,13 @@ from issue_orchestrator.control.completion_handler import (
 )
 from issue_orchestrator.control.actions import (
     AddLabelAction,
+    CloseIssueAction,
     RemoveLabelAction,
     AddCommentAction,
     SetIssueStateAction,
     ActionType,
 )
+from issue_orchestrator.control.completion_types import ResultOnlyDelivery
 from issue_orchestrator.domain.issue_key import FakeIssueKey
 from issue_orchestrator.domain.session_key import SessionKey, TaskKind
 from issue_orchestrator.domain.session_run import SessionRunAssets
@@ -3375,3 +3377,173 @@ class TestTechLeadAuthorityRetention:
         )
 
         assert self._load_authority(config, session) is not None
+
+
+class TestResultOnlyDeliveryReachesTheActionPlanner:
+    """The settlement has to survive the hop from the processor to the planner.
+
+    ``ProcessingResult.result_only`` is proved deep in completion processing and
+    consumed in ``CompletionActionPlanner``. Every hop between them is a place
+    the fact can be dropped, and dropping it is silent: the completion still
+    reports success, and the issue simply reappears in the schedulable pool on
+    the next tick (#337 F1). So the boundary is pinned from the handler in.
+    """
+
+    def test_a_result_only_completion_plans_the_terminal_close(
+        self, config: Config, agent_config: AgentConfig, tmp_worktree: Path
+    ) -> None:
+        issue = make_issue()
+        session = create_test_session(issue, agent_config, tmp_worktree)
+        handler = make_handler(config)
+
+        result = handler.process_completion(
+            session,
+            SessionStatus.COMPLETED,
+            result_only=ResultOnlyDelivery.settled("adds no commit over origin/main"),
+        )
+
+        closes = [a for a in result.actions if isinstance(a, CloseIssueAction)]
+        assert [close.issue_number for close in closes] == [issue.number]
+
+    def test_an_ordinary_completion_plans_no_close(
+        self, config: Config, agent_config: AgentConfig, tmp_worktree: Path
+    ) -> None:
+        """The default is today's PR-carried lifecycle, for every caller."""
+        issue = make_issue()
+        session = create_test_session(issue, agent_config, tmp_worktree)
+        handler = make_handler(config)
+
+        result = handler.process_completion(session, SessionStatus.COMPLETED)
+
+        assert [a for a in result.actions if isinstance(a, CloseIssueAction)] == []
+
+
+class TestAnUnobservablePullRequestCannotAuthorizeTheClose:
+    """"Could not tell" must never arrive as "there is none" (#337 r3, F2).
+
+    The terminal disposition consumed ``pull_request_url: str | None``, where
+    ``None`` meant "no pull request". The review/rework fallback produces that
+    same ``None`` when ``get_pr(session.pr_number)`` RAISES — for a session that
+    is known to carry a pull request, which is precisely the fact that must
+    forbid a result-only close. These pin the three verdicts apart at the seam
+    that reads them.
+    """
+
+    SETTLED = ResultOnlyDelivery.settled("adds no commit over origin/main")
+
+    @staticmethod
+    def _closes(result: CompletionResult) -> list[CloseIssueAction]:
+        return [a for a in result.actions if isinstance(a, CloseIssueAction)]
+
+    def test_an_observed_absence_still_closes(
+        self, config: Config, agent_config: AgentConfig, tmp_worktree: Path
+    ) -> None:
+        """The positive control: the lookup ran and found nothing."""
+        issue = make_issue()
+        session = create_test_session(issue, agent_config, tmp_worktree)
+        handler = make_handler(config, repository_host=make_repository_host(prs=[]))
+
+        result = handler.process_completion(
+            session, SessionStatus.COMPLETED, result_only=self.SETTLED
+        )
+
+        assert [close.issue_number for close in self._closes(result)] == [issue.number]
+
+    def test_an_observed_pull_request_refuses_the_close(
+        self, config: Config, agent_config: AgentConfig, tmp_worktree: Path
+    ) -> None:
+        issue = make_issue()
+        session = create_test_session(issue, agent_config, tmp_worktree)
+        handler = make_handler(
+            config,
+            repository_host=make_repository_host(
+                prs=[
+                    SimpleNamespace(
+                        number=7,
+                        url="https://example.test/owner/repo/pull/7",
+                        labels=[],
+                        state="open",
+                    )
+                ]
+            ),
+        )
+
+        result = handler.process_completion(
+            session, SessionStatus.COMPLETED, result_only=self.SETTLED
+        )
+
+        assert self._closes(result) == []
+
+    def test_a_raised_pull_request_read_refuses_the_close(
+        self, config: Config, agent_config: AgentConfig, tmp_worktree: Path
+    ) -> None:
+        """The F2 failure direction, at the exact fallback that produced it.
+
+        A rework session carries ``pr_number``; the branch lookup finds nothing
+        because the pull request's commits live only on the remote branch. The
+        fallback read then fails — and before this repair the failure was
+        indistinguishable from an absence, so the run's OPEN, UNMERGED pull
+        request would not have stopped the close.
+        """
+        issue = make_issue()
+        session = create_test_session(
+            issue, agent_config, tmp_worktree, terminal_id="rework-7"
+        )
+        host = make_repository_host(prs=[])
+        host.get_pr = Mock(side_effect=RuntimeError("502 from the forge"))
+        handler = make_handler(config, repository_host=host)
+
+        result = handler.process_completion(
+            session, SessionStatus.COMPLETED, result_only=self.SETTLED
+        )
+
+        assert session.pr_number == 7
+        host.get_pr.assert_called_once_with(7)
+        assert self._closes(result) == []
+
+    def test_a_vanished_referenced_pull_request_is_an_observed_absence(
+        self, config: Config, agent_config: AgentConfig, tmp_worktree: Path
+    ) -> None:
+        """A read that SUCCEEDED and returned nothing is still evidence."""
+        issue = make_issue()
+        session = create_test_session(
+            issue, agent_config, tmp_worktree, terminal_id="rework-7"
+        )
+        handler = make_handler(
+            config, repository_host=make_repository_host(prs=[], pr_info=None)
+        )
+
+        result = handler.process_completion(
+            session, SessionStatus.COMPLETED, result_only=self.SETTLED
+        )
+
+        assert [close.issue_number for close in self._closes(result)] == [issue.number]
+
+    def test_the_code_bearing_flow_is_unchanged_by_the_verdict(
+        self, config: Config, agent_config: AgentConfig, tmp_worktree: Path
+    ) -> None:
+        """A run with a pull request keeps its url, its history and no close."""
+        issue = make_issue()
+        session = create_test_session(issue, agent_config, tmp_worktree)
+        handler = make_handler(
+            config,
+            repository_host=make_repository_host(
+                prs=[
+                    SimpleNamespace(
+                        number=7,
+                        url="https://example.test/owner/repo/pull/7",
+                        labels=[],
+                        state="open",
+                    )
+                ]
+            ),
+        )
+
+        result = handler.process_completion(session, SessionStatus.COMPLETED)
+
+        assert result.pr_url == "https://example.test/owner/repo/pull/7"
+        assert result.pr_number == 7
+        assert self._closes(result) == []
+        assert "in-progress" in {
+            a.label for a in result.actions if isinstance(a, RemoveLabelAction)
+        }

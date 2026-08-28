@@ -14,16 +14,18 @@ import time
 from pathlib import Path
 
 from ..adapters.git.git_cli import GitCLI
+from ..execution import git_branch_reads as branch_reads
 from ..execution import git_push_operations as git_push_ops
 from ..execution.command_runner import LocalCommandRunner
-from ..execution.git_push_operations import GitAuthEnvProvider
+from ..execution.git_branch_reads import git_error_output
 from ..execution.git_planted_paths import repo_owns_planted_cli_tools
+from ..execution.git_push_operations import GitAuthEnvProvider
 from ..infra.runtime_artifacts import filter_orchestrator_untracked_planted
 from ..ports.command_runner import OutputNewlines
 from ..ports.git import Git, GitError, GitResult
 from ..ports.working_copy import (
+    BranchCommitsResult,
     BranchPathsResult,
-    BranchTextFile,
     BranchTextFilesResult,
     CommitInfo,
     BranchStatus,
@@ -64,8 +66,8 @@ class GitWorkingCopy:
             args: Git command arguments (without 'git').
             check: Whether to raise on non-zero exit.
             capture_output: Whether to capture stdout/stderr.
-            newlines: Transport newline fidelity. Prefer
-                :meth:`_run_git_output_exact` over passing this directly.
+            newlines: Transport newline fidelity. Byte-exact reads belong in
+                :mod:`.git_branch_reads`, not here.
 
         Returns:
             GitResult with results.
@@ -80,31 +82,16 @@ class GitWorkingCopy:
             newlines=newlines,
         )
 
-    def _run_git_output_exact(self, worktree: Path, args: list[str]) -> GitResult:
+    def _read_exact(self, worktree: Path, args: list[str]) -> GitResult:
         r"""Run a git read whose output keeps the delimiters Git wrote.
 
-        Git delimits patch records and blob lines with LF alone and path lists
-        with NUL, so a bare ``\r`` anywhere in that output is content: inside a
-        source line, or inside a filename, which POSIX permits. The default
-        universal-newline transport rewrites it to ``\n``, which splits one
-        patch record in two -- detaching added source from the ``+`` that marks
-        it -- and silently mutates a path. Every read parsed by Git's own
-        delimiter rules must go through here, so no two of them can drift into
-        different transport semantics.
+        The working copy's half of the :class:`ExactGitRead` contract: a bare
+        ``\r`` Git emitted inside a patch record or a filename is content, and
+        the default universal-newline transport would rewrite it. Every read
+        parsed by Git's own delimiter rules is bound to this method, so none of
+        them can drift into translated transport.
         """
-
         return self._run_git(worktree, args, newlines=OutputNewlines.PRESERVED)
-
-    def _run_git_nul_paths(self, worktree: Path, args: list[str]) -> list[str]:
-        """Run a NUL-delimited git path query and return its paths.
-
-        Reading and parsing are one step on purpose: NUL-delimited output is
-        only safe to split when the transport left it byte-exact, so there is
-        no parse-only entry point a translated read could reach.
-        """
-
-        result = self._run_git_output_exact(worktree, args)
-        return [path for path in result.stdout.split("\0") if path]
 
     def _clear_stale_remote_ref(self, worktree: Path, remote: str, branch: str) -> None:
         """Clear stale remote-tracking refs when the remote branch is missing."""
@@ -249,18 +236,21 @@ class GitWorkingCopy:
             files: set[str] = set()
 
             files.update(
-                self._run_git_nul_paths(worktree, ["diff", "--name-only", "-z"])
+                branch_reads.read_nul_paths(self._read_exact, worktree, ["diff", "--name-only", "-z"])
             )
 
             if mode in {"tracked", "all"}:
                 files.update(
-                    self._run_git_nul_paths(
-                        worktree, ["diff", "--cached", "--name-only", "-z"]
+                    branch_reads.read_nul_paths(
+                        self._read_exact,
+                        worktree,
+                        ["diff", "--cached", "--name-only", "-z"],
                     )
                 )
 
             if mode == "all":
-                untracked_paths = self._run_git_nul_paths(
+                untracked_paths = branch_reads.read_nul_paths(
+                    self._read_exact,
                     worktree,
                     ["ls-files", "--others", "--exclude-standard", "-z"],
                 )
@@ -283,98 +273,27 @@ class GitWorkingCopy:
             logger.warning("Failed to list dirty files in %s", worktree)
             return None
 
+    def commits_against_base(self, worktree: Path, base_ref: str) -> BranchCommitsResult:
+        """Count the commits this branch adds over ``base_ref``."""
+        return branch_reads.commits_against_base(self._read_exact, worktree, base_ref)
+
     def diff_against_base(self, worktree: Path, base_ref: str) -> DiffResult:
-        """Return branch diff using merge-base semantics.
-
-        This is execution-only: callers own any policy decisions made from
-        the diff. A command failure is a first-class result so control code can
-        fail closed with a useful operator-facing message.
-
-        Read byte-exactly: patch records are LF-delimited, so a carriage return
-        Git emitted inside one must survive to the caller.
-        """
-        try:
-            result = self._run_git_output_exact(
-                worktree,
-                [
-                    "diff",
-                    "--unified=0",
-                    "--no-ext-diff",
-                    "--no-color",
-                    f"{base_ref}...HEAD",
-                ],
-            )
-            return DiffResult(success=True, diff_text=result.stdout)
-        except GitError as exc:
-            error = _git_error_output(exc)
-            logger.warning(
-                "Failed to read diff against %s in %s: %s",
-                base_ref,
-                worktree,
-                error,
-            )
-            return DiffResult(success=False, error=error)
+        """Return the branch diff against ``base_ref`` (merge-base semantics)."""
+        return branch_reads.diff_against_base(self._read_exact, worktree, base_ref)
 
     def read_branch_text_files(
         self, worktree: Path, paths: tuple[str, ...]
     ) -> BranchTextFilesResult:
-        """Return exact tracked ``HEAD`` content for selected text files.
-
-        Read byte-exactly, on the same terms as :meth:`diff_against_base`, so
-        blob content and the patch text it is matched against agree on where
-        every line ends.
-        """
-
-        files: list[BranchTextFile] = []
-        try:
-            for path in paths:
-                result = self._run_git_output_exact(worktree, ["show", f"HEAD:{path}"])
-                files.append(BranchTextFile(path=path, content=result.stdout))
-            return BranchTextFilesResult(success=True, files=tuple(files))
-        except GitError as exc:
-            error = _git_error_output(exc)
-            logger.warning(
-                "Failed to read branch-tip text files in %s: %s",
-                worktree,
-                error,
-            )
-            return BranchTextFilesResult(success=False, error=error)
+        """Return exact tracked ``HEAD`` content for the requested paths."""
+        return branch_reads.branch_text_files(self._read_exact, worktree, paths)
 
     def branch_post_image_paths_against_base(
         self, worktree: Path, base_ref: str
     ) -> BranchPathsResult:
-        """Return branch-tip post-image paths via a path-oriented diff.
-
-        ``--name-only --diff-filter=ACMRT -z`` lists branch-tip files (post-image
-        name for renames/copies) excluding deletions, intact through spaces.
-        Unlike a unified-diff parser it sees no-hunk and binary changes, so
-        committed runtime artifacts cannot slip past path-based guards.
-
-        Read byte-exactly: NUL-delimited records make every other byte part of
-        a path, including a carriage return a filename is allowed to contain.
-        """
-        try:
-            paths = self._run_git_nul_paths(
-                worktree,
-                [
-                    "diff",
-                    "--name-only",
-                    "-z",
-                    "--no-ext-diff",
-                    "--diff-filter=ACMRT",
-                    f"{base_ref}...HEAD",
-                ],
-            )
-            return BranchPathsResult(success=True, paths=tuple(paths))
-        except GitError as exc:
-            error = _git_error_output(exc)
-            logger.warning(
-                "Failed to read branch paths against %s in %s: %s",
-                base_ref,
-                worktree,
-                error,
-            )
-            return BranchPathsResult(success=False, error=error)
+        """Return branch-tip post-image paths for the diff against ``base_ref``."""
+        return branch_reads.post_image_paths_against_base(
+            self._read_exact, worktree, base_ref
+        )
 
     def get_commits_ahead_of_main(self, worktree: Path) -> list[CommitInfo]:
         """Get commits that are ahead of main branch."""
@@ -646,7 +565,7 @@ class GitWorkingCopy:
             )
         except GitError as e:
             duration = time.monotonic() - start
-            error_msg = _git_error_output(e)
+            error_msg = git_error_output(e)
             logger.warning(
                 "Push failed in %.2fs: branch=%s remote=%s skip_hooks=%s error=%s",
                 duration,
@@ -831,15 +750,3 @@ class GitWorkingCopy:
             return False
 
 
-def _git_error_output(error: GitError) -> str:
-    """Return the full user-facing output from a failed git command."""
-    parts: list[str] = []
-    stdout = (error.result.stdout or "").strip()
-    stderr = (error.result.stderr or "").strip()
-    if stdout:
-        parts.append(stdout)
-    if stderr and stderr != stdout:
-        parts.append(stderr)
-    if parts:
-        return "\n".join(parts)
-    return str(error)

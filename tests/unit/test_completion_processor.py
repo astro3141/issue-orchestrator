@@ -60,6 +60,7 @@ from issue_orchestrator.ports.review_artifact_reader import (
     ReviewArtifactReadCommand,
 )
 from issue_orchestrator.ports.working_copy import (
+    BranchCommitsResult,
     BranchPathsResult,
     BranchTextFile,
     BranchTextFilesResult,
@@ -308,6 +309,11 @@ def mock_git_adapter():
     adapter.branch_post_image_paths_against_base = Mock(
         return_value=BranchPathsResult(success=True, paths=())
     )
+    # An ordinary candidate offers commits. The zero-code publication lane
+    # (#337) is opened only by a test that says so explicitly.
+    adapter.commits_against_base = Mock(
+        return_value=BranchCommitsResult(success=True, count=1)
+    )
     return adapter
 
 
@@ -386,6 +392,482 @@ def worktree_with_completion(tmp_path):
 
 
 # ==================== Unit Tests ====================
+
+
+class TestOrdinaryZeroCodePublication:
+    """A finished ordinary run that offers a branch nothing (#337).
+
+    #336 measured the defect end to end: the actor's result was produced,
+    validated and independently reviewed, and never reached the issue, because
+    ``post_comment`` is sequenced third behind a ``create_pr`` that a
+    zero-commit branch can never complete. These tests pin the repaired path
+    through the whole processor — not just the settling owner — and pin the
+    unchanged code-bearing path beside it.
+    """
+
+    ZERO_CODE_INTENTS = [
+        RequestedAction.PUSH_BRANCH,
+        RequestedAction.CREATE_PR,
+        RequestedAction.POST_COMMENT,
+    ]
+
+    def _run(self, processor, worktree_with_completion, mock_git_adapter, *, commits):
+        mock_git_adapter.get_head_sha = Mock(return_value="c" * 40)
+        mock_git_adapter.commits_against_base = Mock(
+            return_value=BranchCommitsResult(success=True, count=commits)
+        )
+        record = make_record(
+            outcome=CompletionOutcome.COMPLETED,
+            requested_actions=list(self.ZERO_CODE_INTENTS),
+            summary="Evidence-only measurement",
+            implementation="Read-only observation; no file was changed.",
+            comment_body="## Implementation\n\nThe measured RESULT.",
+        )
+        worktree = worktree_with_completion(record)
+        result = processor.process(
+            worktree,
+            run_assets=make_session_run_assets(worktree),
+            issue_number=123,
+            issue_title="Evidence-only issue",
+            issue_key=None,
+        )
+        return record, result
+
+    def test_the_reviewed_result_reaches_the_issue_without_a_branch_or_a_pr(
+        self,
+        processor,
+        worktree_with_completion,
+        mock_git_adapter,
+        mock_pr_adapter,
+    ):
+        """The whole repair, in one assertion set."""
+        record, result = self._run(
+            processor, worktree_with_completion, mock_git_adapter, commits=0
+        )
+
+        assert result.success is True
+        assert result.pr_url is None
+        mock_git_adapter.push.assert_not_called()
+        mock_pr_adapter.create_pr.assert_not_called()
+        mock_pr_adapter.add_comment.assert_called_once_with(123, record.comment_body)
+
+    def test_the_posted_body_is_the_agent_s_payload_not_a_control_summary(
+        self,
+        processor,
+        worktree_with_completion,
+        mock_git_adapter,
+        mock_pr_adapter,
+    ):
+        """Control relays the reviewed payload; it never reconstructs one."""
+        record, _ = self._run(
+            processor, worktree_with_completion, mock_git_adapter, commits=0
+        )
+
+        posted = mock_pr_adapter.add_comment.call_args.args[1]
+        assert posted == record.comment_body
+        assert "The measured RESULT." in posted
+
+    def test_every_pre_publication_guard_still_judged_the_candidate(
+        self, processor, worktree_with_completion, mock_git_adapter
+    ):
+        """The drop happens LAST, so nothing is bought by taking this lane.
+
+        Both branch guards are gated on the record still reaching the remote,
+        so their having run is proof that the settlement came after them rather
+        than excusing the run from them.
+        """
+        self._run(processor, worktree_with_completion, mock_git_adapter, commits=0)
+
+        mock_git_adapter.diff_against_base.assert_called()
+        mock_git_adapter.branch_post_image_paths_against_base.assert_called()
+
+    def test_the_count_is_taken_against_the_base_a_pr_would_target(
+        self, processor, worktree_with_completion, mock_git_adapter
+    ):
+        self._run(processor, worktree_with_completion, mock_git_adapter, commits=0)
+
+        assert mock_git_adapter.commits_against_base.call_args.args[1] == "origin/main"
+
+    def test_a_code_bearing_completion_still_pushes_and_opens_a_pr(
+        self,
+        processor,
+        worktree_with_completion,
+        mock_git_adapter,
+        mock_pr_adapter,
+    ):
+        """The unchanged ordinary lifecycle, pinned beside the new one."""
+        _, result = self._run(
+            processor, worktree_with_completion, mock_git_adapter, commits=1
+        )
+
+        assert result.success is True
+        assert result.pr_url == "https://github.com/owner/repo/pull/42"
+        mock_git_adapter.push.assert_called_once()
+        mock_pr_adapter.create_pr.assert_called_once()
+
+    def test_an_uncountable_branch_still_pushes_and_opens_a_pr(
+        self,
+        processor,
+        worktree_with_completion,
+        mock_git_adapter,
+        mock_pr_adapter,
+    ):
+        """Fail closed: unreadable is never read as "nothing to publish"."""
+        mock_git_adapter.get_head_sha = Mock(return_value="c" * 40)
+        mock_git_adapter.commits_against_base = Mock(
+            return_value=BranchCommitsResult(success=False, error="unknown revision")
+        )
+        record = make_record(
+            outcome=CompletionOutcome.COMPLETED,
+            requested_actions=list(self.ZERO_CODE_INTENTS),
+            summary="Evidence-only measurement",
+            implementation="Read-only observation.",
+            comment_body="## Implementation\n\nThe measured RESULT.",
+        )
+        worktree = worktree_with_completion(record)
+
+        processor.process(
+            worktree,
+            run_assets=make_session_run_assets(worktree),
+            issue_number=123,
+            issue_title="Evidence-only issue",
+            issue_key=None,
+        )
+
+        mock_git_adapter.push.assert_called_once()
+        mock_pr_adapter.create_pr.assert_called_once()
+
+    def test_dirty_tracked_content_still_pushes_and_opens_a_pr(
+        self,
+        processor,
+        worktree_with_completion,
+        mock_git_adapter,
+        mock_pr_adapter,
+    ):
+        """A run with uncommitted tracked work is not a zero-code run."""
+        mock_git_adapter.list_dirty_files = Mock(return_value=["src/app.py"])
+        self._run(processor, worktree_with_completion, mock_git_adapter, commits=0)
+
+        mock_git_adapter.push.assert_called_once()
+        mock_pr_adapter.create_pr.assert_called_once()
+
+    def test_the_candidates_identity_and_gate_receipt_survive_the_lane(
+        self,
+        mock_label_adapter,
+        mock_pr_adapter,
+        mock_git_adapter,
+        worktree_with_completion,
+    ):
+        """Nothing is bought by taking this lane, ASSERTED rather than argued.
+
+        Being strictly downstream of the guards makes durable receipts true by
+        construction, and a criterion true by construction is one a later edit
+        can quietly stop satisfying. So the publication gate's own hop is
+        pinned here: it is consulted for a run that will take the zero-code
+        lane, and it is handed the session's canonical identity VERBATIM — the
+        hop that decides whether the verdict lands on ``Attempt(issue, A)``
+        with the rest of this candidate's evidence, or is filed under an
+        identity nothing else reads (#85).
+        """
+        from unittest.mock import Mock as _Mock
+
+        from issue_orchestrator.domain.issue_key import GitHubIssueKey
+
+        gate_check = publish_gate_outcome()
+        gate = _Mock()
+        gate.check = _Mock(side_effect=gate_check)
+        processor = CompletionProcessor(
+            agent_callback_endpoint=ready_callback_endpoint(),
+            label_adapter=mock_label_adapter,
+            pr_adapter=mock_pr_adapter,
+            git_adapter=mock_git_adapter,
+            publication_gate=gate,
+            session_output=FileSystemSessionOutput(),
+        )
+        mock_git_adapter.get_head_sha = Mock(return_value="c" * 40)
+        mock_git_adapter.commits_against_base = Mock(
+            return_value=BranchCommitsResult(success=True, count=0)
+        )
+        # Deliberately not the issue number: a key re-derived from ``123``
+        # would satisfy "some key was passed" but not this assertion.
+        issue_key = GitHubIssueKey(repo="owner/repo", external_id="M1-011")
+        record = make_record(
+            outcome=CompletionOutcome.COMPLETED,
+            requested_actions=list(self.ZERO_CODE_INTENTS),
+            summary="Evidence-only measurement",
+            implementation="Read-only observation; no file was changed.",
+            comment_body="## Implementation\n\nThe measured RESULT.",
+        )
+        worktree = worktree_with_completion(record)
+
+        result = processor.process(
+            worktree,
+            run_assets=make_session_run_assets(worktree),
+            issue_number=123,
+            issue_title="Evidence-only issue",
+            issue_key=issue_key,
+        )
+
+        assert result.success is True
+        assert result.pr_url is None
+        gate.check.assert_called_once()
+        assert gate_check.issue_keys == [issue_key]
+        assert gate_check.issue_keys[0] is issue_key
+        # And the reviewed payload still reached the issue on that same pass.
+        mock_pr_adapter.add_comment.assert_called_once_with(123, record.comment_body)
+
+    def test_the_run_is_settled_out_of_the_code_lane_for_the_gate_downstream(
+        self, processor, worktree_with_completion, mock_git_adapter
+    ):
+        """The proof leaves the processor; it is not logged and dropped (#328).
+
+        A settled run that still reported ``offers_code_candidate=True`` would
+        have the quick gate run over a commit it did not produce — and a
+        failure there flips an already-published run into the validation-retry
+        path, relaunched as a coder retry against an empty branch.
+        """
+        _record, result = self._run(
+            processor, worktree_with_completion, mock_git_adapter, commits=0
+        )
+
+        assert result.code_candidate.offers_code_candidate is False
+        assert result.code_candidate.detail
+
+    def test_the_run_is_marked_as_delivering_its_whole_result_by_comment(
+        self, processor, worktree_with_completion, mock_git_adapter
+    ):
+        """The fact that earns the run a terminal disposition (#337 F1).
+
+        No pull request exists, so nothing downstream stamps ``pr-pending``.
+        Unmarked, the completion planner releases ``in-progress`` with nothing
+        to take its place and the finished issue is schedulable again on the
+        next tick.
+        """
+        _record, result = self._run(
+            processor, worktree_with_completion, mock_git_adapter, commits=0
+        )
+
+        assert result.result_only.delivered is True
+        assert result.result_only.detail
+
+    def test_a_code_bearing_completion_is_settled_neither_way(
+        self, processor, worktree_with_completion, mock_git_adapter
+    ):
+        """The boundary: an ordinary run keeps the gate and the PR lifecycle."""
+        _record, result = self._run(
+            processor, worktree_with_completion, mock_git_adapter, commits=1
+        )
+
+        assert result.code_candidate.offers_code_candidate is True
+        assert result.result_only.delivered is False
+
+
+class TestTheSettledLaneProvesItsDeliveryLanded:
+    """A settled run that published NOTHING must not be reported as delivered.
+
+    The five facts are proven before the actions run — they are what shapes
+    them — so at that moment they can only establish "this run has nothing but
+    a comment to deliver". Read afterwards as "the comment was delivered", they
+    hand a terminal disposition to a run whose RESULT never arrived: the issue
+    is closed with no deliverable, which is the exact inverse of what #337
+    exists to fix and worse than the bounded failure it replaced.
+
+    Three reachable ways a settled run delivers nothing, one class each. All
+    three must withdraw the disposition AND report the bounded publish failure,
+    because withdrawing alone would only put the finished issue back in the
+    schedulable pool unbounded.
+    """
+
+    ZERO_CODE_INTENTS = [
+        RequestedAction.PUSH_BRANCH,
+        RequestedAction.CREATE_PR,
+        RequestedAction.POST_COMMENT,
+    ]
+
+    def _run(
+        self,
+        processor,
+        worktree_with_completion,
+        mock_git_adapter,
+        *,
+        requested_actions=None,
+        comment_body="## Implementation\n\nThe measured RESULT.",
+    ):
+        mock_git_adapter.get_head_sha = Mock(return_value="c" * 40)
+        mock_git_adapter.commits_against_base = Mock(
+            return_value=BranchCommitsResult(success=True, count=0)
+        )
+        record = make_record(
+            outcome=CompletionOutcome.COMPLETED,
+            requested_actions=list(
+                self.ZERO_CODE_INTENTS if requested_actions is None
+                else requested_actions
+            ),
+            summary="Evidence-only measurement",
+            implementation="Read-only observation; no file was changed.",
+            comment_body=comment_body,
+        )
+        worktree = worktree_with_completion(record)
+        return processor.process(
+            worktree,
+            run_assets=make_session_run_assets(worktree),
+            issue_number=123,
+            issue_title="Evidence-only issue",
+            issue_key=None,
+        )
+
+    @staticmethod
+    def _posted_bodies(mock_pr_adapter) -> list[str]:
+        return [call.args[1] for call in mock_pr_adapter.add_comment.call_args_list]
+
+    @staticmethod
+    def _undelivered_errors(result) -> list[str]:
+        from issue_orchestrator.control.completion_types import (
+            ERROR_PREFIX_RESULT_UNDELIVERED,
+        )
+
+        return [
+            error
+            for error in (result.errors or [])
+            if error.startswith(ERROR_PREFIX_RESULT_UNDELIVERED)
+        ]
+
+    def test_a_rejected_comment_withdraws_the_terminal_disposition(
+        self, processor, worktree_with_completion, mock_git_adapter, mock_pr_adapter
+    ):
+        """Trigger 1: the forge refuses the comment.
+
+        ``add_comment`` raises on any failure — a 5xx, a rate limit, a locked
+        issue, a body over GitHub's comment size limit, which an evidence-run
+        RESULT can plausibly exceed. ``post_comment`` is not a publication
+        action, so nothing halts and nothing was critical before this.
+        """
+        mock_pr_adapter.add_comment = Mock(side_effect=RuntimeError("502 Bad Gateway"))
+
+        result = self._run(processor, worktree_with_completion, mock_git_adapter)
+
+        assert result.result_only.delivered is False
+
+    def test_a_rejected_comment_is_reported_as_a_publish_failure(
+        self, processor, worktree_with_completion, mock_git_adapter, mock_pr_adapter
+    ):
+        """Withdrawing alone would leave the finished issue relaunching forever.
+
+        On this lane the comment IS the publication, so its loss has to reach
+        the bounded publish-failure owner that counts failures and escalates.
+        """
+        mock_pr_adapter.add_comment = Mock(side_effect=RuntimeError("502 Bad Gateway"))
+
+        result = self._run(processor, worktree_with_completion, mock_git_adapter)
+
+        assert self._undelivered_errors(result)
+        assert result.success is False
+
+    def test_a_record_with_no_comment_body_publishes_nothing_and_says_so(
+        self, processor, worktree_with_completion, mock_git_adapter, mock_pr_adapter
+    ):
+        """Trigger 2: the silent one, and the reason absence of error is not proof.
+
+        Nothing requires a body when ``post_comment`` is requested, and a
+        completion record is untrusted agent input by this repository's own
+        principle. The action then posts nothing and raises nothing.
+        """
+        result = self._run(
+            processor, worktree_with_completion, mock_git_adapter, comment_body=None
+        )
+
+        assert result.result_only.delivered is False
+        assert self._undelivered_errors(result)
+        # The ONLY thing that reached the issue is the processing-failure
+        # notice, so the operator sees a run that published nothing.
+        posted = self._posted_bodies(mock_pr_adapter)
+        assert posted and all(
+            "Orchestrator Processing Failed" in body for body in posted
+        )
+
+    def test_a_record_that_never_asked_to_comment_publishes_nothing(
+        self, processor, worktree_with_completion, mock_git_adapter, mock_pr_adapter
+    ):
+        """Trigger 3: dropping both publication actions leaves an EMPTY plan.
+
+        An empty plan trivially "succeeds", and the run would be handed the
+        terminal disposition for having executed nothing at all.
+        """
+        result = self._run(
+            processor,
+            worktree_with_completion,
+            mock_git_adapter,
+            requested_actions=[RequestedAction.PUSH_BRANCH, RequestedAction.CREATE_PR],
+        )
+
+        assert result.result_only.delivered is False
+        assert self._undelivered_errors(result)
+        assert not any(
+            "The measured RESULT." in body
+            for body in self._posted_bodies(mock_pr_adapter)
+        )
+
+    def test_the_code_candidate_proof_survives_an_undelivered_result(
+        self, processor, worktree_with_completion, mock_git_adapter, mock_pr_adapter
+    ):
+        """Only the delivery half is withdrawn.
+
+        A comment that failed to post does not put commits on the branch, so
+        the checkout reads still hold. Withdrawing both would hand the quick
+        gate back a run with nothing to validate, reopening the #328 drift on a
+        failure path.
+        """
+        mock_pr_adapter.add_comment = Mock(side_effect=RuntimeError("502 Bad Gateway"))
+
+        result = self._run(processor, worktree_with_completion, mock_git_adapter)
+
+        assert result.code_candidate.offers_code_candidate is False
+        assert result.code_candidate.detail
+
+    def test_a_delivered_result_reports_no_failure_and_keeps_its_disposition(
+        self, processor, worktree_with_completion, mock_git_adapter, mock_pr_adapter
+    ):
+        """The falsification control: the happy path must stay untouched."""
+        result = self._run(processor, worktree_with_completion, mock_git_adapter)
+
+        mock_pr_adapter.add_comment.assert_called_once()
+        assert result.result_only.delivered is True
+        assert self._undelivered_errors(result) == []
+        assert result.success is True
+
+    def test_a_code_bearing_run_whose_comment_fails_is_not_charged_this_error(
+        self, processor, worktree_with_completion, mock_git_adapter, mock_pr_adapter
+    ):
+        """The boundary: the ordinary lane's post_comment behaviour is untouched.
+
+        A code-bearing run's branch and pull request still carry its work, so a
+        failed comment is the soft error it has always been — not a claim that
+        the run published nothing.
+        """
+        mock_git_adapter.get_head_sha = Mock(return_value="c" * 40)
+        mock_git_adapter.commits_against_base = Mock(
+            return_value=BranchCommitsResult(success=True, count=1)
+        )
+        mock_pr_adapter.add_comment = Mock(side_effect=RuntimeError("502 Bad Gateway"))
+        record = make_record(
+            outcome=CompletionOutcome.COMPLETED,
+            requested_actions=list(self.ZERO_CODE_INTENTS),
+            summary="Real work",
+            implementation="Changed a file.",
+            comment_body="## Implementation\n\nDone.",
+        )
+        worktree = worktree_with_completion(record)
+
+        result = processor.process(
+            worktree,
+            run_assets=make_session_run_assets(worktree),
+            issue_number=123,
+            issue_title="Ordinary issue",
+            issue_key=None,
+        )
+
+        assert self._undelivered_errors(result) == []
+        mock_git_adapter.push.assert_called_once()
 
 
 class TestCompletionProcessorLabelActions:
@@ -1704,6 +2186,74 @@ class TestReviewExchangeExecution:
         assert len(review_comment) <= GITHUB_COMMENT_BODY_LIMIT
         assert "Review exchange transcript truncated" in review_comment
         assert "Full per-turn artifacts remain" in review_comment
+
+    def test_a_halted_review_never_reaches_the_zero_code_publication_lane(
+        self,
+        tmp_path,
+        mock_label_adapter,
+        mock_pr_adapter,
+        mock_git_adapter,
+        event_bus,
+        worktree_with_completion,
+    ) -> None:
+        """Review cannot be bypassed by having produced no code (#337).
+
+        A zero-code candidate whose exchange halted must take the ordinary
+        halted path. The settlement is downstream of the halt, so the branch
+        it would have counted is never even read — and the agent's payload is
+        not published as a reviewed result.
+        """
+        config = self._make_config(tmp_path)
+        config.review_exchange_mode = "via-local-loop"
+        processor = CompletionProcessor(
+            agent_callback_endpoint=ready_callback_endpoint(),
+            label_adapter=mock_label_adapter,
+            pr_adapter=mock_pr_adapter,
+            git_adapter=mock_git_adapter,
+            session_output=FileSystemSessionOutput(),
+            event_bus=event_bus,
+            label_config={
+                "code_reviewed": "code-reviewed",
+                "code_review": "needs-code-review",
+            },
+            config=config,
+        )
+        mock_git_adapter.get_head_sha = Mock(return_value="c" * 40)
+        mock_git_adapter.commits_against_base = Mock(
+            return_value=BranchCommitsResult(success=True, count=0)
+        )
+        record = make_record(
+            outcome=CompletionOutcome.COMPLETED,
+            requested_actions=[
+                RequestedAction.PUSH_BRANCH,
+                RequestedAction.CREATE_PR,
+                RequestedAction.POST_COMMENT,
+            ],
+            comment_body="## Implementation\n\nThe measured RESULT.",
+        )
+        worktree = worktree_with_completion(record)
+        processor._run_review_exchange_loop = MagicMock(  # noqa: SLF001
+            side_effect=lambda **kw: _review_exchange_outcome(
+                kw["exchange_run"], status="error", rounds=1, reason="boom"
+            )
+        )
+
+        result = processor.process(
+            worktree,
+            run_assets=make_session_run_assets(worktree),
+            issue_number=123,
+            issue_title="Test Issue",
+            agent_label="agent:coder",
+            issue_key=None,
+        )
+
+        assert result.review_exchange_halted is True
+        assert result.success is False
+        mock_git_adapter.commits_against_base.assert_not_called()
+        mock_git_adapter.push.assert_not_called()
+        mock_pr_adapter.create_pr.assert_not_called()
+        posted = [call.args[1] for call in mock_pr_adapter.add_comment.call_args_list]
+        assert record.comment_body not in posted
 
     def test_local_loop_failure_emits_review_changes_requested_trace_event(
         self,

@@ -21,9 +21,20 @@ from issue_orchestrator.control.completion_action_planner import (
     CompletionActionPlanner,
     critical_processing_errors,
 )
+from issue_orchestrator.control.completion_effect_gate import (
+    is_completion_gate_action,
+)
 from issue_orchestrator.control.completion_types import (
     ERROR_PREFIX_CREATE_PR,
     ERROR_PREFIX_PUSH,
+    ERROR_PREFIX_RESULT_UNDELIVERED,
+    ResultOnlyDelivery,
+)
+from issue_orchestrator.control.pull_request_observation import (
+    PullRequestObservation,
+)
+from issue_orchestrator.control.result_only_completion import (
+    ResultOnlyCloseIssueAction,
 )
 from issue_orchestrator.control.tech_lead_completion import (
     admit_tech_lead_completion,
@@ -80,6 +91,21 @@ def make_issue(
         title=f"Test issue {number}",
         labels=labels or ["agent:test"],
         repo="owner/repo",
+    )
+
+
+NO_PULL_REQUEST = PullRequestObservation.observed_none(
+    "branch carries no pull request and the session references none"
+)
+"""A lookup that RAN and found nothing — the only verdict that may close."""
+
+
+def observed_pull_request(
+    url: str = "https://example.test/owner/repo/pull/7", number: int = 7
+) -> PullRequestObservation:
+    """A lookup that ran and found an open pull request for the issue."""
+    return PullRequestObservation.observed(
+        url=url, number=number, detail="branch carries an open pull request"
     )
 
 
@@ -3313,3 +3339,288 @@ def test_provider_blocked_issue_session_adds_no_rework_trigger(
     assert LabelManager(config).needs_rework not in added_labels(actions)
     # The claim is still released, exactly as before.
     assert "in-progress" in removed_labels(actions)
+
+
+class TestAResultOnlyRunReachesATerminalDisposition:
+    """A finished run with no pull request must leave the schedulable pool (#337).
+
+    An ordinary success is safe to release from ``in-progress`` only because
+    ``pr-pending`` takes the claim over and the eventual merge closes the issue.
+    A run the completion settlement PROVED offers no code candidate opens no
+    pull request, so neither half happens: released and unlabelled, the issue is
+    indistinguishable to ``Scheduler`` from work never started, and the next tick
+    launches the same measurement, runs the same review exchange, and posts a
+    second RESULT — every tick, unbounded.
+
+    The pre-#337 behaviour of the same run was a bounded publish FAILURE. These
+    pin that the repair did not trade a bounded stop for an unbounded repeat.
+    """
+
+    @staticmethod
+    def _closes(actions: tuple[object, ...]) -> list[CloseIssueAction]:
+        return [a for a in actions if isinstance(a, CloseIssueAction)]
+
+    def test_a_settled_result_only_run_closes_its_issue(self, tmp_path: Path) -> None:
+        actions = make_planner(Config()).generate_completion_actions(
+            make_session(tmp_path),
+            SessionStatus.COMPLETED,
+            pull_request=NO_PULL_REQUEST,
+            result_only=ResultOnlyDelivery.settled("adds no commit over origin/main"),
+        )
+
+        closes = self._closes(actions)
+        assert len(closes) == 1
+        assert closes[0].issue_number == 1
+        assert "in-progress" in removed_labels(actions)
+
+    def test_the_close_is_planned_as_the_gate_for_the_release(
+        self, tmp_path: Path
+    ) -> None:
+        """Ordering alone is not fail-stop; the close must be a GATE (#337 r3 F1).
+
+        ``ActionApplier`` reports a failed close as a FAILED result and applies
+        the rest of the batch, so a close ordered first and then failing would
+        still be followed by the release of ``in-progress`` — an open, finished,
+        unclaimed issue, exactly the state the ordering was meant to prevent.
+        The typed action is what the completion gate withholds the remainder on.
+        """
+        actions = make_planner(Config()).generate_completion_actions(
+            make_session(tmp_path),
+            SessionStatus.COMPLETED,
+            pull_request=NO_PULL_REQUEST,
+            result_only=ResultOnlyDelivery.settled("adds no commit over origin/main"),
+        )
+
+        assert isinstance(actions[0], ResultOnlyCloseIssueAction)
+        assert is_completion_gate_action(actions[0])
+        releases = [
+            i
+            for i, a in enumerate(actions)
+            if isinstance(a, RemoveLabelAction) and a.label == "in-progress"
+        ]
+        assert releases and releases[0] > 0
+        assert not any(is_completion_gate_action(actions[i]) for i in releases)
+
+    def test_the_close_explains_why_no_pull_request_exists(
+        self, tmp_path: Path
+    ) -> None:
+        """The one fact an operator cannot get from the issue itself."""
+        actions = make_planner(Config()).generate_completion_actions(
+            make_session(tmp_path),
+            SessionStatus.COMPLETED,
+            pull_request=NO_PULL_REQUEST,
+            result_only=ResultOnlyDelivery.settled("adds no commit over origin/main"),
+        )
+
+        assert "no pull request" in self._closes(actions)[0].comment
+
+    def test_the_close_carries_the_reconciliation_expectation(
+        self, tmp_path: Path
+    ) -> None:
+        """A mutating action with no expectation is refused by the applier."""
+        actions = make_planner(Config()).generate_completion_actions(
+            make_session(tmp_path),
+            SessionStatus.COMPLETED,
+            pull_request=NO_PULL_REQUEST,
+            result_only=ResultOnlyDelivery.settled("adds no commit over origin/main"),
+        )
+
+        assert self._closes(actions)[0].expected is not None
+
+    def test_an_ordinary_completion_is_never_closed(self, tmp_path: Path) -> None:
+        """The negative control: a PR-carried run keeps today's lifecycle."""
+        actions = make_planner(Config()).generate_completion_actions(
+            make_session(tmp_path),
+            SessionStatus.COMPLETED,
+            pull_request=observed_pull_request(),
+        )
+
+        assert self._closes(actions) == []
+        assert "in-progress" in removed_labels(actions)
+
+    def test_a_completion_whose_push_failed_is_never_closed(
+        self, tmp_path: Path
+    ) -> None:
+        """A missing PR is not proof of a result-only run.
+
+        A publish that FAILED is also missing its pr_url, and that run needs the
+        bounded publish-failure routing — not a terminal close. Only the carried
+        settlement opens this path, so a failure that (impossibly) arrived
+        carrying one still takes the critical-error branch.
+        """
+        actions = make_planner(Config()).generate_completion_actions(
+            make_session(tmp_path),
+            SessionStatus.COMPLETED,
+            processing_errors=[f"{ERROR_PREFIX_PUSH}: remote rejected"],
+            pull_request=NO_PULL_REQUEST,
+            result_only=ResultOnlyDelivery.settled("adds no commit over origin/main"),
+        )
+
+        assert self._closes(actions) == []
+
+    def test_a_halted_review_exchange_is_never_closed(self, tmp_path: Path) -> None:
+        """Review cannot be bypassed into a terminal disposition either."""
+        actions = make_planner(Config()).generate_completion_actions(
+            make_session(tmp_path),
+            SessionStatus.COMPLETED,
+            review_exchange_halted=True,
+            pull_request=NO_PULL_REQUEST,
+            result_only=ResultOnlyDelivery.settled("adds no commit over origin/main"),
+        )
+
+        assert self._closes(actions) == []
+
+    @pytest.mark.parametrize(
+        "status",
+        [
+            SessionStatus.FAILED,
+            SessionStatus.TIMED_OUT,
+            SessionStatus.BLOCKED,
+            SessionStatus.NEEDS_HUMAN,
+        ],
+    )
+    def test_only_a_completed_run_can_reach_the_disposition(
+        self, tmp_path: Path, status: SessionStatus
+    ) -> None:
+        actions = make_planner(Config()).generate_completion_actions(
+            make_session(tmp_path),
+            status,
+            pull_request=NO_PULL_REQUEST,
+            result_only=ResultOnlyDelivery.settled("adds no commit over origin/main"),
+        )
+
+        assert self._closes(actions) == []
+
+
+class TestAnUndeliveredResultIsBoundedNotClosed:
+    """A settled run whose comment never landed takes the bounded failure path.
+
+    Withdrawing the terminal disposition alone would put the finished issue
+    straight back in the schedulable pool — the round-1 F1 loop, on a failure
+    path. On the zero-code lane the comment IS the publication, so its loss is
+    a publish failure: counted by ``publish-fail-count-N`` and escalated to
+    ``needs-human``, which is the bounded, fail-closed behaviour #336 recorded
+    for this same run before the lane existed.
+    """
+
+    UNDELIVERED = (
+        f"{ERROR_PREFIX_RESULT_UNDELIVERED}: the run for issue #1 offered no"
+        " code candidate, so its issue comment was its whole delivery, and"
+        " that comment did not reach the issue; nothing was published"
+    )
+
+    def _actions(self, tmp_path: Path) -> tuple[object, ...]:
+        return make_planner(Config()).generate_completion_actions(
+            make_session(tmp_path),
+            SessionStatus.COMPLETED,
+            processing_errors=[self.UNDELIVERED],
+            pull_request=NO_PULL_REQUEST,
+            # The settlement is already withdrawn upstream; passing it settled
+            # here proves the routing does not depend on that withdrawal alone.
+            result_only=ResultOnlyDelivery.settled("adds no commit over origin/main"),
+        )
+
+    def test_the_issue_is_not_closed(self, tmp_path: Path) -> None:
+        actions = self._actions(tmp_path)
+
+        assert [a for a in actions if isinstance(a, CloseIssueAction)] == []
+
+    def test_the_run_is_counted_against_the_publish_failure_budget(
+        self, tmp_path: Path
+    ) -> None:
+        """Bounded: the counter is what eventually escalates to needs-human."""
+        actions = self._actions(tmp_path)
+
+        assert any(
+            label.startswith("publish-fail-count-") for label in added_labels(actions)
+        )
+        assert "publish-failed" in added_labels(actions)
+
+    def test_the_error_is_classified_critical(self) -> None:
+        """The classification is what routes it; pinned at its own owner."""
+        critical, downgraded = critical_processing_errors([self.UNDELIVERED])
+
+        assert critical == [self.UNDELIVERED]
+        assert downgraded == []
+
+    def test_a_pr_url_cannot_downgrade_it(self) -> None:
+        """Unlike create_pr, there is no "but it landed anyway" evidence.
+
+        A create_pr error is downgraded when reconciliation finds a PR. Nothing
+        can find a comment that was never posted, so this prefix is critical
+        unconditionally.
+        """
+        critical, _downgraded = critical_processing_errors(
+            [self.UNDELIVERED], pr_url="https://example.test/owner/repo/pull/7"
+        )
+
+        assert critical == [self.UNDELIVERED]
+
+
+class TestTheDispositionRefusesAnIssueWithWorkInFlight:
+    """Fact 5 proves "this RUN produced no code", not "nothing is in flight".
+
+    The two come apart in a shape this repository has seen: a rework worktree
+    that arrives reset to the base, its pull request's commits reachable only
+    from the remote branch. Such a run has a clean tree, sits at the base, and
+    adds no commit — every fact the lane proves — and closing its issue would
+    close one whose pull request is open and unmerged.
+    """
+
+    def test_a_settled_run_with_an_open_pull_request_is_not_closed(
+        self, tmp_path: Path
+    ) -> None:
+        actions = make_planner(Config()).generate_completion_actions(
+            make_session(tmp_path),
+            SessionStatus.COMPLETED,
+            pull_request=observed_pull_request(),
+            result_only=ResultOnlyDelivery.settled("adds no commit over origin/main"),
+        )
+
+        assert [a for a in actions if isinstance(a, CloseIssueAction)] == []
+        assert "in-progress" in removed_labels(actions)
+
+    def test_an_unreadable_pull_request_lookup_refuses_the_close(
+        self, tmp_path: Path
+    ) -> None:
+        """UNKNOWN must not mean OBSERVED_NONE (#337 round 3, F2).
+
+        The review/rework fallback reads ``get_pr(session.pr_number)`` for a
+        session that is KNOWN to carry a pull request. When that read raises,
+        the old ``str | None`` collapsed the failure to "there is no pull
+        request" — the one input that authorises the close.
+        """
+        actions = make_planner(Config()).generate_completion_actions(
+            make_session(tmp_path),
+            SessionStatus.COMPLETED,
+            pull_request=PullRequestObservation.unknown(
+                "pull request #7 for this session could not be read: 502"
+            ),
+            result_only=ResultOnlyDelivery.settled("adds no commit over origin/main"),
+        )
+
+        assert [a for a in actions if isinstance(a, CloseIssueAction)] == []
+        assert "in-progress" in removed_labels(actions)
+
+    def test_a_caller_that_never_looked_refuses_the_close(
+        self, tmp_path: Path
+    ) -> None:
+        """The default is the fail-closed verdict, not an observed absence."""
+        actions = make_planner(Config()).generate_completion_actions(
+            make_session(tmp_path),
+            SessionStatus.COMPLETED,
+            result_only=ResultOnlyDelivery.settled("adds no commit over origin/main"),
+        )
+
+        assert [a for a in actions if isinstance(a, CloseIssueAction)] == []
+
+    def test_the_genuine_evidence_run_still_closes(self, tmp_path: Path) -> None:
+        """The falsification control: an OBSERVED absence is the lane's premise."""
+        actions = make_planner(Config()).generate_completion_actions(
+            make_session(tmp_path),
+            SessionStatus.COMPLETED,
+            pull_request=NO_PULL_REQUEST,
+            result_only=ResultOnlyDelivery.settled("adds no commit over origin/main"),
+        )
+
+        assert [a for a in actions if isinstance(a, CloseIssueAction)]

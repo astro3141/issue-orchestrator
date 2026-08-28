@@ -49,6 +49,8 @@ from .completion_action_planner import (
     CompletionActionPlanner,
     has_review_exchange_errors,
 )
+from .completion_types import ResultOnlyDelivery
+from .pull_request_observation import observe_pull_request
 from .tech_lead_completion import discard_tech_lead_authority_after_completion
 from .invalid_record_actions import (
     failure_event_reason,
@@ -190,6 +192,7 @@ class CompletionHandler:
         diagnostic_path: Optional[str] = None,
         review_exchange_completed: bool = False,
         review_exchange_halted: bool = False,
+        result_only: ResultOnlyDelivery = ResultOnlyDelivery.none(),
         blocked_label: Optional[str] = None,
         blocked_reason: Optional[str] = None,
         completion_detail: Optional[dict[str, Any]] = None,
@@ -202,6 +205,10 @@ class CompletionHandler:
         With ``finalize_terminal=False`` the terminal trace event and the
         state-machine transition defer to ``finalize_terminal_outcome`` so the
         caller can drive both from the effective post-apply status (#6777).
+
+        ``result_only`` is CARRIED from the owner that proved it (#337), never
+        re-derived from a missing ``pr_url``: a PR that failed to open is also
+        missing one, and needs publish-failure routing, not a disposition.
         """
         start_time = time.monotonic()
         issue_key = session.key.issue.stable_id()
@@ -218,7 +225,17 @@ class CompletionHandler:
         review_exchange_halted = review_exchange_halted or has_review_exchange_errors(processing_errors)
 
         # Fetch PR info if completed (or use hint from completion processor)
-        pr_url, pr_number, pr_infos = self._fetch_pr_info(session, status, pr_url_hint=pr_url_hint)
+        pull_request = observe_pull_request(
+            session,
+            status,
+            repository_host=self.repository_host,
+            pr_url_hint=pr_url_hint,
+        )
+        pr_url, pr_number, pr_infos = (
+            pull_request.url,
+            pull_request.number,
+            pull_request.infos,
+        )
         if pr_infos:
             self._emit_pr_view_changed(
                 pr_infos[0],
@@ -281,9 +298,10 @@ class CompletionHandler:
                 review_exchange_halted=review_exchange_halted,
                 blocked_label=blocked_label,
                 blocked_reason=blocked_reason,
-                pr_url=pr_url,
+                pull_request=pull_request,
                 completion_detail=completion_detail,
                 provider_error_type=provider_error_type,
+                result_only=result_only,
             )
         )
         completion_actions.extend(
@@ -490,96 +508,6 @@ class CompletionHandler:
             )
             return []
         return [str(label) for label in labels]
-
-    def _fetch_pr_info(
-        self,
-        session: Session,
-        status: SessionStatus,
-        pr_url_hint: Optional[str] = None,
-    ) -> tuple[Optional[str], Optional[int], Optional[list[Any]]]:
-        """Fetch PR info for a completed session.
-
-        Returns ``(pr_url, pr_number, prs_list)``; ``pr_url_hint`` short-circuits
-        the branch lookup (dry-run mode).
-        """
-        pr_url = None
-        pr_number = None
-        prs = None
-
-        if status != SessionStatus.COMPLETED:
-            return pr_url, pr_number, prs
-
-        if session.key.task == TaskKind.RETROSPECTIVE_REVIEW:
-            return None, None, None
-
-        if pr_url_hint:
-            return self._fetch_pr_info_from_hint(session, pr_url_hint)
-
-        return self._fetch_pr_info_from_branch_or_review_fallback(session)
-
-    def _fetch_pr_info_from_hint(
-        self,
-        session: Session,
-        pr_url_hint: str,
-    ) -> tuple[Optional[str], Optional[int], Optional[list[Any]]]:
-        pr_url = pr_url_hint
-        pr_number: Optional[int] = None
-        prs: Optional[list[Any]] = None
-
-        match = re.search(r"/pull/(\d+)", pr_url)
-        if match:
-            pr_number = int(match.group(1))
-            try:
-                pr_info = self.repository_host.get_pr(pr_number)
-            except Exception as e:
-                logger.warning("Failed to fetch PR %s for PR hint: %s", pr_number, e)
-            else:
-                if pr_info:
-                    prs = [pr_info]
-
-        logger.info(
-            "[PR_HINT] Using PR from completion processor: %s (number=%s)",
-            pr_url,
-            pr_number,
-            extra=log_context(issue_key=session.key.issue.stable_id(), session_id=session.terminal_id),
-        )
-        return pr_url, pr_number, prs
-
-    def _fetch_pr_info_from_branch_or_review_fallback(
-        self,
-        session: Session,
-    ) -> tuple[Optional[str], Optional[int], Optional[list[Any]]]:
-        logger.debug("[ADAPTER] Using GitHubAdapter for get_prs_for_branch")
-        start = time.monotonic()
-        pr_infos = self.repository_host.get_prs_for_branch(session.branch_name)
-        duration = time.monotonic() - start
-        logger.info(
-            "Fetched PRs for branch in %.2fs: branch=%s count=%d",
-            duration,
-            session.branch_name,
-            len(pr_infos),
-            extra=log_context(issue_key=session.key.issue.stable_id(), session_id=session.terminal_id),
-        )
-        if pr_infos:
-            return pr_infos[0].url, pr_infos[0].number, list(pr_infos)
-
-        if session.pr_number is None:
-            return None, None, None
-
-        try:
-            review_pr = self.repository_host.get_pr(session.pr_number)
-        except Exception as e:
-            logger.warning(
-                "Failed to fetch PR %s for review session fallback: %s",
-                session.pr_number,
-                e,
-            )
-            return None, None, None
-
-        if review_pr:
-            return review_pr.url, review_pr.number, [review_pr]
-
-        return None, None, None
 
     def _create_history_entry(
         self,

@@ -269,6 +269,155 @@ Coder and reviewer communicate directly via MCP (Model Context Protocol). Same s
 
 Selects `via-mcp` if both agents support it, otherwise falls back to `via-local-loop`.
 
+## Publishing a run that changed no code
+
+`coding-done completed` asks for the same three actions for every ordinary run,
+in this order: `push_branch`, `create_pr`, `post_comment`. An ordinary work item
+does not have to change code to be finished — a measurement, an audit, a
+read-only investigation produces a RESULT and no commit — and for such a run
+`create_pr` cannot succeed: the forge refuses to open a pull request for a
+branch that adds nothing. The completion was then marked failed and
+`post_comment`, third in the tuple and the only action that publishes the
+result, never ran.
+
+`control/ordinary_zero_code.py` settles that. When a run reported `COMPLETED`
+and the orchestrator can PROVE its branch offers nothing, the two publication
+actions are dropped and `post_comment` is kept, so the reviewed RESULT reaches
+the issue and the outcome stays `completed`.
+
+Five facts are required, and any one of them missing is a refusal rather than a
+benefit of the doubt:
+
+| Fact | Read from | Missing means |
+|------|-----------|---------------|
+| outcome is `completed` | the completion record | ordinary path |
+| publication intent is still present | the plan being executed | nothing to drop |
+| `HEAD` is readable | orchestrator-side git | ordinary path |
+| tracked dirt enumerates, and is empty | `list_dirty_files("tracked")` | ordinary path |
+| the branch adds 0 commits over the PR base | `commits_against_base` | ordinary path |
+
+The settlement runs **last** — after the publish gate, the independent review
+exchange and the pre-publish gate have all judged this candidate and passed it.
+Nothing is bought by taking this lane: validation receipts, the reviewer verdict
+and the candidate execution identities above are recorded exactly as they are
+for a code-bearing run, and only the branch write and the pull request the run
+never needed are dropped. A halted or changes-requested exchange returns before
+the settlement is ever reached, so review cannot be bypassed by having produced
+no code.
+
+### What the settlement tells the phases after it
+
+The proof does not stop at the plan. Two phases run after the actions execute,
+and both would otherwise decide from weaker evidence, so the settlement is
+carried to them on `CompletionSettlement`:
+
+| Reader | Told | Otherwise |
+|--------|------|-----------|
+| the code-validation gate | this run offers no code candidate | the quick gate runs over a commit the run did not produce, and a failure there relaunches an already-published run as a coder retry against an empty branch |
+| `CompletionActionPlanner` | the posted comment is the whole delivery | `in-progress` is released with no `pr-pending` to take it over, and the finished issue is schedulable again on the very next tick |
+
+The first is the same `CodeCandidateSettlement` contract the tech-lead planning
+lane produces; this lane is its second producer, not a second rule.
+
+The second is what gives a zero-code success its **terminal disposition**: the
+orchestrator closes the issue. An ordinary run's issue is closed by the merge of
+the pull request its `Closes #N` body registered; a run with nothing to merge has
+no such carrier, so the close is planned from the settlement instead, carrying a
+short comment saying why an issue closed with no pull request. Reopening it is
+how an operator says the work is not finished.
+
+The close is ordered **before** the `in-progress` release — the opposite of where
+the tech-lead terminal close sits, and deliberately so. That one guards a
+tracking issue, where a half-applied batch is better left open and re-auditable.
+This one guards boundedness: an apply that fails after the release and before the
+close would leave an open, unlabelled, finished work item, which is precisely the
+state the scheduler cannot tell from work never started.
+
+**Ordering alone is not enough**, because it is not a fail-stop boundary:
+`ActionApplier` catches an ordinary close error, reports a failed `ActionResult`,
+and applies the rest of the batch. So the close is planned as a
+`ResultOnlyCloseIssueAction` and is a member of the **completion gate**
+(`control/completion_effect_gate.py`) alongside the tech-lead mandated
+`ResetRetryIssueAction`. Gate members apply first, as their own batch, and the
+success-only remainder applies only if every one of them commits:
+
+| Close | `in-progress` | Resulting state |
+|-------|---------------|-----------------|
+| commits | released | closed, finished — today's success |
+| fails | **withheld** | open, still claimed, and **blocked** — see below |
+
+A failed gate also makes the completion's *effective* terminal status `FAILED`,
+so the observer, history, retry gating and operator surface all agree that the
+run did not finish cleanly.
+
+**Withholding the release is not by itself the boundary.** `Scheduler` blocks
+`in-progress` only while an *active session* also exists, and this session has
+just terminalized — so the label is stale, the planner's ordinary stale cleanup
+removes it, and the only thing left holding the issue is the unreleased
+session-history claim, which is process-local and whose `failed` status is
+deliberately *not* one of `ABANDONED_AFTER_COMPLETION_HISTORY_STATUSES`. A
+restart would start again from an open, unlabelled, finished issue.
+
+So a failed gate also plants the shared `needs-human` blocking label with an
+explanation, which is what `domain/models.py` already says a `failed` completion
+is expected to do: *"plant a BLOCKING label, so the scheduler refuses the issue
+whether or not any in-memory gate is retired."* The escalation ends the way every
+other `SESSION_LIFECYCLE` block ends — a human clears the label — which is the
+same bounded stop the pre-#337 publish failure gave this run.
+
+`control/completion_gate_surfaces.py` is the one place that maps a gate kind to
+what the operator is told, and the mapping is **total** over
+`CompletionGateKind`: a gate that can withhold a completion's effects but leaves
+nothing durable behind is the defect, not a design choice. Each owner declares
+only the words (`GateFailureNarrative`), so a failed result-only close is never
+reported as a failed Reset & Retry and vice versa.
+
+An apply that *raised* past the runtime-kill boundary is not a gate kind at all —
+it is `UnjudgedApply`, the absence of any verdict. It still terminalizes the
+completion `FAILED`, and deliberately writes nothing: a second GitHub write
+immediately after a reconciliation/claim raise would re-fail and mask the
+re-raise.
+
+### The disposition needs two more things than the five facts
+
+The five facts are proven *before* the actions run — they are what shapes them —
+so they establish that the run had **nothing but a comment to deliver**, never
+that the comment **was** delivered, and never that the *issue* has nothing in
+flight. Both gaps close an issue that should not be closed, so both are checked:
+
+| Also required | Why | If missing |
+|---------------|-----|------------|
+| the comment actually posted | `add_comment` raises on a 5xx, a rate limit, or an over-size body; a record may request `post_comment` and carry no body; a record may not request it at all, leaving an empty plan that trivially "succeeds" | the disposition is withdrawn and the run is reported as `result_undelivered` — a **critical** error, so it takes the bounded publish-failure path (`publish-fail-count-N`, escalating to `needs-human`) rather than relaunching forever |
+| no pull request is **observed** for the issue | fact 5 asks what *this run* added over the base, not what is in flight for the issue. A rework worktree that arrives reset to the base satisfies every fact while its PR's commits live only on the remote | the close is refused; the run keeps the ordinary lifecycle |
+
+That second row is a *verdict*, not a missing url. `control/pull_request_observation.py`
+returns one of three answers, and only the middle one may close:
+
+| `PullRequestPresence` | Produced by | Terminal close |
+|-----------------------|-------------|----------------|
+| `OBSERVED_PRESENT` | the branch lookup found a PR, the session's PR read returned one, or the completion processor handed over a PR url | refused |
+| `OBSERVED_NONE` | the branch lookup ran and found nothing, and the session references no PR (or the one it references no longer exists) | allowed |
+| `UNKNOWN` | `get_pr(session.pr_number)` **raised**, the status is not `COMPLETED`, or the task kind never looks | refused (fail-closed) |
+
+The distinction is load-bearing for exactly the rework shape above: that session
+*has* a pull request, so a read that fails is the least safe moment to infer that
+it does not. `UNKNOWN` must never arrive as `OBSERVED_NONE`.
+
+`result_undelivered` is deliberately **not** one of the prefixes
+`PublishRecoveryService` reads. Those arm a Retry Publish that pushes a branch
+and opens a PR, and a zero-code run has no commit to push — offering that retry
+would send the operator straight back to the `create_pr` refusal #336 measured.
+
+Only the delivery half of the settlement is withdrawn. A comment that failed to
+post does not put commits on the branch, so the code-candidate proof still
+holds; withdrawing it too would hand the quick gate back a run with nothing to
+validate.
+
+Tech-lead runs are not settled here. Their publication intent is decided at the
+pre-action seam by `control/tech_lead_zero_code.py`, which drops `post_comment`
+instead of keeping it — tech-lead prompts promise the orchestrator posts no
+comment.
+
 ## Multi-Stage Review Pipeline
 
 After the review loop approves code, additional stages can run.

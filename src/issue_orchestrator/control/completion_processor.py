@@ -115,12 +115,19 @@ from .completion_pre_action import PreActionOutcome, settle_tech_lead_pre_action
 from .completion_pr_labels import apply_pr_labels, reserved_pr_label_error
 from .completion_types import (
     ActionExecutionOutcome,
+    CompletionSettlement,
+    ExecutedActions,
     ERROR_PREFIX_CREATE_PR,
     ERROR_PREFIX_PUBLISH_BLOCKED,
     ERROR_PREFIX_PUSH,
     ProcessingResult,
     RepublicationCheck,
+    ResultOnlyDelivery,
     REVIEW_EXCHANGE_ERROR_PREFIX,
+)
+from .ordinary_zero_code import (
+    confirm_result_only_delivery,
+    settle_ordinary_publication_plan,
 )
 from .pre_publish_gate import PrePublishGate, PrePublishGateResult
 from .validation_reroute_budget import DEFAULT_MAX_ATTEMPTS, ValidationRerouteBudget
@@ -776,7 +783,10 @@ class CompletionProcessor:
         )
         if pre_action.refusal is not None:
             return pre_action.refusal
-        code_candidate = pre_action.code_candidate
+        settlement = CompletionSettlement(
+            code_candidate=pre_action.code_candidate,
+            result_only=ResultOnlyDelivery.none(),
+        )
 
         # Get branch name for PR operations
         branch = self.git_adapter.get_current_branch(worktree)
@@ -818,16 +828,19 @@ class CompletionProcessor:
             issue_key=issue_key,
             rework=rework,
         )
+        # The pre-action owner's answer, narrowed by whatever the execution
+        # phase went on to prove — see ``CompletionSettlement.narrowed_by``.
+        settlement = settlement.narrowed_by(executed.settlement)
         if executed.early_result is not None:
-            return code_candidate.carried_by(executed.early_result)
+            return settlement.carried_by(executed.early_result)
 
         if executed.deferred:
             # Review exchange is running in the background. Leave the completion
             # record on disk so the next observation re-enters this pipeline,
             # and skip result artifacts / cleanup that would imply completion.
-            # The candidate settlement is deliberately NOT carried: this result
-            # is non-terminal, the pass that finishes the record settles it
-            # again from the same owner, and no validation decision reads it.
+            # The settlement is deliberately NOT carried: this result is
+            # non-terminal, the pass that finishes the record settles it again
+            # from the same owners, and no reader consults a deferred result.
             logger.info(
                 "Completion deferred (review exchange running): issue=%d session=%s",
                 issue_number,
@@ -869,7 +882,7 @@ class CompletionProcessor:
             post_issue_comment=self._add_issue_comment,
             cleanup_completion_record_fn=self._cleanup_completion_record,
         )
-        return code_candidate.carried_by(result)
+        return settlement.carried_by(result)
 
     def _review_exchange_approval_gate(
         self,
@@ -1599,11 +1612,13 @@ class CompletionProcessor:
         # not a second reading of where one might be (#180).
         exchange_run = exchange_result.run_assets if exchange_result else None
         if deferred or should_halt:
+            # Returned before the settler runs: this pass proved nothing.
             return ActionExecutionOutcome.of(
                 branch=branch,
                 pr_url=pr_url,
                 review_exchange_completed=review_exchange_completed,
                 review_exchange_run=exchange_run,
+                settlement=CompletionSettlement.unsettled(),
                 deferred=deferred,
             )
 
@@ -1625,16 +1640,25 @@ class CompletionProcessor:
                 pr_url=pr_url,
                 review_exchange_completed=review_exchange_completed,
                 review_exchange_run=exchange_run,
+                settlement=CompletionSettlement.unsettled(),
                 early_result=pre_publish_failure,
             )
 
-        (
-            branch,
-            pr_url,
-            review_exchange_completed,
-            action_result,
-        ) = self._execute_planned_actions(
+        # Every judge of this candidate has now run and passed. Only here may a
+        # run PROVEN to offer a branch nothing have that branch write dropped
+        # while its reviewed result still publishes (#337).
+        settled = settle_ordinary_publication_plan(
             plan=plan,
+            outcome=record.outcome,
+            worktree=worktree,
+            base_ref=f"origin/{self._base_branch()}",
+            worktree_reader=self.git_adapter,
+            governed_elsewhere=self._is_tech_lead_session(agent_label),
+            issue_number=issue_number,
+        )
+
+        executed_plan = self._execute_planned_actions(
+            plan=settled.plan,
             worktree=worktree,
             record=record,
             issue_number=issue_number,
@@ -1656,12 +1680,23 @@ class CompletionProcessor:
                 worktree, record, issue_number, run_assets, issue_key,
             ),
         )
+        # The settled lane held to its own standard now the actions have run:
+        # proving "nothing but a comment to deliver" is not proving it was
+        # delivered, and only the latter may close an issue (#337 r2).
+        confirmed = confirm_result_only_delivery(
+            settled.settlement,
+            result_delivered=executed_plan.result_delivered,
+            issue_number=issue_number,
+        )
+        if confirmed.publish_failure is not None:
+            errors.append(confirmed.publish_failure)
         return ActionExecutionOutcome.of(
-            branch=branch,
-            pr_url=pr_url,
-            review_exchange_completed=review_exchange_completed,
+            branch=executed_plan.branch,
+            pr_url=executed_plan.pr_url,
+            review_exchange_completed=executed_plan.review_exchange_completed,
             review_exchange_run=exchange_run,
-            early_result=action_result,
+            settlement=confirmed.settlement,
+            early_result=executed_plan.early_result,
         )
 
     def _execute_planned_actions(
@@ -1683,9 +1718,10 @@ class CompletionProcessor:
         exchange_result: Any | None,
         review_exchange_completed: bool,
         recertify_rewritten_head: RepublicationCheck,
-    ) -> tuple[str | None, str | None, bool, ProcessingResult | None]:
+    ) -> ExecutedActions:
         pr_url: str | None = None
         early_result: ProcessingResult | None = None
+        result_delivered = False
 
         for action in plan.ordered_actions:
             result = self._execute_action_with_observability(
@@ -1713,6 +1749,8 @@ class CompletionProcessor:
                 pr_url = result.pr_url
             if result.review_exchange_completed:
                 review_exchange_completed = True
+            if result.result_delivered:
+                result_delivered = True
             if result.early_result is not None:
                 early_result = result.early_result
             if result.skip_remaining:
@@ -1723,7 +1761,13 @@ class CompletionProcessor:
                     issue_number,
                 )
                 break
-        return branch, pr_url, review_exchange_completed, early_result
+        return ExecutedActions(
+            branch=branch,
+            pr_url=pr_url,
+            review_exchange_completed=review_exchange_completed,
+            early_result=early_result,
+            result_delivered=result_delivered,
+        )
 
     def _execute_action_with_observability(
         self,
@@ -1826,6 +1870,9 @@ class CompletionProcessor:
         branch: str | None = None  # Updated branch name
         pr_url: str | None = None  # PR URL if created
         review_exchange_completed: bool = False
+        # POSITIVE evidence that the issue comment reached the issue, set only
+        # by the action that posted it — see ``ExecutedActions`` (#337 r2).
+        result_delivered: bool = False
         # The completion's whole outcome, when an action refused publication
         # rather than merely failing: reported as the gate failure it is (#45).
         early_result: "ProcessingResult | None" = None
@@ -1903,6 +1950,8 @@ class CompletionProcessor:
     ) -> "_ActionResult":
         """Execute post-comment action with optional review comment event."""
         if not record.comment_body:
+            # An untrusted record may request this and carry no body: nothing
+            # posts, nothing raises, and nothing is reported as delivered.
             return self._ActionResult()
 
         comment_url = self.pr_adapter.add_comment(label_target, record.comment_body)
@@ -1915,7 +1964,9 @@ class CompletionProcessor:
                 comment_url=comment_url,
                 comment_body=record.comment_body,
             )
-        return self._ActionResult()
+        # Past a returning ``add_comment``, which raises on every failure: this
+        # line IS the proof the comment landed.
+        return self._ActionResult(result_delivered=True)
 
     def _execute_label_mutation_action(
         self,

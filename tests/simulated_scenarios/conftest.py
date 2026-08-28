@@ -16,6 +16,7 @@ from issue_orchestrator.domain.review_exchange_rework import ReviewExchangeRewor
 from issue_orchestrator.domain.review_exchange_run import ReviewExchangeRunAssets
 from issue_orchestrator.execution.agent_runner import AgentRunner, AgentSpec
 from issue_orchestrator.ports.working_copy import (
+    BranchCommitsResult,
     BranchPathsResult,
     BranchStatus,
     BranchTextFilesResult,
@@ -588,6 +589,7 @@ class StubWorkingCopy:
     """
 
     branch: str = "issue-1"
+    commits_ahead_of_base: int = 1
 
     def get_head_sha(self, worktree: Path) -> str | None:
         return "deadbeef"
@@ -645,6 +647,13 @@ class StubWorkingCopy:
         skip_hooks: bool = False,
     ) -> PushResult:
         return PushResult(success=True, branch=self.branch, remote=remote, message="ok")
+
+    def commits_against_base(
+        self, worktree: Path, base_ref: str
+    ) -> BranchCommitsResult:
+        # An ordinary coding candidate offers commits; a scenario that wants the
+        # zero-code publication lane (#337) sets this to 0 explicitly.
+        return BranchCommitsResult(success=True, count=self.commits_ahead_of_base)
 
     def diff_against_base(self, worktree: Path, base_ref: str) -> DiffResult:
         return DiffResult(success=True, diff_text="")

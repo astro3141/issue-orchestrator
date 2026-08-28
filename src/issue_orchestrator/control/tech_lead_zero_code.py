@@ -54,31 +54,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol
 
 from ..domain.models import RequestedAction, without_publication_intent
 from ..domain.tech_lead_session import TechLeadLaunchAuthority, TechLeadSessionFlavor
 from .candidate_integrity import CANDIDATE_DIRT_MODE
-
-_DIRT_PREVIEW = 5
-"""How many altered paths a refusal names before summarising."""
-
-
-class ZeroCodeWorktreeReader(Protocol):
-    """The two orchestrator-side reads that decide the lane.
-
-    Deliberately the narrowest contract this owner needs, and satisfied by the
-    completion path's existing git adapter — no new port, and no rummaging
-    through a broader one for two methods.
-    """
-
-    def get_head_sha(self, worktree: Path) -> str | None:
-        """The commit the checkout stands at, or ``None`` when unreadable."""
-        ...
-
-    def list_dirty_files(self, worktree: Path, mode: str) -> list[str] | None:
-        """Dirty paths for ``mode``, or ``None`` when enumeration failed."""
-        ...
+from .zero_code_reads import ZeroCodeWorktreeReader, summarise_dirt
 
 
 @dataclass(frozen=True, slots=True)
@@ -163,19 +143,11 @@ def _zero_code_refusal(
     if dirt is None:
         return f"the tracked changes in {worktree} could not be enumerated"
     if dirt:
-        return f"tracked content is modified in {worktree}: {_summarise(dirt)}"
+        return f"tracked content is modified in {worktree}: {summarise_dirt(dirt)}"
     return None
-
-
-def _summarise(paths: list[str]) -> str:
-    ordered = sorted(paths)
-    preview = ", ".join(ordered[:_DIRT_PREVIEW])
-    remaining = len(ordered) - _DIRT_PREVIEW
-    return f"{preview} (+{remaining} more)" if remaining > 0 else preview
 
 
 __all__ = [
     "ZeroCodePlanningSettlement",
-    "ZeroCodeWorktreeReader",
     "settle_zero_code_planning_completion",
 ]
