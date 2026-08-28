@@ -18,9 +18,13 @@ from pathlib import Path
 
 import pytest
 
-from issue_orchestrator.control.completion_types import CompletionSettlement
+from issue_orchestrator.control.completion_types import (
+    CompletionSettlement,
+    ERROR_PREFIX_RESULT_UNDELIVERED,
+)
 from issue_orchestrator.control.ordinary_zero_code import (
     ZeroCodeOrdinarySettlement,
+    confirm_result_only_delivery,
     settle_ordinary_publication_plan,
     settle_zero_code_ordinary_completion,
 )
@@ -380,3 +384,74 @@ class TestWhatTheSettlementTellsThePhasesDownstream:
         assert settlement.zero_code is False, why
         assert settlement.code_candidate.offers_code_candidate is True
         assert settlement.result_only.delivered is False
+
+
+class TestTheSettledLaneIsHeldToItsDelivery:
+    """The sixth fact, which cannot be known when the lane is chosen.
+
+    The five facts prove the run had nothing but a comment to deliver. Read as
+    "the comment was delivered", they hand a terminal disposition to a run
+    whose RESULT never arrived — the issue closed with no deliverable, which is
+    the inverse of what the lane exists to do.
+    """
+
+    def _settled(self) -> CompletionSettlement:
+        return settle(FakeCandidateReader()).settlement
+
+    def test_a_confirmed_delivery_keeps_the_settlement_whole(self) -> None:
+        confirmed = confirm_result_only_delivery(
+            self._settled(), result_delivered=True, issue_number=41
+        )
+
+        assert confirmed.settlement == self._settled()
+        assert confirmed.publish_failure is None
+
+    def test_an_unconfirmed_delivery_withdraws_the_disposition(self) -> None:
+        confirmed = confirm_result_only_delivery(
+            self._settled(), result_delivered=False, issue_number=41
+        )
+
+        assert confirmed.settlement.result_only.delivered is False
+
+    def test_an_unconfirmed_delivery_names_a_publish_failure(self) -> None:
+        """Withdrawing alone would only relaunch the finished issue forever."""
+        confirmed = confirm_result_only_delivery(
+            self._settled(), result_delivered=False, issue_number=41
+        )
+
+        assert confirmed.publish_failure is not None
+        assert confirmed.publish_failure.startswith(ERROR_PREFIX_RESULT_UNDELIVERED)
+        assert "#41" in confirmed.publish_failure
+
+    def test_the_code_candidate_proof_is_not_withdrawn_with_it(self) -> None:
+        """A comment that failed to post does not put commits on the branch.
+
+        Withdrawing both would hand the quick gate back a run with nothing to
+        validate, reopening the #328 drift on a failure path.
+        """
+        confirmed = confirm_result_only_delivery(
+            self._settled(), result_delivered=False, issue_number=41
+        )
+
+        assert confirmed.settlement.code_candidate.offers_code_candidate is False
+        assert confirmed.settlement.code_candidate.detail
+
+    @pytest.mark.parametrize("result_delivered", [True, False])
+    def test_a_run_that_never_settled_here_is_never_charged(
+        self, result_delivered: bool
+    ) -> None:
+        """The boundary: this failure belongs to the settled lane alone.
+
+        A code-bearing run's branch and pull request carry its work, so its
+        comment failing is the soft error it has always been.
+        """
+        code_bearing = settle(
+            FakeCandidateReader(commits=BranchCommitsResult(success=True, count=1))
+        ).settlement
+
+        confirmed = confirm_result_only_delivery(
+            code_bearing, result_delivered=result_delivered, issue_number=41
+        )
+
+        assert confirmed.publish_failure is None
+        assert confirmed.settlement == code_bearing

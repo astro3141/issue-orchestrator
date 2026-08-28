@@ -24,6 +24,20 @@ ERROR_PREFIX_TECH_LEAD_AUTHORITY = "tech_lead_authority"
 # must do instead is force the completion to FAIL, so an untrusted block request
 # that was dropped can never be reported as a success.
 ERROR_PREFIX_GOVERNED_LABEL = "governed_label"
+# A run settled onto the zero-code lane whose issue comment — the ONLY thing it
+# had to deliver — did not reach the issue (#337 round 2). Critical, because on
+# that lane the comment IS the publication: the branch write was dropped, so
+# nothing else carries the result, and a quiet success would close a work item
+# whose deliverable never arrived.
+#
+# Its own prefix, and deliberately NOT one of the publish prefixes
+# ``PublishRecoveryService`` reads: those arm durable retry locators for a
+# Retry Publish that pushes a branch and opens a PR, and this run has no commit
+# to push — offering that retry would send the operator back to the exact
+# create_pr refusal #336 measured. What this prefix must do instead is route the
+# completion to the bounded publish-failure owner, which counts the failures and
+# escalates to needs-human.
+ERROR_PREFIX_RESULT_UNDELIVERED = "result_undelivered"
 REVIEW_EXCHANGE_ERROR_PREFIX = "review_exchange:"
 
 
@@ -104,11 +118,23 @@ class ResultOnlyDelivery:
     again — so the next tick would launch the same measurement, run the same
     review exchange, and post a second RESULT, unbounded.
 
-    ``delivered`` is False for every completion no owner settled this way,
-    which is the fail-safe direction: exactly today's behaviour, including
-    every refusal, which proves nothing about a checkout. ``detail`` is the
-    settling owner's own sentence, so the record of a terminal disposition
-    says which run proved what.
+    ``delivered`` is a fact about what LANDED, not about what the run had to
+    give. Those are two different statements and the difference is the whole
+    finding of #337 round 2: the settler decides the lane BEFORE the actions
+    run — it has to, it shapes them — so at that moment it can only prove "this
+    run has nothing but a comment to deliver". Consuming that as "the comment
+    was delivered" closes an issue whose ``add_comment`` was rejected by the
+    forge, or whose record carried no comment body at all: the RESULT never
+    arrives and the work item is closed anyway, which is the exact inverse of
+    what this lane exists to fix. So the claim is withdrawn unless the posting
+    is confirmed, and the run takes the bounded publish-failure routing
+    instead.
+
+    False for every completion no owner settled this way, which is the
+    fail-safe direction: exactly today's behaviour, including every refusal,
+    which proves nothing about a checkout. ``detail`` is the settling owner's
+    own sentence, so the record of a terminal disposition says which run proved
+    what.
     """
 
     delivered: bool
@@ -165,6 +191,19 @@ class CompletionSettlement:
             code_candidate=self.code_candidate.narrowed_by(later.code_candidate),
             result_only=self.result_only.narrowed_by(later.result_only),
         )
+
+    def undelivered(self) -> "CompletionSettlement":
+        """This settlement with its result-only half withdrawn.
+
+        Only that half. The two are proven by different evidence at different
+        times: ``code_candidate`` is proven by reads of the checkout before the
+        actions run and is untouched by what they did — a comment that failed
+        to post does not put commits on the branch — while ``result_only``
+        claims a delivery landed, which only executing the plan can establish.
+        Withdrawing both would hand the quick gate back a run with nothing to
+        validate, reopening the #328 drift on a failure path.
+        """
+        return replace(self, result_only=ResultOnlyDelivery.none())
 
     def carried_by(self, result: "ProcessingResult") -> "ProcessingResult":
         """``result``, naming this settlement for its downstream readers.
@@ -259,6 +298,26 @@ class ProcessingResult:
         return self.review_exchange_deferred or self.validation_failed_rerouted
 
 
+@dataclass(frozen=True, slots=True)
+class ExecutedActions:
+    """What running one completion's ordered actions actually produced.
+
+    Named rather than returned as a tuple because ``result_delivered`` is the
+    kind of fact a positional slot loses: it is the POSITIVE evidence that the
+    issue comment reached the issue, recorded by the action that posted it, and
+    it is what a terminal disposition may be planned from. Derived from the
+    absence of an error instead, it would be wrong in both directions — an
+    absent ``comment_body`` posts nothing and raises nothing, and an error from
+    a later action says nothing about an earlier comment that did land.
+    """
+
+    branch: str | None
+    pr_url: str | None
+    review_exchange_completed: bool
+    early_result: "ProcessingResult | None"
+    result_delivered: bool
+
+
 @dataclass(frozen=True)
 class ActionExecutionOutcome:
     """What executing one completion record's requested actions produced.
@@ -278,6 +337,20 @@ class ActionExecutionOutcome:
     both of its answers are read after it returns (#337). It is a required
     argument, not a defaulted one, so an exit that settled nothing has to say
     so with :meth:`CompletionSettlement.unsettled` rather than by omission.
+
+    The discipline is deliberately strictest HERE and defaulted on the hops
+    that follow (``handle_session_completion``,
+    ``CompletionHandler.process_completion``,
+    ``CompletionActionPlanner.generate_completion_actions``), and the asymmetry
+    is about who can forget what. This type has ONE producer — the phase that
+    holds the settler — and several exits out of it, so omission is the live
+    risk and requiring the argument is what closes it. The hops downstream have
+    a single live caller each and many test callers; requiring the argument
+    there would buy no protection this constructor does not already give and
+    would make every existing caller restate a fail-safe default. If a second
+    production caller of any of those hops ever appears, the argument should
+    become required at that hop too — its failure mode is silent (the finished
+    issue simply reappears in the schedulable pool).
 
     Build one with :meth:`of`, never by calling this constructor: an
     ``early_result`` is returned to the caller VERBATIM and never passes the

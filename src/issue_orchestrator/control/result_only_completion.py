@@ -58,6 +58,8 @@ def result_only_terminal_actions(
     session: Session,
     expected: ExpectedState,
     result_only: ResultOnlyDelivery,
+    *,
+    pull_request_url: str | None,
 ) -> list[Action]:
     """The terminal disposition of a run whose comment is its whole delivery.
 
@@ -65,12 +67,37 @@ def result_only_terminal_actions(
     ordinary PR-carried lifecycle, which is also the fail-safe direction: an
     unsettled run keeps exactly today's behaviour.
 
-    Its caller orders this BEFORE the release of the claim label, so a partial
+    ``pull_request_url`` is a SECOND, independent condition, and it is here
+    because the settlement's five facts answer "did this RUN produce code?"
+    and not "does this ISSUE have work in flight" (#337 round 2, N4). The two
+    come apart in a shape this repository has actually seen: a rework worktree
+    that arrives reset to the base, its pull request's commits reachable only
+    from the remote branch. Such a run has a clean tree, sits at the base, adds
+    no commit, and would satisfy every fact the lane proves — and closing its
+    issue would close one whose pull request is open and unmerged.
+
+    A genuine evidence run has no pull request; that is the whole premise of
+    the lane. So the presence of one is enough to refuse, and it costs nothing
+    to ask: the completion handler has already fetched it for this issue. It is
+    a guard rather than the proof — an unreadable PR lookup yields ``None`` and
+    falls back to the settlement — which is why it sits beside the settlement
+    instead of replacing any part of it.
+
+    The caller orders this BEFORE the release of the claim label, so a partial
     apply fails safe: a closed issue is out of selection whatever becomes of
     its labels afterwards, whereas a released-but-unclosed one is exactly the
     unbounded relaunch this module exists to prevent.
     """
     if not result_only.delivered:
+        return []
+    if pull_request_url:
+        logger.warning(
+            "[COMPLETION] Result-only delivery for issue #%d, but pull request"
+            " %s exists for it; refusing the terminal close (%s)",
+            session.issue.number,
+            pull_request_url,
+            result_only.detail,
+        )
         return []
     logger.info(
         "[COMPLETION] Result-only delivery - closing issue #%d: %s",

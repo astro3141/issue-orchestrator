@@ -333,6 +333,28 @@ This one guards boundedness: an apply that fails after the release and before th
 close would leave an open, unlabelled, finished work item, which is precisely the
 state the scheduler cannot tell from work never started.
 
+### The disposition needs two more things than the five facts
+
+The five facts are proven *before* the actions run — they are what shapes them —
+so they establish that the run had **nothing but a comment to deliver**, never
+that the comment **was** delivered, and never that the *issue* has nothing in
+flight. Both gaps close an issue that should not be closed, so both are checked:
+
+| Also required | Why | If missing |
+|---------------|-----|------------|
+| the comment actually posted | `add_comment` raises on a 5xx, a rate limit, or an over-size body; a record may request `post_comment` and carry no body; a record may not request it at all, leaving an empty plan that trivially "succeeds" | the disposition is withdrawn and the run is reported as `result_undelivered` — a **critical** error, so it takes the bounded publish-failure path (`publish-fail-count-N`, escalating to `needs-human`) rather than relaunching forever |
+| no pull request exists for the issue | fact 5 asks what *this run* added over the base, not what is in flight for the issue. A rework worktree that arrives reset to the base satisfies every fact while its PR's commits live only on the remote | the close is refused; the run keeps the ordinary lifecycle |
+
+`result_undelivered` is deliberately **not** one of the prefixes
+`PublishRecoveryService` reads. Those arm a Retry Publish that pushes a branch
+and opens a PR, and a zero-code run has no commit to push — offering that retry
+would send the operator straight back to the `create_pr` refusal #336 measured.
+
+Only the delivery half of the settlement is withdrawn. A comment that failed to
+post does not put commits on the branch, so the code-candidate proof still
+holds; withdrawing it too would hand the quick gate back a run with nothing to
+validate.
+
 Tech-lead runs are not settled here. Their publication intent is decided at the
 pre-action seam by `control/tech_lead_zero_code.py`, which drops `post_comment`
 instead of keeping it — tech-lead prompts promise the orchestrator posts no

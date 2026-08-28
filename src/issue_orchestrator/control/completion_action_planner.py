@@ -28,6 +28,7 @@ from .completion_types import (
     ERROR_PREFIX_PUBLISH_BLOCKED,
     ERROR_PREFIX_PUSH,
     ERROR_PREFIX_TECH_LEAD_AUTHORITY,
+    ERROR_PREFIX_RESULT_UNDELIVERED,
     ERROR_PREFIX_TECH_LEAD_DECISION,
     ResultOnlyDelivery,
     REVIEW_EXCHANGE_ERROR_PREFIX,
@@ -75,6 +76,11 @@ def critical_processing_errors(
                 ERROR_PREFIX_PUBLISH_BLOCKED,
                 ERROR_PREFIX_TECH_LEAD_DECISION,
                 ERROR_PREFIX_TECH_LEAD_AUTHORITY,
+                # Unconditionally critical, unlike create_pr: there is no
+                # "but it landed anyway" evidence to look for. On the zero-code
+                # lane the comment IS the publication, so its loss means the
+                # run published nothing at all (#337 round 2).
+                ERROR_PREFIX_RESULT_UNDELIVERED,
             )
         ):
             critical.append(error)
@@ -391,6 +397,7 @@ class CompletionActionPlanner:
                 diagnostic_path=diagnostic_path,
                 review_exchange_halted=review_exchange_halted,
                 result_only=result_only,
+                pr_url=pr_url,
             )
 
         if status == SessionStatus.TIMED_OUT:
@@ -441,6 +448,7 @@ class CompletionActionPlanner:
         diagnostic_path: Optional[str],
         review_exchange_halted: bool,
         result_only: ResultOnlyDelivery,
+        pr_url: Optional[str],
     ) -> tuple[Action, ...]:
         """What a self-reported COMPLETED session actually comes to.
 
@@ -483,7 +491,14 @@ class CompletionActionPlanner:
         # relaunches it. Closing first makes a partial apply fail SAFE: a closed
         # issue is out of selection whatever happens to its labels afterwards.
         actions: list[Action] = list(
-            result_only_terminal_actions(session, expected, result_only)
+            result_only_terminal_actions(
+                session,
+                expected,
+                result_only,
+                # A settled run that nonetheless HAS a pull request is not the
+                # shape this lane proves; the disposition refuses (#337 r2 N4).
+                pull_request_url=pr_url,
+            )
         )
         actions.append(
             RemoveLabelAction(

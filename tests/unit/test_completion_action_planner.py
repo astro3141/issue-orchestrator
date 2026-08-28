@@ -24,6 +24,7 @@ from issue_orchestrator.control.completion_action_planner import (
 from issue_orchestrator.control.completion_types import (
     ERROR_PREFIX_CREATE_PR,
     ERROR_PREFIX_PUSH,
+    ERROR_PREFIX_RESULT_UNDELIVERED,
     ResultOnlyDelivery,
 )
 from issue_orchestrator.control.tech_lead_completion import (
@@ -3455,3 +3456,102 @@ class TestAResultOnlyRunReachesATerminalDisposition:
         )
 
         assert self._closes(actions) == []
+
+
+class TestAnUndeliveredResultIsBoundedNotClosed:
+    """A settled run whose comment never landed takes the bounded failure path.
+
+    Withdrawing the terminal disposition alone would put the finished issue
+    straight back in the schedulable pool — the round-1 F1 loop, on a failure
+    path. On the zero-code lane the comment IS the publication, so its loss is
+    a publish failure: counted by ``publish-fail-count-N`` and escalated to
+    ``needs-human``, which is the bounded, fail-closed behaviour #336 recorded
+    for this same run before the lane existed.
+    """
+
+    UNDELIVERED = (
+        f"{ERROR_PREFIX_RESULT_UNDELIVERED}: the run for issue #1 offered no"
+        " code candidate, so its issue comment was its whole delivery, and"
+        " that comment did not reach the issue; nothing was published"
+    )
+
+    def _actions(self, tmp_path: Path) -> tuple[object, ...]:
+        return make_planner(Config()).generate_completion_actions(
+            make_session(tmp_path),
+            SessionStatus.COMPLETED,
+            processing_errors=[self.UNDELIVERED],
+            # The settlement is already withdrawn upstream; passing it settled
+            # here proves the routing does not depend on that withdrawal alone.
+            result_only=ResultOnlyDelivery.settled("adds no commit over origin/main"),
+        )
+
+    def test_the_issue_is_not_closed(self, tmp_path: Path) -> None:
+        actions = self._actions(tmp_path)
+
+        assert [a for a in actions if isinstance(a, CloseIssueAction)] == []
+
+    def test_the_run_is_counted_against_the_publish_failure_budget(
+        self, tmp_path: Path
+    ) -> None:
+        """Bounded: the counter is what eventually escalates to needs-human."""
+        actions = self._actions(tmp_path)
+
+        assert any(
+            label.startswith("publish-fail-count-") for label in added_labels(actions)
+        )
+        assert "publish-failed" in added_labels(actions)
+
+    def test_the_error_is_classified_critical(self) -> None:
+        """The classification is what routes it; pinned at its own owner."""
+        critical, downgraded = critical_processing_errors([self.UNDELIVERED])
+
+        assert critical == [self.UNDELIVERED]
+        assert downgraded == []
+
+    def test_a_pr_url_cannot_downgrade_it(self) -> None:
+        """Unlike create_pr, there is no "but it landed anyway" evidence.
+
+        A create_pr error is downgraded when reconciliation finds a PR. Nothing
+        can find a comment that was never posted, so this prefix is critical
+        unconditionally.
+        """
+        critical, _downgraded = critical_processing_errors(
+            [self.UNDELIVERED], pr_url="https://example.test/owner/repo/pull/7"
+        )
+
+        assert critical == [self.UNDELIVERED]
+
+
+class TestTheDispositionRefusesAnIssueWithWorkInFlight:
+    """Fact 5 proves "this RUN produced no code", not "nothing is in flight".
+
+    The two come apart in a shape this repository has seen: a rework worktree
+    that arrives reset to the base, its pull request's commits reachable only
+    from the remote branch. Such a run has a clean tree, sits at the base, and
+    adds no commit — every fact the lane proves — and closing its issue would
+    close one whose pull request is open and unmerged.
+    """
+
+    def test_a_settled_run_with_an_open_pull_request_is_not_closed(
+        self, tmp_path: Path
+    ) -> None:
+        actions = make_planner(Config()).generate_completion_actions(
+            make_session(tmp_path),
+            SessionStatus.COMPLETED,
+            pr_url="https://example.test/owner/repo/pull/7",
+            result_only=ResultOnlyDelivery.settled("adds no commit over origin/main"),
+        )
+
+        assert [a for a in actions if isinstance(a, CloseIssueAction)] == []
+        assert "in-progress" in removed_labels(actions)
+
+    def test_the_genuine_evidence_run_still_closes(self, tmp_path: Path) -> None:
+        """The falsification control: no pull request is the lane's premise."""
+        actions = make_planner(Config()).generate_completion_actions(
+            make_session(tmp_path),
+            SessionStatus.COMPLETED,
+            pr_url=None,
+            result_only=ResultOnlyDelivery.settled("adds no commit over origin/main"),
+        )
+
+        assert [a for a in actions if isinstance(a, CloseIssueAction)]

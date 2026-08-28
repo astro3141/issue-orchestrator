@@ -662,6 +662,214 @@ class TestOrdinaryZeroCodePublication:
         assert result.result_only.delivered is False
 
 
+class TestTheSettledLaneProvesItsDeliveryLanded:
+    """A settled run that published NOTHING must not be reported as delivered.
+
+    The five facts are proven before the actions run — they are what shapes
+    them — so at that moment they can only establish "this run has nothing but
+    a comment to deliver". Read afterwards as "the comment was delivered", they
+    hand a terminal disposition to a run whose RESULT never arrived: the issue
+    is closed with no deliverable, which is the exact inverse of what #337
+    exists to fix and worse than the bounded failure it replaced.
+
+    Three reachable ways a settled run delivers nothing, one class each. All
+    three must withdraw the disposition AND report the bounded publish failure,
+    because withdrawing alone would only put the finished issue back in the
+    schedulable pool unbounded.
+    """
+
+    ZERO_CODE_INTENTS = [
+        RequestedAction.PUSH_BRANCH,
+        RequestedAction.CREATE_PR,
+        RequestedAction.POST_COMMENT,
+    ]
+
+    def _run(
+        self,
+        processor,
+        worktree_with_completion,
+        mock_git_adapter,
+        *,
+        requested_actions=None,
+        comment_body="## Implementation\n\nThe measured RESULT.",
+    ):
+        mock_git_adapter.get_head_sha = Mock(return_value="c" * 40)
+        mock_git_adapter.commits_against_base = Mock(
+            return_value=BranchCommitsResult(success=True, count=0)
+        )
+        record = make_record(
+            outcome=CompletionOutcome.COMPLETED,
+            requested_actions=list(
+                self.ZERO_CODE_INTENTS if requested_actions is None
+                else requested_actions
+            ),
+            summary="Evidence-only measurement",
+            implementation="Read-only observation; no file was changed.",
+            comment_body=comment_body,
+        )
+        worktree = worktree_with_completion(record)
+        return processor.process(
+            worktree,
+            run_assets=make_session_run_assets(worktree),
+            issue_number=123,
+            issue_title="Evidence-only issue",
+            issue_key=None,
+        )
+
+    @staticmethod
+    def _posted_bodies(mock_pr_adapter) -> list[str]:
+        return [call.args[1] for call in mock_pr_adapter.add_comment.call_args_list]
+
+    @staticmethod
+    def _undelivered_errors(result) -> list[str]:
+        from issue_orchestrator.control.completion_types import (
+            ERROR_PREFIX_RESULT_UNDELIVERED,
+        )
+
+        return [
+            error
+            for error in (result.errors or [])
+            if error.startswith(ERROR_PREFIX_RESULT_UNDELIVERED)
+        ]
+
+    def test_a_rejected_comment_withdraws_the_terminal_disposition(
+        self, processor, worktree_with_completion, mock_git_adapter, mock_pr_adapter
+    ):
+        """Trigger 1: the forge refuses the comment.
+
+        ``add_comment`` raises on any failure — a 5xx, a rate limit, a locked
+        issue, a body over GitHub's comment size limit, which an evidence-run
+        RESULT can plausibly exceed. ``post_comment`` is not a publication
+        action, so nothing halts and nothing was critical before this.
+        """
+        mock_pr_adapter.add_comment = Mock(side_effect=RuntimeError("502 Bad Gateway"))
+
+        result = self._run(processor, worktree_with_completion, mock_git_adapter)
+
+        assert result.result_only.delivered is False
+
+    def test_a_rejected_comment_is_reported_as_a_publish_failure(
+        self, processor, worktree_with_completion, mock_git_adapter, mock_pr_adapter
+    ):
+        """Withdrawing alone would leave the finished issue relaunching forever.
+
+        On this lane the comment IS the publication, so its loss has to reach
+        the bounded publish-failure owner that counts failures and escalates.
+        """
+        mock_pr_adapter.add_comment = Mock(side_effect=RuntimeError("502 Bad Gateway"))
+
+        result = self._run(processor, worktree_with_completion, mock_git_adapter)
+
+        assert self._undelivered_errors(result)
+        assert result.success is False
+
+    def test_a_record_with_no_comment_body_publishes_nothing_and_says_so(
+        self, processor, worktree_with_completion, mock_git_adapter, mock_pr_adapter
+    ):
+        """Trigger 2: the silent one, and the reason absence of error is not proof.
+
+        Nothing requires a body when ``post_comment`` is requested, and a
+        completion record is untrusted agent input by this repository's own
+        principle. The action then posts nothing and raises nothing.
+        """
+        result = self._run(
+            processor, worktree_with_completion, mock_git_adapter, comment_body=None
+        )
+
+        assert result.result_only.delivered is False
+        assert self._undelivered_errors(result)
+        # The ONLY thing that reached the issue is the processing-failure
+        # notice, so the operator sees a run that published nothing.
+        posted = self._posted_bodies(mock_pr_adapter)
+        assert posted and all(
+            "Orchestrator Processing Failed" in body for body in posted
+        )
+
+    def test_a_record_that_never_asked_to_comment_publishes_nothing(
+        self, processor, worktree_with_completion, mock_git_adapter, mock_pr_adapter
+    ):
+        """Trigger 3: dropping both publication actions leaves an EMPTY plan.
+
+        An empty plan trivially "succeeds", and the run would be handed the
+        terminal disposition for having executed nothing at all.
+        """
+        result = self._run(
+            processor,
+            worktree_with_completion,
+            mock_git_adapter,
+            requested_actions=[RequestedAction.PUSH_BRANCH, RequestedAction.CREATE_PR],
+        )
+
+        assert result.result_only.delivered is False
+        assert self._undelivered_errors(result)
+        assert not any(
+            "The measured RESULT." in body
+            for body in self._posted_bodies(mock_pr_adapter)
+        )
+
+    def test_the_code_candidate_proof_survives_an_undelivered_result(
+        self, processor, worktree_with_completion, mock_git_adapter, mock_pr_adapter
+    ):
+        """Only the delivery half is withdrawn.
+
+        A comment that failed to post does not put commits on the branch, so
+        the checkout reads still hold. Withdrawing both would hand the quick
+        gate back a run with nothing to validate, reopening the #328 drift on a
+        failure path.
+        """
+        mock_pr_adapter.add_comment = Mock(side_effect=RuntimeError("502 Bad Gateway"))
+
+        result = self._run(processor, worktree_with_completion, mock_git_adapter)
+
+        assert result.code_candidate.offers_code_candidate is False
+        assert result.code_candidate.detail
+
+    def test_a_delivered_result_reports_no_failure_and_keeps_its_disposition(
+        self, processor, worktree_with_completion, mock_git_adapter, mock_pr_adapter
+    ):
+        """The falsification control: the happy path must stay untouched."""
+        result = self._run(processor, worktree_with_completion, mock_git_adapter)
+
+        mock_pr_adapter.add_comment.assert_called_once()
+        assert result.result_only.delivered is True
+        assert self._undelivered_errors(result) == []
+        assert result.success is True
+
+    def test_a_code_bearing_run_whose_comment_fails_is_not_charged_this_error(
+        self, processor, worktree_with_completion, mock_git_adapter, mock_pr_adapter
+    ):
+        """The boundary: the ordinary lane's post_comment behaviour is untouched.
+
+        A code-bearing run's branch and pull request still carry its work, so a
+        failed comment is the soft error it has always been — not a claim that
+        the run published nothing.
+        """
+        mock_git_adapter.get_head_sha = Mock(return_value="c" * 40)
+        mock_git_adapter.commits_against_base = Mock(
+            return_value=BranchCommitsResult(success=True, count=1)
+        )
+        mock_pr_adapter.add_comment = Mock(side_effect=RuntimeError("502 Bad Gateway"))
+        record = make_record(
+            outcome=CompletionOutcome.COMPLETED,
+            requested_actions=list(self.ZERO_CODE_INTENTS),
+            summary="Real work",
+            implementation="Changed a file.",
+            comment_body="## Implementation\n\nDone.",
+        )
+        worktree = worktree_with_completion(record)
+
+        result = processor.process(
+            worktree,
+            run_assets=make_session_run_assets(worktree),
+            issue_number=123,
+            issue_title="Ordinary issue",
+            issue_key=None,
+        )
+
+        assert self._undelivered_errors(result) == []
+        mock_git_adapter.push.assert_called_once()
+
+
 class TestCompletionProcessorLabelActions:
     """Tests for label-related actions from completion records."""
 

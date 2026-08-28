@@ -75,6 +75,7 @@ from tests.unit.session_run_helpers import make_session_run_assets
 
 TECH_LEAD_AGENT = "agent:tech-lead"
 CODER_AGENT = "agent:coder"
+RESULT_BODY = "## Implementation\n\nThe measured RESULT."
 LAUNCH_SHA = "c" * 40
 MOVED_SHA = "d" * 40
 QUICK_CMD = "./scripts/validate-quick.sh"
@@ -166,15 +167,28 @@ def _config(tmp_path: Path) -> Config:
     return config
 
 
-def _completion_record(session_id: str = "planning-run") -> CompletionRecord:
-    """What ``coding-done completed`` writes — planning runs included."""
+def _completion_record(
+    session_id: str = "planning-run",
+    *,
+    comment_body: str | None = None,
+) -> CompletionRecord:
+    """What ``coding-done completed`` writes — planning runs included.
+
+    The real CLI always asks for ``post_comment`` and always carries a body;
+    ``comment_body`` is supplied only where a test needs the ordinary lane's
+    deliverable, because the tech_lead lane drops the comment either way.
+    """
+    actions = [RequestedAction.PUSH_BRANCH, RequestedAction.CREATE_PR]
+    if comment_body is not None:
+        actions.append(RequestedAction.POST_COMMENT)
     return CompletionRecord(
         session_id=session_id,
         timestamp=datetime.now().isoformat(),
         outcome=CompletionOutcome.COMPLETED,
         summary="Prepared #123",
-        requested_actions=[RequestedAction.PUSH_BRANCH, RequestedAction.CREATE_PR],
+        requested_actions=actions,
         implementation="Read the issue and proposed follow-up work",
+        comment_body=comment_body,
     )
 
 
@@ -535,7 +549,7 @@ class TestSettledZeroCodeOrdinaryRun:
         run_assets = make_session_run_assets(worktree, session_name="issue-123")
         completion_path = _write_completion(
             worktree,
-            _completion_record("coder-run"),
+            _completion_record("coder-run", comment_body=RESULT_BODY),
             f"completion-{sanitize_agent_label(CODER_AGENT)}.json",
         )
         events = RecordingEventSink()

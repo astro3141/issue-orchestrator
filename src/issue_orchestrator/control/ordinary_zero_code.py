@@ -55,6 +55,14 @@ run's claim label with nothing to take its place. So the proof leaves here on
 contract rather than re-derived from a role name or the shape of a completion
 record that says the opposite.
 
+**A sixth fact is required, and it cannot be known when the lane is chosen.**
+The five above prove the run had nothing but a comment to deliver; they do NOT
+prove the comment WAS delivered, and the difference decides whether a work item
+may be closed. The settler runs before the actions — it is what shapes them —
+so :func:`confirm_result_only_delivery` holds the settled lane to the same
+standard afterwards, and an unconfirmed delivery is a refusal there exactly as
+an unreadable checkout is here.
+
 **Fact 5 is the ordinary analogue of the planning lane's launch-base equality,
 not a copy of it.** :mod:`.tech_lead_zero_code` proves a planning run stood
 still by comparing its HEAD against the base the ORCHESTRATOR launched it on —
@@ -103,6 +111,7 @@ from .candidate_integrity import CANDIDATE_DIRT_MODE
 from .completion_types import (
     CodeCandidateSettlement,
     CompletionSettlement,
+    ERROR_PREFIX_RESULT_UNDELIVERED,
     ResultOnlyDelivery,
 )
 from .review_publish_pipeline import PublishPipelinePlan
@@ -346,10 +355,84 @@ def settle_ordinary_publication_plan(
     )
 
 
+@dataclass(frozen=True, slots=True)
+class ConfirmedResultDelivery:
+    """The settlement as EXECUTION left it, and the failure to report if any.
+
+    ``publish_failure`` is ``None`` on every path but one: a run that took the
+    zero-code lane and whose comment did not land. The string is returned
+    rather than appended to a caller's error list here, so this module stays a
+    decision and the caller keeps ownership of its own accumulators.
+    """
+
+    settlement: CompletionSettlement
+    publish_failure: str | None
+
+
+def confirm_result_only_delivery(
+    settlement: CompletionSettlement,
+    *,
+    result_delivered: bool,
+    issue_number: int,
+) -> ConfirmedResultDelivery:
+    """Hold the settled lane to the standard the rest of this module keeps.
+
+    Every one of the five facts above is PROVEN before the lane is taken. The
+    sixth is not knowable then: whether the comment the lane preserved actually
+    reached the issue can only be answered after the actions run, and the
+    settler cannot wait for that — it is what shapes those actions.
+
+    So it is answered here, and an unproven answer is a refusal exactly as it
+    is upstream. Three reachable ways a settled run delivers nothing, none of
+    which raise past the completion:
+
+    - ``add_comment`` fails. The forge rejects a body over its comment size
+      limit, rate-limits, or 5xxs. ``post_comment`` is not a publication
+      action, so the failure neither halts the remaining actions nor counts as
+      critical anywhere today;
+    - the record requests ``post_comment`` and carries no ``comment_body``.
+      Nothing requires one, and a completion record is untrusted agent input by
+      this repository's own principle — "the CLI always sets it" is not a
+      guard. The action then posts nothing and reports nothing;
+    - the record never requested ``post_comment`` at all. Dropping the two
+      publication actions leaves an EMPTY plan, and an empty plan trivially
+      "succeeds".
+
+    In all three the run is finished, has published nothing, and would be
+    handed the terminal disposition — closing a work item whose deliverable
+    never arrived, which is the inverse of what this lane exists to do and
+    worse than the bounded failure it replaced. Withdrawing the disposition
+    alone would only put such a run back in the schedulable pool unbounded, so
+    the failure is named as what it is: on this lane the comment IS the
+    publication, and its loss routes to the bounded publish-failure owner that
+    counts failures and escalates to ``needs-human``.
+
+    ``code_candidate`` is deliberately left standing — see
+    :meth:`~.completion_types.CompletionSettlement.undelivered`.
+    """
+    if not settlement.result_only.delivered or result_delivered:
+        return ConfirmedResultDelivery(settlement, None)
+    failure = (
+        f"{ERROR_PREFIX_RESULT_UNDELIVERED}: the run for issue #{issue_number}"
+        " offered no code candidate, so its issue comment was its whole"
+        " delivery, and that comment did not reach the issue; nothing was"
+        " published"
+    )
+    logger.error(
+        "Result-only delivery failed for issue #%d; withdrawing the terminal"
+        " disposition and reporting a publish failure (%s)",
+        issue_number,
+        settlement.result_only.detail,
+    )
+    return ConfirmedResultDelivery(settlement.undelivered(), failure)
+
+
 __all__ = [
+    "ConfirmedResultDelivery",
     "OrdinaryZeroCodeReader",
     "SettledOrdinaryPublication",
     "ZeroCodeOrdinarySettlement",
+    "confirm_result_only_delivery",
     "settle_ordinary_publication_plan",
     "settle_zero_code_ordinary_completion",
 ]

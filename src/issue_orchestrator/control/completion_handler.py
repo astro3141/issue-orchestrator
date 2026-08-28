@@ -205,11 +205,9 @@ class CompletionHandler:
         state-machine transition defer to ``finalize_terminal_outcome`` so the
         caller can drive both from the effective post-apply status (#6777).
 
-        ``result_only`` is the completion settlement's answer to "will a pull
-        request ever carry this run's work?" (#337). It is CARRIED from the
-        owner that proved it, never re-derived from the absence of a
-        ``pr_url``: a PR that failed to open is also missing one, and that run
-        needs the publish-failure routing, not a terminal disposition.
+        ``result_only`` is CARRIED from the owner that proved it (#337), never
+        re-derived from a missing ``pr_url``: a PR that failed to open is also
+        missing one, and needs publish-failure routing, not a disposition.
         """
         start_time = time.monotonic()
         issue_key = session.key.issue.stable_id()
