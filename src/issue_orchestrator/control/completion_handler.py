@@ -49,6 +49,7 @@ from .completion_action_planner import (
     CompletionActionPlanner,
     has_review_exchange_errors,
 )
+from .completion_types import ResultOnlyDelivery
 from .tech_lead_completion import discard_tech_lead_authority_after_completion
 from .invalid_record_actions import (
     failure_event_reason,
@@ -190,6 +191,7 @@ class CompletionHandler:
         diagnostic_path: Optional[str] = None,
         review_exchange_completed: bool = False,
         review_exchange_halted: bool = False,
+        result_only: ResultOnlyDelivery = ResultOnlyDelivery.none(),
         blocked_label: Optional[str] = None,
         blocked_reason: Optional[str] = None,
         completion_detail: Optional[dict[str, Any]] = None,
@@ -202,6 +204,12 @@ class CompletionHandler:
         With ``finalize_terminal=False`` the terminal trace event and the
         state-machine transition defer to ``finalize_terminal_outcome`` so the
         caller can drive both from the effective post-apply status (#6777).
+
+        ``result_only`` is the completion settlement's answer to "will a pull
+        request ever carry this run's work?" (#337). It is CARRIED from the
+        owner that proved it, never re-derived from the absence of a
+        ``pr_url``: a PR that failed to open is also missing one, and that run
+        needs the publish-failure routing, not a terminal disposition.
         """
         start_time = time.monotonic()
         issue_key = session.key.issue.stable_id()
@@ -284,6 +292,7 @@ class CompletionHandler:
                 pr_url=pr_url,
                 completion_detail=completion_detail,
                 provider_error_type=provider_error_type,
+                result_only=result_only,
             )
         )
         completion_actions.extend(

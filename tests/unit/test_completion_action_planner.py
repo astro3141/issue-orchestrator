@@ -24,6 +24,7 @@ from issue_orchestrator.control.completion_action_planner import (
 from issue_orchestrator.control.completion_types import (
     ERROR_PREFIX_CREATE_PR,
     ERROR_PREFIX_PUSH,
+    ResultOnlyDelivery,
 )
 from issue_orchestrator.control.tech_lead_completion import (
     admit_tech_lead_completion,
@@ -3313,3 +3314,144 @@ def test_provider_blocked_issue_session_adds_no_rework_trigger(
     assert LabelManager(config).needs_rework not in added_labels(actions)
     # The claim is still released, exactly as before.
     assert "in-progress" in removed_labels(actions)
+
+
+class TestAResultOnlyRunReachesATerminalDisposition:
+    """A finished run with no pull request must leave the schedulable pool (#337).
+
+    An ordinary success is safe to release from ``in-progress`` only because
+    ``pr-pending`` takes the claim over and the eventual merge closes the issue.
+    A run the completion settlement PROVED offers no code candidate opens no
+    pull request, so neither half happens: released and unlabelled, the issue is
+    indistinguishable to ``Scheduler`` from work never started, and the next tick
+    launches the same measurement, runs the same review exchange, and posts a
+    second RESULT — every tick, unbounded.
+
+    The pre-#337 behaviour of the same run was a bounded publish FAILURE. These
+    pin that the repair did not trade a bounded stop for an unbounded repeat.
+    """
+
+    @staticmethod
+    def _closes(actions: tuple[object, ...]) -> list[CloseIssueAction]:
+        return [a for a in actions if isinstance(a, CloseIssueAction)]
+
+    def test_a_settled_result_only_run_closes_its_issue(self, tmp_path: Path) -> None:
+        actions = make_planner(Config()).generate_completion_actions(
+            make_session(tmp_path),
+            SessionStatus.COMPLETED,
+            result_only=ResultOnlyDelivery.settled("adds no commit over origin/main"),
+        )
+
+        closes = self._closes(actions)
+        assert len(closes) == 1
+        assert closes[0].issue_number == 1
+        assert "in-progress" in removed_labels(actions)
+
+    def test_the_close_is_ordered_before_the_claim_label_is_released(
+        self, tmp_path: Path
+    ) -> None:
+        """A partial apply must fail SAFE, which here means closed.
+
+        Releasing ``in-progress`` first and then failing to close leaves an
+        open, unlabelled, finished work item — the exact state the scheduler
+        cannot tell from work never started. A close that lands first is out of
+        selection whatever happens to the labels afterwards.
+        """
+        actions = make_planner(Config()).generate_completion_actions(
+            make_session(tmp_path),
+            SessionStatus.COMPLETED,
+            result_only=ResultOnlyDelivery.settled("adds no commit over origin/main"),
+        )
+
+        assert isinstance(actions[0], CloseIssueAction)
+        releases = [
+            i
+            for i, a in enumerate(actions)
+            if isinstance(a, RemoveLabelAction) and a.label == "in-progress"
+        ]
+        assert releases and releases[0] > 0
+
+    def test_the_close_explains_why_no_pull_request_exists(
+        self, tmp_path: Path
+    ) -> None:
+        """The one fact an operator cannot get from the issue itself."""
+        actions = make_planner(Config()).generate_completion_actions(
+            make_session(tmp_path),
+            SessionStatus.COMPLETED,
+            result_only=ResultOnlyDelivery.settled("adds no commit over origin/main"),
+        )
+
+        assert "no pull request" in self._closes(actions)[0].comment
+
+    def test_the_close_carries_the_reconciliation_expectation(
+        self, tmp_path: Path
+    ) -> None:
+        """A mutating action with no expectation is refused by the applier."""
+        actions = make_planner(Config()).generate_completion_actions(
+            make_session(tmp_path),
+            SessionStatus.COMPLETED,
+            result_only=ResultOnlyDelivery.settled("adds no commit over origin/main"),
+        )
+
+        assert self._closes(actions)[0].expected is not None
+
+    def test_an_ordinary_completion_is_never_closed(self, tmp_path: Path) -> None:
+        """The negative control: a PR-carried run keeps today's lifecycle."""
+        actions = make_planner(Config()).generate_completion_actions(
+            make_session(tmp_path),
+            SessionStatus.COMPLETED,
+            pr_url="https://example.test/owner/repo/pull/7",
+        )
+
+        assert self._closes(actions) == []
+        assert "in-progress" in removed_labels(actions)
+
+    def test_a_completion_whose_push_failed_is_never_closed(
+        self, tmp_path: Path
+    ) -> None:
+        """A missing PR is not proof of a result-only run.
+
+        A publish that FAILED is also missing its pr_url, and that run needs the
+        bounded publish-failure routing — not a terminal close. Only the carried
+        settlement opens this path, so a failure that (impossibly) arrived
+        carrying one still takes the critical-error branch.
+        """
+        actions = make_planner(Config()).generate_completion_actions(
+            make_session(tmp_path),
+            SessionStatus.COMPLETED,
+            processing_errors=[f"{ERROR_PREFIX_PUSH}: remote rejected"],
+            result_only=ResultOnlyDelivery.settled("adds no commit over origin/main"),
+        )
+
+        assert self._closes(actions) == []
+
+    def test_a_halted_review_exchange_is_never_closed(self, tmp_path: Path) -> None:
+        """Review cannot be bypassed into a terminal disposition either."""
+        actions = make_planner(Config()).generate_completion_actions(
+            make_session(tmp_path),
+            SessionStatus.COMPLETED,
+            review_exchange_halted=True,
+            result_only=ResultOnlyDelivery.settled("adds no commit over origin/main"),
+        )
+
+        assert self._closes(actions) == []
+
+    @pytest.mark.parametrize(
+        "status",
+        [
+            SessionStatus.FAILED,
+            SessionStatus.TIMED_OUT,
+            SessionStatus.BLOCKED,
+            SessionStatus.NEEDS_HUMAN,
+        ],
+    )
+    def test_only_a_completed_run_can_reach_the_disposition(
+        self, tmp_path: Path, status: SessionStatus
+    ) -> None:
+        actions = make_planner(Config()).generate_completion_actions(
+            make_session(tmp_path),
+            status,
+            result_only=ResultOnlyDelivery.settled("adds no commit over origin/main"),
+        )
+
+        assert self._closes(actions) == []

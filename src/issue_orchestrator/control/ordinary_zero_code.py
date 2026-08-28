@@ -35,6 +35,26 @@ Unobservable is never read as zero-code, for the reason
 :mod:`.candidate_integrity` states about the same reads: a checkout whose state
 could not be read is not a checkout that was proven unchanged.
 
+**The order the five are asked in is deliberate, and it is not cheapest-first.**
+Facts 3 and 4 are two local git reads that a code-bearing completion now pays
+before fact 5 refuses it, and putting the commit count first would save them.
+It would also cost the answer: a checkout with uncommitted tracked work is
+refused for that reason and the operator is told which files, whereas asked
+after a non-zero count the same run would be reported as merely code-bearing.
+The reads are local and sub-second; the refusal an operator has to act on is
+not, so the message wins.
+
+**A settlement that shaped a plan and told nobody what it proved would be half
+a settlement.** These five facts are the strongest statement the completion
+pipeline can make about a run — clean tracked content AND zero commits over the
+base the pull request would target — and two phases downstream decide from
+weaker evidence unless they are told: the code-validation gate would run over a
+commit this run did not produce, and the completion planner would release the
+run's claim label with nothing to take its place. So the proof leaves here on
+:class:`~.completion_types.CompletionSettlement`, carried on the existing
+contract rather than re-derived from a role name or the shape of a completion
+record that says the opposite.
+
 **Fact 5 is the ordinary analogue of the planning lane's launch-base equality,
 not a copy of it.** :mod:`.tech_lead_zero_code` proves a planning run stood
 still by comparing its HEAD against the base the ORCHESTRATOR launched it on —
@@ -80,6 +100,11 @@ from ..domain.models import (
 )
 from ..ports.working_copy import BranchCommitsResult
 from .candidate_integrity import CANDIDATE_DIRT_MODE
+from .completion_types import (
+    CodeCandidateSettlement,
+    CompletionSettlement,
+    ResultOnlyDelivery,
+)
 from .review_publish_pipeline import PublishPipelinePlan
 from .zero_code_reads import ZeroCodeWorktreeReader, summarise_dirt
 
@@ -111,11 +136,70 @@ class ZeroCodeOrdinarySettlement:
     when it does not. ``detail`` always says why, so an operator reading the log
     of a run that took the ordinary path sees which fact was missing — and the
     log of one that did not says which commit it stood at and against what.
+
+    The two properties below are what the phases AFTER execution must be told.
+    They are not extra derivations: a settlement that shaped a plan and told
+    nobody what it proved would leave the pipeline's strongest statement about
+    this run — clean tracked content and zero commits over the PR base — as a
+    log line, and both readers would go on deciding from the shape of a
+    completion record that says the opposite.
     """
 
     zero_code: bool
     detail: str
     requested_actions: tuple[RequestedAction, ...]
+
+    @property
+    def settlement(self) -> CompletionSettlement:
+        """Everything this proof tells the phases downstream of execution."""
+        return CompletionSettlement(
+            code_candidate=self.code_candidate,
+            result_only=self.result_only,
+        )
+
+    @property
+    def code_candidate(self) -> CodeCandidateSettlement:
+        """What a downstream code-validation gate is left to judge (#328).
+
+        The very contract the tech_lead completion owner produces, from
+        STRONGER evidence: that owner proves a planning run stood at its launch
+        base, and this one proves clean tracked content AND zero commits over
+        the base a pull request would target. Carried on the one contract
+        rather than restated, so a settled run cannot have candidate-shaped
+        PASS evidence written for a commit it did not produce — nor be flipped
+        into the validation-retry path and relaunched as a coder retry against
+        an empty branch, which is the failure this whole lane repairs.
+        """
+        if self.zero_code:
+            return CodeCandidateSettlement.settled_zero_code(self.detail)
+        return CodeCandidateSettlement.presented()
+
+    @property
+    def result_only(self) -> ResultOnlyDelivery:
+        """Whether the comment this run posts is its whole delivery (#337).
+
+        A settled run publishes no branch and opens no pull request, so nothing
+        downstream would ever stamp the ``pr-pending`` that holds a finished
+        issue. Told, the completion planner can give the run a terminal
+        disposition; untold, it releases the claim label and the finished work
+        item falls straight back into the schedulable pool.
+        """
+        if self.zero_code:
+            return ResultOnlyDelivery.settled(self.detail)
+        return ResultOnlyDelivery.none()
+
+
+@dataclass(frozen=True, slots=True)
+class SettledOrdinaryPublication:
+    """What this run may still EXECUTE, and what the settling PROVED.
+
+    Both halves leave the owner together because both are consequences of the
+    same five facts. Returning only the plan is what an earlier round of #337
+    did, and the proof was logged and dropped at the door.
+    """
+
+    plan: PublishPipelinePlan
+    settlement: CompletionSettlement
 
 
 def settle_zero_code_ordinary_completion(
@@ -214,7 +298,7 @@ def settle_ordinary_publication_plan(
     worktree_reader: OrdinaryZeroCodeReader,
     governed_elsewhere: bool,
     issue_number: int,
-) -> PublishPipelinePlan:
+) -> SettledOrdinaryPublication:
     """The execution plan this run may still carry out, and the trace of why.
 
     The command form of :func:`settle_zero_code_ordinary_completion` for the
@@ -232,9 +316,15 @@ def settle_ordinary_publication_plan(
     follows it are that lane's settled behaviour, not this one's to re-decide.
     The flag is passed rather than derived so tech_lead role policy stays with
     its owner instead of being restated here.
+
+    A run governed elsewhere settles to :meth:`CompletionSettlement.unsettled`
+    — NOT to a proof of its own. Its own owner has already answered both
+    questions this settlement carries, and answering them a second time here
+    would be exactly the cross-path drift the carried contract exists to
+    prevent.
     """
     if governed_elsewhere:
-        return plan
+        return SettledOrdinaryPublication(plan, CompletionSettlement.unsettled())
     settlement = settle_zero_code_ordinary_completion(
         outcome=outcome,
         requested_actions=plan.ordered_actions,
@@ -249,12 +339,16 @@ def settle_ordinary_publication_plan(
         settlement.detail,
     )
     if not settlement.zero_code:
-        return plan
-    return replace(plan, ordered_actions=settlement.requested_actions)
+        return SettledOrdinaryPublication(plan, settlement.settlement)
+    return SettledOrdinaryPublication(
+        replace(plan, ordered_actions=settlement.requested_actions),
+        settlement.settlement,
+    )
 
 
 __all__ = [
     "OrdinaryZeroCodeReader",
+    "SettledOrdinaryPublication",
     "ZeroCodeOrdinarySettlement",
     "settle_ordinary_publication_plan",
     "settle_zero_code_ordinary_completion",

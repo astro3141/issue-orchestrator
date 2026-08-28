@@ -305,6 +305,34 @@ never needed are dropped. A halted or changes-requested exchange returns before
 the settlement is ever reached, so review cannot be bypassed by having produced
 no code.
 
+### What the settlement tells the phases after it
+
+The proof does not stop at the plan. Two phases run after the actions execute,
+and both would otherwise decide from weaker evidence, so the settlement is
+carried to them on `CompletionSettlement`:
+
+| Reader | Told | Otherwise |
+|--------|------|-----------|
+| the code-validation gate | this run offers no code candidate | the quick gate runs over a commit the run did not produce, and a failure there relaunches an already-published run as a coder retry against an empty branch |
+| `CompletionActionPlanner` | the posted comment is the whole delivery | `in-progress` is released with no `pr-pending` to take it over, and the finished issue is schedulable again on the very next tick |
+
+The first is the same `CodeCandidateSettlement` contract the tech-lead planning
+lane produces; this lane is its second producer, not a second rule.
+
+The second is what gives a zero-code success its **terminal disposition**: the
+orchestrator closes the issue. An ordinary run's issue is closed by the merge of
+the pull request its `Closes #N` body registered; a run with nothing to merge has
+no such carrier, so the close is planned from the settlement instead, carrying a
+short comment saying why an issue closed with no pull request. Reopening it is
+how an operator says the work is not finished.
+
+The close is ordered **before** the `in-progress` release — the opposite of where
+the tech-lead terminal close sits, and deliberately so. That one guards a
+tracking issue, where a half-applied batch is better left open and re-auditable.
+This one guards boundedness: an apply that fails after the release and before the
+close would leave an open, unlabelled, finished work item, which is precisely the
+state the scheduler cannot tell from work never started.
+
 Tech-lead runs are not settled here. Their publication intent is decided at the
 pre-action seam by `control/tech_lead_zero_code.py`, which drops `post_comment`
 instead of keeping it — tech-lead prompts promise the orchestrator posts no

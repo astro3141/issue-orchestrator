@@ -29,6 +29,7 @@ from .completion_types import (
     ERROR_PREFIX_PUSH,
     ERROR_PREFIX_TECH_LEAD_AUTHORITY,
     ERROR_PREFIX_TECH_LEAD_DECISION,
+    ResultOnlyDelivery,
     REVIEW_EXCHANGE_ERROR_PREFIX,
 )
 from .invalid_record_actions import (
@@ -40,6 +41,7 @@ from .provider_availability import ProviderAvailabilityPolicy
 from .provider_blocked_completion import provider_blocked_actions
 from .publish_failure_completion import publish_failure_actions
 from .reconciliation import ExpectedState, build_expected_for_mutation
+from .result_only_completion import result_only_terminal_actions
 from .tech_lead_session_policy import is_tech_lead_session
 from ..ports.provider_resilience import ProviderErrorType
 from .needs_human_block import NeedsHumanCause
@@ -354,6 +356,7 @@ class CompletionActionPlanner:
         pr_url: Optional[str] = None,
         completion_detail: Optional[dict[str, Any]] = None,
         provider_error_type: ProviderErrorType | None = None,
+        result_only: ResultOnlyDelivery = ResultOnlyDelivery.none(),
     ) -> tuple[Action, ...]:
         """Generate label/comment actions for session completion.
 
@@ -363,6 +366,11 @@ class CompletionActionPlanner:
         ``provider_error_type`` carries the typed verdict a provider-caused
         block ended on. It is what routes the block to the provider-impact
         owner instead of generic blocked handling, for every session kind.
+
+        ``result_only`` is the completion settlement's proof that no pull
+        request will ever carry this run's work (#337), and it is what lets a
+        successful zero-code run reach a terminal disposition instead of being
+        released back into the schedulable pool.
         """
         expected = build_expected_for_mutation()
 
@@ -382,6 +390,7 @@ class CompletionActionPlanner:
                 critical_errors=critical_errors,
                 diagnostic_path=diagnostic_path,
                 review_exchange_halted=review_exchange_halted,
+                result_only=result_only,
             )
 
         if status == SessionStatus.TIMED_OUT:
@@ -431,6 +440,7 @@ class CompletionActionPlanner:
         critical_errors: list[str],
         diagnostic_path: Optional[str],
         review_exchange_halted: bool,
+        result_only: ResultOnlyDelivery,
     ) -> tuple[Action, ...]:
         """What a self-reported COMPLETED session actually comes to.
 
@@ -440,6 +450,11 @@ class CompletionActionPlanner:
         contradicted releases the claim label. All three read as one list here
         rather than as three ``status == COMPLETED`` tests differing by a second
         condition.
+
+        Releasing the claim label is safe only because ``pr-pending`` takes it
+        over; a run whose settlement proves no pull request will ever exist has
+        no such successor, so it is given its terminal disposition here rather
+        than being released into nothing (#337).
         """
         if critical_errors:
             return self._generate_completed_with_critical_actions(
@@ -458,14 +473,26 @@ class CompletionActionPlanner:
                 )
             )
         # POLICY: Completion -> release in-progress (claim maintained via pr-pending).
-        actions: list[Action] = [
+        # The terminal disposition is ordered BEFORE that release, and this is
+        # the opposite of where the tech_lead terminal close sits (#337). That
+        # close guards a tracking issue, where a half-applied batch is better
+        # left open and re-auditable; this one guards the boundedness the whole
+        # lane exists for. An apply that raises after the release and before the
+        # close leaves an open, unlabelled, finished work item — which the
+        # scheduler cannot tell from work never started, so the next tick
+        # relaunches it. Closing first makes a partial apply fail SAFE: a closed
+        # issue is out of selection whatever happens to its labels afterwards.
+        actions: list[Action] = list(
+            result_only_terminal_actions(session, expected, result_only)
+        )
+        actions.append(
             RemoveLabelAction(
                 issue_number=session.issue.number,
                 label=self._lm.in_progress,
                 reason="Session completed successfully",
                 expected=expected,
             )
-        ]
+        )
         actions.extend(self._generate_tech_lead_actions(session, expected))
         return tuple(actions)
 

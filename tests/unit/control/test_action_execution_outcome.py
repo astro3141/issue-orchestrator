@@ -9,6 +9,12 @@ was introduced to prevent, one exit further out (#180).
 
 These are about :meth:`ActionExecutionOutcome.of`, the one place that
 relationship is decided.
+
+The same type also carries what the action-execution phase PROVED about the run
+(#337). The publication settler that decides the zero-code lane runs INSIDE that
+phase, and both of its answers — whether a code candidate survives, and whether
+the posted comment is the whole delivery — are read after it returns, so they
+leave on the outcome rather than in a log line.
 """
 
 from __future__ import annotations
@@ -17,7 +23,10 @@ from pathlib import Path
 
 from issue_orchestrator.control.completion_types import (
     ActionExecutionOutcome,
+    CodeCandidateSettlement,
+    CompletionSettlement,
     ProcessingResult,
+    ResultOnlyDelivery,
 )
 from issue_orchestrator.domain.review_exchange_run import ReviewExchangeRunAssets
 
@@ -31,12 +40,14 @@ def _outcome(
     review_exchange_run: ReviewExchangeRunAssets | None,
     early_result: ProcessingResult | None = None,
     deferred: bool = False,
+    settlement: CompletionSettlement | None = None,
 ) -> ActionExecutionOutcome:
     return ActionExecutionOutcome.of(
         branch="issue-1",
         pr_url=None,
         review_exchange_completed=True,
         review_exchange_run=review_exchange_run,
+        settlement=settlement or CompletionSettlement.unsettled(),
         deferred=deferred,
         early_result=early_result,
     )
@@ -131,3 +142,107 @@ class TestOutcomesWithNoEarlyResult:
         assert outcome.deferred is False
         assert outcome.early_result is None
         assert outcome.review_exchange_run == exchange_run
+
+
+class TestTheSettlementLeavesTheExecutionPhase:
+    """The proof the publication settler makes has to reach its two readers.
+
+    The settler runs inside action execution; the code-validation gate and the
+    completion action planner both run after it. An outcome that did not name
+    the settlement would leave the pipeline's strongest statement about the run
+    as a log line — which is exactly what an earlier round of #337 did.
+    """
+
+    def test_an_outcome_names_the_settlement_it_was_built_with(
+        self, tmp_path: Path
+    ) -> None:
+        settlement = CompletionSettlement(
+            code_candidate=CodeCandidateSettlement.settled_zero_code("no commits"),
+            result_only=ResultOnlyDelivery.settled("no commits"),
+        )
+
+        outcome = _outcome(review_exchange_run=None, settlement=settlement)
+
+        assert outcome.settlement == settlement
+
+    def test_an_exit_that_proved_nothing_says_so_neutrally(
+        self, tmp_path: Path
+    ) -> None:
+        """Fail-safe: unsettled keeps today's gate and today's lifecycle."""
+        outcome = _outcome(review_exchange_run=None)
+
+        assert outcome.settlement.code_candidate.offers_code_candidate is True
+        assert outcome.settlement.result_only.delivered is False
+
+
+class TestNarrowingTwoSettlingSeams:
+    """Completion processing settles at two seams, and neither may erase the other.
+
+    The pre-action owner settles a tech_lead planning run; the publication
+    settler settles an ordinary zero-code run. They never both fire, so the
+    combination must let a proof through from EITHER side while a phase that
+    proved nothing stays neutral in both directions.
+    """
+
+    def test_a_later_proof_is_not_suppressed_by_an_earlier_neutral_answer(
+        self,
+    ) -> None:
+        settled = CompletionSettlement(
+            code_candidate=CodeCandidateSettlement.settled_zero_code("proved"),
+            result_only=ResultOnlyDelivery.settled("proved"),
+        )
+
+        combined = CompletionSettlement.unsettled().narrowed_by(settled)
+
+        assert combined.code_candidate.offers_code_candidate is False
+        assert combined.code_candidate.detail == "proved"
+        assert combined.result_only.delivered is True
+        assert combined.result_only.detail == "proved"
+
+    def test_an_earlier_proof_is_not_erased_by_a_later_neutral_answer(self) -> None:
+        """The direction that matters most: a proof survives a silent phase."""
+        settled = CompletionSettlement(
+            code_candidate=CodeCandidateSettlement.settled_zero_code("proved"),
+            result_only=ResultOnlyDelivery.settled("proved"),
+        )
+
+        combined = settled.narrowed_by(CompletionSettlement.unsettled())
+
+        assert combined.code_candidate.offers_code_candidate is False
+        assert combined.code_candidate.detail == "proved"
+        assert combined.result_only.delivered is True
+
+    def test_two_neutral_answers_stay_neutral(self) -> None:
+        combined = CompletionSettlement.unsettled().narrowed_by(
+            CompletionSettlement.unsettled()
+        )
+
+        assert combined == CompletionSettlement.unsettled()
+
+
+class TestTheSettlementIsCarriedOntoTheResult:
+    def test_carrying_names_both_halves_on_the_result(self) -> None:
+        """Both readers read the ProcessingResult; both fields must be set."""
+        settlement = CompletionSettlement(
+            code_candidate=CodeCandidateSettlement.settled_zero_code("proved"),
+            result_only=ResultOnlyDelivery.settled("proved"),
+        )
+
+        carried = settlement.carried_by(
+            ProcessingResult(success=True, message="published")
+        )
+
+        assert carried.code_candidate.offers_code_candidate is False
+        assert carried.result_only.delivered is True
+        assert carried.message == "published"
+
+    def test_the_supplied_result_is_not_mutated(self) -> None:
+        supplied = ProcessingResult(success=True, message="published")
+
+        CompletionSettlement(
+            code_candidate=CodeCandidateSettlement.settled_zero_code("proved"),
+            result_only=ResultOnlyDelivery.settled("proved"),
+        ).carried_by(supplied)
+
+        assert supplied.code_candidate.offers_code_candidate is True
+        assert supplied.result_only.delivered is False

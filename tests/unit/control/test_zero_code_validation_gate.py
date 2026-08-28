@@ -64,6 +64,7 @@ from issue_orchestrator.ports import EventSink
 from issue_orchestrator.ports.event_sink import TraceEvent
 from issue_orchestrator.ports.pull_request_tracker import PRInfo
 from issue_orchestrator.ports.working_copy import (
+    BranchCommitsResult,
     BranchPathsResult,
     BranchTextFilesResult,
     DiffResult,
@@ -73,6 +74,7 @@ from tests.callback_endpoint_helpers import ready_callback_endpoint
 from tests.unit.session_run_helpers import make_session_run_assets
 
 TECH_LEAD_AGENT = "agent:tech-lead"
+CODER_AGENT = "agent:coder"
 LAUNCH_SHA = "c" * 40
 MOVED_SHA = "d" * 40
 QUICK_CMD = "./scripts/validate-quick.sh"
@@ -155,7 +157,12 @@ def _config(tmp_path: Path) -> Config:
     config = Config()
     config.repo_root = tmp_path
     config.tech_lead_review_agent = TECH_LEAD_AGENT
-    config.agents = {TECH_LEAD_AGENT: AgentConfig(prompt_path=prompt)}
+    # Both roles are registered so an ordinary completion resolves its own
+    # agent label from its record filename, exactly as the tech_lead one does.
+    config.agents = {
+        TECH_LEAD_AGENT: AgentConfig(prompt_path=prompt),
+        CODER_AGENT: AgentConfig(prompt_path=prompt),
+    }
     return config
 
 
@@ -499,3 +506,130 @@ class TestTheGateSurvivesEverywhereElse:
         assert decision.processing_result.success is False
         assert decision.processing_result.code_candidate.offers_code_candidate is True
         assert command_runner.run_calls == [QUICK_CMD]
+
+
+class TestSettledZeroCodeOrdinaryRun:
+    """The SECOND producer of the same contract (#337).
+
+    The ordinary publication settler proves the same fact from stronger
+    evidence — clean tracked content AND zero commits over the base a pull
+    request would target. An earlier round of #337 shaped the plan on that proof
+    and then dropped it, so the same rule was enforced along two paths and one
+    of them stopped enforcing it: the quick gate ran over a commit the run had
+    not produced, and a FAILURE there would have flipped an already-published
+    run into the validation-retry path — relaunched as a coder retry that ends
+    up trying to open a pull request on an empty branch, the very failure this
+    lane repairs.
+
+    The whole hop is exercised: the real processor settles, the real controller
+    decides. A double for either one would let the propagation be deleted
+    without a failure here.
+    """
+
+    def _run(self, tmp_path: Path, git_adapter: Mock, authority_store):
+        git_adapter.commits_against_base = Mock(
+            return_value=BranchCommitsResult(success=True, count=0)
+        )
+        worktree = tmp_path / "worktree"
+        worktree.mkdir(parents=True, exist_ok=True)
+        run_assets = make_session_run_assets(worktree, session_name="issue-123")
+        completion_path = _write_completion(
+            worktree,
+            _completion_record("coder-run"),
+            f"completion-{sanitize_agent_label(CODER_AGENT)}.json",
+        )
+        events = RecordingEventSink()
+        command_runner = RecordingCommandRunner()
+        controller = _controller(
+            _processor(_config(tmp_path), git_adapter, authority_store),
+            events,
+            command_runner,
+        )
+        decision = controller.decide_outcome(
+            SessionObservationResult.terminated(runtime_minutes=10.0),
+            worktree,
+            123,
+            "Measure the thing",
+            run_assets.session_name,
+            completion_path,
+            session_run_assets=run_assets,
+            task_kind=TaskKind.CODE,
+        )
+        return decision, events, command_runner, run_assets
+
+    def test_the_quick_command_is_never_executed(
+        self, tmp_path: Path, git_adapter: Mock, authority_store
+    ) -> None:
+        decision, _events, command_runner, _assets = self._run(
+            tmp_path, git_adapter, authority_store
+        )
+
+        assert decision.status == SessionStatus.COMPLETED
+        assert command_runner.run_calls == []
+
+    def test_no_candidate_validation_evidence_is_written(
+        self, tmp_path: Path, git_adapter: Mock, authority_store
+    ) -> None:
+        """Nothing claims a commit this run did not produce was validated."""
+        decision, events, _runner, run_assets = self._run(
+            tmp_path, git_adapter, authority_store
+        )
+
+        assert decision.validation_passed is None
+        assert _validation_records(run_assets.run_dir) == []
+        assert EventName.SESSION_VALIDATION_PASSED not in events.names()
+        assert EventName.SESSION_VALIDATION_FAILED not in events.names()
+        assert EventName.SESSION_VALIDATION_RETRY_NEEDED not in events.names()
+
+    def test_the_settlement_is_carried_on_the_result(
+        self, tmp_path: Path, git_adapter: Mock, authority_store
+    ) -> None:
+        """Both halves of the proof reach the result, not just the one."""
+        decision, _events, _runner, _assets = self._run(
+            tmp_path, git_adapter, authority_store
+        )
+
+        assert decision.processing_result is not None
+        assert decision.processing_result.success is True
+        assert decision.processing_result.code_candidate.offers_code_candidate is False
+        assert decision.processing_result.code_candidate.detail
+        assert decision.processing_result.result_only.delivered is True
+        assert decision.processing_result.result_only.detail
+
+    def test_a_code_bearing_ordinary_run_keeps_the_gate_and_the_pr_lifecycle(
+        self, tmp_path: Path, git_adapter: Mock, authority_store
+    ) -> None:
+        """The boundary: only the PROVEN zero-code run buys either change."""
+        git_adapter.commits_against_base = Mock(
+            return_value=BranchCommitsResult(success=True, count=2)
+        )
+        worktree = tmp_path / "worktree"
+        worktree.mkdir(parents=True, exist_ok=True)
+        run_assets = make_session_run_assets(worktree, session_name="issue-123")
+        completion_path = _write_completion(
+            worktree,
+            _completion_record("coder-run"),
+            f"completion-{sanitize_agent_label(CODER_AGENT)}.json",
+        )
+        command_runner = RecordingCommandRunner()
+        controller = _controller(
+            _processor(_config(tmp_path), git_adapter, authority_store),
+            RecordingEventSink(),
+            command_runner,
+        )
+
+        decision = controller.decide_outcome(
+            SessionObservationResult.terminated(runtime_minutes=10.0),
+            worktree,
+            123,
+            "Do the work",
+            run_assets.session_name,
+            completion_path,
+            session_run_assets=run_assets,
+            task_kind=TaskKind.CODE,
+        )
+
+        assert command_runner.run_calls == [QUICK_CMD]
+        assert decision.processing_result is not None
+        assert decision.processing_result.code_candidate.offers_code_candidate is True
+        assert decision.processing_result.result_only.delivered is False

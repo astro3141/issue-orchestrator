@@ -34,6 +34,7 @@ from .completion_dispatcher import (
     CompletionDispatcher,
     SynchronousCompletionDispatcher,
 )
+from .completion_types import ResultOnlyDelivery
 from .session_completion_decision import completion_decider
 from .session_completion_diagnostics import run_session_analysis, surface_failure_context
 from .session_run_resolution import resolve_session_run_dir
@@ -238,6 +239,10 @@ def handle_session_completion(  # noqa: C901, PLR0912 - handles validation, acti
     validation_error_file: Optional[str] = None,
     review_exchange_completed: bool = False,
     review_exchange_halted: bool = False,
+    # Whether the comment this run posted is its whole delivery (#337).
+    # Defaulted to "nothing settled it" so every caller that never met the
+    # publication settler keeps the ordinary PR-carried lifecycle.
+    result_only: ResultOnlyDelivery = ResultOnlyDelivery.none(),
     blocked_label: Optional[str] = None,
     blocked_reason: Optional[str] = None,
     completion_detail: Optional[dict[str, Any]] = None,
@@ -331,6 +336,7 @@ def handle_session_completion(  # noqa: C901, PLR0912 - handles validation, acti
             diagnostic_path=diagnostic_path,
             review_exchange_completed=review_exchange_completed,
             review_exchange_halted=review_exchange_halted,
+            result_only=result_only,
             blocked_label=blocked_label,
             blocked_reason=blocked_reason,
             completion_detail=completion_detail,
@@ -675,6 +681,7 @@ def _apply_completed_decision(
     validation_error_file = decision.validation_error_file
     review_exchange_completed = False
     review_exchange_halted = False
+    result_only = ResultOnlyDelivery.none()
     if decision.processing_result:
         if decision.processing_result.pr_url:
             pr_url_hint = decision.processing_result.pr_url
@@ -684,6 +691,10 @@ def _apply_completed_decision(
             diagnostic_path = decision.processing_result.diagnostic_path
         review_exchange_completed = decision.processing_result.review_exchange_completed
         review_exchange_halted = decision.processing_result.review_exchange_halted
+        # Carried, never re-derived: whether this run's posted comment is its
+        # whole delivery is what decides if the completion planner may release
+        # the claim label with nothing to take its place (#337).
+        result_only = decision.processing_result.result_only
     diagnostic_path = decision.diagnostic_path or diagnostic_path
     handle_session_completion(
         session, decision.status, state, completion_handler, action_applier,
@@ -695,6 +706,7 @@ def _apply_completed_decision(
         validation_error_file=str(validation_error_file) if validation_error_file else None,
         review_exchange_completed=review_exchange_completed,
         review_exchange_halted=review_exchange_halted,
+        result_only=result_only,
         blocked_label=decision.blocked_label,
         blocked_reason=decision.blocked_reason,
         completion_detail=decision.completion_detail,

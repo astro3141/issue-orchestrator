@@ -115,11 +115,13 @@ from .completion_pre_action import PreActionOutcome, settle_tech_lead_pre_action
 from .completion_pr_labels import apply_pr_labels, reserved_pr_label_error
 from .completion_types import (
     ActionExecutionOutcome,
+    CompletionSettlement,
     ERROR_PREFIX_CREATE_PR,
     ERROR_PREFIX_PUBLISH_BLOCKED,
     ERROR_PREFIX_PUSH,
     ProcessingResult,
     RepublicationCheck,
+    ResultOnlyDelivery,
     REVIEW_EXCHANGE_ERROR_PREFIX,
 )
 from .ordinary_zero_code import settle_ordinary_publication_plan
@@ -777,7 +779,10 @@ class CompletionProcessor:
         )
         if pre_action.refusal is not None:
             return pre_action.refusal
-        code_candidate = pre_action.code_candidate
+        settlement = CompletionSettlement(
+            code_candidate=pre_action.code_candidate,
+            result_only=ResultOnlyDelivery.none(),
+        )
 
         # Get branch name for PR operations
         branch = self.git_adapter.get_current_branch(worktree)
@@ -819,16 +824,22 @@ class CompletionProcessor:
             issue_key=issue_key,
             rework=rework,
         )
+        # The pre-action owner's answer, narrowed by whatever the execution
+        # phase went on to prove (#337). The two seams never both settle one
+        # run, and narrowing rather than assigning means neither one's neutral
+        # answer can erase the other's proof.
+        settlement = settlement.narrowed_by(executed.settlement)
         if executed.early_result is not None:
-            return code_candidate.carried_by(executed.early_result)
+            return settlement.carried_by(executed.early_result)
 
         if executed.deferred:
             # Review exchange is running in the background. Leave the completion
             # record on disk so the next observation re-enters this pipeline,
             # and skip result artifacts / cleanup that would imply completion.
-            # The candidate settlement is deliberately NOT carried: this result
-            # is non-terminal, the pass that finishes the record settles it
-            # again from the same owner, and no validation decision reads it.
+            # The settlement is deliberately NOT carried: this result is
+            # non-terminal, the pass that finishes the record settles it again
+            # from the same owners, and neither the validation gate nor the
+            # completion planner reads a deferred result.
             logger.info(
                 "Completion deferred (review exchange running): issue=%d session=%s",
                 issue_number,
@@ -870,7 +881,7 @@ class CompletionProcessor:
             post_issue_comment=self._add_issue_comment,
             cleanup_completion_record_fn=self._cleanup_completion_record,
         )
-        return code_candidate.carried_by(result)
+        return settlement.carried_by(result)
 
     def _review_exchange_approval_gate(
         self,
@@ -1600,11 +1611,14 @@ class CompletionProcessor:
         # not a second reading of where one might be (#180).
         exchange_run = exchange_result.run_assets if exchange_result else None
         if deferred or should_halt:
+            # Returned before the publication settler is reached, so this pass
+            # proved nothing about the checkout and says so explicitly (#337).
             return ActionExecutionOutcome.of(
                 branch=branch,
                 pr_url=pr_url,
                 review_exchange_completed=review_exchange_completed,
                 review_exchange_run=exchange_run,
+                settlement=CompletionSettlement.unsettled(),
                 deferred=deferred,
             )
 
@@ -1626,6 +1640,7 @@ class CompletionProcessor:
                 pr_url=pr_url,
                 review_exchange_completed=review_exchange_completed,
                 review_exchange_run=exchange_run,
+                settlement=CompletionSettlement.unsettled(),
                 early_result=pre_publish_failure,
             )
 
@@ -1633,7 +1648,7 @@ class CompletionProcessor:
         # run PROVEN to offer a branch nothing have that branch write dropped
         # while its reviewed result still publishes (#337). Tech_lead runs are
         # settled by their own owner at the pre-action seam and pass through.
-        plan = settle_ordinary_publication_plan(
+        settled = settle_ordinary_publication_plan(
             plan=plan,
             outcome=record.outcome,
             worktree=worktree,
@@ -1642,6 +1657,7 @@ class CompletionProcessor:
             governed_elsewhere=self._is_tech_lead_session(agent_label),
             issue_number=issue_number,
         )
+        plan = settled.plan
 
         (
             branch,
@@ -1676,6 +1692,7 @@ class CompletionProcessor:
             pr_url=pr_url,
             review_exchange_completed=review_exchange_completed,
             review_exchange_run=exchange_run,
+            settlement=settled.settlement,
             early_result=action_result,
         )
 

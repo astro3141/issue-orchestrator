@@ -32,11 +32,13 @@ from issue_orchestrator.control.completion_handler import (
 )
 from issue_orchestrator.control.actions import (
     AddLabelAction,
+    CloseIssueAction,
     RemoveLabelAction,
     AddCommentAction,
     SetIssueStateAction,
     ActionType,
 )
+from issue_orchestrator.control.completion_types import ResultOnlyDelivery
 from issue_orchestrator.domain.issue_key import FakeIssueKey
 from issue_orchestrator.domain.session_key import SessionKey, TaskKind
 from issue_orchestrator.domain.session_run import SessionRunAssets
@@ -3375,3 +3377,42 @@ class TestTechLeadAuthorityRetention:
         )
 
         assert self._load_authority(config, session) is not None
+
+
+class TestResultOnlyDeliveryReachesTheActionPlanner:
+    """The settlement has to survive the hop from the processor to the planner.
+
+    ``ProcessingResult.result_only`` is proved deep in completion processing and
+    consumed in ``CompletionActionPlanner``. Every hop between them is a place
+    the fact can be dropped, and dropping it is silent: the completion still
+    reports success, and the issue simply reappears in the schedulable pool on
+    the next tick (#337 F1). So the boundary is pinned from the handler in.
+    """
+
+    def test_a_result_only_completion_plans_the_terminal_close(
+        self, config: Config, agent_config: AgentConfig, tmp_worktree: Path
+    ) -> None:
+        issue = make_issue()
+        session = create_test_session(issue, agent_config, tmp_worktree)
+        handler = make_handler(config)
+
+        result = handler.process_completion(
+            session,
+            SessionStatus.COMPLETED,
+            result_only=ResultOnlyDelivery.settled("adds no commit over origin/main"),
+        )
+
+        closes = [a for a in result.actions if isinstance(a, CloseIssueAction)]
+        assert [close.issue_number for close in closes] == [issue.number]
+
+    def test_an_ordinary_completion_plans_no_close(
+        self, config: Config, agent_config: AgentConfig, tmp_worktree: Path
+    ) -> None:
+        """The default is today's PR-carried lifecycle, for every caller."""
+        issue = make_issue()
+        session = create_test_session(issue, agent_config, tmp_worktree)
+        handler = make_handler(config)
+
+        result = handler.process_completion(session, SessionStatus.COMPLETED)
+
+        assert [a for a in result.actions if isinstance(a, CloseIssueAction)] == []

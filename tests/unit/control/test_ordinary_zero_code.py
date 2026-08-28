@@ -18,7 +18,9 @@ from pathlib import Path
 
 import pytest
 
+from issue_orchestrator.control.completion_types import CompletionSettlement
 from issue_orchestrator.control.ordinary_zero_code import (
+    ZeroCodeOrdinarySettlement,
     settle_ordinary_publication_plan,
     settle_zero_code_ordinary_completion,
 )
@@ -266,30 +268,115 @@ class TestThePlanTheCallerCarriesForward:
         )
 
     def test_a_proven_run_carries_only_the_comment_forward(self) -> None:
-        shaped = self._settle_plan(FakeCandidateReader(), governed_elsewhere=False)
+        settled = self._settle_plan(FakeCandidateReader(), governed_elsewhere=False)
 
-        assert shaped.ordered_actions == (RequestedAction.POST_COMMENT,)
+        assert settled.plan.ordered_actions == (RequestedAction.POST_COMMENT,)
 
     def test_the_rest_of_the_plan_is_left_alone(self) -> None:
         """Only the actions are settled; the pipeline's own decision is not."""
-        shaped = self._settle_plan(FakeCandidateReader(), governed_elsewhere=False)
+        settled = self._settle_plan(FakeCandidateReader(), governed_elsewhere=False)
 
-        assert shaped.run_review_exchange_before_publish is True
+        assert settled.plan.run_review_exchange_before_publish is True
 
     def test_a_run_another_owner_governs_is_handed_back_untouched(self) -> None:
         """Tech_lead publication intent is settled at the pre-action seam."""
         reader = FakeCandidateReader()
 
-        shaped = self._settle_plan(reader, governed_elsewhere=True)
+        settled = self._settle_plan(reader, governed_elsewhere=True)
 
-        assert shaped == self._plan()
+        assert settled.plan == self._plan()
         assert reader.dirt_modes == []
         assert reader.counted_against == []
 
+    def test_a_run_another_owner_governs_proves_nothing_here(self) -> None:
+        """Its own owner already answered both; a second answer is drift.
+
+        A tech_lead planning run IS settled out of the code lane — by the
+        pre-action seam, whose answer this module must not overwrite. Claiming
+        the proof here would be the same rule enforced twice, from evidence
+        this module never gathered (it read nothing at all above).
+        """
+        settled = self._settle_plan(FakeCandidateReader(), governed_elsewhere=True)
+
+        assert settled.settlement == CompletionSettlement.unsettled()
+
     def test_a_code_bearing_run_keeps_the_whole_plan(self) -> None:
-        shaped = self._settle_plan(
+        settled = self._settle_plan(
             FakeCandidateReader(commits=BranchCommitsResult(success=True, count=1)),
             governed_elsewhere=False,
         )
 
-        assert shaped == self._plan()
+        assert settled.plan == self._plan()
+
+
+class TestWhatTheSettlementTellsThePhasesDownstream:
+    """The proof leaves this module, or two later phases decide from less.
+
+    An earlier round of #337 shaped the plan and logged the proof. The
+    code-validation gate then ran over a commit the run did not produce, and the
+    completion planner released the run's claim label with nothing to take its
+    place. Both are decided from the settlement, so both are pinned here.
+    """
+
+    def _settle(self, reader: FakeCandidateReader) -> ZeroCodeOrdinarySettlement:
+        return settle_zero_code_ordinary_completion(
+            outcome=CompletionOutcome.COMPLETED,
+            requested_actions=COMPLETED_INTENTS,
+            worktree=WORKTREE,
+            base_ref=BASE_REF,
+            worktree_reader=reader,
+        )
+
+    def test_a_proven_run_offers_no_code_candidate_to_validate(self) -> None:
+        """The #328 contract, carried by its second producer rather than dropped."""
+        settlement = self._settle(FakeCandidateReader())
+
+        assert settlement.code_candidate.offers_code_candidate is False
+        assert settlement.code_candidate.detail == settlement.detail
+
+    def test_a_proven_run_delivers_its_whole_result_as_the_comment(self) -> None:
+        settlement = self._settle(FakeCandidateReader())
+
+        assert settlement.result_only.delivered is True
+        assert settlement.result_only.detail == settlement.detail
+
+    def test_the_settlement_property_carries_both_halves_together(self) -> None:
+        settlement = self._settle(FakeCandidateReader())
+
+        assert settlement.settlement == CompletionSettlement(
+            code_candidate=settlement.code_candidate,
+            result_only=settlement.result_only,
+        )
+
+    @pytest.mark.parametrize(
+        ("reader", "why"),
+        [
+            (
+                FakeCandidateReader(commits=BranchCommitsResult(success=True, count=1)),
+                "the branch adds a commit",
+            ),
+            (
+                FakeCandidateReader(
+                    commits=BranchCommitsResult(success=False, error="bad revision")
+                ),
+                "the count could not be read",
+            ),
+            (FakeCandidateReader(head=None), "HEAD could not be read"),
+            (FakeCandidateReader(dirt=None), "the dirt could not be enumerated"),
+            (FakeCandidateReader(dirt=["src/app.py"]), "tracked content is modified"),
+        ],
+    )
+    def test_a_refusal_proves_nothing_and_says_so(
+        self, reader: FakeCandidateReader, why: str
+    ) -> None:
+        """Fail-safe in the direction that matters: a refusal keeps today's path.
+
+        A refusal is not evidence that a candidate exists — it is the absence of
+        evidence that one does not. Both readers must therefore get the ordinary
+        answer: the gate still runs, and the PR-carried lifecycle still applies.
+        """
+        settlement = self._settle(reader)
+
+        assert settlement.zero_code is False, why
+        assert settlement.code_candidate.offers_code_candidate is True
+        assert settlement.result_only.delivered is False

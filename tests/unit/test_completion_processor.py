@@ -551,6 +551,116 @@ class TestOrdinaryZeroCodePublication:
         mock_git_adapter.push.assert_called_once()
         mock_pr_adapter.create_pr.assert_called_once()
 
+    def test_the_candidates_identity_and_gate_receipt_survive_the_lane(
+        self,
+        mock_label_adapter,
+        mock_pr_adapter,
+        mock_git_adapter,
+        worktree_with_completion,
+    ):
+        """Nothing is bought by taking this lane, ASSERTED rather than argued.
+
+        Being strictly downstream of the guards makes durable receipts true by
+        construction, and a criterion true by construction is one a later edit
+        can quietly stop satisfying. So the publication gate's own hop is
+        pinned here: it is consulted for a run that will take the zero-code
+        lane, and it is handed the session's canonical identity VERBATIM — the
+        hop that decides whether the verdict lands on ``Attempt(issue, A)``
+        with the rest of this candidate's evidence, or is filed under an
+        identity nothing else reads (#85).
+        """
+        from unittest.mock import Mock as _Mock
+
+        from issue_orchestrator.domain.issue_key import GitHubIssueKey
+
+        gate_check = publish_gate_outcome()
+        gate = _Mock()
+        gate.check = _Mock(side_effect=gate_check)
+        processor = CompletionProcessor(
+            agent_callback_endpoint=ready_callback_endpoint(),
+            label_adapter=mock_label_adapter,
+            pr_adapter=mock_pr_adapter,
+            git_adapter=mock_git_adapter,
+            publication_gate=gate,
+            session_output=FileSystemSessionOutput(),
+        )
+        mock_git_adapter.get_head_sha = Mock(return_value="c" * 40)
+        mock_git_adapter.commits_against_base = Mock(
+            return_value=BranchCommitsResult(success=True, count=0)
+        )
+        # Deliberately not the issue number: a key re-derived from ``123``
+        # would satisfy "some key was passed" but not this assertion.
+        issue_key = GitHubIssueKey(repo="owner/repo", external_id="M1-011")
+        record = make_record(
+            outcome=CompletionOutcome.COMPLETED,
+            requested_actions=list(self.ZERO_CODE_INTENTS),
+            summary="Evidence-only measurement",
+            implementation="Read-only observation; no file was changed.",
+            comment_body="## Implementation\n\nThe measured RESULT.",
+        )
+        worktree = worktree_with_completion(record)
+
+        result = processor.process(
+            worktree,
+            run_assets=make_session_run_assets(worktree),
+            issue_number=123,
+            issue_title="Evidence-only issue",
+            issue_key=issue_key,
+        )
+
+        assert result.success is True
+        assert result.pr_url is None
+        gate.check.assert_called_once()
+        assert gate_check.issue_keys == [issue_key]
+        assert gate_check.issue_keys[0] is issue_key
+        # And the reviewed payload still reached the issue on that same pass.
+        mock_pr_adapter.add_comment.assert_called_once_with(123, record.comment_body)
+
+    def test_the_run_is_settled_out_of_the_code_lane_for_the_gate_downstream(
+        self, processor, worktree_with_completion, mock_git_adapter
+    ):
+        """The proof leaves the processor; it is not logged and dropped (#328).
+
+        A settled run that still reported ``offers_code_candidate=True`` would
+        have the quick gate run over a commit it did not produce — and a
+        failure there flips an already-published run into the validation-retry
+        path, relaunched as a coder retry against an empty branch.
+        """
+        _record, result = self._run(
+            processor, worktree_with_completion, mock_git_adapter, commits=0
+        )
+
+        assert result.code_candidate.offers_code_candidate is False
+        assert result.code_candidate.detail
+
+    def test_the_run_is_marked_as_delivering_its_whole_result_by_comment(
+        self, processor, worktree_with_completion, mock_git_adapter
+    ):
+        """The fact that earns the run a terminal disposition (#337 F1).
+
+        No pull request exists, so nothing downstream stamps ``pr-pending``.
+        Unmarked, the completion planner releases ``in-progress`` with nothing
+        to take its place and the finished issue is schedulable again on the
+        next tick.
+        """
+        _record, result = self._run(
+            processor, worktree_with_completion, mock_git_adapter, commits=0
+        )
+
+        assert result.result_only.delivered is True
+        assert result.result_only.detail
+
+    def test_a_code_bearing_completion_is_settled_neither_way(
+        self, processor, worktree_with_completion, mock_git_adapter
+    ):
+        """The boundary: an ordinary run keeps the gate and the PR lifecycle."""
+        _record, result = self._run(
+            processor, worktree_with_completion, mock_git_adapter, commits=1
+        )
+
+        assert result.code_candidate.offers_code_candidate is True
+        assert result.result_only.delivered is False
+
 
 class TestCompletionProcessorLabelActions:
     """Tests for label-related actions from completion records."""
