@@ -191,27 +191,27 @@ def _failure_artifact_hints(
     return tuple(str(path) for path in resolved if path.exists())
 
 
-def _surface_required_act_level_failure(
+def _surface_completion_gate_failures(
     action_applier: "ActionApplier",
     config: Config,
     session: Session,
     outcome: "CompletionGateOutcome",
 ) -> None:
-    """Apply the durable operator surface for a failed mandated act-level action.
+    """Apply the durable operator surface for every gate that did not commit.
 
-    Routes a failed decision-mandated reset to a needs-human label + comment via
-    the existing action owners so the FAILED terminal is not merely in-memory
-    (#6764 F2). The builder returns [] for a committed/genuine-failure outcome —
-    and for a gate failure that was not a reset — so this applies nothing on
-    those paths.
+    Routes each failed gate to a needs-human label + comment via the existing
+    action owners, so the FAILED terminal is not merely in-memory (#6764 F2,
+    #337 r4 F1-R). WHICH gates have a surface and what each says is the
+    dispatch's business, not this call site's
+    (:mod:`.completion_gate_surfaces`); the builder returns [] for a
+    committed/genuine-failure outcome, so this applies nothing on those paths.
     """
-    from .completion_effect_gate import CompletionGateKind
-    from .tech_lead_reset_retry import build_required_act_level_failure_actions
+    from .completion_gate_surfaces import build_completion_gate_failure_actions
 
-    actions = build_required_act_level_failure_actions(
+    actions = build_completion_gate_failure_actions(
+        outcome,
         issue_number=session.issue.number,
         needs_human_label=config.get_label_needs_human(),
-        reset_failures=outcome.failures_of(CompletionGateKind.MANDATED_RESET),
         session_id=session.terminal_id,
         runtime_minutes=session.runtime_minutes,
     )
@@ -488,12 +488,12 @@ def handle_session_completion(  # noqa: C901, PLR0912 - handles validation, acti
         # Surface AI session logs for debugging
         surface_failure_context(session, effective_status)
 
-        # Crash-safe operator surface for a mandated reset that FAILED in-band —
+        # Crash-safe operator surface for a completion GATE that FAILED in-band —
         # driven by the REAL applied verdict, not the effective one. On the
         # raised-apply path the verdict is committed (no results), so this posts
         # nothing: a second GitHub write right after a reconciliation/claim raise
         # would re-fail and mask the re-raise (the terminal is already FAILED).
-        _surface_required_act_level_failure(
+        _surface_completion_gate_failures(
             action_applier, config, session,
             evaluate_completion_gate_outcome(applied_results),
         )

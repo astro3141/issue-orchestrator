@@ -36,6 +36,7 @@ from dataclasses import dataclass
 
 from ..domain.models import Session
 from .actions import Action, CloseIssueAction
+from .completion_gate_narrative import GateFailureNarrative
 from .completion_types import ResultOnlyDelivery
 from .pull_request_observation import PullRequestObservation
 from .reconciliation import ExpectedState
@@ -57,9 +58,14 @@ class ResultOnlyCloseIssueAction(CloseIssueAction):
     given up, which the scheduler cannot tell from work never started.
 
     Marked as a completion GATE (``completion_effect_gate``), the release is
-    withheld unless this close COMMITS. A failed close therefore leaves the
-    issue open and still claimed — not runnable, and reconcilable by the
-    ordinary stale-claim path — instead of open and released.
+    withheld unless this close COMMITS, so a failed close leaves the issue open
+    and still carrying its claim label instead of open and released. That alone
+    is not the boundary: ``Scheduler`` blocks ``in-progress`` only while an
+    ACTIVE session also exists, and this session has just terminalized, so the
+    label is stale and the planner's ordinary stale cleanup removes it (#337
+    round 4, F1-R). What makes the state durable is the BLOCKING label the gate
+    failure's surface plants — see
+    :data:`FAILED_RESULT_ONLY_CLOSE_NARRATIVE`.
 
     It carries no fields of its own; ``ActionApplier`` dispatches it on the
     inherited ``ActionType.CLOSE_ISSUE`` and applies it exactly like any other
@@ -122,7 +128,8 @@ def result_only_terminal_actions(
     The caller orders the returned close BEFORE the release of the claim label,
     and :mod:`.completion_effect_gate` makes that ordering binding: the close
     is a gate, so a close that FAILS withholds the release instead of letting
-    it commit after it.
+    it commit after it, and its failure is escalated durably by
+    :data:`FAILED_RESULT_ONLY_CLOSE_NARRATIVE`.
     """
     if not result_only.delivered:
         return []
@@ -151,8 +158,53 @@ def result_only_terminal_actions(
     ]
 
 
+FAILED_RESULT_ONLY_CLOSE_NARRATIVE = GateFailureNarrative(
+    subject="result-only terminal close",
+    heading="Result-Only Close Did Not Complete",
+    explanation=(
+        "This run delivered its result as the comment above and produced no code"
+        " to merge, so the orchestrator planned to close the issue instead of"
+        " handing it to `pr-pending`. The close failed at apply time. The release"
+        " of `in-progress` was withheld and the session was recorded as FAILED,"
+        " so no half-applied disposition committed — but the issue is still OPEN"
+        " with no pull request whose merge could ever close it."
+    ),
+    label_because=(
+        "a finished run left an open issue that nothing else will ever close,"
+        " and an open issue with no blocking label is selected again on the next"
+        " tick — which would re-run the same measurement and post the same"
+        " result, without bound"
+    ),
+    remedy=(
+        "Close the issue by hand once you have read the result above, or remove"
+        " the label to let the issue be worked again."
+    ),
+)
+"""What an operator reads when the terminal close of a result-only run fails.
+
+The durable half of the F1 boundary (#337 round 4, F1-R). Withholding the
+release is what stops a HALF-APPLIED disposition from committing, but it does
+not by itself keep the issue out of the queue: the ``in-progress`` label left
+behind is stale the moment the session terminalizes, ``Scheduler`` blocks that
+label only alongside an active session, and the ordinary stale cleanup removes
+it. The only thing holding the issue after that is the unreleased session-history
+claim, which is process-local and is NOT one of
+``ABANDONED_AFTER_COMPLETION_HISTORY_STATUSES`` — so a restart would relaunch
+the finished run.
+
+Planting the shared blocking label is what makes the stop durable and bounded,
+and it is what ``domain.models`` already says a ``failed`` history status is
+expected to do: "plant a BLOCKING label, so the scheduler refuses the issue
+whether or not any in-memory gate is retired". The escalation ends the way every
+other :attr:`~.needs_human_block.NeedsHumanCause.SESSION_LIFECYCLE` block ends —
+a human clears the label — which is the same bounded stop this lane replaced a
+bounded publish failure with.
+"""
+
+
 __all__ = [
     "CLOSE_COMMENT",
+    "FAILED_RESULT_ONLY_CLOSE_NARRATIVE",
     "ResultOnlyCloseIssueAction",
     "result_only_terminal_actions",
 ]

@@ -31,10 +31,11 @@ A ``ResetRetryIssueAction`` is one member of the COMPLETION GATE, whose
 apply-time boundary and terminal-status verdict live next door in
 :mod:`.completion_effect_gate` — general machinery with a second member since
 #337 r3, and no longer this module's to own. What stays here is the
-tech_lead-specific consequence:
-:func:`build_required_act_level_failure_actions` routes a failed mandated
-reset to a durable needs-human label + comment so the FAILED terminal
-:func:`~.completion_effect_gate.effective_terminal_status` assigns is not
+tech_lead-specific consequence, and since #337 r4 only its WORDS:
+:data:`FAILED_MANDATED_RESET_NARRATIVE` is what an operator reads when a
+mandated reset does not commit, and :mod:`.completion_gate_surfaces` turns it
+into the durable needs-human label + comment that keeps the FAILED terminal
+:func:`~.completion_effect_gate.effective_terminal_status` assigns from being
 merely in-memory. A failed mandated reset can therefore never be recorded as
 a clean success.
 
@@ -60,15 +61,11 @@ from ..events import EventName
 from ..infra.logging_config import issue_log
 from ..ports import EventSink, make_trace_event
 from .actions import (
-    Action,
     ActionResult,
-    AddCommentAction,
-    AddLabelAction,
     ResetRetryIssueAction,
     SurfaceTechLeadProposalAction,
 )
-from .completion_effect_gate import CompletionGateFailure
-from .needs_human_block import NeedsHumanCause
+from .completion_gate_narrative import GateFailureNarrative
 
 if TYPE_CHECKING:
     from ..ports.issue import Issue
@@ -327,64 +324,31 @@ def preserve_reset_retry_eligibility(
     return cleared
 
 
-def build_required_act_level_failure_actions(
-    *,
-    issue_number: int,
-    needs_human_label: str,
-    reset_failures: Sequence[CompletionGateFailure],
-    session_id: str,
-    runtime_minutes: float,
-) -> list[Action]:
-    """Durable, crash-safe operator surface for a failed mandated act-level action.
+FAILED_MANDATED_RESET_NARRATIVE = GateFailureNarrative(
+    subject="mandated reset_retry",
+    heading="Reset & Retry Did Not Complete",
+    explanation=(
+        "The tech_lead decision mandated a scratch reset for this issue, but"
+        " the reset owner failed at apply time. The orchestrator recorded the"
+        " session as FAILED instead of accepting the agent's completed"
+        " intent, so the issue is not silently left as a partial reset."
+    ),
+    label_because="the orchestrator could not safely apply the mandated reset",
+    remedy="Remove the label after correcting or re-running the reset.",
+)
+"""How a failed mandated reset reads to the operator who must clear it.
 
-    A failed mandated reset terminalizes the completion as FAILED
-    (:func:`~.completion_effect_gate.effective_terminal_status`), but that
-    terminal record is in-memory only — a crash between it and the next tick
-    would lose the signal. This
-    routes the failure to GitHub through the SAME label/comment action owners the
-    rest of completion uses (no parallel mechanism): the needs-human blocking
-    label plus an explanatory comment, mirroring the invalid-completion-record
-    surface ("the orchestrator could not safely apply the agent's requested
-    outcome"). Returns an EMPTY list when nothing was handed to it, so the caller
-    applies nothing on the success path and the genuine-failure path (whose
-    surface the completion handler already planned).
+The tech_lead-specific half of the durable surface. A failed mandated reset
+terminalizes the completion as FAILED
+(:func:`~.completion_effect_gate.effective_terminal_status`), but that terminal
+record is in-memory only — a crash between it and the next tick would lose the
+signal, so the failure is written to GitHub as a blocking label plus an
+explanation. What is written and how is :mod:`.completion_gate_surfaces`'s
+business; only the WORDS are this owner's, mirroring the
+invalid-completion-record surface ("the orchestrator could not safely apply the
+agent's requested outcome").
 
-    It takes the reset failures THEMSELVES rather than the whole completion-gate
-    outcome, because the gate holds a second member whose failure is not a reset
-    (#337 r3 F1): telling an operator that "Reset & Retry did not complete" when
-    no reset was ever mandated would be a false report. Selecting the kind is the
-    caller's routing decision — see
-    :meth:`~.completion_effect_gate.CompletionGateOutcome.failures_of` — and what
-    arrives here is only ever this owner's own failures. The other member is
-    durably surfaced by the state its failure declines to leave — an open,
-    still-claimed issue — so it needs no writes here.
-    """
-    if not reset_failures:
-        return []
-    summary = "; ".join(failure.detail for failure in reset_failures)
-    comment = (
-        "**Reset & Retry Did Not Complete**\n\n"
-        "The tech_lead decision mandated a scratch reset for this issue, but the "
-        "reset owner failed at apply time. The orchestrator recorded the session "
-        "as FAILED instead of accepting the agent's completed intent, so the "
-        "issue is not silently left as a partial reset.\n\n"
-        f"- Failure: {summary}\n"
-        f"- Session: `{session_id}`\n"
-        f"- Runtime: {runtime_minutes:.1f} minutes\n\n"
-        f"This issue has been marked as `{needs_human_label}` because the "
-        "orchestrator could not safely apply the mandated reset.\n"
-        "Remove the label after correcting or re-running the reset."
-    )
-    return [
-        AddLabelAction(
-            issue_number=issue_number,
-            label=needs_human_label,
-            reason="mandated reset_retry did not commit; routing to needs-human",
-            needs_human_cause=NeedsHumanCause.SESSION_LIFECYCLE,
-        ),
-        AddCommentAction(
-            number=issue_number,
-            comment=comment,
-            reason="notify operator that the mandated reset failed at apply time",
-        ),
-    ]
+The dispatch hands each owner only its OWN failures and only when it has some,
+so telling an operator that "Reset & Retry did not complete" for a run that
+mandated no reset is not a report this owner can produce (#337 r3 F1).
+"""

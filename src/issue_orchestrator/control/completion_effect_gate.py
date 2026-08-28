@@ -28,8 +28,10 @@ shape from opposite directions:
     close that FAILED followed by a release that succeeded leaves an OPEN issue
     with its execution claim given up — indistinguishable to ``Scheduler`` from
     work never started, so the finished measurement relaunches every tick. Held
-    behind the gate, the failed close leaves the issue open and still CLAIMED:
-    not runnable, and recoverable by the ordinary stale-claim path.
+    behind the gate, the failed close leaves the issue open and still carrying
+    the ``in-progress`` claim label; the BLOCKING label its owner then plants
+    (:mod:`.completion_gate_surfaces`) is what makes that state durable rather
+    than merely process-local.
 
 The verdict this produces is also the single terminal-status policy for the
 whole post-apply completion phase (#6764 re-review F2, #6777):
@@ -40,11 +42,14 @@ what actually committed. An apply that RAISED past the runtime-kill boundary is
 folded through the same machinery, so it cannot be a false success either.
 
 The failure carries its KIND, because the durable operator surface a failure
-deserves is the failing owner's business and not this module's: a failed
-mandated reset routes to needs-human through
-``tech_lead_reset_retry.build_required_act_level_failure_actions``, whereas a
-failed result-only close is already durably surfaced by the state it declines
-to leave — an open, still-claimed issue carrying the run's RESULT comment.
+deserves is the failing owner's business and not this module's. Both members
+earn one, and :mod:`.completion_gate_surfaces` is the dispatch that hands each
+owner its own failures and nothing else.
+
+A raise past the runtime-kill boundary is NOT a kind. It is the absence of any
+verdict — :class:`UnjudgedApply` — because no gate ran far enough to be judged
+and no owner's surface would be truthful about it (#337 r4, N2). It still
+terminalizes the completion FAILED through the same machinery.
 """
 
 from __future__ import annotations
@@ -67,16 +72,19 @@ logger = logging.getLogger(__name__)
 
 
 class CompletionGateKind(Enum):
-    """Which gate an action is, so its failure can be surfaced by its owner."""
+    """Which gate an action is, so its failure can be surfaced by its owner.
+
+    Every member is a real gate: one returned by :func:`completion_gate_kind`
+    for some planned action, and one with an owner able to word a truthful
+    operator report about it. "No verdict could be reached" is deliberately NOT
+    a member — see :class:`UnjudgedApply` (#337 r4, N2).
+    """
 
     MANDATED_RESET = "mandated_reset"
     """A tech_lead decision's required act-level reset (ADR-0031 §2)."""
 
     RESULT_ONLY_CLOSE = "result_only_close"
     """The terminal close of a run whose comment was its whole delivery (#337)."""
-
-    APPLY_RAISED = "apply_raised"
-    """No gate result at all: ``apply_all`` raised before anything committed."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -87,26 +95,47 @@ class CompletionGateFailure:
     detail: str
 
 
+@dataclass(frozen=True, slots=True)
+class UnjudgedApply:
+    """``apply_all`` raised, so no gate reached a verdict at all.
+
+    Distinct from a :class:`CompletionGateFailure` because it names the absence
+    of a verdict rather than one gate's failure. Keeping it out of the kind enum
+    is what lets :mod:`.completion_gate_surfaces` route EVERY kind to an owner
+    exhaustively: there is no member here for which no owner exists, and no
+    surface has to be written about a gate that may never have been applied
+    (#337 r4, N2).
+    """
+
+    detail: str
+
+
 @dataclass(frozen=True)
 class CompletionGateOutcome:
     """Did every gating action of this completion commit?
 
     The single authoritative boundary the completion path consumes to decide
-    terminalization. ``committed`` is true when no gate FAILED. A stale
-    downgrade (``ActionResultType.SKIPPED``) counts as committed: the board
-    moved and the owner correctly surfaced instead of mutating — a non-failure
-    outcome. Only a hard FAILURE blocks success terminalization.
+    terminalization. ``committed`` is true when no gate FAILED and the apply
+    reached a verdict at all. A stale downgrade
+    (``ActionResultType.SKIPPED``) counts as committed: the board moved and the
+    owner correctly surfaced instead of mutating — a non-failure outcome. Only a
+    hard FAILURE, or an apply that raised, blocks success terminalization.
     """
 
     committed: bool
     failures: tuple[CompletionGateFailure, ...] = ()
+    unjudged: UnjudgedApply | None = None
 
     @property
     def failed(self) -> bool:
         return not self.committed
 
     def failed_kinds(self) -> frozenset[CompletionGateKind]:
-        """Which gates failed — what a kind-specific surface keys off."""
+        """Which gates failed — what a kind-specific surface keys off.
+
+        EMPTY on the unjudged path, and that is the point: no gate is known to
+        have failed, so no owner is handed a failure to report.
+        """
         return frozenset(failure.kind for failure in self.failures)
 
     def failures_of(
@@ -121,9 +150,10 @@ class CompletionGateOutcome:
         return tuple(failure for failure in self.failures if failure.kind is kind)
 
     def failure_summary(self) -> str:
-        return "; ".join(failure.detail for failure in self.failures) or (
-            "a required completion action did not commit"
-        )
+        details = [failure.detail for failure in self.failures]
+        if self.unjudged is not None:
+            details.append(self.unjudged.detail)
+        return "; ".join(details) or "a required completion action did not commit"
 
 
 def completion_gate_kind(action: Action) -> CompletionGateKind | None:
@@ -274,13 +304,9 @@ def completion_gate_outcome_after_apply(
     if apply_error is not None:
         return CompletionGateOutcome(
             committed=False,
-            failures=(
-                CompletionGateFailure(
-                    kind=CompletionGateKind.APPLY_RAISED,
-                    detail=(
-                        "completion action apply raised before commit:"
-                        f" {apply_error}"
-                    ),
+            unjudged=UnjudgedApply(
+                detail=(
+                    f"completion action apply raised before commit: {apply_error}"
                 ),
             ),
         )
@@ -339,6 +365,7 @@ __all__ = [
     "CompletionGateFailure",
     "CompletionGateKind",
     "CompletionGateOutcome",
+    "UnjudgedApply",
     "apply_completion_actions_gated",
     "completion_gate_kind",
     "completion_gate_outcome_after_apply",

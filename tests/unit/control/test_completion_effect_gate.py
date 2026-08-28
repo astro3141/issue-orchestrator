@@ -39,12 +39,13 @@ from issue_orchestrator.control.completion_effect_gate import (
     is_completion_gate_action,
     partition_completion_gate_actions,
 )
+from issue_orchestrator.control.completion_gate_surfaces import (
+    GATE_FAILURE_NARRATIVES,
+    build_completion_gate_failure_actions,
+)
 from issue_orchestrator.control.result_only_completion import (
     CLOSE_COMMENT,
     ResultOnlyCloseIssueAction,
-)
-from issue_orchestrator.control.tech_lead_reset_retry import (
-    build_required_act_level_failure_actions,
 )
 from issue_orchestrator.domain.models import SessionHistoryEntry, SessionStatus
 
@@ -75,6 +76,20 @@ def applier(labels: MagicMock, repository_host: MagicMock) -> ActionApplier:
         worktree_manager=MagicMock(),
         fresh_issue_reader=None,
         reconcile=False,
+    )
+
+
+def _surface_for(kind: CompletionGateKind, detail: str) -> list:
+    """The durable surface one gate's failure produces, through the dispatch."""
+    return build_completion_gate_failure_actions(
+        CompletionGateOutcome(
+            committed=False,
+            failures=(CompletionGateFailure(kind=kind, detail=detail),),
+        ),
+        issue_number=ISSUE,
+        needs_human_label="needs-human",
+        session_id="issue-337",
+        runtime_minutes=1.0,
     )
 
 
@@ -115,10 +130,12 @@ class TestAFailedTerminalCloseCannotReleaseTheClaim:
     def test_the_issue_is_left_claimed_and_open_not_released(
         self, applier: ActionApplier, labels: MagicMock, repository_host: MagicMock
     ) -> None:
-        """The durable state a failed close leaves must not be runnable.
+        """What the BATCH did and did not commit — not the durable boundary.
 
-        Open + ``in-progress`` is out of selection and recoverable by the
-        ordinary stale-claim path; open + unlabelled is the unbounded relaunch.
+        Withholding the release is the half this module owns. Whether the
+        resulting state actually survives into the next planning cycle is
+        proved in ``test_result_only_close_failure_recovery.py``, because
+        ordering and withholding alone never made it durable (#337 F1-R).
         """
         repository_host.update_issue_state.side_effect = RuntimeError("GitHub refused")
 
@@ -184,60 +201,46 @@ class TestAFailedTerminalCloseCannotReleaseTheClaim:
         assert "GitHub refused" in (entry.status_reason or "")
 
     def test_a_failed_close_is_not_reported_as_a_failed_reset(self) -> None:
-        """The tech_lead surface is keyed on its OWN gate, not on any failure.
+        """Each surface is keyed on its OWN gate, not on any failure.
 
         Telling an operator that "Reset & Retry did not complete" for a run that
         never mandated a reset would be a false report.
         """
-        outcome = CompletionGateOutcome(
-            committed=False,
-            failures=(
-                CompletionGateFailure(
-                    kind=CompletionGateKind.RESULT_ONLY_CLOSE,
-                    detail="GitHub refused",
-                ),
-            ),
-        )
+        actions = _surface_for(CompletionGateKind.RESULT_ONLY_CLOSE, "GitHub refused")
 
-        assert outcome.failures_of(CompletionGateKind.MANDATED_RESET) == ()
-        assert (
-            build_required_act_level_failure_actions(
-                issue_number=ISSUE,
-                needs_human_label="needs-human",
-                reset_failures=outcome.failures_of(
-                    CompletionGateKind.MANDATED_RESET
-                ),
-                session_id="issue-337",
-                runtime_minutes=1.0,
-            )
-            == []
-        )
+        assert "Reset & Retry" not in actions[1].comment
+        assert "Result-Only Close Did Not Complete" in actions[1].comment
+        assert "GitHub refused" in actions[1].comment
 
     def test_a_failed_reset_still_reaches_its_needs_human_surface(self) -> None:
         """The pre-existing member's operator surface must not have been lost."""
-        outcome = CompletionGateOutcome(
-            committed=False,
-            failures=(
-                CompletionGateFailure(
-                    kind=CompletionGateKind.MANDATED_RESET,
-                    detail="reset owner failed",
-                ),
-            ),
-        )
-
-        actions = build_required_act_level_failure_actions(
-            issue_number=ISSUE,
-            needs_human_label="needs-human",
-            reset_failures=outcome.failures_of(CompletionGateKind.MANDATED_RESET),
-            session_id="issue-337",
-            runtime_minutes=1.0,
+        actions = _surface_for(
+            CompletionGateKind.MANDATED_RESET, "reset owner failed"
         )
 
         assert [type(action).__name__ for action in actions] == [
             "AddLabelAction",
             "AddCommentAction",
         ]
+        assert "Reset & Retry Did Not Complete" in actions[1].comment
         assert "reset owner failed" in actions[1].comment
+
+    def test_a_committed_gate_surfaces_nothing(self) -> None:
+        """The success path writes nothing to GitHub."""
+        assert (
+            build_completion_gate_failure_actions(
+                CompletionGateOutcome(committed=True),
+                issue_number=ISSUE,
+                needs_human_label="needs-human",
+                session_id="issue-337",
+                runtime_minutes=1.0,
+            )
+            == []
+        )
+
+    def test_every_gate_kind_has_a_surface(self) -> None:
+        """A gate with no durable surface is the F1 defect, not a design choice."""
+        assert set(GATE_FAILURE_NARRATIVES) == set(CompletionGateKind)
 
 
 class TestOnlyTheResultOnlyCloseGatesTheBatch:
@@ -319,8 +322,29 @@ class TestTheGateVerdictFoldsWhatActuallyCommitted:
         outcome = completion_gate_outcome_after_apply([], RuntimeError("claim lost"))
 
         assert outcome.failed
-        assert outcome.failed_kinds() == {CompletionGateKind.APPLY_RAISED}
+        assert "claim lost" in outcome.failure_summary()
         assert (
             effective_terminal_status(SessionStatus.COMPLETED, outcome)
             is SessionStatus.FAILED
+        )
+
+    def test_a_raised_apply_names_no_gate_and_surfaces_nothing(self) -> None:
+        """No gate reached a verdict, so no owner's report would be true.
+
+        A second GitHub write immediately after a reconciliation/claim raise
+        would re-fail and mask the re-raise; the terminal is already FAILED.
+        """
+        outcome = completion_gate_outcome_after_apply([], RuntimeError("claim lost"))
+
+        assert outcome.failed_kinds() == frozenset()
+        assert outcome.unjudged is not None
+        assert (
+            build_completion_gate_failure_actions(
+                outcome,
+                issue_number=ISSUE,
+                needs_human_label="needs-human",
+                session_id="issue-337",
+                runtime_minutes=1.0,
+            )
+            == []
         )

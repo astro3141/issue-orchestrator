@@ -344,13 +344,39 @@ success-only remainder applies only if every one of them commits:
 | Close | `in-progress` | Resulting state |
 |-------|---------------|-----------------|
 | commits | released | closed, finished — today's success |
-| fails | **withheld** | open **and still claimed** — out of selection, recoverable by the ordinary stale-claim path |
+| fails | **withheld** | open, still claimed, and **blocked** — see below |
 
 A failed gate also makes the completion's *effective* terminal status `FAILED`,
 so the observer, history, retry gating and operator surface all agree that the
-run did not finish cleanly. The needs-human surface a failed mandated reset gets
-is keyed on **that gate's** failures (`CompletionGateOutcome.failures_of`), so a
-failed result-only close is never reported as a failed Reset & Retry.
+run did not finish cleanly.
+
+**Withholding the release is not by itself the boundary.** `Scheduler` blocks
+`in-progress` only while an *active session* also exists, and this session has
+just terminalized — so the label is stale, the planner's ordinary stale cleanup
+removes it, and the only thing left holding the issue is the unreleased
+session-history claim, which is process-local and whose `failed` status is
+deliberately *not* one of `ABANDONED_AFTER_COMPLETION_HISTORY_STATUSES`. A
+restart would start again from an open, unlabelled, finished issue.
+
+So a failed gate also plants the shared `needs-human` blocking label with an
+explanation, which is what `domain/models.py` already says a `failed` completion
+is expected to do: *"plant a BLOCKING label, so the scheduler refuses the issue
+whether or not any in-memory gate is retired."* The escalation ends the way every
+other `SESSION_LIFECYCLE` block ends — a human clears the label — which is the
+same bounded stop the pre-#337 publish failure gave this run.
+
+`control/completion_gate_surfaces.py` is the one place that maps a gate kind to
+what the operator is told, and the mapping is **total** over
+`CompletionGateKind`: a gate that can withhold a completion's effects but leaves
+nothing durable behind is the defect, not a design choice. Each owner declares
+only the words (`GateFailureNarrative`), so a failed result-only close is never
+reported as a failed Reset & Retry and vice versa.
+
+An apply that *raised* past the runtime-kill boundary is not a gate kind at all —
+it is `UnjudgedApply`, the absence of any verdict. It still terminalizes the
+completion `FAILED`, and deliberately writes nothing: a second GitHub write
+immediately after a reconciliation/claim raise would re-fail and mask the
+re-raise.
 
 ### The disposition needs two more things than the five facts
 
