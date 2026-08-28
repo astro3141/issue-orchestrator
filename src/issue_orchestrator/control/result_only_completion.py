@@ -32,13 +32,40 @@ terminal close.
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 
 from ..domain.models import Session
 from .actions import Action, CloseIssueAction
 from .completion_types import ResultOnlyDelivery
+from .pull_request_observation import PullRequestObservation
 from .reconciliation import ExpectedState
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class ResultOnlyCloseIssueAction(CloseIssueAction):
+    """The terminal close of a result-only run — and the GATE for its release.
+
+    A distinct type rather than a plain :class:`CloseIssueAction` because the
+    completion applier must be able to tell this one close from every other
+    (#337 round 3, F1). Ordering the close before the release of ``in-progress``
+    is not a fail-stop boundary: ``ActionApplier`` catches an ordinary close
+    error and reports a FAILED result, then applies the rest of the batch — so
+    a failed close followed by a successful release leaves exactly the state
+    the ordering was meant to prevent, an OPEN issue with its execution claim
+    given up, which the scheduler cannot tell from work never started.
+
+    Marked as a completion GATE (``completion_effect_gate``), the release is
+    withheld unless this close COMMITS. A failed close therefore leaves the
+    issue open and still claimed — not runnable, and reconcilable by the
+    ordinary stale-claim path — instead of open and released.
+
+    It carries no fields of its own; ``ActionApplier`` dispatches it on the
+    inherited ``ActionType.CLOSE_ISSUE`` and applies it exactly like any other
+    close. What differs is not HOW it applies, but what may follow it.
+    """
+
 
 CLOSE_COMMENT = (
     "Closed by issue-orchestrator: this run published its result as the comment"
@@ -59,7 +86,7 @@ def result_only_terminal_actions(
     expected: ExpectedState,
     result_only: ResultOnlyDelivery,
     *,
-    pull_request_url: str | None,
+    pull_request: PullRequestObservation,
 ) -> list[Action]:
     """The terminal disposition of a run whose comment is its whole delivery.
 
@@ -67,35 +94,45 @@ def result_only_terminal_actions(
     ordinary PR-carried lifecycle, which is also the fail-safe direction: an
     unsettled run keeps exactly today's behaviour.
 
-    ``pull_request_url`` is a SECOND, independent condition, and it is here
-    because the settlement's five facts answer "did this RUN produce code?"
-    and not "does this ISSUE have work in flight" (#337 round 2, N4). The two
-    come apart in a shape this repository has actually seen: a rework worktree
-    that arrives reset to the base, its pull request's commits reachable only
-    from the remote branch. Such a run has a clean tree, sits at the base, adds
-    no commit, and would satisfy every fact the lane proves — and closing its
+    ``pull_request`` is a SECOND, independent condition, and it is here because
+    the settlement's five facts answer "did this RUN produce code?" and not
+    "does this ISSUE have work in flight" (#337 round 2, N4). The two come
+    apart in a shape this repository has actually seen: a rework worktree that
+    arrives reset to the base, its pull request's commits reachable only from
+    the remote branch. Such a run has a clean tree, sits at the base, adds no
+    commit, and would satisfy every fact the lane proves — and closing its
     issue would close one whose pull request is open and unmerged.
 
-    A genuine evidence run has no pull request; that is the whole premise of
-    the lane. So the presence of one is enough to refuse, and it costs nothing
-    to ask: the completion handler has already fetched it for this issue. It is
-    a guard rather than the proof — an unreadable PR lookup yields ``None`` and
-    falls back to the settlement — which is why it sits beside the settlement
-    instead of replacing any part of it.
+    It is the OBSERVATION and not a url, because ``None`` is what a missing
+    pull request and an unreadable lookup both leave behind, and this decision
+    is exactly where the two must not be confused (#337 round 3, F2). The
+    review/rework fallback reads ``get_pr(session.pr_number)`` for a session
+    that is KNOWN to have a pull request; when that read raises, "I could not
+    tell" arriving as "there is none" would authorise the very close the guard
+    exists to refuse. Only an OBSERVED absence opens this path; both
+    ``OBSERVED_PRESENT`` and ``UNKNOWN`` refuse, and the run keeps the ordinary
+    lifecycle it would have had before the lane existed.
 
-    The caller orders this BEFORE the release of the claim label, so a partial
-    apply fails safe: a closed issue is out of selection whatever becomes of
-    its labels afterwards, whereas a released-but-unclosed one is exactly the
-    unbounded relaunch this module exists to prevent.
+    A genuine evidence run has no pull request; that is the whole premise of
+    the lane. Asking costs nothing — the completion handler has already fetched
+    it for this issue — and it stays a guard beside the settlement rather than
+    a part of the proof, which is why an unproven settlement still refuses
+    first.
+
+    The caller orders the returned close BEFORE the release of the claim label,
+    and :mod:`.completion_effect_gate` makes that ordering binding: the close
+    is a gate, so a close that FAILS withholds the release instead of letting
+    it commit after it.
     """
     if not result_only.delivered:
         return []
-    if pull_request_url:
+    if not pull_request.observed_absent:
         logger.warning(
-            "[COMPLETION] Result-only delivery for issue #%d, but pull request"
-            " %s exists for it; refusing the terminal close (%s)",
+            "[COMPLETION] Result-only delivery for issue #%d, but its pull"
+            " request is %s (%s); refusing the terminal close (%s)",
             session.issue.number,
-            pull_request_url,
+            pull_request.presence.value,
+            pull_request.detail or "no detail recorded",
             result_only.detail,
         )
         return []
@@ -105,7 +142,7 @@ def result_only_terminal_actions(
         result_only.detail,
     )
     return [
-        CloseIssueAction(
+        ResultOnlyCloseIssueAction(
             issue_number=session.issue.number,
             comment=CLOSE_COMMENT,
             reason="Completed run delivered its result with no code to merge",
@@ -114,4 +151,8 @@ def result_only_terminal_actions(
     ]
 
 
-__all__ = ["CLOSE_COMMENT", "result_only_terminal_actions"]
+__all__ = [
+    "CLOSE_COMMENT",
+    "ResultOnlyCloseIssueAction",
+    "result_only_terminal_actions",
+]

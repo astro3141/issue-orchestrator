@@ -21,11 +21,20 @@ from issue_orchestrator.control.completion_action_planner import (
     CompletionActionPlanner,
     critical_processing_errors,
 )
+from issue_orchestrator.control.completion_effect_gate import (
+    is_completion_gate_action,
+)
 from issue_orchestrator.control.completion_types import (
     ERROR_PREFIX_CREATE_PR,
     ERROR_PREFIX_PUSH,
     ERROR_PREFIX_RESULT_UNDELIVERED,
     ResultOnlyDelivery,
+)
+from issue_orchestrator.control.pull_request_observation import (
+    PullRequestObservation,
+)
+from issue_orchestrator.control.result_only_completion import (
+    ResultOnlyCloseIssueAction,
 )
 from issue_orchestrator.control.tech_lead_completion import (
     admit_tech_lead_completion,
@@ -82,6 +91,21 @@ def make_issue(
         title=f"Test issue {number}",
         labels=labels or ["agent:test"],
         repo="owner/repo",
+    )
+
+
+NO_PULL_REQUEST = PullRequestObservation.observed_none(
+    "branch carries no pull request and the session references none"
+)
+"""A lookup that RAN and found nothing — the only verdict that may close."""
+
+
+def observed_pull_request(
+    url: str = "https://example.test/owner/repo/pull/7", number: int = 7
+) -> PullRequestObservation:
+    """A lookup that ran and found an open pull request for the issue."""
+    return PullRequestObservation.observed(
+        url=url, number=number, detail="branch carries an open pull request"
     )
 
 
@@ -3340,6 +3364,7 @@ class TestAResultOnlyRunReachesATerminalDisposition:
         actions = make_planner(Config()).generate_completion_actions(
             make_session(tmp_path),
             SessionStatus.COMPLETED,
+            pull_request=NO_PULL_REQUEST,
             result_only=ResultOnlyDelivery.settled("adds no commit over origin/main"),
         )
 
@@ -3348,29 +3373,33 @@ class TestAResultOnlyRunReachesATerminalDisposition:
         assert closes[0].issue_number == 1
         assert "in-progress" in removed_labels(actions)
 
-    def test_the_close_is_ordered_before_the_claim_label_is_released(
+    def test_the_close_is_planned_as_the_gate_for_the_release(
         self, tmp_path: Path
     ) -> None:
-        """A partial apply must fail SAFE, which here means closed.
+        """Ordering alone is not fail-stop; the close must be a GATE (#337 r3 F1).
 
-        Releasing ``in-progress`` first and then failing to close leaves an
-        open, unlabelled, finished work item — the exact state the scheduler
-        cannot tell from work never started. A close that lands first is out of
-        selection whatever happens to the labels afterwards.
+        ``ActionApplier`` reports a failed close as a FAILED result and applies
+        the rest of the batch, so a close ordered first and then failing would
+        still be followed by the release of ``in-progress`` — an open, finished,
+        unclaimed issue, exactly the state the ordering was meant to prevent.
+        The typed action is what the completion gate withholds the remainder on.
         """
         actions = make_planner(Config()).generate_completion_actions(
             make_session(tmp_path),
             SessionStatus.COMPLETED,
+            pull_request=NO_PULL_REQUEST,
             result_only=ResultOnlyDelivery.settled("adds no commit over origin/main"),
         )
 
-        assert isinstance(actions[0], CloseIssueAction)
+        assert isinstance(actions[0], ResultOnlyCloseIssueAction)
+        assert is_completion_gate_action(actions[0])
         releases = [
             i
             for i, a in enumerate(actions)
             if isinstance(a, RemoveLabelAction) and a.label == "in-progress"
         ]
         assert releases and releases[0] > 0
+        assert not any(is_completion_gate_action(actions[i]) for i in releases)
 
     def test_the_close_explains_why_no_pull_request_exists(
         self, tmp_path: Path
@@ -3379,6 +3408,7 @@ class TestAResultOnlyRunReachesATerminalDisposition:
         actions = make_planner(Config()).generate_completion_actions(
             make_session(tmp_path),
             SessionStatus.COMPLETED,
+            pull_request=NO_PULL_REQUEST,
             result_only=ResultOnlyDelivery.settled("adds no commit over origin/main"),
         )
 
@@ -3391,6 +3421,7 @@ class TestAResultOnlyRunReachesATerminalDisposition:
         actions = make_planner(Config()).generate_completion_actions(
             make_session(tmp_path),
             SessionStatus.COMPLETED,
+            pull_request=NO_PULL_REQUEST,
             result_only=ResultOnlyDelivery.settled("adds no commit over origin/main"),
         )
 
@@ -3401,7 +3432,7 @@ class TestAResultOnlyRunReachesATerminalDisposition:
         actions = make_planner(Config()).generate_completion_actions(
             make_session(tmp_path),
             SessionStatus.COMPLETED,
-            pr_url="https://example.test/owner/repo/pull/7",
+            pull_request=observed_pull_request(),
         )
 
         assert self._closes(actions) == []
@@ -3421,6 +3452,7 @@ class TestAResultOnlyRunReachesATerminalDisposition:
             make_session(tmp_path),
             SessionStatus.COMPLETED,
             processing_errors=[f"{ERROR_PREFIX_PUSH}: remote rejected"],
+            pull_request=NO_PULL_REQUEST,
             result_only=ResultOnlyDelivery.settled("adds no commit over origin/main"),
         )
 
@@ -3432,6 +3464,7 @@ class TestAResultOnlyRunReachesATerminalDisposition:
             make_session(tmp_path),
             SessionStatus.COMPLETED,
             review_exchange_halted=True,
+            pull_request=NO_PULL_REQUEST,
             result_only=ResultOnlyDelivery.settled("adds no commit over origin/main"),
         )
 
@@ -3452,6 +3485,7 @@ class TestAResultOnlyRunReachesATerminalDisposition:
         actions = make_planner(Config()).generate_completion_actions(
             make_session(tmp_path),
             status,
+            pull_request=NO_PULL_REQUEST,
             result_only=ResultOnlyDelivery.settled("adds no commit over origin/main"),
         )
 
@@ -3480,6 +3514,7 @@ class TestAnUndeliveredResultIsBoundedNotClosed:
             make_session(tmp_path),
             SessionStatus.COMPLETED,
             processing_errors=[self.UNDELIVERED],
+            pull_request=NO_PULL_REQUEST,
             # The settlement is already withdrawn upstream; passing it settled
             # here proves the routing does not depend on that withdrawal alone.
             result_only=ResultOnlyDelivery.settled("adds no commit over origin/main"),
@@ -3538,19 +3573,53 @@ class TestTheDispositionRefusesAnIssueWithWorkInFlight:
         actions = make_planner(Config()).generate_completion_actions(
             make_session(tmp_path),
             SessionStatus.COMPLETED,
-            pr_url="https://example.test/owner/repo/pull/7",
+            pull_request=observed_pull_request(),
             result_only=ResultOnlyDelivery.settled("adds no commit over origin/main"),
         )
 
         assert [a for a in actions if isinstance(a, CloseIssueAction)] == []
         assert "in-progress" in removed_labels(actions)
 
-    def test_the_genuine_evidence_run_still_closes(self, tmp_path: Path) -> None:
-        """The falsification control: no pull request is the lane's premise."""
+    def test_an_unreadable_pull_request_lookup_refuses_the_close(
+        self, tmp_path: Path
+    ) -> None:
+        """UNKNOWN must not mean OBSERVED_NONE (#337 round 3, F2).
+
+        The review/rework fallback reads ``get_pr(session.pr_number)`` for a
+        session that is KNOWN to carry a pull request. When that read raises,
+        the old ``str | None`` collapsed the failure to "there is no pull
+        request" — the one input that authorises the close.
+        """
         actions = make_planner(Config()).generate_completion_actions(
             make_session(tmp_path),
             SessionStatus.COMPLETED,
-            pr_url=None,
+            pull_request=PullRequestObservation.unknown(
+                "pull request #7 for this session could not be read: 502"
+            ),
+            result_only=ResultOnlyDelivery.settled("adds no commit over origin/main"),
+        )
+
+        assert [a for a in actions if isinstance(a, CloseIssueAction)] == []
+        assert "in-progress" in removed_labels(actions)
+
+    def test_a_caller_that_never_looked_refuses_the_close(
+        self, tmp_path: Path
+    ) -> None:
+        """The default is the fail-closed verdict, not an observed absence."""
+        actions = make_planner(Config()).generate_completion_actions(
+            make_session(tmp_path),
+            SessionStatus.COMPLETED,
+            result_only=ResultOnlyDelivery.settled("adds no commit over origin/main"),
+        )
+
+        assert [a for a in actions if isinstance(a, CloseIssueAction)] == []
+
+    def test_the_genuine_evidence_run_still_closes(self, tmp_path: Path) -> None:
+        """The falsification control: an OBSERVED absence is the lane's premise."""
+        actions = make_planner(Config()).generate_completion_actions(
+            make_session(tmp_path),
+            SessionStatus.COMPLETED,
+            pull_request=NO_PULL_REQUEST,
             result_only=ResultOnlyDelivery.settled("adds no commit over origin/main"),
         )
 

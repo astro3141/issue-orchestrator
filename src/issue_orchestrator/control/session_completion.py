@@ -46,11 +46,11 @@ if TYPE_CHECKING:
     from ..observation.observer import SessionObserver
     from ..ports.claim_manager import ClaimManager
     from .action_applier import ActionApplier
+    from .completion_effect_gate import CompletionGateOutcome
     from .completion_handler import CompletionHandler
     from .provider_resilience import ProviderResilienceManager
     from .publish_recovery import PublishRecoveryService
     from .session_controller import SessionController, SessionDecision
-    from .tech_lead_reset_retry import RequiredActLevelOutcome
 
 logger = logging.getLogger(__name__)
 
@@ -195,21 +195,23 @@ def _surface_required_act_level_failure(
     action_applier: "ActionApplier",
     config: Config,
     session: Session,
-    outcome: "RequiredActLevelOutcome",
+    outcome: "CompletionGateOutcome",
 ) -> None:
     """Apply the durable operator surface for a failed mandated act-level action.
 
     Routes a failed decision-mandated reset to a needs-human label + comment via
     the existing action owners so the FAILED terminal is not merely in-memory
-    (#6764 F2). The builder returns [] for a committed/genuine-failure outcome, so
-    this applies nothing on those paths.
+    (#6764 F2). The builder returns [] for a committed/genuine-failure outcome —
+    and for a gate failure that was not a reset — so this applies nothing on
+    those paths.
     """
+    from .completion_effect_gate import CompletionGateKind
     from .tech_lead_reset_retry import build_required_act_level_failure_actions
 
     actions = build_required_act_level_failure_actions(
         issue_number=session.issue.number,
         needs_human_label=config.get_label_needs_human(),
-        outcome=outcome,
+        reset_failures=outcome.failures_of(CompletionGateKind.MANDATED_RESET),
         session_id=session.terminal_id,
         runtime_minutes=session.runtime_minutes,
     )
@@ -367,32 +369,33 @@ def handle_session_completion(  # noqa: C901, PLR0912 - handles validation, acti
     run_session_analysis(run_dir)
 
     # Apply completion actions through the authority-with-effects owner (#6779 R13,
-    # #6777): the mandated act-level action GATES its success-only siblings — they
-    # do not commit unless it commits — and a raised apply past the runtime-kill
-    # boundary (ReconciliationRequired / ClaimLostError / adapter fault) is captured
-    # so terminal finalization still runs, then re-raised. Neither a failing
-    # mandated reset nor an aborted apply may leave a success effect committed or
-    # the cached machine RUNNING with the runtime dead.
-    from .tech_lead_reset_retry import (
+    # #6777, #337 r3 F1): every GATING action — the mandated act-level reset, the
+    # result-only terminal close — applies first and gates its success-only
+    # siblings, which do not commit unless it commits; and a raised apply past the
+    # runtime-kill boundary (ReconciliationRequired / ClaimLostError / adapter
+    # fault) is captured so terminal finalization still runs, then re-raised.
+    # Neither a failing gate nor an aborted apply may leave a success effect
+    # committed or the cached machine RUNNING with the runtime dead.
+    from .completion_effect_gate import (
         apply_completion_actions_gated,
+        completion_gate_outcome_after_apply,
         effective_terminal_status,
-        evaluate_required_act_level_outcome,
-        finalize_required_act_level_history,
-        required_act_level_outcome_after_apply,
+        evaluate_completion_gate_outcome,
+        finalize_completion_gate_history,
     )
     applied_results, apply_error = apply_completion_actions_gated(
         action_applier, result.actions, issue_number=session.issue.number
     )
 
-    # The required-act-level outcome is the single authoritative terminal-status
+    # The completion-gate outcome is the single authoritative terminal-status
     # policy for the whole post-apply phase (ADR-0031 §2, #6764 F2, #6777): a
-    # mandated reset that FAILED — or an apply that RAISED — makes the EFFECTIVE
-    # status FAILED regardless of the agent's intent, so every consumer below
-    # routes through `effective_status` and an aborted apply is never a success.
-    required_act_outcome = required_act_level_outcome_after_apply(
+    # gate that FAILED — or an apply that RAISED — makes the EFFECTIVE status
+    # FAILED regardless of the agent's intent, so every consumer below routes
+    # through `effective_status` and an aborted apply is never a success.
+    gate_outcome = completion_gate_outcome_after_apply(
         applied_results, apply_error
     )
-    effective_status = effective_terminal_status(status, required_act_outcome)
+    effective_status = effective_terminal_status(status, gate_outcome)
 
     # Finalize BOTH terminal-outcome commits — the ONE trace event and the cached
     # SessionStateMachine transition — from the SAME effective outcome (#6777), on
@@ -400,7 +403,7 @@ def handle_session_completion(  # noqa: C901, PLR0912 - handles validation, acti
     # FAILED and emits a single SESSION_FAILED, never a false COMPLETED.
     completion_handler.finalize_terminal_outcome(
         session,
-        effective_terminal_status(result.history_status, required_act_outcome),
+        effective_terminal_status(result.history_status, gate_outcome),
         result.pr_url,
         result.pr_number,
         blocked_reason=blocked_reason,
@@ -445,14 +448,14 @@ def handle_session_completion(  # noqa: C901, PLR0912 - handles validation, acti
                 e,
             )
 
-    # Terminalize through the required-act-level outcome boundary (ADR-0031 §2,
-    # #6764 F2, #6777): a mandated reset that failed — or an apply that raised —
+    # Terminalize through the completion-gate outcome boundary (ADR-0031 §2,
+    # #6764 F2, #6777, #337 r3 F1): a gate that failed — or an apply that raised —
     # routes the whole completion to a FAILED terminal record, never masked by the
     # agent's "completed" intent. A committed/downgraded outcome is untouched.
     state.session_history.append(
-        finalize_required_act_level_history(
+        finalize_completion_gate_history(
             result.history_entry,
-            required_act_outcome,
+            gate_outcome,
         )
     )
     CompletionCleanupStateOwner(state).record(result.cleanup, session, effective_status)
@@ -492,7 +495,7 @@ def handle_session_completion(  # noqa: C901, PLR0912 - handles validation, acti
         # would re-fail and mask the re-raise (the terminal is already FAILED).
         _surface_required_act_level_failure(
             action_applier, config, session,
-            evaluate_required_act_level_outcome(applied_results),
+            evaluate_completion_gate_outcome(applied_results),
         )
 
     # A successful reset_retry made its target issue retryable mid-apply, but the

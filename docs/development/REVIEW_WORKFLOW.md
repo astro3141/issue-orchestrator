@@ -333,6 +333,25 @@ This one guards boundedness: an apply that fails after the release and before th
 close would leave an open, unlabelled, finished work item, which is precisely the
 state the scheduler cannot tell from work never started.
 
+**Ordering alone is not enough**, because it is not a fail-stop boundary:
+`ActionApplier` catches an ordinary close error, reports a failed `ActionResult`,
+and applies the rest of the batch. So the close is planned as a
+`ResultOnlyCloseIssueAction` and is a member of the **completion gate**
+(`control/completion_effect_gate.py`) alongside the tech-lead mandated
+`ResetRetryIssueAction`. Gate members apply first, as their own batch, and the
+success-only remainder applies only if every one of them commits:
+
+| Close | `in-progress` | Resulting state |
+|-------|---------------|-----------------|
+| commits | released | closed, finished — today's success |
+| fails | **withheld** | open **and still claimed** — out of selection, recoverable by the ordinary stale-claim path |
+
+A failed gate also makes the completion's *effective* terminal status `FAILED`,
+so the observer, history, retry gating and operator surface all agree that the
+run did not finish cleanly. The needs-human surface a failed mandated reset gets
+is keyed on **that gate's** failures (`CompletionGateOutcome.failures_of`), so a
+failed result-only close is never reported as a failed Reset & Retry.
+
 ### The disposition needs two more things than the five facts
 
 The five facts are proven *before* the actions run — they are what shapes them —
@@ -343,7 +362,20 @@ flight. Both gaps close an issue that should not be closed, so both are checked:
 | Also required | Why | If missing |
 |---------------|-----|------------|
 | the comment actually posted | `add_comment` raises on a 5xx, a rate limit, or an over-size body; a record may request `post_comment` and carry no body; a record may not request it at all, leaving an empty plan that trivially "succeeds" | the disposition is withdrawn and the run is reported as `result_undelivered` — a **critical** error, so it takes the bounded publish-failure path (`publish-fail-count-N`, escalating to `needs-human`) rather than relaunching forever |
-| no pull request exists for the issue | fact 5 asks what *this run* added over the base, not what is in flight for the issue. A rework worktree that arrives reset to the base satisfies every fact while its PR's commits live only on the remote | the close is refused; the run keeps the ordinary lifecycle |
+| no pull request is **observed** for the issue | fact 5 asks what *this run* added over the base, not what is in flight for the issue. A rework worktree that arrives reset to the base satisfies every fact while its PR's commits live only on the remote | the close is refused; the run keeps the ordinary lifecycle |
+
+That second row is a *verdict*, not a missing url. `control/pull_request_observation.py`
+returns one of three answers, and only the middle one may close:
+
+| `PullRequestPresence` | Produced by | Terminal close |
+|-----------------------|-------------|----------------|
+| `OBSERVED_PRESENT` | the branch lookup found a PR, the session's PR read returned one, or the completion processor handed over a PR url | refused |
+| `OBSERVED_NONE` | the branch lookup ran and found nothing, and the session references no PR (or the one it references no longer exists) | allowed |
+| `UNKNOWN` | `get_pr(session.pr_number)` **raised**, the status is not `COMPLETED`, or the task kind never looks | refused (fail-closed) |
+
+The distinction is load-bearing for exactly the rework shape above: that session
+*has* a pull request, so a read that fails is the least safe moment to infer that
+it does not. `UNKNOWN` must never arrive as `OBSERVED_NONE`.
 
 `result_undelivered` is deliberately **not** one of the prefixes
 `PublishRecoveryService` reads. Those arm a Retry Publish that pushes a branch

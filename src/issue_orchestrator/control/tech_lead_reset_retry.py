@@ -27,18 +27,14 @@ surfaced-proposal event (``TECH_LEAD_ACTION_PROPOSED`` with
 success a ``TECH_LEAD_ACTION_EXECUTED`` event records the boundary effects.
 Reset-owner failures fail the action loudly — never a silent success.
 
-This module is also the single authoritative outcome boundary for
-completion terminalization: :class:`RequiredActLevelOutcome` /
-:func:`evaluate_required_act_level_outcome` fold the applied results into
-one verdict ("did the mandated act-level action commit?"), and
-:func:`effective_terminal_status` turns that verdict into the ONE terminal
-status the whole post-apply completion phase consumes — so the observer,
-failure discovery, retry gating, cleanup reason, operator surface, and
-history all agree, never split between the agent's reported status and this
-verdict (#6764 re-review F2). :func:`finalize_required_act_level_history`
-keeps the persisted history row consistent with that status, and
+A ``ResetRetryIssueAction`` is one member of the COMPLETION GATE, whose
+apply-time boundary and terminal-status verdict live next door in
+:mod:`.completion_effect_gate` — general machinery with a second member since
+#337 r3, and no longer this module's to own. What stays here is the
+tech_lead-specific consequence:
 :func:`build_required_act_level_failure_actions` routes a failed mandated
-reset to a durable needs-human label + comment so the FAILED terminal is not
+reset to a durable needs-human label + comment so the FAILED terminal
+:func:`~.completion_effect_gate.effective_terminal_status` assigns is not
 merely in-memory. A failed mandated reset can therefore never be recorded as
 a clean success.
 
@@ -57,28 +53,25 @@ handler and the stale-downgrade path cannot drift apart.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, Mapping, Sequence
 
-from ..domain.models import SessionStatus
 from ..events import EventName
 from ..infra.logging_config import issue_log
 from ..ports import EventSink, make_trace_event
 from .actions import (
     Action,
     ActionResult,
-    ActionResultType,
     AddCommentAction,
     AddLabelAction,
     ResetRetryIssueAction,
     SurfaceTechLeadProposalAction,
 )
+from .completion_effect_gate import CompletionGateFailure
 from .needs_human_block import NeedsHumanCause
 
 if TYPE_CHECKING:
-    from ..domain.models import SessionHistoryEntry
     from ..ports.issue import Issue
-    from .action_applier import ActionApplier
     from .label_manager import LabelManager
 
 logger = logging.getLogger(__name__)
@@ -334,248 +327,48 @@ def preserve_reset_retry_eligibility(
     return cleared
 
 
-@dataclass(frozen=True)
-class RequiredActLevelOutcome:
-    """Did every decision-mandated act-level tech_lead action commit? (ADR-0031 §2).
-
-    The single authoritative boundary the completion path consumes to decide
-    terminalization. A planned :class:`ResetRetryIssueAction` is a
-    decision-MANDATED act-level mutation: the tech_lead decision required it, so a
-    completion is authoritative-success only if it committed. This owner folds
-    the applied results into that one verdict so the executor and the
-    completion handler cannot drift on what "committed" means.
-
-    ``committed`` is true when no required act-level action FAILED. A stale
-    downgrade (``ActionResultType.SKIPPED``) counts as committed: the board
-    moved and the reset owner correctly surfaced instead of mutating — a
-    non-failure outcome. Only a hard FAILURE (the reset owner itself failed)
-    blocks success terminalization.
-    """
-
-    committed: bool
-    failures: tuple[str, ...] = ()
-
-    @property
-    def failed(self) -> bool:
-        return not self.committed
-
-    def failure_summary(self) -> str:
-        return "; ".join(self.failures) or "reset owner did not commit"
-
-
-def is_required_act_level_action(action: Action) -> bool:
-    """True for a decision-MANDATED act-level action (ADR-0031 §2).
-
-    THE single source of "which actions carry mandated authority", shared by the
-    apply-time GATE (:func:`partition_required_act_level_actions`, which withholds
-    success-only effects) and the terminal VERDICT
-    (:func:`evaluate_required_act_level_outcome`), so authority and the effects it
-    gates classify the same actions and cannot drift (#6779 R13). A
-    ``ResetRetryIssueAction`` is the only wired act-level mutation today.
-    """
-    return isinstance(action, ResetRetryIssueAction)
-
-
-def partition_required_act_level_actions(
-    actions: Sequence[Action],
-) -> tuple[list[Action], list[Action]]:
-    """Split completion actions into (mandated act-level, success-only remainder).
-
-    Relative order within each partition is preserved. The mandated partition is
-    the authority gate applied first; the remainder holds the success-only effects
-    (labels/comments/close) that must NOT commit unless the gate commits (#6779).
-    """
-    mandated = [action for action in actions if is_required_act_level_action(action)]
-    remainder = [
-        action for action in actions if not is_required_act_level_action(action)
-    ]
-    return mandated, remainder
-
-
-def evaluate_required_act_level_outcome(
-    applied: Sequence[ActionResult],
-) -> RequiredActLevelOutcome:
-    """Fold applied results into the required-act-level commit verdict.
-
-    Pure over the apply results — the single seam that classifies a mandated
-    act-level failure, shared by the completion terminalization path so a
-    failed reset can never be recorded as a clean success (#6764 re-review F2).
-    """
-    failures = tuple(
-        result.error or "reset owner failed"
-        for result in applied
-        if is_required_act_level_action(result.action)
-        and result.result_type is ActionResultType.FAILURE
-    )
-    return RequiredActLevelOutcome(committed=not failures, failures=failures)
-
-
-def apply_completion_actions_gated(
-    action_applier: "ActionApplier",
-    actions: Sequence[Action],
-    *,
-    issue_number: int,
-) -> tuple[list[ActionResult], BaseException | None]:
-    """Apply completion actions so the mandated act-level outcome GATES the rest.
-
-    THE authority-with-effects owner (ADR-0031 §2, #6779 R13 root cause): the
-    decision-mandated ``ResetRetryIssueAction`` is applied FIRST as the gate, and
-    its success-only siblings (completion labels/comments/close) apply ONLY when it
-    commits — so a failing mandated reset can never leave a success-only effect
-    committed, no matter where it sat in the planned list. A raised apply past the
-    runtime-kill boundary (Reconciliation/Claim/adapter, #6777) withholds the
-    remainder too and is returned so the caller can finalize the ONE terminal
-    outcome, then re-raise. With no mandated action the whole list applies in one
-    pass — behavior for ordinary completions is unchanged.
-    """
-    mandated, remainder = partition_required_act_level_actions(actions)
-    applied, error = _apply_completion_action_batch(
-        action_applier, mandated or list(actions), issue_number
-    )
-    if not mandated or error is not None or evaluate_required_act_level_outcome(applied).failed:
-        if mandated and remainder:
-            logger.warning(
-                issue_log(issue_number, "Mandated act-level action did not commit; "
-                          "withholding %d success-only completion effect(s)"),
-                len(remainder),
-            )
-        return applied, error
-    remainder_applied, error = _apply_completion_action_batch(
-        action_applier, remainder, issue_number
-    )
-    return applied + remainder_applied, error
-
-
-def _apply_completion_action_batch(
-    action_applier: "ActionApplier",
-    actions: Sequence[Action],
-    issue_number: int,
-) -> tuple[list[ActionResult], BaseException | None]:
-    """Apply one batch of actions, capturing a raise past the runtime-kill boundary.
-
-    Terminal finalization must run on EVERY apply outcome (#6777): a propagated
-    ``ReconciliationRequired`` / ``ClaimLostError`` / adapter fault is CAPTURED and
-    returned rather than aborting before finalization.
-    """
-    if not actions:
-        return [], None
-    logger.info(
-        issue_log(issue_number, "Applying %d completion action(s): %s"),
-        len(actions),
-        [type(action).__name__ for action in actions],
-    )
-    try:
-        # `or []` tolerates test doubles whose apply_all returns None.
-        return list(action_applier.apply_all(list(actions)) or []), None
-    except Exception as exc:
-        logger.warning(
-            issue_log(issue_number, "Completion-action apply raised; finalizing "
-                      "terminal FAILED before re-raising: %s"),
-            exc,
-        )
-        return [], exc
-
-
-def required_act_level_outcome_after_apply(
-    applied: Sequence[ActionResult],
-    apply_error: BaseException | None,
-) -> RequiredActLevelOutcome:
-    """The required-act-level verdict once completion actions have been applied.
-
-    On a normal return this folds the real applied results
-    (:func:`evaluate_required_act_level_outcome`). When ``apply_all`` RAISED past
-    the runtime-kill boundary — ``ReconciliationRequired`` / ``ClaimLostError`` /
-    any adapter fault — the mandated act-level action cannot be confirmed
-    committed, so the verdict is a hard failure through the SAME machinery
-    (#6777). :func:`effective_terminal_status` therefore terminalizes the whole
-    completion FAILED (never a false COMPLETED) with no parallel status path, and
-    the caller re-raises ``apply_error`` only AFTER finalization has committed.
-    """
-    if apply_error is not None:
-        return RequiredActLevelOutcome(
-            committed=False,
-            failures=(f"completion action apply raised before commit: {apply_error}",),
-        )
-    return evaluate_required_act_level_outcome(applied)
-
-
-def finalize_required_act_level_history(
-    history_entry: "SessionHistoryEntry",
-    outcome: RequiredActLevelOutcome,
-) -> "SessionHistoryEntry":
-    """Terminal history status for a completion carrying required act-level work.
-
-    The authoritative outcome boundary (ADR-0031 §2, #6764 re-review F2): a
-    decision-mandated act-level action that FAILED at apply time makes the
-    WHOLE completion a failure — never a partial success. The reset either
-    committed or the session's terminal record is FAILED, so the agent's
-    "completed" intent can never mask an un-run reset (orchestrator-authoritative,
-    fail-loud). A committed or stale-downgraded outcome returns the caller's
-    entry unchanged — success terminalization proceeds as before.
-    """
-    if outcome.committed:
-        return history_entry
-    return replace(
-        history_entry,
-        status="failed",
-        status_reason=(
-            "required act-level tech_lead action did not commit: "
-            + outcome.failure_summary()
-        ),
-    )
-
-
-def effective_terminal_status(
-    status: SessionStatus, outcome: RequiredActLevelOutcome
-) -> SessionStatus:
-    """The single terminal status the WHOLE post-apply completion phase consumes.
-
-    Terminal-status policy lives HERE, co-located with the required-act-level
-    outcome boundary, so the completion path cannot split it between the agent's
-    reported ``status`` and this outcome object (#6764 re-review F2, the final
-    abstraction point). A decision-mandated act-level action that FAILED at apply
-    time makes the effective terminal status :attr:`SessionStatus.FAILED`
-    regardless of the agent's "completed" intent — every downstream consumer
-    (observer, failure discovery, retry gating, cleanup reason, operator surface,
-    and history) then routes the completion as the failure it is. A committed or
-    stale-downgraded outcome preserves the agent-reported status unchanged, so
-    ordinary completions and genuine failures behave exactly as before.
-    """
-    if outcome.failed:
-        return SessionStatus.FAILED
-    return status
-
-
 def build_required_act_level_failure_actions(
     *,
     issue_number: int,
     needs_human_label: str,
-    outcome: RequiredActLevelOutcome,
+    reset_failures: Sequence[CompletionGateFailure],
     session_id: str,
     runtime_minutes: float,
 ) -> list[Action]:
     """Durable, crash-safe operator surface for a failed mandated act-level action.
 
     A failed mandated reset terminalizes the completion as FAILED
-    (:func:`effective_terminal_status`), but that terminal record is in-memory
-    only — a crash between it and the next tick would lose the signal. This
+    (:func:`~.completion_effect_gate.effective_terminal_status`), but that
+    terminal record is in-memory only — a crash between it and the next tick
+    would lose the signal. This
     routes the failure to GitHub through the SAME label/comment action owners the
     rest of completion uses (no parallel mechanism): the needs-human blocking
     label plus an explanatory comment, mirroring the invalid-completion-record
     surface ("the orchestrator could not safely apply the agent's requested
-    outcome"). Returns an EMPTY list when the outcome committed (or
-    stale-downgraded), so the caller applies nothing on the success path and the
-    genuine-failure path (whose surface the completion handler already planned).
+    outcome"). Returns an EMPTY list when nothing was handed to it, so the caller
+    applies nothing on the success path and the genuine-failure path (whose
+    surface the completion handler already planned).
+
+    It takes the reset failures THEMSELVES rather than the whole completion-gate
+    outcome, because the gate holds a second member whose failure is not a reset
+    (#337 r3 F1): telling an operator that "Reset & Retry did not complete" when
+    no reset was ever mandated would be a false report. Selecting the kind is the
+    caller's routing decision — see
+    :meth:`~.completion_effect_gate.CompletionGateOutcome.failures_of` — and what
+    arrives here is only ever this owner's own failures. The other member is
+    durably surfaced by the state its failure declines to leave — an open,
+    still-claimed issue — so it needs no writes here.
     """
-    if outcome.committed:
+    if not reset_failures:
         return []
+    summary = "; ".join(failure.detail for failure in reset_failures)
     comment = (
         "**Reset & Retry Did Not Complete**\n\n"
         "The tech_lead decision mandated a scratch reset for this issue, but the "
         "reset owner failed at apply time. The orchestrator recorded the session "
         "as FAILED instead of accepting the agent's completed intent, so the "
         "issue is not silently left as a partial reset.\n\n"
-        f"- Failure: {outcome.failure_summary()}\n"
+        f"- Failure: {summary}\n"
         f"- Session: `{session_id}`\n"
         f"- Runtime: {runtime_minutes:.1f} minutes\n\n"
         f"This issue has been marked as `{needs_human_label}` because the "

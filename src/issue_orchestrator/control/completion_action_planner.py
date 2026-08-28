@@ -41,6 +41,7 @@ from .label_manager import LabelManager
 from .provider_availability import ProviderAvailabilityPolicy
 from .provider_blocked_completion import provider_blocked_actions
 from .publish_failure_completion import publish_failure_actions
+from .pull_request_observation import PullRequestObservation
 from .reconciliation import ExpectedState, build_expected_for_mutation
 from .result_only_completion import result_only_terminal_actions
 from .tech_lead_session_policy import is_tech_lead_session
@@ -359,7 +360,9 @@ class CompletionActionPlanner:
         review_exchange_halted: bool = False,
         blocked_label: Optional[str] = None,
         blocked_reason: Optional[str] = None,
-        pr_url: Optional[str] = None,
+        pull_request: PullRequestObservation = PullRequestObservation.unknown(
+            "no pull request observation was supplied"
+        ),
         completion_detail: Optional[dict[str, Any]] = None,
         provider_error_type: ProviderErrorType | None = None,
         result_only: ResultOnlyDelivery = ResultOnlyDelivery.none(),
@@ -377,13 +380,20 @@ class CompletionActionPlanner:
         request will ever carry this run's work (#337), and it is what lets a
         successful zero-code run reach a terminal disposition instead of being
         released back into the schedulable pool.
+
+        ``pull_request`` is what the completion path LEARNED about this issue's
+        pull request, not merely its url (#337 round 3, F2). The url alone is
+        ``None`` both when the lookup found nothing and when it failed, and the
+        terminal disposition may only be taken on the first. Defaulted to
+        ``UNKNOWN`` — the fail-closed value — so a caller that never looked can
+        never be read as having observed an absence.
         """
         expected = build_expected_for_mutation()
 
         # Check for critical processing errors (push/PR creation failures).
         critical_errors, _downgraded_errors = critical_processing_errors(
             processing_errors,
-            pr_url=pr_url,
+            pr_url=pull_request.url,
             issue_number=session.issue.number,
             log_downgraded=True,
             context="actions",
@@ -397,7 +407,7 @@ class CompletionActionPlanner:
                 diagnostic_path=diagnostic_path,
                 review_exchange_halted=review_exchange_halted,
                 result_only=result_only,
-                pr_url=pr_url,
+                pull_request=pull_request,
             )
 
         if status == SessionStatus.TIMED_OUT:
@@ -448,7 +458,7 @@ class CompletionActionPlanner:
         diagnostic_path: Optional[str],
         review_exchange_halted: bool,
         result_only: ResultOnlyDelivery,
-        pr_url: Optional[str],
+        pull_request: PullRequestObservation,
     ) -> tuple[Action, ...]:
         """What a self-reported COMPLETED session actually comes to.
 
@@ -497,7 +507,8 @@ class CompletionActionPlanner:
                 result_only,
                 # A settled run that nonetheless HAS a pull request is not the
                 # shape this lane proves; the disposition refuses (#337 r2 N4).
-                pull_request_url=pr_url,
+                # It refuses just as hard when the lookup could not tell (r3 F2).
+                pull_request=pull_request,
             )
         )
         actions.append(

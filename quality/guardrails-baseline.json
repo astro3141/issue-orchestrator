@@ -408,6 +408,14 @@
       "rule_id": "control_policy_branch_sites",
       "value": 5
     },
+    "control_policy_branch_sites:src/issue_orchestrator/control/tech_lead_reset_retry.py": {
+      "detail": "3 branch site(s) mention lifecycle/control terms",
+      "kind": "control_policy_branch_sites",
+      "metric_id": "src/issue_orchestrator/control/tech_lead_reset_retry.py",
+      "path": "src/issue_orchestrator/control/tech_lead_reset_retry.py",
+      "rule_id": "control_policy_branch_sites",
+      "value": 3
+    },
     "control_policy_branch_sites:src/issue_orchestrator/control/validation.py": {
       "detail": "6 branch site(s) mention lifecycle/control terms",
       "kind": "control_policy_branch_sites",
@@ -1369,12 +1377,12 @@
       "value": 963
     },
     "oversized_control_hotspots:src/issue_orchestrator/control/completion_handler.py": {
-      "detail": "1235 lines exceeds budget 800",
+      "detail": "1156 lines exceeds budget 800",
       "kind": "file_line_budget",
       "metric_id": "src/issue_orchestrator/control/completion_handler.py",
       "path": "src/issue_orchestrator/control/completion_handler.py",
       "rule_id": "oversized_control_hotspots",
-      "value": 1235
+      "value": 1156
     },
     "oversized_control_hotspots:src/issue_orchestrator/control/completion_processor.py": {
       "detail": "2710 lines exceeds budget 800",
