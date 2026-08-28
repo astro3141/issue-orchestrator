@@ -102,6 +102,23 @@ class BranchPathsResult:
     error: str | None = None
 
 
+@dataclass(frozen=True)
+class BranchCommitsResult:
+    """How many commits a branch contributes over a base ref.
+
+    ``count`` is the number of commits reachable from ``HEAD`` and not from the
+    base — the same question a forge asks before it will open a pull request, so
+    ``0`` is exactly the state in which "create a PR for this branch" cannot
+    succeed. ``success`` is ``False`` on a git failure (an unknown base ref, a
+    broken checkout) so callers fail closed instead of reading an unreadable
+    branch as an empty one.
+    """
+
+    success: bool
+    count: int = 0
+    error: str | None = None
+
+
 @dataclass
 class RebaseResult:
     """Result of a git rebase operation."""
@@ -306,6 +323,20 @@ class WorkingCopy(Protocol):
 
         Returns:
             PushResult indicating success or failure.
+        """
+        ...
+
+    def commits_against_base(self, worktree: Path, base_ref: str) -> BranchCommitsResult:
+        """Return how many commits this branch contributes over *base_ref*.
+
+        Range semantics (``base_ref..HEAD``), NOT the symmetric difference
+        :meth:`diff_against_base` uses: the question is what the branch adds,
+        and a base that has moved ahead must never be counted as the branch's
+        own work. ``count == 0`` therefore means ``HEAD`` is already contained
+        in the base — the branch offers nothing to publish.
+
+        A git failure must be reported as ``success=False`` rather than a zero
+        count, so a caller cannot mistake an unreadable branch for an empty one.
         """
         ...
 

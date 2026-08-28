@@ -13,6 +13,7 @@ from typing import Any, Protocol, runtime_checkable
 from ..ports.pull_request_tracker import PRInfo
 from ..ports.review_artifact_reader import ReviewArtifactReadCommand
 from ..ports.working_copy import (
+    BranchCommitsResult,
     BranchPathsResult,
     BranchTextFilesResult,
     DiffResult,
@@ -62,6 +63,9 @@ class GitAdapter(Protocol):
     def has_uncommitted_changes(self, worktree: Path) -> bool: ...
     def has_tracked_changes(self, worktree: Path, include_staged: bool = True) -> bool: ...
     def list_dirty_files(self, worktree: Path, mode: str) -> list[str] | None: ...
+    def commits_against_base(
+        self, worktree: Path, base_ref: str
+    ) -> BranchCommitsResult: ...
     def diff_against_base(self, worktree: Path, base_ref: str) -> DiffResult: ...
     def read_branch_text_files(
         self, worktree: Path, paths: tuple[str, ...]

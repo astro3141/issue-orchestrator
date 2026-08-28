@@ -122,6 +122,7 @@ from .completion_types import (
     RepublicationCheck,
     REVIEW_EXCHANGE_ERROR_PREFIX,
 )
+from .ordinary_zero_code import settle_ordinary_publication_plan
 from .pre_publish_gate import PrePublishGate, PrePublishGateResult
 from .validation_reroute_budget import DEFAULT_MAX_ATTEMPTS, ValidationRerouteBudget
 from .review_exchange_contracts import ReviewExchangeCanceller
@@ -1627,6 +1628,20 @@ class CompletionProcessor:
                 review_exchange_run=exchange_run,
                 early_result=pre_publish_failure,
             )
+
+        # Every judge of this candidate has now run and passed. Only here may a
+        # run PROVEN to offer a branch nothing have that branch write dropped
+        # while its reviewed result still publishes (#337). Tech_lead runs are
+        # settled by their own owner at the pre-action seam and pass through.
+        plan = settle_ordinary_publication_plan(
+            plan=plan,
+            outcome=record.outcome,
+            worktree=worktree,
+            base_ref=f"origin/{self._base_branch()}",
+            worktree_reader=self.git_adapter,
+            governed_elsewhere=self._is_tech_lead_session(agent_label),
+            issue_number=issue_number,
+        )
 
         (
             branch,

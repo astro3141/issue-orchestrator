@@ -269,6 +269,47 @@ Coder and reviewer communicate directly via MCP (Model Context Protocol). Same s
 
 Selects `via-mcp` if both agents support it, otherwise falls back to `via-local-loop`.
 
+## Publishing a run that changed no code
+
+`coding-done completed` asks for the same three actions for every ordinary run,
+in this order: `push_branch`, `create_pr`, `post_comment`. An ordinary work item
+does not have to change code to be finished — a measurement, an audit, a
+read-only investigation produces a RESULT and no commit — and for such a run
+`create_pr` cannot succeed: the forge refuses to open a pull request for a
+branch that adds nothing. The completion was then marked failed and
+`post_comment`, third in the tuple and the only action that publishes the
+result, never ran.
+
+`control/ordinary_zero_code.py` settles that. When a run reported `COMPLETED`
+and the orchestrator can PROVE its branch offers nothing, the two publication
+actions are dropped and `post_comment` is kept, so the reviewed RESULT reaches
+the issue and the outcome stays `completed`.
+
+Five facts are required, and any one of them missing is a refusal rather than a
+benefit of the doubt:
+
+| Fact | Read from | Missing means |
+|------|-----------|---------------|
+| outcome is `completed` | the completion record | ordinary path |
+| publication intent is still present | the plan being executed | nothing to drop |
+| `HEAD` is readable | orchestrator-side git | ordinary path |
+| tracked dirt enumerates, and is empty | `list_dirty_files("tracked")` | ordinary path |
+| the branch adds 0 commits over the PR base | `commits_against_base` | ordinary path |
+
+The settlement runs **last** — after the publish gate, the independent review
+exchange and the pre-publish gate have all judged this candidate and passed it.
+Nothing is bought by taking this lane: validation receipts, the reviewer verdict
+and the candidate execution identities above are recorded exactly as they are
+for a code-bearing run, and only the branch write and the pull request the run
+never needed are dropped. A halted or changes-requested exchange returns before
+the settlement is ever reached, so review cannot be bypassed by having produced
+no code.
+
+Tech-lead runs are not settled here. Their publication intent is decided at the
+pre-action seam by `control/tech_lead_zero_code.py`, which drops `post_comment`
+instead of keeping it — tech-lead prompts promise the orchestrator posts no
+comment.
+
 ## Multi-Stage Review Pipeline
 
 After the review loop approves code, additional stages can run.

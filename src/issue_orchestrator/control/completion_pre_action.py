@@ -35,7 +35,7 @@ from ..domain.session_run import SessionRunAssets
 from .completion_types import CodeCandidateSettlement, ProcessingResult
 from .tech_lead_completion import settle_tech_lead_completion
 from .tech_lead_session_policy import is_tech_lead_session
-from .tech_lead_zero_code import ZeroCodeWorktreeReader
+from .zero_code_reads import ZeroCodeWorktreeReader
 
 if TYPE_CHECKING:
     from ..infra.config import Config

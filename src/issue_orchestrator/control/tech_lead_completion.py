@@ -101,10 +101,8 @@ from .tech_lead_case_files import build_pattern_ledger
 from .tech_lead_decision_contract import validate_decision_for_authority
 from .tech_lead_proposals import build_op_ledger
 from .tech_lead_session_policy import is_tech_lead_session
-from .tech_lead_zero_code import (
-    ZeroCodeWorktreeReader,
-    settle_zero_code_planning_completion,
-)
+from .tech_lead_zero_code import settle_zero_code_planning_completion
+from .zero_code_reads import ZeroCodeWorktreeReader
 
 if TYPE_CHECKING:
     from ..infra.config import Config

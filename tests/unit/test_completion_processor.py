@@ -60,6 +60,7 @@ from issue_orchestrator.ports.review_artifact_reader import (
     ReviewArtifactReadCommand,
 )
 from issue_orchestrator.ports.working_copy import (
+    BranchCommitsResult,
     BranchPathsResult,
     BranchTextFile,
     BranchTextFilesResult,
@@ -308,6 +309,11 @@ def mock_git_adapter():
     adapter.branch_post_image_paths_against_base = Mock(
         return_value=BranchPathsResult(success=True, paths=())
     )
+    # An ordinary candidate offers commits. The zero-code publication lane
+    # (#337) is opened only by a test that says so explicitly.
+    adapter.commits_against_base = Mock(
+        return_value=BranchCommitsResult(success=True, count=1)
+    )
     return adapter
 
 
@@ -386,6 +392,164 @@ def worktree_with_completion(tmp_path):
 
 
 # ==================== Unit Tests ====================
+
+
+class TestOrdinaryZeroCodePublication:
+    """A finished ordinary run that offers a branch nothing (#337).
+
+    #336 measured the defect end to end: the actor's result was produced,
+    validated and independently reviewed, and never reached the issue, because
+    ``post_comment`` is sequenced third behind a ``create_pr`` that a
+    zero-commit branch can never complete. These tests pin the repaired path
+    through the whole processor — not just the settling owner — and pin the
+    unchanged code-bearing path beside it.
+    """
+
+    ZERO_CODE_INTENTS = [
+        RequestedAction.PUSH_BRANCH,
+        RequestedAction.CREATE_PR,
+        RequestedAction.POST_COMMENT,
+    ]
+
+    def _run(self, processor, worktree_with_completion, mock_git_adapter, *, commits):
+        mock_git_adapter.get_head_sha = Mock(return_value="c" * 40)
+        mock_git_adapter.commits_against_base = Mock(
+            return_value=BranchCommitsResult(success=True, count=commits)
+        )
+        record = make_record(
+            outcome=CompletionOutcome.COMPLETED,
+            requested_actions=list(self.ZERO_CODE_INTENTS),
+            summary="Evidence-only measurement",
+            implementation="Read-only observation; no file was changed.",
+            comment_body="## Implementation\n\nThe measured RESULT.",
+        )
+        worktree = worktree_with_completion(record)
+        result = processor.process(
+            worktree,
+            run_assets=make_session_run_assets(worktree),
+            issue_number=123,
+            issue_title="Evidence-only issue",
+            issue_key=None,
+        )
+        return record, result
+
+    def test_the_reviewed_result_reaches_the_issue_without_a_branch_or_a_pr(
+        self,
+        processor,
+        worktree_with_completion,
+        mock_git_adapter,
+        mock_pr_adapter,
+    ):
+        """The whole repair, in one assertion set."""
+        record, result = self._run(
+            processor, worktree_with_completion, mock_git_adapter, commits=0
+        )
+
+        assert result.success is True
+        assert result.pr_url is None
+        mock_git_adapter.push.assert_not_called()
+        mock_pr_adapter.create_pr.assert_not_called()
+        mock_pr_adapter.add_comment.assert_called_once_with(123, record.comment_body)
+
+    def test_the_posted_body_is_the_agent_s_payload_not_a_control_summary(
+        self,
+        processor,
+        worktree_with_completion,
+        mock_git_adapter,
+        mock_pr_adapter,
+    ):
+        """Control relays the reviewed payload; it never reconstructs one."""
+        record, _ = self._run(
+            processor, worktree_with_completion, mock_git_adapter, commits=0
+        )
+
+        posted = mock_pr_adapter.add_comment.call_args.args[1]
+        assert posted == record.comment_body
+        assert "The measured RESULT." in posted
+
+    def test_every_pre_publication_guard_still_judged_the_candidate(
+        self, processor, worktree_with_completion, mock_git_adapter
+    ):
+        """The drop happens LAST, so nothing is bought by taking this lane.
+
+        Both branch guards are gated on the record still reaching the remote,
+        so their having run is proof that the settlement came after them rather
+        than excusing the run from them.
+        """
+        self._run(processor, worktree_with_completion, mock_git_adapter, commits=0)
+
+        mock_git_adapter.diff_against_base.assert_called()
+        mock_git_adapter.branch_post_image_paths_against_base.assert_called()
+
+    def test_the_count_is_taken_against_the_base_a_pr_would_target(
+        self, processor, worktree_with_completion, mock_git_adapter
+    ):
+        self._run(processor, worktree_with_completion, mock_git_adapter, commits=0)
+
+        assert mock_git_adapter.commits_against_base.call_args.args[1] == "origin/main"
+
+    def test_a_code_bearing_completion_still_pushes_and_opens_a_pr(
+        self,
+        processor,
+        worktree_with_completion,
+        mock_git_adapter,
+        mock_pr_adapter,
+    ):
+        """The unchanged ordinary lifecycle, pinned beside the new one."""
+        _, result = self._run(
+            processor, worktree_with_completion, mock_git_adapter, commits=1
+        )
+
+        assert result.success is True
+        assert result.pr_url == "https://github.com/owner/repo/pull/42"
+        mock_git_adapter.push.assert_called_once()
+        mock_pr_adapter.create_pr.assert_called_once()
+
+    def test_an_uncountable_branch_still_pushes_and_opens_a_pr(
+        self,
+        processor,
+        worktree_with_completion,
+        mock_git_adapter,
+        mock_pr_adapter,
+    ):
+        """Fail closed: unreadable is never read as "nothing to publish"."""
+        mock_git_adapter.get_head_sha = Mock(return_value="c" * 40)
+        mock_git_adapter.commits_against_base = Mock(
+            return_value=BranchCommitsResult(success=False, error="unknown revision")
+        )
+        record = make_record(
+            outcome=CompletionOutcome.COMPLETED,
+            requested_actions=list(self.ZERO_CODE_INTENTS),
+            summary="Evidence-only measurement",
+            implementation="Read-only observation.",
+            comment_body="## Implementation\n\nThe measured RESULT.",
+        )
+        worktree = worktree_with_completion(record)
+
+        processor.process(
+            worktree,
+            run_assets=make_session_run_assets(worktree),
+            issue_number=123,
+            issue_title="Evidence-only issue",
+            issue_key=None,
+        )
+
+        mock_git_adapter.push.assert_called_once()
+        mock_pr_adapter.create_pr.assert_called_once()
+
+    def test_dirty_tracked_content_still_pushes_and_opens_a_pr(
+        self,
+        processor,
+        worktree_with_completion,
+        mock_git_adapter,
+        mock_pr_adapter,
+    ):
+        """A run with uncommitted tracked work is not a zero-code run."""
+        mock_git_adapter.list_dirty_files = Mock(return_value=["src/app.py"])
+        self._run(processor, worktree_with_completion, mock_git_adapter, commits=0)
+
+        mock_git_adapter.push.assert_called_once()
+        mock_pr_adapter.create_pr.assert_called_once()
 
 
 class TestCompletionProcessorLabelActions:
@@ -1704,6 +1868,74 @@ class TestReviewExchangeExecution:
         assert len(review_comment) <= GITHUB_COMMENT_BODY_LIMIT
         assert "Review exchange transcript truncated" in review_comment
         assert "Full per-turn artifacts remain" in review_comment
+
+    def test_a_halted_review_never_reaches_the_zero_code_publication_lane(
+        self,
+        tmp_path,
+        mock_label_adapter,
+        mock_pr_adapter,
+        mock_git_adapter,
+        event_bus,
+        worktree_with_completion,
+    ) -> None:
+        """Review cannot be bypassed by having produced no code (#337).
+
+        A zero-code candidate whose exchange halted must take the ordinary
+        halted path. The settlement is downstream of the halt, so the branch
+        it would have counted is never even read — and the agent's payload is
+        not published as a reviewed result.
+        """
+        config = self._make_config(tmp_path)
+        config.review_exchange_mode = "via-local-loop"
+        processor = CompletionProcessor(
+            agent_callback_endpoint=ready_callback_endpoint(),
+            label_adapter=mock_label_adapter,
+            pr_adapter=mock_pr_adapter,
+            git_adapter=mock_git_adapter,
+            session_output=FileSystemSessionOutput(),
+            event_bus=event_bus,
+            label_config={
+                "code_reviewed": "code-reviewed",
+                "code_review": "needs-code-review",
+            },
+            config=config,
+        )
+        mock_git_adapter.get_head_sha = Mock(return_value="c" * 40)
+        mock_git_adapter.commits_against_base = Mock(
+            return_value=BranchCommitsResult(success=True, count=0)
+        )
+        record = make_record(
+            outcome=CompletionOutcome.COMPLETED,
+            requested_actions=[
+                RequestedAction.PUSH_BRANCH,
+                RequestedAction.CREATE_PR,
+                RequestedAction.POST_COMMENT,
+            ],
+            comment_body="## Implementation\n\nThe measured RESULT.",
+        )
+        worktree = worktree_with_completion(record)
+        processor._run_review_exchange_loop = MagicMock(  # noqa: SLF001
+            side_effect=lambda **kw: _review_exchange_outcome(
+                kw["exchange_run"], status="error", rounds=1, reason="boom"
+            )
+        )
+
+        result = processor.process(
+            worktree,
+            run_assets=make_session_run_assets(worktree),
+            issue_number=123,
+            issue_title="Test Issue",
+            agent_label="agent:coder",
+            issue_key=None,
+        )
+
+        assert result.review_exchange_halted is True
+        assert result.success is False
+        mock_git_adapter.commits_against_base.assert_not_called()
+        mock_git_adapter.push.assert_not_called()
+        mock_pr_adapter.create_pr.assert_not_called()
+        posted = [call.args[1] for call in mock_pr_adapter.add_comment.call_args_list]
+        assert record.comment_body not in posted
 
     def test_local_loop_failure_emits_review_changes_requested_trace_event(
         self,

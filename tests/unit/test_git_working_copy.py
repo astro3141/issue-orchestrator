@@ -12,6 +12,7 @@ from issue_orchestrator.execution.git_working_copy import GitWorkingCopy
 from issue_orchestrator.ports.command_runner import OutputNewlines
 from issue_orchestrator.ports.git import GitError, GitResult
 from issue_orchestrator.ports.working_copy import (
+    BranchCommitsResult,
     BranchPathsResult,
     BranchStatus,
     BranchTextFile,
@@ -1718,3 +1719,81 @@ class TestBranchPostImagePathsAgainstBase:
             assert result.success is False
             assert result.paths == ()
             assert result.error
+
+
+class TestCommitsAgainstBase:
+    """What a branch ADDS over a base ref (#337).
+
+    The trusted half of the ordinary zero-code publication lane: ``0`` is the
+    state in which ``create_pr`` cannot succeed, and it must be distinguishable
+    from a read that failed.
+    """
+
+    def test_counts_the_range_not_the_symmetric_difference(
+        self, git_wc, worktree_path
+    ):
+        """A base that moved ahead is not the branch's own work."""
+        with patch.object(git_wc, "_run_git") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout="2\n", stderr="")
+
+            result = git_wc.commits_against_base(worktree_path, "origin/main")
+
+            assert result == BranchCommitsResult(success=True, count=2)
+            mock_run.assert_called_once_with(
+                worktree_path,
+                ["rev-list", "--count", "origin/main..HEAD"],
+                newlines=OutputNewlines.PRESERVED,
+            )
+
+    def test_an_empty_branch_counts_zero(self, git_wc, worktree_path):
+        with patch.object(git_wc, "_run_git") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout="0\n", stderr="")
+
+            assert git_wc.commits_against_base(worktree_path, "origin/main").count == 0
+
+    def test_git_error_fails_closed_rather_than_counting_zero(
+        self, git_wc, worktree_path
+    ):
+        with patch.object(git_wc, "_run_git") as mock_run:
+            mock_run.side_effect = git_error(stderr="fatal: bad revision")
+
+            result = git_wc.commits_against_base(worktree_path, "origin/nope")
+
+            assert result.success is False
+            assert result.count == 0
+            assert "bad revision" in (result.error or "")
+
+    def test_a_non_numeric_answer_fails_closed(self, git_wc, worktree_path):
+        """Git answered, but not with a number. Unreadable is not empty."""
+        with patch.object(git_wc, "_run_git") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+
+            result = git_wc.commits_against_base(worktree_path, "origin/main")
+
+            assert result.success is False
+            assert result.count == 0
+
+    def test_counts_real_commits_in_a_real_repository(self, tmp_path):
+        """The command really answers this question, against git itself."""
+        root = tmp_path / "repo"
+        root.mkdir(parents=True, exist_ok=True)
+        _run_git_cmd(root, "init", "-q")
+        _run_git_cmd(root, "config", "user.email", "test@example.com")
+        _run_git_cmd(root, "config", "user.name", "Test User")
+        _run_git_cmd(root, "config", "commit.gpgsign", "false")
+        (root / "a.txt").write_text("hello\n")
+        _run_git_cmd(root, "add", "-A")
+        _run_git_cmd(root, "commit", "-q", "-m", "base")
+        base = _run_git_cmd(root, "rev-parse", "HEAD")
+
+        # A branch cut from the base and left alone adds nothing.
+        _run_git_cmd(root, "checkout", "-q", "-b", "evidence")
+        assert GitWorkingCopy().commits_against_base(root, base) == (
+            BranchCommitsResult(success=True, count=0)
+        )
+
+        # One commit later it does.
+        (root / "b.txt").write_text("world\n")
+        _run_git_cmd(root, "add", "-A")
+        _run_git_cmd(root, "commit", "-q", "-m", "work")
+        assert GitWorkingCopy().commits_against_base(root, base).count == 1
