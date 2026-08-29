@@ -67,6 +67,28 @@ class TestCandidateStanding:
         assert CandidateStanding.MOVED.permits_authority is False
         assert CandidateStanding.UNREADABLE.permits_authority is False
         assert CandidateStanding.UNBOUND.permits_authority is False
+        assert CandidateStanding.TERMINAL.permits_authority is False
+
+    def test_every_standing_answers_the_authority_question(self) -> None:
+        """The property is per member so a new one cannot inherit an answer."""
+        assert all(
+            isinstance(standing.permits_authority, bool)
+            for standing in CandidateStanding
+        )
+        assert [
+            standing for standing in CandidateStanding if standing.permits_authority
+        ] == [CandidateStanding.CURRENT]
+
+    def test_a_terminal_pull_request_defers_a_pass(self) -> None:
+        """#352: merged at the audited commit is not "still the candidate"."""
+        assert (
+            CandidateOutcome.resolve(
+                disposition=TechLeadCandidateDisposition.PASS,
+                standing=CandidateStanding.TERMINAL,
+                unmet_prerequisites=(),
+            )
+            is CandidateOutcome.DEFERRED
+        )
 
 
 class TestCandidateVerdict:

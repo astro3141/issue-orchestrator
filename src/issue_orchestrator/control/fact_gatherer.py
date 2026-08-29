@@ -61,6 +61,7 @@ clear_discovered_facts = _clear_discovered_facts
 if TYPE_CHECKING:
     from ..ports.issue import Issue
     from ..ports.promotion_target import PromotionTargetHost
+    from ..ports.pull_request_tracker import PRInfo
     from ..ports.queue_cache_store import QueueCacheStore
     from ..ports.tech_lead_authority import TechLeadAuthorityStore
     from ..domain.models import (
@@ -500,7 +501,7 @@ class FactGatherer:
             # anchor is meaningless while the batch trigger is off.
             if batch_armed:
                 existing_tech_lead_issue = batch_anchor
-        prs = self._fetch_tech_lead_prs(watch_label) if batch_armed else []
+        prs = self._fetch_tech_lead_prs() if batch_armed else []
         all_labels, source_milestones = self._collect_pr_metadata(prs)
 
         facts = TechLeadFacts(
@@ -603,19 +604,27 @@ class FactGatherer:
             return None
         return self.config.tech_lead_watch_label
 
-    def _fetch_tech_lead_prs(self, watch_label: str) -> list[Any]:
-        """Fetch PRs that are current tech_lead batch candidates.
+    def _fetch_tech_lead_prs(self) -> list["PRInfo"]:
+        """Observe the PRs that are current tech_lead batch candidates.
 
-        Eligibility comes from the shared :class:`TechLeadCandidatePolicy` — the
-        same predicate the manifest builder applies — so terminally-triaged
-        PRs never count toward the threshold that the manifest then filters
-        out (#6768 round 5: that divergence created empty-batch loops).
+        The whole observation — which pull requests are asked for, and which of
+        them still qualify — comes from the shared
+        :class:`TechLeadCandidatePolicy`, the same single call the manifest
+        builder makes. Terminally-triaged PRs never count toward the threshold
+        that the manifest then filters out (#6768 round 5: that divergence
+        created empty-batch loops), and neither do closed or merged ones, which
+        counted a repository's whole merged history toward a merge-facing
+        threshold until #352.
+
+        Takes no watch label: the policy resolves the same
+        ``Config.tech_lead_watch_label`` this gatherer publishes as the
+        ``TechLeadFacts.watch_label`` fact, and handing it one would be a
+        second place the selecting label could be decided.
         """
         from .tech_lead_candidate_policy import TechLeadCandidatePolicy
 
         policy = TechLeadCandidatePolicy.from_config(self.config)
-        prs = self.repository_host.get_prs_with_label(watch_label, state="all")
-        return [pr for pr in prs if policy.is_candidate(_pr_labels(pr))]
+        return policy.open_candidates(self.repository_host)
 
     def _classify_tech_lead_anchor_scan(
         self,

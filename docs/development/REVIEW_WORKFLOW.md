@@ -448,7 +448,11 @@ for a pull-request number:
    contract;
 4. the decision returns one `candidate_verdicts` entry per candidate — `pass`,
    `rework`, or `human_a` — validated against the launch authority, and
-   completion re-reads each pull request's live head before applying it.
+   completion re-reads each pull request before applying it: its **lifecycle
+   state and its head**. The head alone is not enough, because a pull request
+   merges at exactly the commit that was audited, so a head-only re-read
+   answers "unchanged" for the one transition after which no merge-facing
+   authority may be applied at all.
 
 A merge-facing `pass` rests on **both** staged prerequisites, recorded on the
 launch authority before the session spawns and asked as one question by
@@ -497,6 +501,7 @@ candidate's labels become.
 | `human_a` | `+tech-lead-failed`, `+needs-human` | no | operator removes `tech-lead-failed` |
 | `pass` refused — a staged prerequisite (exact-candidate reviewer approval and its publication certification, or a resolved leaf contract) is missing; the receipt names which and the reason recorded for it | `+tech-lead-failed` | no | operator removes `tech-lead-failed` |
 | head moved, unreadable, or never observed | none | **yes, deliberately** | it never left — re-audited at whatever it then proposes |
+| the pull request merged or closed after the manifest bound it — whatever its head | none | yes, but unreachable | it never re-enters: the batch observes open pull requests only |
 
 Each row's last column is owned by `CandidateWatchExit.readmission` and is
 repeated verbatim in the receipt on the pull request, so the two cannot drift.
@@ -506,6 +511,29 @@ threshold trigger and the manifest builder already share. `tech-lead-failed`
 here carries the same meaning it does for a dead session: *this run produced no
 Tech Lead authority for this pull request*. Deferred worktree/session cleanup
 waits on either terminal label, not on `tech-lead-reviewed` alone.
+
+Membership is bounded by pull-request lifecycle as well as by labels: only
+**currently open** pull requests are candidates. Nothing takes the watch label
+off on merge, so a repository's merged history keeps it forever — a batch that
+counted that history tripped its threshold on pull requests that can never
+merge again. The same owner narrows the query *and* re-checks what comes back,
+which is also what settles the race: a candidate that merges between the
+threshold count and manifest construction is simply absent from the batch, so
+it is never audited and receives no disposition. The later observation wins;
+openness observed at threshold time is not carried forward. A configured
+`review.tech_lead_review_label` still narrows which *open* pull requests are
+candidates, but it is not what keeps closed history out.
+
+The same bound holds at the *third* read, completion, where each verdict is
+applied — and it is asked there through the same owner
+(`TechLeadCandidatePolicy.is_open`) rather than derived again. A batch review
+runs for as long as it runs, so a candidate can merge while it is being
+audited, at the very commit that was audited. Its standing is then `terminal`
+rather than `current`: the pull request receives a refusal receipt and nothing
+else — no merge-facing label, no `needs-rework` admission, no `needs-human`
+escalation, and no watch-set or terminal label written onto what is now
+history. The three reads — threshold, manifest, completion — therefore spell
+"may this pull request bear Tech Lead authority" exactly once between them.
 
 Because omitting a candidate would leave it counting toward the threshold, a
 decision that renders no verdict for a bound manifest candidate is a contract
@@ -559,10 +587,10 @@ flowchart TD
   CR --> TECH_LEAD{"Tech Lead batch review configured?"}
   TECH_LEAD -->|yes, threshold met| TR["Tech Lead audits each exact candidate"]
   TR --> PASS{"Per-candidate verdict"}
-  PASS -->|PASS, head unmoved| DONE["Tech-Lead-reviewed — ready for human merge"]
+  PASS -->|"PASS, still open at the audited head"| DONE["Tech-Lead-reviewed — ready for human merge"]
   PASS -->|REWORK| NR["Feedback posted, then needs-rework"]
   PASS -->|HUMAN_A| BNH["Escalated to a human, blocked"]
-  PASS -->|head moved / unreadable| REFUSED["Refusal recorded; no authority applied"]
+  PASS -->|"head moved / unreadable / no longer open"| REFUSED["Refusal recorded; no authority applied"]
   TECH_LEAD -->|no| DONE2["Ready for human merge"]
 
   FAIL["Session failed / blocked / timeout"] --> TFAIL{"tech_lead_review_on_failure?"}

@@ -5,6 +5,9 @@ The proof directions of the leaf, one class each:
 * **A. Exact candidate movement** — a disposition rendered against ``A`` may not
   reach ``B``. Removing the completion-time head re-read makes these fail by
   observing the authority transfer.
+* **B. Terminal pull request** — a candidate that merged or closed after the
+  manifest bound it receives no disposition, even though the head it merged at
+  is exactly the head that was audited (#352).
 * **C. PASS** — only a still-current candidate receives the merge-facing label,
   and the receipt names the exact commit and the run that decided it.
 * **D. REWORK** — actionable, candidate-bound feedback lands BEFORE the
@@ -27,6 +30,7 @@ so the rule holds against an agent that renders one anyway.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
@@ -38,9 +42,10 @@ from issue_orchestrator.control.actions import (
 )
 from issue_orchestrator.control.label_manager import LabelManager
 from issue_orchestrator.control.tech_lead_candidate_disposition import (
+    CandidateObservationReader,
     candidate_effects,
     plan_candidate_dispositions,
-    repository_candidate_heads,
+    repository_candidate_observations,
 )
 from issue_orchestrator.domain.tech_lead_artifacts import TechLeadDecision
 from issue_orchestrator.control.tech_lead_candidate_policy import (
@@ -68,6 +73,42 @@ def _config(tmp_path: Path) -> Config:
     config = Config(repo="acme/repo", repo_root=tmp_path)
     config.tech_lead_review_agent = "agent:tech-lead"
     return config
+
+
+@dataclass(frozen=True)
+class ObservedPR:
+    """One open pull-request observation, as the candidate owner reads it."""
+
+    labels: list[str]
+    state: str = "open"
+
+
+@dataclass(frozen=True)
+class LivePullRequest:
+    """One completion-time observation, as the disposition planner reads it."""
+
+    head_sha: str | None
+    state: str = "open"
+
+
+def _observations(
+    heads: dict[int, str | None], states: dict[int, str] | None = None
+) -> CandidateObservationReader:
+    """The completion-time reader, over a fixture of live pull requests.
+
+    A pull request mapped to ``None`` could not be observed at all. ``states``
+    names the lifecycle only for the directions that are about lifecycle;
+    everything else is open, which is the only state that can bear authority.
+    """
+    lifecycle = states or {}
+
+    def observe(pr_number: int) -> LivePullRequest | None:
+        head = heads.get(pr_number)
+        if head is None:
+            return None
+        return LivePullRequest(head, lifecycle.get(pr_number, "open"))
+
+    return observe
 
 
 def _authority(
@@ -126,6 +167,7 @@ def _plan(
     authority: TechLeadLaunchAuthority,
     decision: TechLeadDecision,
     heads: dict[int, str | None],
+    states: dict[int, str] | None = None,
 ) -> list[object]:
     config = _config(tmp_path)
     return plan_candidate_dispositions(
@@ -134,7 +176,7 @@ def _plan(
         decision,
         expected=None,
         labels=LabelManager(config),
-        heads=lambda pr_number: heads.get(pr_number),
+        observations=_observations(heads, states),
         run_identity=RUN_IDENTITY,
     )
 
@@ -224,10 +266,15 @@ class TestExactCandidateMovement:
 
         assert _labels(actions, "tech-lead-reviewed") == []
 
-    def test_the_head_reader_asks_the_repository_for_the_live_head(
+    def test_the_reader_asks_the_repository_for_the_live_pull_request(
         self, tmp_path: Path
     ) -> None:
-        """The mutation the proof rests on: remove this read and A becomes B."""
+        """The mutation the proof rests on: remove this read and A becomes B.
+
+        The observation carries the pull request's LIFECYCLE beside its head,
+        in one read: dropping either half is what lets a superseded (#345) or a
+        merged (#352) pull request be treated as the current candidate.
+        """
 
         class Host:
             def __init__(self) -> None:
@@ -235,12 +282,15 @@ class TestExactCandidateMovement:
 
             def get_pr(self, pr_number: int) -> object:
                 self.asked.append(pr_number)
-                return type("PR", (), {"head_sha": CANDIDATE_B})()
+                return LivePullRequest(CANDIDATE_B, "merged")
 
         host = Host()
-        reader = repository_candidate_heads(host)  # type: ignore[arg-type]
+        reader = repository_candidate_observations(host)  # type: ignore[arg-type]
 
-        assert reader(101) == CANDIDATE_B
+        observed = reader(101)
+        assert observed is not None
+        assert observed.head_sha == CANDIDATE_B
+        assert observed.state == "merged"
         assert host.asked == [101]
 
     def test_an_unreadable_repository_answers_unknown_not_unchanged(
@@ -250,9 +300,100 @@ class TestExactCandidateMovement:
             def get_pr(self, pr_number: int) -> object:
                 raise RuntimeError("transport is down")
 
-        reader = repository_candidate_heads(ExplodingHost())  # type: ignore[arg-type]
+        reader = repository_candidate_observations(  # type: ignore[arg-type]
+            ExplodingHost()
+        )
 
         assert reader(101) is None
+
+
+class TestTerminalPullRequest:
+    """B: a pull request that is no longer OPEN cannot receive a disposition.
+
+    The direction a head re-read alone cannot see (#352): a pull request MERGES
+    at the very commit that was audited, so "is the head still A" answers yes
+    for exactly the transition that removes every reason to project merge
+    authority. Deleting the lifecycle question from ``candidate_standing``
+    makes every test here fail by projecting onto a settled pull request.
+    """
+
+    @pytest.mark.parametrize("state", ["merged", "closed"])
+    def test_a_settled_candidate_receives_no_merge_facing_authority(
+        self, tmp_path: Path, state: str
+    ) -> None:
+        actions = _plan(
+            tmp_path,
+            _authority(TechLeadCandidate(101, CANDIDATE_A)),
+            _decision(_verdict(101, "pass")),
+            {101: CANDIDATE_A},
+            {101: state},
+        )
+
+        assert _labels(actions, "tech-lead-reviewed") == []
+
+    @pytest.mark.parametrize(
+        ("disposition", "lane"),
+        [("rework", "needs-rework"), ("human_a", "needs-human")],
+    )
+    def test_no_candidate_bound_effect_reaches_it_at_all(
+        self, tmp_path: Path, disposition: str, lane: str
+    ) -> None:
+        """Not the lane label, and not the watch-set projection either.
+
+        A REWORK admission and a HUMAN_A escalation are candidate-bound
+        authority as much as a PASS is, and the terminal/watch-set labels are
+        writes onto a pull request that is now history.
+        """
+        actions = _plan(
+            tmp_path,
+            _authority(TechLeadCandidate(101, CANDIDATE_A)),
+            _decision(_verdict(101, disposition, rationale="Stated reason.")),
+            {101: CANDIDATE_A},
+            {101: "merged"},
+        )
+
+        assert _labels(actions, lane) == []
+        assert not [a for a in actions if isinstance(a, AddLabelAction)]
+        assert not [a for a in actions if isinstance(a, RemoveLabelAction)]
+
+    def test_an_unchanged_head_does_not_make_a_settled_candidate_current(
+        self, tmp_path: Path
+    ) -> None:
+        """The standing is its own, not a shade of CURRENT (#352 rework F1)."""
+        config = _config(tmp_path)
+        effects = candidate_effects(
+            config,
+            _authority(TechLeadCandidate(101, CANDIDATE_A)),
+            _decision(_verdict(101, "pass")),
+            expected=None,
+            labels=LabelManager(config),
+            observations=_observations({101: CANDIDATE_A}, {101: "merged"}),
+            run_identity=RUN_IDENTITY,
+        )
+
+        [planned] = effects
+        assert planned.standing is CandidateStanding.TERMINAL
+        assert planned.outcome is CandidateOutcome.DEFERRED
+        assert planned.projected_reviewed_label is False
+
+    def test_the_receipt_says_the_pull_request_is_no_longer_open(
+        self, tmp_path: Path
+    ) -> None:
+        """And does not promise a re-review that can never happen."""
+        actions = _plan(
+            tmp_path,
+            _authority(TechLeadCandidate(101, CANDIDATE_A)),
+            _decision(_verdict(101, "pass")),
+            {101: CANDIDATE_A},
+            {101: "merged"},
+        )
+
+        [receipt] = _comments(actions, 101)
+        assert "no longer open" in receipt.comment
+        assert "merged or closed" in receipt.comment
+        assert CANDIDATE_A in receipt.comment
+        assert RUN_IDENTITY in receipt.comment
+        assert "stays eligible" not in receipt.comment
 
 
 class TestPassVerdict:
@@ -448,7 +589,7 @@ class TestMultiCandidateIsolation:
             decision,
             expected=None,
             labels=LabelManager(_config(tmp_path)),
-            heads=lambda pr_number: {101: CANDIDATE_A, 102: "c" * 40}[pr_number],
+            observations=_observations({101: CANDIDATE_A, 102: "c" * 40}),
             run_identity=RUN_IDENTITY,
         )
 
@@ -728,7 +869,7 @@ class TestWatchSetExit:
             _decision(_verdict(101, "rework", rationale="Extract the owner.")),
             expected=None,
             labels=LabelManager(config),
-            heads=lambda pr_number: CANDIDATE_A,
+            observations=_observations({101: CANDIDATE_A}),
             run_identity=RUN_IDENTITY,
         )
 
@@ -755,8 +896,10 @@ class TestWatchSetExit:
             action.label for action in actions if isinstance(action, AddLabelAction)
         ]
 
-        assert policy.is_candidate([config.tech_lead_watch_label]) is True
-        assert policy.is_candidate(settled_labels) is False
+        assert policy.is_candidate(
+            ObservedPR(labels=[config.tech_lead_watch_label])
+        ) is True
+        assert policy.is_candidate(ObservedPR(labels=settled_labels)) is False
 
     @pytest.mark.parametrize(
         ("disposition", "prerequisites", "expected"),
@@ -783,7 +926,7 @@ class TestWatchSetExit:
             _decision(_verdict(101, disposition, rationale="Stated reason.")),
             expected=None,
             labels=LabelManager(config),
-            heads=lambda pr_number: CANDIDATE_A,
+            observations=_observations({101: CANDIDATE_A}),
             run_identity=RUN_IDENTITY,
         )
 
@@ -880,7 +1023,7 @@ class TestTheReceiptSaysWhatLeavingTheSetMeant:
             _decision(_verdict(101, "human_a", rationale="Whose call?")),
             expected=None,
             labels=LabelManager(config),
-            heads=lambda pr_number: CANDIDATE_A,
+            observations=_observations({101: CANDIDATE_A}),
             run_identity=RUN_IDENTITY,
         )
 

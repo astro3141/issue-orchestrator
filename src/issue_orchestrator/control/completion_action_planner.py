@@ -18,7 +18,7 @@ from .tech_lead_completion import (
     has_tech_lead_decision_errors,
 )
 from .subject_recovery_authority import SubjectRecoveryAuthority
-from .tech_lead_candidate_disposition import repository_candidate_heads
+from .tech_lead_candidate_disposition import repository_candidate_observations
 from .tech_lead_terminal_effects import (
     generate_tech_lead_decision_failure_actions,
     plan_tech_lead_terminal_effects,
@@ -277,10 +277,13 @@ class CompletionActionPlanner:
             tech_lead_authority=self._tech_lead_authority,
             open_issue_corpus=self._open_issue_corpus,
             active_session_run_id=self._active_session_run_id,
-            # The completion-time re-read of each audited candidate's live head
-            # (#345). Built over the planner's own repository host so the
-            # tech-lead owner states the policy and this seam supplies the fact.
-            current_candidate_head=repository_candidate_heads(self.repository_host),
+            # The completion-time re-read of each audited candidate's live
+            # pull request — its lifecycle and its head (#345, #352). Built
+            # over the planner's own repository host so the tech-lead owner
+            # states the policy and this seam supplies the fact.
+            current_candidate_observation=repository_candidate_observations(
+                self.repository_host
+            ),
         )
 
     def _plan_terminal_actions(

@@ -691,6 +691,7 @@ class TestTheLaunchPathCarriesTheAnswer:
             branch=branch,
             head_sha=head_sha,
             labels=["tech-lead-review"],
+            state="open",
         )
 
     def test_a_resolved_contract_reaches_the_launch_authority(

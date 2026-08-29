@@ -20,9 +20,10 @@ Four value objects, each with exactly one job:
 * :class:`TechLeadCandidateVerdict` — the per-candidate disposition the tech
   lead renders (PASS / REWORK / HUMAN_A). Per candidate, not per session: a
   multi-PR batch may not transfer one candidate's answer to another.
-* :class:`CandidateStanding` — what a completion-time re-read of the live head
-  found. A verdict is authority only while the candidate it names is still the
-  candidate.
+* :class:`CandidateStanding` — what a completion-time re-read of the live pull
+  request found: its lifecycle AND its head. A verdict is authority only while
+  the candidate it names is still the candidate — which a merged pull request
+  is not, however unchanged its head (#352).
 * :class:`CandidatePassPrerequisite` — the staged facts a merge-facing PASS
   rests on: an exact-commit reviewer approval that cleared the publication
   gate, and the candidate's staged executable-leaf contract. Both are
@@ -146,7 +147,12 @@ class TechLeadCandidate:
 
 
 class CandidateStanding(Enum):
-    """What a completion-time re-read found the candidate's live head to be.
+    """What a completion-time re-read found the candidate's pull request to be.
+
+    Both halves of it: the pull request's lifecycle state and its head. A
+    verdict is authority only while the candidate it names is still the
+    candidate, and that is false in two independent ways — the head moved on,
+    or the pull request itself is no longer open.
 
     ``permits_authority`` is a property of the member rather than a set held
     beside the enum, for the reason :class:`~.continuation_phase.
@@ -154,10 +160,19 @@ class CandidateStanding(Enum):
     whether a candidate holding it may still receive a merge-facing effect.
     """
 
-    #: The live head is still the audited commit. Only this permits authority.
+    #: The pull request is still open AND its head is still the audited
+    #: commit. Only this permits authority.
     CURRENT = ("current", True)
     #: The live head is a different commit: the review is about other work.
     MOVED = ("moved", False)
+    #: The pull request itself reached a terminal state — merged or closed —
+    #: since the manifest bound the candidate. Its own standing rather than a
+    #: shade of :attr:`CURRENT` because the head is typically UNCHANGED there
+    #: (#352): a pull request merges at exactly the commit that was audited,
+    #: so a re-read that asked only "is the head still A" answered yes and
+    #: projected merge-facing authority onto a pull request that can no longer
+    #: merge. A closed or merged pull request is historical evidence.
+    TERMINAL = ("terminal", False)
     #: The live head could not be read. Unknown is not unchanged.
     UNREADABLE = ("unreadable", False)
     #: The manifest never bound this pull request to an observed commit.

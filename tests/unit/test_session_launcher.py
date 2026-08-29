@@ -4778,7 +4778,7 @@ class TestLaunchTechLeadIssueSessionFlavors:
 
         assert result.success is True
         assert mock_repo_host.get_prs_with_label_calls == [
-            (config.tech_lead_watch_label, "all")
+            (config.tech_lead_watch_label, "open")
         ]
         run_dir = self._started_run_dir(mock_events)
         run_manifest = json.loads((run_dir / "manifest.json").read_text())
@@ -4879,7 +4879,7 @@ class TestLaunchTechLeadIssueSessionFlavors:
         assert snapshot.orchestrator_paused is False
         # No new repository-host call types: only the batch manifest fetch.
         assert mock_repo_host.get_prs_with_label_calls == [
-            (config.tech_lead_watch_label, "all")
+            (config.tech_lead_watch_label, "open")
         ]
         assert mock_repo_host.add_label_calls == []
         assert mock_repo_host.remove_label_calls == []
@@ -6155,7 +6155,7 @@ class TestTechLeadProducerToLaunchBoundary:
 
         # Batch review must prepare the PR manifest...
         assert mock_repo_host.get_prs_with_label_calls == [
-            (config.tech_lead_watch_label, "all")
+            (config.tech_lead_watch_label, "open")
         ]
         run_dir = TestLaunchTechLeadIssueSessionFlavors._started_run_dir(mock_events)
         run_manifest = json.loads((run_dir / "manifest.json").read_text())
