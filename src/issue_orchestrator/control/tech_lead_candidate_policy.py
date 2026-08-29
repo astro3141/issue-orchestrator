@@ -54,17 +54,77 @@ That was already true of the whole-session failure projection; what this module
 adds is candidates reaching it one at a time, which is exactly why every such
 receipt has to name the label and the manual step rather than leave the reader
 to discover the door only swings one way.
+
+Membership has a third question, and #352 is what happened while it had no
+owner: **which pull requests the observation may contain at all.** Both call
+sites asked the repository host for ``state="all"``, so every pull request the
+repository had EVER merged carrying the watch label answered the entry
+predicate — a merged pull request keeps its labels forever, and nothing removes
+the watch label on merge. A threshold of 1 duly tripped on a 100-pull-request
+manifest spanning years of closed history. A closed or merged pull request is
+historical evidence, never a merge-facing candidate, so the lifecycle rule
+lives here beside the label rules and is applied by ONE method,
+:meth:`TechLeadCandidatePolicy.open_candidates`, which owns both halves of the
+observation: the ``state`` it asks the host for AND the predicate it then
+applies. A caller cannot pair one with the other's semantics because a caller
+never names either.
+
+That the predicate re-asks a question the query already narrowed is not
+redundancy, it is the race: threshold observation and manifest construction are
+two separate reads, and a candidate that merges between them must be gone from
+the second. The later observation wins, and openness is never carried forward
+from the earlier one.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Sequence
+from typing import TYPE_CHECKING, Protocol, Sequence, TypeVar
 
 from ..domain.tech_lead_candidate import CandidateOutcome
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from ..infra.config import Config
+
+
+#: The ONE pull-request lifecycle state a merge-facing batch candidate can
+#: occupy (#352). Both the query and the predicate read this constant, so
+#: "which pull requests may be candidates" has a single spelling.
+OPEN_PR_STATE = "open"
+
+
+class ObservedPullRequest(Protocol):
+    """The facts candidacy is decided from, as one observation of a PR.
+
+    Read-only members: this is what the policy READS, never what it writes, and
+    stating it that way is what lets any pull-request observation the
+    repository host returns satisfy it structurally without the policy
+    depending on the concrete port type.
+    """
+
+    @property
+    def state(self) -> str: ...
+
+    @property
+    def labels(self) -> Sequence[str]: ...
+
+
+_ObservedPR = TypeVar("_ObservedPR", bound=ObservedPullRequest)
+
+
+class WatchLabelledPullRequests(Protocol[_ObservedPR]):
+    """The single read a batch-candidate observation makes.
+
+    Narrower than :class:`~..ports.RepositoryHost` on purpose: the policy needs
+    exactly one query, and taking only that one keeps the lifecycle rule from
+    acquiring a second way to be asked. Generic in the observation type so the
+    caller gets its own pull-request type back — the manifest builder still
+    reads ``number``/``branch``/``head_sha`` off what it receives.
+    """
+
+    def get_prs_with_label(
+        self, label: str, state: str = ...
+    ) -> list[_ObservedPR]: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -103,6 +163,11 @@ class TechLeadCandidatePolicy:
     (``tech_lead_candidate_disposition``) all go through this one type, so the
     count that trips a batch, the set the session audits and the set the review
     settles cannot disagree.
+
+    The first two reach it through :meth:`open_candidates` rather than through
+    :meth:`is_candidate` alone: the pull-request LIFECYCLE scope of a candidate
+    is part of the answer, and a call site that supplied its own would be a
+    second rule (#352).
     """
 
     #: The label that SELECTS pull requests into the batch. Always
@@ -157,9 +222,33 @@ class TechLeadCandidatePolicy:
         """
         return (self.tech_lead_reviewed_label, self.tech_lead_failed_label)
 
-    def is_candidate(self, labels: Sequence[str]) -> bool:
-        """True when a watch-labelled PR still needs a tech_lead batch review."""
-        label_set = set(labels)
+    def open_candidates(
+        self, host: WatchLabelledPullRequests[_ObservedPR]
+    ) -> list[_ObservedPR]:
+        """Observe every pull request this batch may currently audit.
+
+        ONE method for the whole question, because the threshold count and the
+        manifest are two calls to it and neither may hold a piece of the answer
+        of its own (#352). It narrows the query to open pull requests — a
+        merged one is history, and asking for it costs GitHub reads to fetch
+        candidates that can never merge — and then applies
+        :meth:`is_candidate`, which asks lifecycle again on what came back.
+        """
+        prs = host.get_prs_with_label(self.watch_label, state=OPEN_PR_STATE)
+        return [pr for pr in prs if self.is_candidate(pr)]
+
+    def is_candidate(self, pr: ObservedPullRequest) -> bool:
+        """True when an observed PR still needs a tech_lead batch review.
+
+        Lifecycle first: a batch review exists to produce merge authority, and
+        a closed or merged pull request has nothing left to authorize. It is
+        asked of the observation rather than assumed from the query, so a
+        candidate that reached a terminal state since it was counted drops out
+        of the set the batch actually audits.
+        """
+        if pr.state != OPEN_PR_STATE:
+            return False
+        label_set = set(pr.labels)
         terminalized = bool(set(self.terminal_labels) & label_set)
         in_scope = self.required_label is None or self.required_label in label_set
         return not terminalized and in_scope
@@ -229,4 +318,10 @@ _WATCH_EXITS = {
 }
 
 
-__all__ = ["CandidateWatchExit", "TechLeadCandidatePolicy"]
+__all__ = [
+    "OPEN_PR_STATE",
+    "CandidateWatchExit",
+    "ObservedPullRequest",
+    "TechLeadCandidatePolicy",
+    "WatchLabelledPullRequests",
+]

@@ -534,7 +534,7 @@ class TestFactGathererTechLeadFacts:
 
         assert result is not None
         assert result.watch_label == "ready-for-tech-lead"
-        mock_repository_host.get_prs_with_label.assert_called_with("ready-for-tech-lead", state="all")
+        mock_repository_host.get_prs_with_label.assert_called_with("ready-for-tech-lead", state="open")
 
     def test_tech_lead_facts_collects_labels_from_prs_and_linked_issues(
         self, fact_gatherer, sample_state, mock_config, mock_repository_host

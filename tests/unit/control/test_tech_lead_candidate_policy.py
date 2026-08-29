@@ -9,6 +9,7 @@ produced the outcome fires again over unchanged evidence.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
@@ -22,6 +23,14 @@ from issue_orchestrator.infra.config import Config
 
 def _config(tmp_path: Path) -> Config:
     return Config(repo="acme/repo", repo_root=tmp_path)
+
+
+@dataclass(frozen=True)
+class ObservedPR:
+    """One pull-request observation, as the policy reads it."""
+
+    labels: list[str]
+    state: str = "open"
 
 
 class TestTheWatchLabelHasOneOwner:
@@ -135,7 +144,9 @@ class TestEveryOutcomeSettlesOrDeliberatelyDoesNot:
         ]
         selected = policy.watch_label in after
 
-        assert (selected and policy.is_candidate(after)) is exit_rule.keeps_membership
+        assert (
+            selected and policy.is_candidate(ObservedPR(labels=after))
+        ) is exit_rule.keeps_membership
 
 
 class TestTerminalLabels:
@@ -151,8 +162,12 @@ class TestTerminalLabels:
     def test_either_terminal_label_ends_candidacy(self, tmp_path: Path) -> None:
         policy = TechLeadCandidatePolicy.from_config(_config(tmp_path))
 
-        assert policy.is_candidate(["code-reviewed", "tech-lead-reviewed"]) is False
-        assert policy.is_candidate(["code-reviewed", "tech-lead-failed"]) is False
+        assert policy.is_candidate(
+            ObservedPR(labels=["code-reviewed", "tech-lead-reviewed"])
+        ) is False
+        assert policy.is_candidate(
+            ObservedPR(labels=["code-reviewed", "tech-lead-failed"])
+        ) is False
 
 
 class TestTheOwnerSaysHowEachExitIsUndone:

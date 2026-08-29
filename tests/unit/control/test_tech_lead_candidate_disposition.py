@@ -27,6 +27,7 @@ so the rule holds against an agent that renders one anyway.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
@@ -68,6 +69,14 @@ def _config(tmp_path: Path) -> Config:
     config = Config(repo="acme/repo", repo_root=tmp_path)
     config.tech_lead_review_agent = "agent:tech-lead"
     return config
+
+
+@dataclass(frozen=True)
+class ObservedPR:
+    """One open pull-request observation, as the candidate owner reads it."""
+
+    labels: list[str]
+    state: str = "open"
 
 
 def _authority(
@@ -755,8 +764,10 @@ class TestWatchSetExit:
             action.label for action in actions if isinstance(action, AddLabelAction)
         ]
 
-        assert policy.is_candidate([config.tech_lead_watch_label]) is True
-        assert policy.is_candidate(settled_labels) is False
+        assert policy.is_candidate(
+            ObservedPR(labels=[config.tech_lead_watch_label])
+        ) is True
+        assert policy.is_candidate(ObservedPR(labels=settled_labels)) is False
 
     @pytest.mark.parametrize(
         ("disposition", "prerequisites", "expected"),

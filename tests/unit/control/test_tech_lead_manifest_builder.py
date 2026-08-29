@@ -26,7 +26,12 @@ class MockPR:
 
 
 class MockRepositoryHost:
-    """Mock RepositoryHost for testing."""
+    """Mock RepositoryHost for testing.
+
+    Honors the ``state`` filter the way GitHub does, so a test that asserts a
+    manifest excludes closed history is proving the QUERY, not just a predicate
+    downstream of it.
+    """
 
     def __init__(self, prs: list[MockPR] | None = None):
         self.prs = prs or []
@@ -34,8 +39,19 @@ class MockRepositoryHost:
 
     def get_prs_with_label(self, label: str, state: str = "all") -> list[MockPR]:
         self.get_prs_with_label_calls.append((label, state))
-        # Return PRs that have the requested label
-        return [pr for pr in self.prs if label in pr.labels]
+        # Return PRs that have the requested label, in the requested state
+        return [
+            pr
+            for pr in self.prs
+            if label in pr.labels and state in ("all", pr.state)
+        ]
+
+
+def _observed(labels: list[str], state: str = "open") -> MockPR:
+    """One pull-request observation, for asking the policy about it directly."""
+    return MockPR(
+        number=1, title="PR", url="u", branch="b", labels=labels, state=state
+    )
 
 
 class TestTechLeadManifestBuilder:
@@ -52,7 +68,7 @@ class TestTechLeadManifestBuilder:
         assert manifest.data_dir == "tech-lead-data"
         assert manifest.prs == []
         assert len(host.get_prs_with_label_calls) == 1
-        assert host.get_prs_with_label_calls[0] == ("code-reviewed", "all")
+        assert host.get_prs_with_label_calls[0] == ("code-reviewed", "open")
 
     def test_build_includes_prs_needing_tech_lead(self):
         """Includes PRs with code-reviewed but not tech-lead-reviewed."""
@@ -166,7 +182,7 @@ class TestTechLeadManifestBuilder:
         manifest = builder.build(data_dir="data")
 
         # Should query with custom label
-        assert host.get_prs_with_label_calls[0] == ("my-reviewed", "all")
+        assert host.get_prs_with_label_calls[0] == ("my-reviewed", "open")
         # Should exclude PR with my-triaged
         assert len(manifest.prs) == 1
         assert manifest.prs[0].number == 1
@@ -289,14 +305,14 @@ class TestTechLeadCandidatePolicy:
 
     def test_candidate_truth_table(self):
         policy = TechLeadCandidatePolicy()
-        assert policy.is_candidate(["code-reviewed"]) is True
-        assert policy.is_candidate(["code-reviewed", "tech-lead-reviewed"]) is False
-        assert policy.is_candidate(["code-reviewed", "tech-lead-failed"]) is False
+        assert policy.is_candidate(_observed(["code-reviewed"])) is True
+        assert policy.is_candidate(_observed(["code-reviewed", "tech-lead-reviewed"])) is False
+        assert policy.is_candidate(_observed(["code-reviewed", "tech-lead-failed"])) is False
 
     def test_required_label_scopes_candidates(self):
         policy = TechLeadCandidatePolicy(required_label="io:e2e:run-1")
-        assert policy.is_candidate(["code-reviewed", "io:e2e:run-1"]) is True
-        assert policy.is_candidate(["code-reviewed"]) is False
+        assert policy.is_candidate(_observed(["code-reviewed", "io:e2e:run-1"])) is True
+        assert policy.is_candidate(_observed(["code-reviewed"])) is False
 
     def test_from_config_honors_custom_labels_and_filter(self):
         from issue_orchestrator.infra.config import Config
@@ -308,19 +324,19 @@ class TestTechLeadCandidatePolicy:
 
         policy = TechLeadCandidatePolicy.from_config(config)
 
-        assert policy.is_candidate(["code-reviewed", "scope-x"]) is True
-        assert policy.is_candidate(["code-reviewed", "scope-x", "my-triaged"]) is False
-        assert policy.is_candidate(["code-reviewed", "scope-x", "my-failed"]) is False
-        assert policy.is_candidate(["code-reviewed"]) is False
+        assert policy.is_candidate(_observed(["code-reviewed", "scope-x"])) is True
+        assert policy.is_candidate(_observed(["code-reviewed", "scope-x", "my-triaged"])) is False
+        assert policy.is_candidate(_observed(["code-reviewed", "scope-x", "my-failed"])) is False
+        assert policy.is_candidate(_observed(["code-reviewed"])) is False
 
     def test_from_config_defaults(self):
         from issue_orchestrator.infra.config import Config
 
         policy = TechLeadCandidatePolicy.from_config(Config())
 
-        assert policy.is_candidate(["code-reviewed"]) is True
-        assert policy.is_candidate(["code-reviewed", "tech-lead-reviewed"]) is False
-        assert policy.is_candidate(["code-reviewed", "tech-lead-failed"]) is False
+        assert policy.is_candidate(_observed(["code-reviewed"])) is True
+        assert policy.is_candidate(_observed(["code-reviewed", "tech-lead-reviewed"])) is False
+        assert policy.is_candidate(_observed(["code-reviewed", "tech-lead-failed"])) is False
 
 
 class TestExactCandidateBinding:
