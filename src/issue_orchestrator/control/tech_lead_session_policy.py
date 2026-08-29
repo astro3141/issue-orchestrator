@@ -41,6 +41,7 @@ from ..ports.planning_command_guard import (
     PlanningCommandGuardError,
 )
 from .completion_pr_collision import NoCommitsBetweenError
+from .tech_lead_candidate_contract import stage_candidate_contracts
 from .tech_lead_canonical_context import stage_canonical_context
 from .tech_lead_evidence import build_evidence_map, write_evidence_map
 from .tech_lead_candidate_policy import TechLeadCandidatePolicy
@@ -238,10 +239,11 @@ def prepare_tech_lead_manifest(
     matches the threshold set.
 
     Each selected PR is bound to the exact head commit the orchestrator
-    observed, and the independent Reviewer's verdict for THAT commit is staged
-    beside the manifest (#345) — the tech lead's data-source contract forbids
-    it from fetching that context itself, so an unstaged prerequisite would be
-    an unprovable one.
+    observed, and two things a stateless review cannot reconstruct for itself
+    are staged beside the manifest (#345): the independent Reviewer's verdict
+    for THAT commit, and the bounded contract of the executable issue the pull
+    request implements. The tech lead's data-source contract forbids it from
+    fetching either, so an unstaged prerequisite would be an unprovable one.
     """
     builder = TechLeadManifestBuilder(
         repository_host=repository_host,
@@ -257,6 +259,15 @@ def prepare_tech_lead_manifest(
         return None
 
     manifest = manifest_downloader.download(manifest, worktree_path)
+    # The leaf contract each candidate is judged against, staged AFTER the
+    # download so its own answer rides the same manifest entries the reviewer
+    # evidence does, and BEFORE the manifest is written so the file the agent
+    # reads already carries both.
+    stage_candidate_contracts(
+        manifest.prs,
+        repository_host=repository_host,
+        data_path=worktree_path / data_dir,
+    )
 
     manifest_path = worktree_path / data_dir / "manifest.json"
     manifest.write(manifest_path)
@@ -531,6 +542,13 @@ def prepare_tech_lead_session_data(
             # that exact commit — the prerequisite a PASS rests on (#345).
             reviewed_candidates=(
                 tech_lead_manifest.reviewed_candidates() if tech_lead_manifest else ()
+            ),
+            # And which of them arrived with a resolved executable-leaf
+            # contract — the other half of what a PASS rests on (#345).
+            contracted_candidates=(
+                tech_lead_manifest.contracted_candidates()
+                if tech_lead_manifest
+                else ()
             ),
             problem_issue_numbers=problem_issue_numbers,
             launch_base_sha=_launch_base_sha(working_copy, ctx.worktree_path),

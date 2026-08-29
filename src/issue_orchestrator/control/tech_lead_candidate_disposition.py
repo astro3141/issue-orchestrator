@@ -14,9 +14,12 @@ So the projection is now a consequence of two facts, and both are per candidate:
 2. **whether that candidate is still the candidate** — re-read from the live
    pull-request head at completion, because a verdict is authority only for the
    commit it was rendered against;
-3. **whether an independent Reviewer approved that exact commit** — recorded on
-   the launch authority before the session spawned, so a PASS the agent renders
-   over staged evidence that carried a gap is refused rather than trusted.
+3. **whether the candidate holds the prerequisites a merge-facing PASS rests
+   on** — an independent Reviewer's approval of that exact commit, and the
+   staged bounded contract of the executable issue it implements. Both are
+   recorded on the launch authority before the session spawned, so a PASS the
+   agent renders over staged inputs that carried a gap is refused rather than
+   trusted.
 
 Every outcome leaves a receipt on the pull request, including the refusals. A
 moved candidate that silently receives nothing is indistinguishable from a
@@ -49,8 +52,9 @@ Where each outcome routes, and why nothing new was built for it:
   label plus an explanatory comment), unchanged from what an
   ``escalate_to_human`` proposal already reaches. This verdict means only that
   the already-defined boundary was reached; it invents no new human authority.
-* UNSETTLED (a PASS the orchestrator refused for want of an exact-candidate
-  reviewer approval) -> the refusal receipt, and nothing merge-facing.
+* UNSETTLED (a PASS the orchestrator refused for want of a staged
+  prerequisite) -> the refusal receipt naming which one was missing, and
+  nothing merge-facing.
 * DEFERRED (the candidate moved, could not be read, or was never bound) -> the
   refusal receipt if a verdict was rendered, and deliberately no label at all:
   this is the one outcome that leaves the candidate in the watch set, because
@@ -70,6 +74,7 @@ from typing import TYPE_CHECKING, Callable
 
 from ..domain.tech_lead_candidate import (
     CandidateOutcome,
+    CandidatePassPrerequisite,
     CandidateStanding,
     TechLeadCandidate,
     TechLeadCandidateDisposition,
@@ -227,7 +232,7 @@ def candidate_effects(
                 policy=policy,
                 labels=labels,
                 run_identity=run_identity,
-                reviewed=authority.review_established(candidate),
+                unmet=authority.unmet_pass_prerequisites(candidate),
             )
         )
     return planned
@@ -243,7 +248,7 @@ def _effects_for(
     policy: TechLeadCandidatePolicy,
     labels: "LabelManager",
     run_identity: str,
-    reviewed: bool,
+    unmet: tuple[CandidatePassPrerequisite, ...],
 ) -> TechLeadCandidateEffects:
     """The effects for ONE candidate, in the order they must be applied.
 
@@ -257,9 +262,9 @@ def _effects_for(
     outcome = CandidateOutcome.resolve(
         disposition=verdict.disposition if verdict is not None else None,
         standing=standing,
-        review_established=reviewed,
+        unmet_prerequisites=unmet,
     )
-    _log_outcome(candidate, verdict, standing, outcome)
+    _log_outcome(candidate, verdict, standing, outcome, unmet)
     # Resolved ONCE and handed to both halves: the receipt describes exactly
     # the labels the same rule is about to apply, so it can never announce a
     # projection that did not happen or stay silent about one that did.
@@ -273,6 +278,7 @@ def _effects_for(
         expected,
         run_identity=run_identity,
         readmission=exit_rule.readmission,
+        unmet=unmet,
     )
     return TechLeadCandidateEffects(
         candidate,
@@ -294,6 +300,7 @@ def _log_outcome(
     verdict: TechLeadCandidateVerdict | None,
     standing: CandidateStanding,
     outcome: CandidateOutcome,
+    unmet: tuple[CandidatePassPrerequisite, ...],
 ) -> None:
     """Say why a candidate reached a non-merge-facing conclusion."""
     if verdict is None:
@@ -313,16 +320,17 @@ def _log_outcome(
             standing.value,
         )
     elif outcome is CandidateOutcome.UNSETTLED:
-        # The prerequisite the merge contract assumes, checked where the agent
-        # cannot reach it (#345). The prompt tells the tech lead not to pass a
-        # candidate whose staged evidence carries a gap; this is what makes
-        # that hold when it does anyway. REWORK and HUMAN_A are unaffected —
-        # neither claims the candidate is mergeable.
+        # The prerequisites the merge contract assumes, checked where the agent
+        # cannot reach them (#345). The prompt tells the tech lead not to pass a
+        # candidate whose staged inputs carry a gap; this is what makes that
+        # hold when it does anyway. REWORK and HUMAN_A are unaffected — neither
+        # claims the candidate is mergeable.
         logger.warning(
-            "[tech_lead] Refusing PASS for PR #%d @ %s: no independent reviewer"
-            " approval of that exact commit was established at launch",
+            "[tech_lead] Refusing PASS for PR #%d @ %s: %s not established at"
+            " launch",
             candidate.pr_number,
             candidate.short_sha,
+            ", ".join(prerequisite.value for prerequisite in unmet),
         )
 
 
@@ -336,6 +344,7 @@ def _receipt_for(
     *,
     run_identity: str,
     readmission: str,
+    unmet: tuple[CandidatePassPrerequisite, ...],
 ) -> tuple[Action, ...]:
     """The one comment this outcome publishes on the pull request, if any.
 
@@ -360,8 +369,10 @@ def _receipt_for(
         )
         reason_detail = standing.value
     elif outcome is CandidateOutcome.UNSETTLED:
-        comment = _unreviewed_receipt(candidate, verdict, run_identity)
-        reason_detail = "unreviewed candidate"
+        comment = _unproven_receipt(candidate, verdict, run_identity, unmet)
+        reason_detail = ", ".join(
+            f"unmet {prerequisite.value}" for prerequisite in unmet
+        )
     else:
         return (
             AddCommentAction(
@@ -548,18 +559,31 @@ _SETTLED_RECEIPTS: dict[
 }
 
 
-def _unreviewed_receipt(
-    candidate: TechLeadCandidate, verdict: TechLeadCandidateVerdict, run_identity: str
+def _unproven_receipt(
+    candidate: TechLeadCandidate,
+    verdict: TechLeadCandidateVerdict,
+    run_identity: str,
+    unmet: tuple[CandidatePassPrerequisite, ...],
 ) -> str:
+    """Which staged prerequisite the refused PASS was missing, in its own words.
+
+    Every unmet member is listed rather than only the first: a candidate that
+    is neither independently reviewed nor contract-resolved needs two things
+    fixed, and a receipt naming one of them sends the reader back for a second
+    round.
+    """
+    missing = "\n".join(
+        f"- **{prerequisite.value}** — {prerequisite.description}."
+        for prerequisite in unmet
+    )
     return (
-        "## ⛔ Tech Lead PASS refused — the candidate is not independently"
-        " reviewed\n\n"
+        "## ⛔ Tech Lead PASS refused — a merge prerequisite is not"
+        " established\n\n"
         f"{_identity_lines(candidate, run_identity)}\n\n"
-        "The Tech Lead review passed the candidate above, but no independent"
-        " Reviewer approval of that exact commit was established when this"
-        " review's inputs were staged. A review label on the pull request is"
-        " evidence about the pull request, not about this commit, so no"
-        " merge-facing Tech Lead authority has been applied.\n\n"
+        "The Tech Lead review passed the candidate above, but the orchestrator"
+        " could not show that this exact commit holds everything a merge-facing"
+        " PASS rests on, so no merge-facing Tech Lead authority has been"
+        f" applied.\n\n{missing}\n\n"
         f"{verdict.rationale}"
         f"{_findings_line(verdict)}"
     )

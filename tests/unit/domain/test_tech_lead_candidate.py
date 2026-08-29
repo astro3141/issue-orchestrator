@@ -13,6 +13,8 @@ import pytest
 
 from issue_orchestrator.domain.tech_lead_artifacts import TechLeadDecision
 from issue_orchestrator.domain.tech_lead_candidate import (
+    CandidateOutcome,
+    CandidatePassPrerequisite,
     CandidateStanding,
     TechLeadCandidate,
     TechLeadCandidateDisposition,
@@ -215,3 +217,76 @@ class TestDecisionCarriesVerdicts:
         reloaded = TechLeadDecision.from_agent_payload(decision.to_dict())
 
         assert reloaded.candidate_verdicts == decision.candidate_verdicts
+
+
+class TestPassPrerequisites:
+    """A merge-facing PASS is a conjunction, and it says which half failed.
+
+    Both members name a fact the orchestrator staged before the session
+    spawned. Adding a third must not require a new refusal path — the fold
+    below is written against the sequence rather than against two booleans,
+    which is what keeps that true.
+    """
+
+    def test_every_prerequisite_explains_its_own_absence(self) -> None:
+        for prerequisite in CandidatePassPrerequisite:
+            assert prerequisite.description.strip()
+            assert prerequisite.value.strip()
+
+    def test_a_pass_holding_every_prerequisite_is_authority(self) -> None:
+        assert (
+            CandidateOutcome.resolve(
+                disposition=TechLeadCandidateDisposition.PASS,
+                standing=CandidateStanding.CURRENT,
+                unmet_prerequisites=(),
+            )
+            is CandidateOutcome.AUTHORITY
+        )
+
+    @pytest.mark.parametrize("unmet", list(CandidatePassPrerequisite))
+    def test_any_single_unmet_prerequisite_refuses_the_pass(
+        self, unmet: CandidatePassPrerequisite
+    ) -> None:
+        assert (
+            CandidateOutcome.resolve(
+                disposition=TechLeadCandidateDisposition.PASS,
+                standing=CandidateStanding.CURRENT,
+                unmet_prerequisites=(unmet,),
+            )
+            is CandidateOutcome.UNSETTLED
+        )
+
+    @pytest.mark.parametrize(
+        ("disposition", "expected"),
+        [
+            (TechLeadCandidateDisposition.REWORK, CandidateOutcome.REWORK),
+            (TechLeadCandidateDisposition.HUMAN_A, CandidateOutcome.HUMAN),
+        ],
+    )
+    def test_rework_and_human_a_are_not_gated_on_the_prerequisites(
+        self,
+        disposition: TechLeadCandidateDisposition,
+        expected: CandidateOutcome,
+    ) -> None:
+        """Neither claims the candidate is mergeable."""
+        assert (
+            CandidateOutcome.resolve(
+                disposition=disposition,
+                standing=CandidateStanding.CURRENT,
+                unmet_prerequisites=tuple(CandidatePassPrerequisite),
+            )
+            is expected
+        )
+
+    def test_a_moved_candidate_is_deferred_even_holding_every_prerequisite(
+        self,
+    ) -> None:
+        """Standing is asked first: the prerequisites are about a stale commit."""
+        assert (
+            CandidateOutcome.resolve(
+                disposition=TechLeadCandidateDisposition.PASS,
+                standing=CandidateStanding.MOVED,
+                unmet_prerequisites=(),
+            )
+            is CandidateOutcome.DEFERRED
+        )

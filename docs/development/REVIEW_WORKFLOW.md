@@ -435,9 +435,34 @@ for a pull-request number:
    Reviewer's exact-SHA verdict and the publication certification for the same
    commit, so the session never has to fetch that context itself. An entry with
    a non-empty `gap` has not established an approval of this commit;
-3. the decision returns one `candidate_verdicts` entry per candidate — `pass`,
+3. `candidate-contracts.json` is staged beside it with the **executable leaf
+   contract** each candidate is judged against: the issue the pull request
+   implements (read from the branch, the way every PR-to-issue association in
+   this orchestrator is read), that issue's current body, and only the
+   governing sources the issue itself declares via `Governed-by:` /
+   `Governed-by-optional:`. Each source is recorded by number, `updated_at` and
+   `body_sha256`, staged under
+   `candidate-contracts/pr-<n>-<sha12>/issue-<m>/`. A bounded issue may narrow
+   the work below the repository's Spec/TD, so a constraint that exists only in
+   the leaf governs the verdict; an entry with a non-empty `gap` has no resolved
+   contract;
+4. the decision returns one `candidate_verdicts` entry per candidate — `pass`,
    `rework`, or `human_a` — validated against the launch authority, and
    completion re-reads each pull request's live head before applying it.
+
+A merge-facing `pass` rests on **both** staged prerequisites, recorded on the
+launch authority before the session spawns and asked as one question by
+`TechLeadLaunchAuthority.unmet_pass_prerequisites`:
+`CandidatePassPrerequisite.INDEPENDENT_REVIEW` and
+`CandidatePassPrerequisite.LEAF_CONTRACT`. Either one unmet refuses the `pass`
+and the refusal receipt names which. Neither gates `rework` or `human_a` —
+neither of those claims the candidate is mergeable.
+
+The fetch/write/digest mechanics are shared with the planning lane's canonical
+context (#183) through `control/canonical_source_staging.py`; what differs is
+the failure direction. A planning run whose required source cannot be staged
+fails the launch closed, because it has one subject. A batch review records the
+failure as a gap on the ONE candidate and audits its siblings normally.
 
 `tech-lead-reviewed` therefore means "this exact candidate passed Tech Lead
 contract review", never "a session produced a valid artifact over a manifest
@@ -457,7 +482,7 @@ candidate's labels become.
 | `pass`, head unmoved, exact-candidate approval established | `+tech-lead-reviewed` | no (terminal) | n/a — it passed |
 | `rework` | `-` watch label, `-` review-approval label, `+needs-rework` | no | automatically, on the next review that approves it |
 | `human_a` | `+tech-lead-failed`, `+needs-human` | no | operator removes `tech-lead-failed` |
-| `pass` refused — no exact-candidate reviewer approval | `+tech-lead-failed` | no | operator removes `tech-lead-failed` |
+| `pass` refused — a staged prerequisite (exact-candidate reviewer approval, resolved leaf contract) is missing | `+tech-lead-failed` | no | operator removes `tech-lead-failed` |
 | head moved, unreadable, or never observed | none | **yes, deliberately** | it never left — re-audited at whatever it then proposes |
 
 Each row's last column is owned by `CandidateWatchExit.readmission` and is

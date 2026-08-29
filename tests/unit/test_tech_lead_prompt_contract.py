@@ -1020,3 +1020,115 @@ def test_the_decision_example_renders_a_candidate_verdict(variant: str) -> None:
     verdict = decision.candidate_verdicts[0]
     assert verdict.candidate.is_bound
     assert verdict.rationale
+
+
+# --- Staged executable-leaf contract (#345 direction C/H) -------------------
+#
+# The runtime stages, per candidate, the executable issue the pull request
+# implements and the governing sources that issue declares. A prompt variant
+# that does not name that file and does not tell the run to judge conformance
+# against it leaves the "governing contract" of the verdict undefined — which
+# is the audit-only wording this leaf replaces.
+
+
+@pytest.mark.parametrize("variant", sorted(PROMPT_VARIANTS))
+def test_batch_flow_names_the_staged_leaf_contract(variant: str) -> None:
+    batch = _flow_section(PROMPT_VARIANTS[variant], "Batch Review Flow")
+
+    assert "candidate-contracts.json" in batch, (
+        f"{variant} batch flow does not name the staged leaf contract"
+    )
+    assert "candidate-contracts/" in batch, (
+        f"{variant} batch flow does not point at the staged contract bodies"
+    )
+    assert "Governed-by" in batch, (
+        f"{variant} batch flow does not say which sources the leaf declares"
+    )
+
+
+@pytest.mark.parametrize("variant", sorted(PROMPT_VARIANTS))
+def test_batch_flow_teaches_that_a_leaf_only_constraint_governs(
+    variant: str,
+) -> None:
+    """The whole reason repository Spec/TD is not enough (#345 F)."""
+    batch = _normalized(_flow_section(PROMPT_VARIANTS[variant], "Batch Review Flow"))
+
+    assert "narrow the work below the repository's Spec/TD" in batch, (
+        f"{variant} does not teach that a leaf may narrow Spec/TD"
+    )
+    assert "exists ONLY in the leaf" in batch, (
+        f"{variant} does not teach that a leaf-only constraint governs"
+    )
+    assert "do NOT reconstruct the contract from the PR description" in batch, (
+        f"{variant} permits inferring the contract from PR prose"
+    )
+    assert "anything a previous session knew" in batch, (
+        f"{variant} does not forbid reasoning from prior-session memory"
+    )
+
+
+@pytest.mark.parametrize("variant", sorted(PROMPT_VARIANTS))
+def test_pass_requires_both_staged_prerequisites(variant: str) -> None:
+    """The mutation direction: the audit-only `pass` rule must be gone.
+
+    The superseded bullet made `pass` rest on the reviewer approval alone and
+    asked for patterns rather than conformance. If a variant reverts to it,
+    this fails — which is what makes the prompt part of the contract rather
+    than commentary.
+    """
+    batch = _normalized(_flow_section(PROMPT_VARIANTS[variant], "Batch Review Flow"))
+
+    assert "Requires BOTH staged prerequisites for this candidate" in batch, (
+        f"{variant} does not require both staged prerequisites for a pass"
+    )
+    assert "a resolved leaf contract in `candidate-contracts.json` with an empty" in (
+        batch
+    ), f"{variant} does not require a resolved leaf contract for a pass"
+    assert "acceptance criteria" in batch and "STOP conditions" in batch, (
+        f"{variant} does not ask for contract conformance, only patterns"
+    )
+    assert "rather than listing patterns" in batch, (
+        f"{variant} still frames the batch flow as a pattern audit"
+    )
+    # The superseded single-prerequisite sentence must not survive anywhere.
+    assert "a `pass` on a candidate it never established an exact-commit" not in (
+        batch
+    ), f"{variant} still states the reviewer-only pass prerequisite"
+
+
+def test_prompt_leaf_contract_names_match_the_staged_artifact() -> None:
+    """The prompt names the REAL descriptor, not a drifted alias.
+
+    Pins the filename and directory the batch flow tells the agent to read to
+    the constants the staging owner actually writes, so a rename cannot leave
+    every variant pointing at a file that never exists.
+    """
+    from issue_orchestrator.domain.tech_lead_candidate_contract import (
+        TECH_LEAD_CANDIDATE_CONTRACT_DIRNAME,
+        TECH_LEAD_CANDIDATE_CONTRACT_FILENAME,
+        TechLeadCandidateContract,
+        candidate_sources_dirname,
+    )
+    from issue_orchestrator.domain.tech_lead_candidate import TechLeadCandidate
+
+    assert TECH_LEAD_CANDIDATE_CONTRACT_FILENAME == "candidate-contracts.json"
+    assert TECH_LEAD_CANDIDATE_CONTRACT_DIRNAME == "candidate-contracts"
+    # The per-candidate directory shape the prompt shows.
+    candidate = TechLeadCandidate(123, "4f2a9c1b8e77" + "0" * 28)
+    assert candidate_sources_dirname(candidate) == "pr-123-4f2a9c1b8e77"
+    # And the field the prompt tells the agent to read the refusal off.
+    unresolved = TechLeadCandidateContract(candidate=candidate, gap="unreadable")
+    assert unresolved.to_payload()["gap"] == "unreadable"
+    assert unresolved.establishes_leaf_contract is False
+
+
+@pytest.mark.parametrize("variant", sorted(PROMPT_VARIANTS))
+def test_non_batch_flows_do_not_inherit_the_leaf_contract_step(
+    variant: str,
+) -> None:
+    """Only a batch review is staged one; the other flavors get no manifest."""
+    for heading in ("Health Review Flow", "Failure Investigation Flow"):
+        section = _flow_section(PROMPT_VARIANTS[variant], heading)
+        assert "candidate-contracts.json" not in section, (
+            f"{variant} '{heading}' contains the batch-only leaf-contract step"
+        )

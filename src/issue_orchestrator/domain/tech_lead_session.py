@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Collection, cast
 
 from .tech_lead_artifacts import ACT_LEVEL_TECH_LEAD_ACTIONS
-from .tech_lead_candidate import TechLeadCandidate
+from .tech_lead_candidate import CandidatePassPrerequisite, TechLeadCandidate
 
 TECH_LEAD_ASSIGNMENT_FILENAME = "tech-lead-assignment.json"
 
@@ -521,6 +521,15 @@ class TechLeadLaunchAuthority:
     # refused: the prompt asks the agent not to render one, and this is what
     # makes the rule hold when it does anyway.
     reviewed_candidates: tuple[TechLeadCandidate, ...] = ()
+    # The subset whose EXECUTABLE-LEAF CONTRACT the orchestrator staged before
+    # the session spawned (#345): the bounded issue the pull request implements
+    # plus the governing sources that issue itself declares. Recorded beside
+    # ``reviewed_candidates`` and for the same reason — the merge contract is a
+    # conjunction, and a PASS rendered against a contract no run could resolve
+    # is a claim about a document nobody read. Absence covers every way it
+    # failed (no issue association, an unreadable issue, an unresolvable
+    # declared source, a legacy row), because they all mean the same thing here.
+    contracted_candidates: tuple[TechLeadCandidate, ...] = ()
     # The health review's OWNED problem cohort (#6780), recorded from the
     # producer's ``TechLeadLaunchScope`` grant (or the durable cohort ledger for
     # an anchor launched outside the pending queue) — never inferred from the
@@ -556,22 +565,7 @@ class TechLeadLaunchAuthority:
                 f"TechLeadLaunchAuthority with flavor={self.flavor.value} requires "
                 "focus_issue_number"
             )
-        if tuple(
-            candidate.pr_number for candidate in self.manifest_candidates
-        ) not in ((), self.manifest_pr_numbers):
-            raise ValueError(
-                "TechLeadLaunchAuthority manifest_candidates must name exactly"
-                " the manifest PR set, in the same order; got"
-                f" {[candidate.pr_number for candidate in self.manifest_candidates]}"
-                f" against {list(self.manifest_pr_numbers)}"
-            )
-        if not set(self.reviewed_candidates) <= set(self.manifest_candidates):
-            raise ValueError(
-                "TechLeadLaunchAuthority reviewed_candidates must be a subset of"
-                " the manifest candidates this run audited; got"
-                f" {[c.pr_number for c in self.reviewed_candidates]} against"
-                f" {[c.pr_number for c in self.manifest_candidates]}"
-            )
+        self._validate_candidates()
         if self.flavor is TechLeadSessionFlavor.HEALTH_REVIEW and (
             self.focus_issue_number is not None or self.manifest_pr_numbers
         ):
@@ -602,6 +596,36 @@ class TechLeadLaunchAuthority:
                 "TechLeadLaunchAuthority problem_issue_numbers must be sorted "
                 "and unique"
             )
+
+    def _validate_candidates(self) -> None:
+        """The candidate axis's own invariants (#345).
+
+        Extracted from ``__post_init__`` because it is one subject with several
+        rules — the audited set, and every per-candidate prerequisite recorded
+        against it — and because a third prerequisite must land in the tuple
+        below rather than as another branch in the record's constructor.
+        """
+        if tuple(
+            candidate.pr_number for candidate in self.manifest_candidates
+        ) not in ((), self.manifest_pr_numbers):
+            raise ValueError(
+                "TechLeadLaunchAuthority manifest_candidates must name exactly"
+                " the manifest PR set, in the same order; got"
+                f" {[candidate.pr_number for candidate in self.manifest_candidates]}"
+                f" against {list(self.manifest_pr_numbers)}"
+            )
+        audited = set(self.manifest_candidates)
+        for name, subset in (
+            ("reviewed_candidates", self.reviewed_candidates),
+            ("contracted_candidates", self.contracted_candidates),
+        ):
+            if not set(subset) <= audited:
+                raise ValueError(
+                    f"TechLeadLaunchAuthority {name} must be a subset of"
+                    " the manifest candidates this run audited; got"
+                    f" {[c.pr_number for c in subset]} against"
+                    f" {[c.pr_number for c in self.manifest_candidates]}"
+                )
 
     def allowed_targets(self) -> frozenset[int]:
         """Issue/PR numbers a decision from this session may target.
@@ -677,16 +701,38 @@ class TechLeadLaunchAuthority:
                 return candidate
         return None
 
-    def review_established(self, candidate: TechLeadCandidate) -> bool:
-        """Whether an independent reviewer approved THIS exact commit (#345).
+    def unmet_pass_prerequisites(
+        self, candidate: TechLeadCandidate
+    ) -> tuple[CandidatePassPrerequisite, ...]:
+        """Which merge-facing prerequisites this candidate does NOT hold (#345).
 
-        Asked before any merge-facing PASS is projected. False covers every
-        way the prerequisite failed — no verdict, a verdict about another
-        commit, a rejection, an unreadable record, or a legacy row that never
-        established one — because they all mean the same thing here: nothing
-        proves this candidate was independently approved.
+        The ONE question asked before any PASS is projected, and deliberately
+        the only one this record answers about the merge contract. Two separate
+        predicates beside it would let a caller ask about the reviewer approval
+        and forget the leaf contract — which is exactly the half-checked gate
+        this leaf exists to close. Empty means the candidate holds them all;
+        anything else is a refusal, and each member says why in its own words.
+
+        Absence covers every way a prerequisite failed — no verdict, a verdict
+        about another commit, a rejection, an unreadable record, an
+        unresolvable leaf, or a legacy row that established neither — because
+        they all mean the same thing here: nothing proves this candidate holds
+        it.
         """
-        return candidate in self.reviewed_candidates
+        return tuple(
+            prerequisite
+            for prerequisite, established in (
+                (
+                    CandidatePassPrerequisite.INDEPENDENT_REVIEW,
+                    self.reviewed_candidates,
+                ),
+                (
+                    CandidatePassPrerequisite.LEAF_CONTRACT,
+                    self.contracted_candidates,
+                ),
+            )
+            if candidate not in established
+        )
 
     def matches_assignment(self, assignment: TechLeadAssignment) -> bool:
         """True when the agent-visible assignment copy mirrors this authority."""
@@ -707,6 +753,9 @@ class TechLeadLaunchAuthority:
             ],
             "reviewed_candidates": [
                 candidate.to_payload() for candidate in self.reviewed_candidates
+            ],
+            "contracted_candidates": [
+                candidate.to_payload() for candidate in self.contracted_candidates
             ],
             "problem_issue_numbers": list(self.problem_issue_numbers),
             "launch_base_sha": self.launch_base_sha,
@@ -747,6 +796,9 @@ class TechLeadLaunchAuthority:
             )
         candidates = _manifest_candidates_from(data.get("manifest_candidates", []))
         reviewed = _manifest_candidates_from(data.get("reviewed_candidates", []))
+        contracted = _manifest_candidates_from(
+            data.get("contracted_candidates", [])
+        )
         raw_problems = data.get("problem_issue_numbers", [])
         if not isinstance(raw_problems, list) or any(
             isinstance(number, bool) or not isinstance(number, int)
@@ -773,6 +825,7 @@ class TechLeadLaunchAuthority:
             manifest_pr_numbers=tuple(raw_prs),
             manifest_candidates=candidates,
             reviewed_candidates=reviewed,
+            contracted_candidates=contracted,
             problem_issue_numbers=tuple(raw_problems),
             launch_base_sha=raw_base_sha,
             schema_version=raw_schema,

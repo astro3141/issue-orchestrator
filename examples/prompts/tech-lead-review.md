@@ -87,6 +87,8 @@ The orchestrator writes PR data into your session directory:
 .issue-orchestrator/sessions/{run}/tech-lead-data/
   manifest.json                  # PRs to review, each bound to an exact head_sha
   candidate-evidence.json        # the independent Reviewer's verdict per candidate
+  candidate-contracts.json       # the executable-leaf contract per candidate
+  candidate-contracts/pr-123-4f2a9c1b8e77/issue-345/body.md   # its staged bytes
   pr-123-4f2a9c1b8e77-diff.txt   # Diff for PR #123 AT THAT EXACT COMMIT
   pr-123-4f2a9c1b8e77-meta.json  # Metadata for PR #123
   ...
@@ -104,6 +106,20 @@ decided about that exact commit and whether the same commit cleared the
 publication gate. Read it; do NOT call `gh` to reconstruct it. An entry with a
 non-empty `gap` has NOT established an independent approval of this commit and
 must never receive `pass`.
+
+`candidate-contracts.json` carries, per candidate, the EXECUTABLE ISSUE the pull
+request implements: that issue's current body plus only the governing sources
+that issue itself declares (`Governed-by:` / `Governed-by-optional:`), staged
+under `candidate-contracts/pr-<number>-<sha12>/issue-<issue>/body.md` with a
+`body_sha256` and `updated_at` for each. This is the governing contract you
+judge the candidate against. A bounded issue may legitimately narrow the work
+below the repository's Spec/TD, so a constraint that exists ONLY in the leaf - a
+narrowed scope, an excluded item, a STOP condition - governs your verdict even
+where the repository says nothing about it. Read the staged bodies; do NOT
+reconstruct the contract from the PR description, repository context, or
+anything a previous session knew. An entry with a non-empty `gap` has NO
+resolved contract and must never receive `pass`; a source with `"staged": false`
+was declared but could not be read, so do not assume its content.
 
 ```bash
 TECH_LEAD_DIR="$ISSUE_ORCHESTRATOR_RUN_DIR/tech-lead-data"
@@ -138,11 +154,15 @@ Then complete with
 
 ```bash
 cat "$TECH_LEAD_DIR/candidate-evidence.json"        # reviewer verdict per candidate
+cat "$TECH_LEAD_DIR/candidate-contracts.json"       # leaf contract per candidate
+cat "$TECH_LEAD_DIR/candidate-contracts/pr-123-4f2a9c1b8e77/issue-345/body.md"
 cat "$TECH_LEAD_DIR/pr-123-4f2a9c1b8e77-meta.json"  # title, body, branch, candidate_sha
 cat "$TECH_LEAD_DIR/pr-123-4f2a9c1b8e77-diff.txt"   # that candidate's code changes
 ```
 
-Look for:
+Judge each candidate against its staged leaf contract FIRST - does it satisfy
+that issue's acceptance criteria, and does it honour its non-goals and STOP
+conditions? Then look for:
 
 - Code quality patterns (good and bad)
 - Test coverage gaps
@@ -160,12 +180,16 @@ For every manifest candidate, add an entry to `candidate_verdicts` in
 batch carrying two PRs reaches two independent answers.
 
 - `pass` — the candidate conforms to the governing contract and systemic
-  context, and the merge gate may consume that. Requires an exact-candidate
-  reviewer approval in `candidate-evidence.json` with an empty `gap`.
-  Informational findings may coexist with a `pass`; a blocking bounded defect
-  may not. The orchestrator re-checks this
-prerequisite itself: a `pass` on a candidate it never established an
-exact-commit reviewer approval for is refused and projects nothing.
+  context, and the merge gate may consume that. Judge that conformance against
+  the staged leaf contract - its bounded purpose, acceptance criteria, non-goals
+  and STOP conditions - and against the governing sources it declares, rather
+  than listing patterns. Requires BOTH staged prerequisites for this candidate:
+  an exact-candidate reviewer approval in `candidate-evidence.json` with an
+  empty `gap`, AND a resolved leaf contract in `candidate-contracts.json` with
+  an empty `gap`. Informational findings may coexist with a `pass`; a blocking
+  bounded defect may not. The orchestrator re-checks both prerequisites itself:
+  a `pass` on a candidate whose exact-commit reviewer approval or whose leaf
+  contract it never established is refused and projects nothing.
 - `rework` — a bounded implementation or process defect inside already-settled
   Spec/TD/policy. Your `rationale` IS the feedback the rework agent works from,
   so make it specific and actionable. No human decision is implied.

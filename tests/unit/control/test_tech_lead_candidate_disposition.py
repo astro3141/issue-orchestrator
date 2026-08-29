@@ -48,6 +48,7 @@ from issue_orchestrator.control.tech_lead_candidate_policy import (
 )
 from issue_orchestrator.domain.tech_lead_candidate import (
     CandidateOutcome,
+    CandidatePassPrerequisite,
     CandidateStanding,
     TechLeadCandidate,
 )
@@ -69,12 +70,15 @@ def _config(tmp_path: Path) -> Config:
 
 
 def _authority(
-    *candidates: TechLeadCandidate, reviewed: tuple[TechLeadCandidate, ...] | None = None
+    *candidates: TechLeadCandidate,
+    reviewed: tuple[TechLeadCandidate, ...] | None = None,
+    contracted: tuple[TechLeadCandidate, ...] | None = None,
 ) -> TechLeadLaunchAuthority:
-    """A batch authority whose candidates arrived independently reviewed.
+    """A batch authority whose candidates hold every merge prerequisite.
 
-    ``reviewed`` defaults to ALL of them: these tests are about what a verdict
-    does to a candidate, and the prerequisite has its own class below.
+    ``reviewed``/``contracted`` default to ALL of them: these tests are about
+    what a verdict does to a candidate, and the prerequisites have their own
+    class below.
     """
     return TechLeadLaunchAuthority(
         flavor=TechLeadSessionFlavor.BATCH_REVIEW,
@@ -82,6 +86,7 @@ def _authority(
         manifest_pr_numbers=tuple(candidate.pr_number for candidate in candidates),
         manifest_candidates=candidates,
         reviewed_candidates=candidates if reviewed is None else reviewed,
+        contracted_candidates=candidates if contracted is None else contracted,
     )
 
 
@@ -450,12 +455,13 @@ class TestMultiCandidateIsolation:
         assert by_pr[102].projected_reviewed_label is False
 
 
-class TestIndependentReviewPrerequisite:
-    """A PASS rests on evidence the orchestrator itself established (#345).
+class TestPassPrerequisites:
+    """A PASS rests on facts the orchestrator itself established (#345).
 
-    The prompt tells the tech lead not to pass a candidate whose staged
-    evidence carries a gap. These fix what happens when it does anyway — the
-    check the agent cannot reach.
+    Two of them, and both are staged inputs the tech lead is told not to pass
+    without: an independent Reviewer's approval of this exact commit, and the
+    bounded contract of the executable issue this candidate implements. These
+    fix what happens when the agent passes anyway — the check it cannot reach.
     """
 
     def test_a_pass_on_an_unreviewed_candidate_projects_nothing(
@@ -470,19 +476,71 @@ class TestIndependentReviewPrerequisite:
 
         assert _labels(actions, "tech-lead-reviewed") == []
 
-    def test_the_refusal_says_which_prerequisite_was_missing(
+    def test_a_pass_without_a_staged_leaf_contract_projects_nothing(
         self, tmp_path: Path
+    ) -> None:
+        """C: a candidate nobody could resolve a contract for is not passable.
+
+        The decisive constraint of a bounded leaf lives only in its issue. If
+        that issue could not be staged, no run can show which contract the
+        candidate was judged against — so the merge-facing projection is
+        refused even though the reviewer approved the same commit.
+        """
+        actions = _plan(
+            tmp_path,
+            _authority(TechLeadCandidate(101, CANDIDATE_A), contracted=()),
+            _decision(_verdict(101, "pass")),
+            {101: CANDIDATE_A},
+        )
+
+        assert _labels(actions, "tech-lead-reviewed") == []
+        assert [l.issue_number for l in _labels(actions, "tech-lead-failed")] == [101]
+
+    @pytest.mark.parametrize(
+        ("missing", "expected"),
+        [
+            ("reviewed", CandidatePassPrerequisite.INDEPENDENT_REVIEW),
+            ("contracted", CandidatePassPrerequisite.LEAF_CONTRACT),
+        ],
+    )
+    def test_the_refusal_says_which_prerequisite_was_missing(
+        self, tmp_path: Path, missing: str, expected: CandidatePassPrerequisite
     ) -> None:
         actions = _plan(
             tmp_path,
-            _authority(TechLeadCandidate(101, CANDIDATE_A), reviewed=()),
+            _authority(TechLeadCandidate(101, CANDIDATE_A), **{missing: ()}),
             _decision(_verdict(101, "pass")),
             {101: CANDIDATE_A},
         )
 
         [receipt] = _comments(actions, 101)
-        assert "not independently" in receipt.comment
+        assert expected.value in receipt.comment
+        assert expected.description in receipt.comment
+        # Only the one that is actually missing is named.
+        other = next(
+            member
+            for member in CandidatePassPrerequisite
+            if member is not expected
+        )
+        assert other.value not in receipt.comment
         assert CANDIDATE_A in receipt.comment
+
+    def test_both_missing_prerequisites_are_named_in_one_receipt(
+        self, tmp_path: Path
+    ) -> None:
+        """A reader fixing one and re-running would otherwise be refused twice."""
+        actions = _plan(
+            tmp_path,
+            _authority(
+                TechLeadCandidate(101, CANDIDATE_A), reviewed=(), contracted=()
+            ),
+            _decision(_verdict(101, "pass")),
+            {101: CANDIDATE_A},
+        )
+
+        [receipt] = _comments(actions, 101)
+        for member in CandidatePassPrerequisite:
+            assert member.value in receipt.comment
 
     def test_rework_and_human_a_do_not_need_the_prerequisite(
         self, tmp_path: Path
@@ -490,13 +548,17 @@ class TestIndependentReviewPrerequisite:
         """Neither claims the candidate is mergeable, so neither is gated on it."""
         rework = _plan(
             tmp_path,
-            _authority(TechLeadCandidate(101, CANDIDATE_A), reviewed=()),
+            _authority(
+                TechLeadCandidate(101, CANDIDATE_A), reviewed=(), contracted=()
+            ),
             _decision(_verdict(101, "rework", rationale="Extract the owner.")),
             {101: CANDIDATE_A},
         )
         human = _plan(
             tmp_path,
-            _authority(TechLeadCandidate(101, CANDIDATE_A), reviewed=()),
+            _authority(
+                TechLeadCandidate(101, CANDIDATE_A), reviewed=(), contracted=()
+            ),
             _decision(_verdict(101, "human_a", rationale="Whose call?")),
             {101: CANDIDATE_A},
         )
@@ -636,7 +698,7 @@ class TestWatchSetExit:
         assert policy.is_candidate(settled_labels) is False
 
     @pytest.mark.parametrize(
-        ("disposition", "reviewed", "expected"),
+        ("disposition", "prerequisites", "expected"),
         [
             ("pass", True, CandidateOutcome.AUTHORITY),
             ("pass", False, CandidateOutcome.UNSETTLED),
@@ -648,14 +710,15 @@ class TestWatchSetExit:
         self,
         tmp_path: Path,
         disposition: str,
-        reviewed: bool,
+        prerequisites: bool,
         expected: CandidateOutcome,
     ) -> None:
         candidate = TechLeadCandidate(101, CANDIDATE_A)
         config = _config(tmp_path)
+        held = (candidate,) if prerequisites else ()
         effects = candidate_effects(
             config,
-            _authority(candidate, reviewed=(candidate,) if reviewed else ()),
+            _authority(candidate, reviewed=held, contracted=held),
             _decision(_verdict(101, disposition, rationale="Stated reason.")),
             expected=None,
             labels=LabelManager(config),

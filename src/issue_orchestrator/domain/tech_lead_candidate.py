@@ -23,8 +23,12 @@ Four value objects, each with exactly one job:
 * :class:`CandidateStanding` — what a completion-time re-read of the live head
   found. A verdict is authority only while the candidate it names is still the
   candidate.
+* :class:`CandidatePassPrerequisite` — the staged facts a merge-facing PASS
+  rests on: an exact-commit reviewer approval, and the candidate's staged
+  executable-leaf contract. Both are established by the orchestrator before the
+  session spawns and recorded where the agent cannot reach them.
 * :class:`CandidateOutcome` — what the run actually concluded about the
-  candidate once standing and the review prerequisite are folded into the
+  candidate once standing and those prerequisites are folded into the
   disposition. This is the value the watch-set owner keys its label effects on,
   so "what happened" and "which labels say so" stay one decision apart.
 
@@ -37,7 +41,7 @@ exactly the set that tripped the threshold (#6768's lesson).
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum, StrEnum
 from typing import Any, cast
@@ -183,6 +187,46 @@ class TechLeadCandidateDisposition(StrEnum):
         return self is TechLeadCandidateDisposition.PASS
 
 
+class CandidatePassPrerequisite(Enum):
+    """A staged fact a merge-facing PASS rests on, and its absence sentence.
+
+    Both members name something the ORCHESTRATOR established before the session
+    spawned and recorded outside the agent's reach. The prompt tells the tech
+    lead not to pass a candidate missing either; these are what make that hold
+    when it does anyway, and what let one refusal receipt say which of them was
+    missing rather than "something".
+
+    Neither gates REWORK or HUMAN_A: neither of those claims the candidate is
+    mergeable, so neither rests on the merge contract's prerequisites.
+    """
+
+    #: An independent Reviewer approved this exact commit (#345 direction B).
+    INDEPENDENT_REVIEW = (
+        "independent_review",
+        "no independent Reviewer approval of that exact commit was established"
+        " when this review's inputs were staged; a review label on the pull"
+        " request is evidence about the pull request, not about this commit",
+    )
+    #: The executable issue's bounded contract, and the governing sources that
+    #: issue declares, were staged for this run (#345 direction C).
+    LEAF_CONTRACT = (
+        "leaf_contract",
+        "the bounded contract of the executable issue this candidate implements"
+        " could not be staged, so no run could show which contract the candidate"
+        " was judged against; repository Spec/TD does not stand in for a leaf's"
+        " own narrowed scope or STOP conditions",
+    )
+
+    def __init__(self, value: str, description: str) -> None:
+        self._value_ = value
+        self._description = description
+
+    @property
+    def description(self) -> str:
+        """Why a PASS may not rest on this run, in one sentence."""
+        return self._description
+
+
 class CandidateOutcome(Enum):
     """What ONE batch run actually concluded about ONE candidate.
 
@@ -207,9 +251,9 @@ class CandidateOutcome(Enum):
     REWORK = ("rework", True)
     #: HUMAN_A: stop. A new Spec/TD/policy decision is required.
     HUMAN = ("human", True)
-    #: A disposition the orchestrator refused for want of an exact-candidate
-    #: reviewer approval. The run answered, and the answer is "not on this
-    #: batch's authority".
+    #: A PASS the orchestrator refused for want of a staged prerequisite — an
+    #: exact-candidate reviewer approval, a resolved leaf contract, or both.
+    #: The run answered, and the answer is "not on this batch's authority".
     UNSETTLED = ("unsettled", True)
     #: The run could not audit this candidate (moved, unreadable or unbound
     #: head), so it concluded nothing about it and must see it again.
@@ -230,21 +274,26 @@ class CandidateOutcome(Enum):
         *,
         disposition: "TechLeadCandidateDisposition | None",
         standing: CandidateStanding,
-        review_established: bool,
+        unmet_prerequisites: "Sequence[CandidatePassPrerequisite]",
     ) -> "CandidateOutcome":
         """Fold one candidate's three facts into the run's conclusion.
 
         Order is the contract. Standing is asked first because a verdict about
         a commit that is no longer proposed is not a verdict about anything
-        this pull request currently holds — including a PASS whose reviewer
-        approval WAS established, since that approval is about the same
+        this pull request currently holds — including a PASS whose
+        prerequisites WERE all established, since they are about the same
         superseded commit. A missing disposition lands here too: a run that
         rendered nothing for a candidate concluded nothing about it.
+
+        ``unmet_prerequisites`` is asked only of a PASS, and any single unmet
+        member refuses it: the merge contract is a conjunction, so "reviewed
+        but with no staged contract" and "contract staged but unreviewed" are
+        the same answer here and differ only in the receipt.
         """
         if disposition is None or not standing.permits_authority:
             return cls.DEFERRED
         if disposition is TechLeadCandidateDisposition.PASS:
-            return cls.AUTHORITY if review_established else cls.UNSETTLED
+            return cls.UNSETTLED if unmet_prerequisites else cls.AUTHORITY
         if disposition is TechLeadCandidateDisposition.REWORK:
             return cls.REWORK
         return cls.HUMAN
@@ -435,6 +484,7 @@ __all__ = [
     "TECH_LEAD_CANDIDATE_EVIDENCE_FILENAME",
     "TECH_LEAD_CANDIDATE_SCHEMA_VERSION",
     "CandidateOutcome",
+    "CandidatePassPrerequisite",
     "CandidateStanding",
     "TechLeadCandidate",
     "TechLeadCandidateDisposition",

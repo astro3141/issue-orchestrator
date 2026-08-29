@@ -17,7 +17,10 @@ from issue_orchestrator.domain.tech_lead_findings import (
     PendingCaseFile,
     PendingPromotion,
 )
-from issue_orchestrator.domain.tech_lead_candidate import TechLeadCandidate
+from issue_orchestrator.domain.tech_lead_candidate import (
+    CandidatePassPrerequisite,
+    TechLeadCandidate,
+)
 from issue_orchestrator.domain.tech_lead_session import (
     StoredTechLeadOp,
     TechLeadLaunchAuthority,
@@ -319,6 +322,63 @@ def test_candidates_that_disagree_with_the_manifest_set_are_refused() -> None:
             anchor_issue_number=7,
             manifest_pr_numbers=(101, 102),
             manifest_candidates=(TechLeadCandidate(101, "a" * 40),),
+        )
+
+
+def test_the_pass_prerequisites_survive_the_store(tmp_path: Path) -> None:
+    """Both halves of what a PASS rests on outlive the launch (#345).
+
+    The record is the one thing a completing session cannot have touched, so
+    the answer to "may this candidate be passed" must come back off disk
+    exactly as it was written before the session spawned.
+    """
+    reviewed_only = TechLeadCandidate(101, "a" * 40)
+    both = TechLeadCandidate(102, "b" * 40)
+    authority = TechLeadLaunchAuthority(
+        flavor=TechLeadSessionFlavor.BATCH_REVIEW,
+        anchor_issue_number=7,
+        manifest_pr_numbers=(101, 102),
+        manifest_candidates=(reviewed_only, both),
+        reviewed_candidates=(reviewed_only, both),
+        contracted_candidates=(both,),
+    )
+    store = SqliteTechLeadAuthorityStore.for_repo(tmp_path)
+    store.record(run_id="r1", session_name="issue-7", authority=authority)
+
+    loaded = SqliteTechLeadAuthorityStore.for_repo(tmp_path).load(
+        run_id="r1", session_name="issue-7"
+    )
+
+    assert loaded is not None
+    assert loaded.unmet_pass_prerequisites(both) == ()
+    assert loaded.unmet_pass_prerequisites(reviewed_only) == (
+        CandidatePassPrerequisite.LEAF_CONTRACT,
+    )
+
+
+def test_a_row_written_before_leaf_contracts_existed_holds_none() -> None:
+    """The fail-closed direction: a legacy row proves no contract was staged."""
+    legacy = _bound_batch().to_dict()
+    del legacy["contracted_candidates"]
+
+    restored = TechLeadLaunchAuthority.from_dict(legacy)
+
+    assert restored.contracted_candidates == ()
+    assert restored.unmet_pass_prerequisites(TechLeadCandidate(101, "a" * 40)) == (
+        CandidatePassPrerequisite.INDEPENDENT_REVIEW,
+        CandidatePassPrerequisite.LEAF_CONTRACT,
+    )
+
+
+def test_contracted_candidates_outside_the_manifest_are_refused() -> None:
+    """A prerequisite may only be recorded for work this run actually audited."""
+    with pytest.raises(ValueError, match="contracted_candidates"):
+        TechLeadLaunchAuthority(
+            flavor=TechLeadSessionFlavor.BATCH_REVIEW,
+            anchor_issue_number=7,
+            manifest_pr_numbers=(101,),
+            manifest_candidates=(TechLeadCandidate(101, "a" * 40),),
+            contracted_candidates=(TechLeadCandidate(999, "c" * 40),),
         )
 
 

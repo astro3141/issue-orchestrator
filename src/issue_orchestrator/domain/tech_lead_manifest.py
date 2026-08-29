@@ -39,6 +39,7 @@ class PRToReviewDict(TypedDict):
     branch: str
     head_sha: str
     review_established: bool
+    contract_established: bool
     files: PRFilesDict
 
 
@@ -85,6 +86,13 @@ class PRToReview:
     # spawns — so completion can refuse a PASS on an unreviewed candidate
     # without re-reading anything the agent could have touched.
     review_established: bool = False
+    # Whether the bounded contract of the executable issue this pull request
+    # implements — and the governing sources that issue itself declares — were
+    # staged for this run (#345). Written by the leaf-contract staging owner,
+    # never by the agent, and carried into the launch authority for the same
+    # reason ``review_established`` is: a PASS on a candidate whose governing
+    # contract nobody could resolve is authority for nothing.
+    contract_established: bool = False
     files: PRFiles = field(default_factory=PRFiles)
 
     def candidate(self) -> TechLeadCandidate:
@@ -117,6 +125,7 @@ class TechLeadManifest:
                     "branch": pr.branch,
                     "head_sha": pr.head_sha,
                     "review_established": pr.review_established,
+                    "contract_established": pr.contract_established,
                     "files": {
                         "diff": pr.files.diff,
                         "metadata": pr.files.metadata,
@@ -139,6 +148,9 @@ class TechLeadManifest:
                 branch=pr_data["branch"],
                 head_sha=pr_data.get("head_sha", ""),
                 review_established=bool(pr_data.get("review_established", False)),
+                contract_established=bool(
+                    pr_data.get("contract_established", False)
+                ),
                 files=PRFiles(
                     diff=files_data.get("diff", ""),
                     metadata=files_data.get("metadata", ""),
@@ -174,3 +186,7 @@ class TechLeadManifest:
     def reviewed_candidates(self) -> tuple[TechLeadCandidate, ...]:
         """The candidates that arrived with an exact-commit reviewer approval."""
         return tuple(pr.candidate() for pr in self.prs if pr.review_established)
+
+    def contracted_candidates(self) -> tuple[TechLeadCandidate, ...]:
+        """The candidates whose executable-leaf contract was staged (#345)."""
+        return tuple(pr.candidate() for pr in self.prs if pr.contract_established)

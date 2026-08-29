@@ -18,6 +18,8 @@ The primary input. The orchestrator writes it into your session directory:
 |--------|--------|-------------------|
 | Manifest | `cat "$ISSUE_ORCHESTRATOR_RUN_DIR/tech-lead-data/manifest.json"` | Which PRs to review, each bound to the exact `head_sha` it was selected at |
 | Candidate evidence | `cat .../tech-lead-data/candidate-evidence.json` | What the independent Reviewer decided about that exact commit, and whether it cleared the publication gate |
+| Candidate contracts | `cat .../tech-lead-data/candidate-contracts.json` | The executable issue each candidate implements, its bounded contract, and the governing sources that issue declares |
+| Staged contract bodies | `cat .../tech-lead-data/candidate-contracts/pr-{N}-{sha12}/issue-{M}/body.md` | The exact bytes of a staged leaf/governing source, digested in the descriptor |
 | PR metadata | `cat .../tech-lead-data/pr-{N}-{sha12}-meta.json` | Title, body, branch, `candidate_sha` |
 | PR diff | `cat .../tech-lead-data/pr-{N}-{sha12}-diff.txt` | That candidate's code changes |
 
@@ -25,6 +27,16 @@ The manifest is the definitive list of candidates in scope. Review exactly those
 PRs - no more, no less - and render your verdict against the commit named there.
 A candidate whose `candidate-evidence.json` entry carries a non-empty `gap` has
 no established independent approval of that commit and must never be passed.
+
+`candidate-contracts.json` is the governing contract you judge each candidate
+against. It names the executable ISSUE the pull request implements, stages that
+issue's current body, and stages only the sources that issue itself declares
+(`Governed-by:` / `Governed-by-optional:`). A constraint that exists only in the
+leaf issue - a narrowed scope, an excluded item, a STOP condition - governs your
+verdict even when the repository's tracked Spec/TD says nothing about it. Read
+the staged bodies; do NOT reconstruct the contract from PR prose, repository
+context, or anything a previous session may have known. A candidate whose entry
+carries a non-empty `gap` has no resolved contract and must never be passed.
 
 ### Board Snapshot (Authoritative)
 
