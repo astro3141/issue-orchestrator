@@ -1096,6 +1096,48 @@ def test_pass_requires_both_staged_prerequisites(variant: str) -> None:
     ), f"{variant} still states the reviewer-only pass prerequisite"
 
 
+def _completion_section(text: str) -> str:
+    """The ``## Completion …`` section, whatever the variant titles it.
+
+    The three variants spell the heading differently ("(MANDATORY)",
+    "(Labels Are Automatic)", "(Labels are Automatic)"), which is exactly how
+    a rule stated in one of them drifted out of another unnoticed.
+    """
+    match = re.search(r"^## Completion\b.*$", text, re.MULTILINE)
+    assert match is not None, "completion section missing"
+    rest = text[match.end() :]
+    end = re.search(r"\n## (?!#)", rest)
+    return text[match.start() : match.end() + (end.start() if end else len(rest))]
+
+
+@pytest.mark.parametrize("variant", sorted(PROMPT_VARIANTS))
+def test_completion_effects_name_both_pass_prerequisites(variant: str) -> None:
+    """What the orchestrator does AFTER the verdict is stated the same way.
+
+    ``test_pass_requires_both_staged_prerequisites`` pins the agent-facing rule
+    in the batch flow; this pins the narrative of the orchestrator's own
+    completion effects, which is a different sentence in a different section
+    and drifted independently — one variant kept describing the refused `pass`
+    as resting on the reviewer prerequisite alone while its `pass` bullet
+    already required both.
+    """
+    section = _normalized(_completion_section(PROMPT_VARIANTS[variant]))
+
+    assert "EITHER staged prerequisite" in section, (
+        f"{variant} does not say a refused `pass` may want either prerequisite"
+    )
+    assert "exact-candidate reviewer approval" in section, (
+        f"{variant} does not name the reviewer prerequisite in its effects"
+    )
+    assert "resolved leaf contract" in section, (
+        f"{variant} does not name the leaf-contract prerequisite in its effects"
+    )
+    # The superseded half-stated sentence, in the shape all three carried it.
+    assert "want of an exact-candidate reviewer approval" not in section, (
+        f"{variant} still describes the refusal as reviewer-only"
+    )
+
+
 def test_prompt_leaf_contract_names_match_the_staged_artifact() -> None:
     """The prompt names the REAL descriptor, not a drifted alias.
 

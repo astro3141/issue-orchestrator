@@ -759,9 +759,11 @@ candidate-bound feedback and then routes that pull request into the ordinary
 rework lane, clearing the watch label so it does not re-trip the batch it just
 left; escalates a `human_a` candidate to a human, blocks it, and marks it
 `tech-lead-failed` so a stopped candidate does not re-enter the batch that
-stopped it — as it does for a `pass` refused for want of an exact-candidate
-reviewer approval. That label is a one-way door an operator has to remove
-before the pull request is audited again, and the receipt says so. It applies no label at all to a candidate whose head moved,
+stopped it — as it does for a `pass` refused for want of EITHER staged
+prerequisite, an exact-candidate reviewer approval or a resolved leaf contract.
+That label is a one-way door an operator has to remove before the pull request
+is audited again, and the receipt says which prerequisite it observed missing.
+It applies no label at all to a candidate whose head moved,
 recording the refusal on the pull request and re-auditing it later at whatever
 it then proposes. It also executes your proposed actions per its configured
 authority. You never touch GitHub yourself.
