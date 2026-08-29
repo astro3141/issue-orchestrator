@@ -611,7 +611,7 @@ class FactGatherer:
         PRs never count toward the threshold that the manifest then filters
         out (#6768 round 5: that divergence created empty-batch loops).
         """
-        from .tech_lead_manifest_builder import TechLeadCandidatePolicy
+        from .tech_lead_candidate_policy import TechLeadCandidatePolicy
 
         policy = TechLeadCandidatePolicy.from_config(self.config)
         prs = self.repository_host.get_prs_with_label(watch_label, state="all")

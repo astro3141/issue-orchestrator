@@ -2441,7 +2441,16 @@ class TestFlavorActionKindCapabilities:
         """
         config, session = self._armed(tmp_path, flavor)
         _plant_decision_with_actions(
-            session, _capability_probe_actions(flavor, action_type)
+            session,
+            _capability_probe_actions(flavor, action_type),
+            # A batch review owes a verdict for every candidate it was armed
+            # with (#345); without them the coverage axis rejects the decision
+            # before this test's own axis is reached.
+            candidate_verdicts=(
+                pass_verdicts(101, 102)
+                if flavor is TechLeadSessionFlavor.BATCH_REVIEW
+                else None
+            ),
         )
 
         assert self._processing_error(config, session) is None
@@ -2673,7 +2682,10 @@ class TestFlavorActionKindCapabilities:
         valid_actions = _capability_probe_actions(
             TechLeadSessionFlavor.BATCH_REVIEW, "post_comment"
         )
-        _plant_decision_with_actions(session, valid_actions)
+        verdicts = pass_verdicts(101, 102)
+        _plant_decision_with_actions(
+            session, valid_actions, candidate_verdicts=verdicts
+        )
 
         assert self._processing_error(config, session) is None
 
@@ -2688,6 +2700,7 @@ class TestFlavorActionKindCapabilities:
                     "body": "Smuggled in after the first pass.",
                 },
             ],
+            candidate_verdicts=verdicts,
         )
 
         error = self._processing_error(config, session)
@@ -2961,6 +2974,7 @@ def test_protected_agent_label_on_create_issue_rejects_decision(
                 "finding_ids": ["T1"],
             }
         ],
+        candidate_verdicts=pass_verdicts(101, 102),
     )
 
     actions = make_planner(config).generate_completion_actions(

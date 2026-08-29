@@ -444,6 +444,55 @@ contract review", never "a session produced a valid artifact over a manifest
 containing this number". A moved candidate inherits nothing; the refusal is
 recorded on the pull request.
 
+#### Leaving the watch set
+
+The set that trips the batch threshold has to be the set a review settles, or
+the same batch re-fires over the same evidence forever. One owner —
+`control/tech_lead_candidate_policy.TechLeadCandidatePolicy` — answers both
+halves: which watch-labelled PRs are candidates, and what each concluded
+candidate's labels become.
+
+| The run concluded | Labels | Still a candidate? |
+|---|---|---|
+| `pass`, head unmoved, exact-candidate approval established | `+tech-lead-reviewed` | no (terminal) |
+| `rework` | `-` watch label, `-` review-approval label, `+needs-rework` | no |
+| `human_a` | `+tech-lead-failed`, `+needs-human` | no |
+| `pass` refused — no exact-candidate reviewer approval | `+tech-lead-failed` | no |
+| head moved, unreadable, or never observed | none | **yes, deliberately** — re-audited at whatever it then proposes |
+
+The watch label is always `Config.tech_lead_watch_label`, the single owner the
+threshold trigger and the manifest builder already share. `tech-lead-failed`
+here carries the same meaning it does for a dead session: *this run produced no
+Tech Lead authority for this pull request*. Deferred worktree/session cleanup
+waits on either terminal label, not on `tech-lead-reviewed` alone.
+
+Because omitting a candidate would leave it counting toward the threshold, a
+decision that renders no verdict for a bound manifest candidate is a contract
+violation and rejects the whole decision — the same severity as a verdict about
+a pull request the run never audited.
+
+#### Precondition: `pass` needs a candidate-bound reviewer verdict
+
+A `pass` only projects `tech-lead-reviewed` when the orchestrator itself
+established that an independent reviewer approved **that exact commit**. It
+files that fact only where it concludes a review against a candidate it
+observed — the review exchange (`review.exchange.mode` of `auto`, `via-mcp`, or
+`via-local-loop`, with a reviewer configured for the coder agent).
+
+The classic lane does not: a standalone review session ending in
+`reviewer-done approved` produces the `code-reviewed` label, which is evidence
+about the pull request rather than about a commit. In a deployment whose
+reviews take that lane — `review.exchange.mode: via-draft-pr`, or an agent with
+no reviewer — **every batch `pass` is refused** and `tech-lead-reviewed` is
+unreachable. `doctor` reports this as a `Tech Lead Merge Authority` warning at
+startup rather than leaving it to be inferred from refusal receipts.
+
+The same applies transitionally to pull requests already open when exact-
+candidate binding was introduced: their attempts carry no recorded verdict, so
+the first batch after upgrade refuses their `pass` and marks them
+`tech-lead-failed` with a receipt explaining why. They re-enter the lane through
+an ordinary review, which files the verdict the next batch needs.
+
 ```mermaid
 flowchart TD
   LOOP["Review loop approves code"] --> CR["Code-reviewed"]

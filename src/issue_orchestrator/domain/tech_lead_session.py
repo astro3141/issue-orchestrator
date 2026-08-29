@@ -650,6 +650,20 @@ class TechLeadLaunchAuthority:
             return frozenset(self.problem_issue_numbers)
         return frozenset()
 
+    @property
+    def candidates_recorded(self) -> bool:
+        """Whether this run can settle its manifest per candidate at all (#345).
+
+        False only for a LEGACY row: manifest PR numbers written before
+        candidate identities existed. Such a run cannot prove which commit it
+        audited for any of them, so it may produce no per-candidate authority —
+        and it must not produce nothing either, or its pull requests stay in
+        the tech-lead watch set forever. The completion owner routes it to the
+        whole-manifest failure projection instead, which is the fail-closed
+        direction and the only one that terminalizes them.
+        """
+        return not self.manifest_pr_numbers or bool(self.manifest_candidates)
+
     def candidate_for(self, pr_number: int) -> TechLeadCandidate | None:
         """The exact candidate this run audited for ``pr_number`` (#345).
 

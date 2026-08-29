@@ -171,3 +171,100 @@ def test_a_focused_flavor_may_render_no_candidate_verdict_at_all(
     )
 
     assert detail is not None
+
+
+class TestEveryAuditedCandidateIsAnswered:
+    """The dual axis: silence about an audited candidate is refused too.
+
+    A batch is launched over an exact set of candidates. One left unanswered
+    keeps the watch label, keeps counting toward the threshold, and the next
+    tick launches an identical session over identical evidence — indefinitely,
+    with no operator-visible reason. So the decision has to answer for all of
+    them or be rejected, which at least terminalizes them via the failure
+    projection.
+    """
+
+    def test_a_decision_that_answers_every_candidate_is_admissible(
+        self, tmp_path: Path
+    ) -> None:
+        assert (
+            _violation(
+                tmp_path,
+                _authority(
+                    TechLeadCandidate(101, CANDIDATE_A),
+                    TechLeadCandidate(102, CANDIDATE_B),
+                ),
+                _decision(
+                    {
+                        "pr_number": 101,
+                        "candidate_sha": CANDIDATE_A,
+                        "disposition": "pass",
+                        "rationale": "Conforms.",
+                    },
+                    {
+                        "pr_number": 102,
+                        "candidate_sha": CANDIDATE_B,
+                        "disposition": "human_a",
+                        "rationale": "Whose call is this?",
+                    },
+                ),
+            )
+            is None
+        )
+
+    def test_an_unanswered_candidate_rejects_the_whole_decision(
+        self, tmp_path: Path
+    ) -> None:
+        violation = _violation(
+            tmp_path,
+            _authority(
+                TechLeadCandidate(101, CANDIDATE_A),
+                TechLeadCandidate(102, CANDIDATE_B),
+            ),
+            _decision(
+                {
+                    "pr_number": 101,
+                    "candidate_sha": CANDIDATE_A,
+                    "disposition": "pass",
+                    "rationale": "Conforms.",
+                }
+            ),
+        )
+
+        assert violation is not None
+        assert "102" in violation
+        assert "no candidate verdict" in violation
+
+    def test_a_candidate_with_no_observable_commit_carries_no_duty(
+        self, tmp_path: Path
+    ) -> None:
+        """It could not receive an admissible verdict, so demanding one would
+        make the batch impossible to complete rather than make it answer."""
+        assert (
+            _violation(
+                tmp_path,
+                _authority(
+                    TechLeadCandidate(101, CANDIDATE_A),
+                    TechLeadCandidate(102, ""),
+                ),
+                _decision(
+                    {
+                        "pr_number": 101,
+                        "candidate_sha": CANDIDATE_A,
+                        "disposition": "pass",
+                        "rationale": "Conforms.",
+                    }
+                ),
+            )
+            is None
+        )
+
+    def test_a_flavor_with_no_candidates_owes_no_verdicts(
+        self, tmp_path: Path
+    ) -> None:
+        health = TechLeadLaunchAuthority(
+            flavor=TechLeadSessionFlavor.HEALTH_REVIEW,
+            anchor_issue_number=7,
+        )
+
+        assert _violation(tmp_path, health, _decision()) is None

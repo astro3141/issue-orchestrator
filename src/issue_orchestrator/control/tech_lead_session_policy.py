@@ -43,7 +43,8 @@ from ..ports.planning_command_guard import (
 from .completion_pr_collision import NoCommitsBetweenError
 from .tech_lead_canonical_context import stage_canonical_context
 from .tech_lead_evidence import build_evidence_map, write_evidence_map
-from .tech_lead_manifest_builder import TechLeadCandidatePolicy, TechLeadManifestBuilder
+from .tech_lead_candidate_policy import TechLeadCandidatePolicy
+from .tech_lead_manifest_builder import TechLeadManifestBuilder
 
 if TYPE_CHECKING:
     from ..domain.session_run import SessionRunIdentity
@@ -244,7 +245,6 @@ def prepare_tech_lead_manifest(
     """
     builder = TechLeadManifestBuilder(
         repository_host=repository_host,
-        watch_label=config.tech_lead_watch_label,
         candidate_policy=TechLeadCandidatePolicy.from_config(config),
     )
 

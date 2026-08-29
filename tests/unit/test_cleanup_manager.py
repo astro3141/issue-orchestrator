@@ -66,6 +66,7 @@ def mock_config():
     config.tech_lead_review_agent = None
     config.code_review_agent = None
     config.tech_lead_reviewed_label = "tech-lead-reviewed"
+    config.tech_lead_failed_label = "tech-lead-failed"
     config.code_reviewed_label = "code-reviewed"
     config.cleanup.with_tech_lead.close_ai_session_tabs = True
     config.cleanup.with_tech_lead.remove_worktrees = True
@@ -216,7 +217,35 @@ class TestProcessDeferredCleanups:
         result = cleanup_manager.process_deferred_cleanups(pending)
 
         assert result == []  # Cleanup was processed and removed
-        mock_repository_host.get_prs_with_label.assert_called_once_with("tech-lead-reviewed")
+        # Both terminal labels, because a candidate the batch STOPPED or
+        # refused never earns tech-lead-reviewed and this list has no TTL
+        # (#345): waiting on the merge-facing label alone retains its worktree
+        # and session tab forever.
+        assert mock_repository_host.get_prs_with_label.call_args_list == [
+            call("tech-lead-reviewed"),
+            call("tech-lead-failed"),
+        ]
+
+    def test_a_stopped_candidate_still_releases_its_deferred_cleanup(
+        self, cleanup_manager, mock_config, mock_repository_host
+    ):
+        """#345 F2-B: `human_a` and refused passes settle via tech-lead-failed."""
+        mock_config.tech_lead_review_agent = "agent:tech-lead"
+
+        pending = [make_pending_cleanup(issue_number=123, pr_number=456)]
+        mock_repository_host.get_prs_with_label.side_effect = lambda label: (
+            [
+                PRInfo(
+                    number=456, url="...", title="PR", branch="123-fix",
+                    labels=["code-reviewed", "tech-lead-failed"], body="",
+                    state="open",
+                )
+            ]
+            if label == "tech-lead-failed"
+            else []
+        )
+
+        assert cleanup_manager.process_deferred_cleanups(pending) == []
 
     def test_code_review_workflow_cleans_up_reviewed_prs(
         self, cleanup_manager, mock_config, mock_repository_host

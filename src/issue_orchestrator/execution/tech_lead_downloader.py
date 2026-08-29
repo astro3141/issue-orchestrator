@@ -24,7 +24,9 @@ data-source contract forbids the agent from fetching it — so an unstaged
 prerequisite would be an unprovable one. The POLICY of what counts as complete
 evidence is not here; it arrives through
 :class:`~..ports.tech_lead_candidate_evidence.TechLeadCandidateEvidenceSource`,
-so this adapter never learns where the answer is stored.
+so this adapter never learns where the answer is stored. Writing the assembled
+set to disk IS here (:func:`write_candidate_evidence`), for the same reason the
+diffs and metadata are.
 
 This is an adapter implementing the ManifestDownloader port.
 """
@@ -33,11 +35,12 @@ import json
 import logging
 from pathlib import Path
 
-from ..control.tech_lead_candidate_evidence import (
-    build_candidate_evidence,
-    write_candidate_evidence,
+from ..control.tech_lead_candidate_evidence import build_candidate_evidence
+from ..domain.tech_lead_candidate import (
+    TECH_LEAD_CANDIDATE_EVIDENCE_FILENAME,
+    TechLeadCandidate,
+    TechLeadCandidateEvidenceSet,
 )
-from ..domain.tech_lead_candidate import TechLeadCandidate
 from ..domain.tech_lead_manifest import TechLeadManifest, PRFiles, PRToReview
 from ..ports import RepositoryHost, CommandRunner
 from ..ports.tech_lead_candidate_evidence import (
@@ -46,6 +49,31 @@ from ..ports.tech_lead_candidate_evidence import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def write_candidate_evidence(
+    data_dir: Path, evidence: TechLeadCandidateEvidenceSet
+) -> Path:
+    """Write the staged evidence beside the manifest, and return its path.
+
+    Beside the downloader rather than beside the policy that builds the set:
+    this is ``path.write_text`` and nothing else, and materializing files into
+    ``tech-lead-data`` is already this adapter's job.
+
+    Fail-fast like the board snapshot and unlike the evidence map: the Tech
+    Lead contract gate cannot render an exact-candidate verdict without this
+    file, so a launch that cannot write it must fail rather than spawn a
+    session that will be refused at completion for a reason it could not see.
+    """
+    path = data_dir / TECH_LEAD_CANDIDATE_EVIDENCE_FILENAME
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(evidence.to_payload(), indent=2) + "\n")
+    logger.info(
+        "[tech_lead] Staged exact-candidate review evidence for %d PR(s): %s",
+        len(evidence.entries),
+        path,
+    )
+    return path
 
 
 class TechLeadDownloader:

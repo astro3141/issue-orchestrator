@@ -3,8 +3,10 @@
 from dataclasses import dataclass
 from typing import Optional
 
-from issue_orchestrator.control.tech_lead_manifest_builder import (
+from issue_orchestrator.control.tech_lead_candidate_policy import (
     TechLeadCandidatePolicy,
+)
+from issue_orchestrator.control.tech_lead_manifest_builder import (
     TechLeadManifestBuilder,
 )
 
@@ -154,8 +156,8 @@ class TestTechLeadManifestBuilder:
         host = MockRepositoryHost(prs=prs)
         builder = TechLeadManifestBuilder(
             host,
-            watch_label="my-reviewed",
             candidate_policy=TechLeadCandidatePolicy(
+                watch_label="my-reviewed",
                 tech_lead_reviewed_label="my-triaged",
                 tech_lead_failed_label="my-failed",
             ),

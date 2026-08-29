@@ -1173,10 +1173,18 @@ class ReviewSettings(BaseModel):
     tech_lead_reviewed_label: str = Field(
         "tech-lead-reviewed",
         title=f"{TECH_LEAD_DISPLAY_NAME} Reviewed Label",
-        description="Label added to manifest PRs after tech lead completes",
+        description="Label marking one exact candidate as Tech Lead approved",
         json_schema_extra={
             "doc_examples": ["tech-lead-reviewed"],
-            "doc_notes": "Added to every PR in the tech lead manifest on success.",
+            "doc_notes": (
+                "Added per candidate, only for a `pass` on a pull request still"
+                " standing at the audited commit whose exact-commit reviewer"
+                " approval the orchestrator established. Requires a review"
+                " exchange (`review.exchange.mode` of auto/via-mcp/"
+                "via-local-loop with a reviewer configured); the classic review"
+                " lane records no candidate-bound verdict, so every `pass` is"
+                " refused there. `doctor` warns when that is the case."
+            ),
             "section": _TECH_LEAD_SECTION,
             "config_attr": "tech_lead_reviewed_label",
             "yaml_path": "review.tech_lead_reviewed_label",
@@ -1185,10 +1193,17 @@ class ReviewSettings(BaseModel):
     tech_lead_failed_label: str = Field(
         "tech-lead-failed",
         title=f"{TECH_LEAD_DISPLAY_NAME} Failed Label",
-        description="Label added to manifest PRs when a tech lead session fails",
+        description="Label marking a PR the tech lead produced no authority for",
         json_schema_extra={
             "doc_examples": ["tech-lead-failed"],
-            "doc_notes": "Added to every PR in the tech lead manifest on failure.",
+            "doc_notes": (
+                "Added to every PR in the tech lead manifest when the session"
+                " fails, and to a single candidate the run could not settle (a"
+                " `human_a`, or a `pass` refused for want of an exact-commit"
+                " reviewer approval). Either way it means the PR no longer"
+                " awaits a tech lead answer, so it stops counting toward the"
+                " batch threshold and releases deferred cleanup."
+            ),
             "section": _TECH_LEAD_SECTION,
             "config_attr": "tech_lead_failed_label",
             "yaml_path": "review.tech_lead_failed_label",

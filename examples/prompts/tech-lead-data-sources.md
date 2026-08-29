@@ -85,10 +85,15 @@ Use for investigation; they may be incomplete, rotated, or stale.
   per candidate — the configured `tech_lead_reviewed_label` (default
   `tech-lead-reviewed`) for a `pass` on a candidate still standing at the commit
   you judged, the ordinary rework lane for a `rework`, human escalation for a
-  `human_a`, and nothing at all for a candidate whose head has moved — and
+  `human_a`, and no label at all for a candidate whose head has moved — and
   publishes any commits on your branch.
 - Session failure: manifest PRs get the `tech_lead_failed_label`
-  (default `tech-lead-failed`).
+  (default `tech-lead-failed`). So does any single candidate this run could not
+  settle — a `human_a`, or a `pass` refused for want of an exact-candidate
+  reviewer approval — because a candidate left in the watch set would re-trip
+  the threshold and re-run this identical audit. A candidate whose head MOVED
+  is the deliberate exception: it keeps the watch label and is re-audited at
+  whatever it then proposes.
 - Each candidate receives ONE receipt comment naming the exact commit your
   verdict was about and this run's identity — including the refusals, so a
   disposition that could not be applied is visible rather than silent. Nothing

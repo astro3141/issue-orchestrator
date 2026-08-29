@@ -293,6 +293,22 @@ def test_a_row_written_before_candidates_existed_carries_none(tmp_path: Path) ->
     assert restored.manifest_candidates == ()
     assert restored.manifest_pr_numbers == (101, 102)
     assert restored.candidate_for(101) is None
+    # ...and says so, so the completion owner routes it to the whole-manifest
+    # failure projection. Producing NOTHING would leave both pull requests in
+    # the watch set, re-tripping the threshold for a batch that can never
+    # settle them.
+    assert restored.candidates_recorded is False
+    assert _bound_batch().candidates_recorded is True
+
+
+def test_a_run_with_no_manifest_at_all_can_still_settle_itself() -> None:
+    """An empty batch has nothing to bind, and nothing left unsettled either."""
+    empty = TechLeadLaunchAuthority(
+        flavor=TechLeadSessionFlavor.BATCH_REVIEW,
+        anchor_issue_number=7,
+    )
+
+    assert empty.candidates_recorded is True
 
 
 def test_candidates_that_disagree_with_the_manifest_set_are_refused() -> None:

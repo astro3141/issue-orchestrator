@@ -11,9 +11,10 @@ This module answers that question per candidate, and the manifest downloader
 stages the answers into the same ``tech-lead-data`` directory the manifest lives
 in — so the agent reads a file instead of making a network call it is not
 allowed to make. The two halves are split on the layer boundary they belong to:
-the policy of what counts as complete evidence is control's, and materializing
-files beside the manifest is the downloader's, which is already the owner of
-everything a batch review reads about its candidates.
+the policy of what counts as complete evidence is control's and lives here, and
+WRITING the file beside the manifest is the downloader's, which is already the
+owner of everything a batch review reads about its candidates. Control builds
+the set; nothing in this module touches a filesystem.
 
 Three properties are the contract:
 
@@ -40,17 +41,14 @@ SHA, and it never comes from a branch name.
 
 from __future__ import annotations
 
-import json
 import logging
 from dataclasses import dataclass
-from pathlib import Path
 from typing import TYPE_CHECKING, Sequence
 
 from ..domain.attempt import AttemptKey
 from ..domain.branch_naming import extract_issue_number_from_branch
 from ..domain.review_verdict_binding import ReviewVerdictOutcome
 from ..domain.tech_lead_candidate import (
-    TECH_LEAD_CANDIDATE_EVIDENCE_FILENAME,
     TechLeadCandidate,
     TechLeadCandidateEvidence,
     TechLeadCandidateEvidenceSet,
@@ -170,6 +168,13 @@ def _evidence_gap(
             f" {candidate.short_sha}; a PR-level review label is evidence about"
             " the pull request, not about this commit"
         )
+    # Defence for a future non-attempt-backed implementation of the verdict
+    # port, and unreachable through the shipped one: ``Attempt.__post_init__``
+    # already rejects a stored verdict that does not cover its own key, so
+    # ``AttemptReviewVerdictStore.read`` raises on a misbound record and the
+    # caller reports it as "unreadable" before this line is asked. A port whose
+    # store does not enforce that invariant would reach here, and the gap it
+    # needs is this one rather than the absence above.
     if not candidate.covers(verdict.reviewed_sha):
         return (
             f"the recorded reviewer verdict is bound to"
@@ -204,29 +209,7 @@ def build_candidate_evidence(
     )
 
 
-def write_candidate_evidence(
-    data_dir: Path, evidence: TechLeadCandidateEvidenceSet
-) -> Path:
-    """Write the staged evidence beside the manifest, and return its path.
-
-    Fail-fast like the board snapshot and unlike the evidence map: the Tech
-    Lead contract gate cannot render an exact-candidate verdict without this
-    file, so a launch that cannot write it must fail rather than spawn a
-    session that will be refused at completion for a reason it could not see.
-    """
-    path = data_dir / TECH_LEAD_CANDIDATE_EVIDENCE_FILENAME
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(evidence.to_payload(), indent=2) + "\n")
-    logger.info(
-        "[tech_lead] Staged exact-candidate review evidence for %d PR(s): %s",
-        len(evidence.entries),
-        path,
-    )
-    return path
-
-
 __all__ = [
     "DurableCandidateEvidence",
     "build_candidate_evidence",
-    "write_candidate_evidence",
 ]

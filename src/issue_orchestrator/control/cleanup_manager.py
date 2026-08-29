@@ -74,8 +74,17 @@ class CleanupManager:
         """Process deferred cleanups for sessions awaiting review completion.
 
         Checks pending cleanups and performs cleanup when:
-        - Tech Lead workflow: PR has tech-lead-reviewed label
+        - Tech Lead workflow: tech_lead has SETTLED the PR, either way
         - Code review workflow: PR has code-reviewed label
+
+        "Either way" is the #345 correction. A batch review used to project
+        ``tech-lead-reviewed`` onto every manifest PR, so waiting on that one
+        label eventually released every deferred cleanup. Since the projection
+        became per candidate, a candidate the tech lead stopped or the
+        orchestrator refused never receives it — and this list has no TTL, so
+        its worktree and session tab would be retained forever. The terminal
+        set comes from the tech_lead candidate owner, which is the same type
+        that decides those PRs are no longer awaiting an answer.
 
         Args:
             pending_cleanups: List of pending cleanups to process
@@ -86,15 +95,17 @@ class CleanupManager:
         if not pending_cleanups:
             return pending_cleanups
 
-        cleanup_label = self._get_cleanup_label()
-        if not cleanup_label:
+        cleanup_labels = self._get_cleanup_labels()
+        if not cleanup_labels:
             return pending_cleanups
 
-        reviewed_pr_numbers = self._get_reviewed_pr_numbers(cleanup_label)
+        reviewed_pr_numbers = self._get_reviewed_pr_numbers(cleanup_labels)
         if reviewed_pr_numbers is None:
             return pending_cleanups
 
-        cleanups_to_remove = self._process_pending_cleanups(pending_cleanups, reviewed_pr_numbers, cleanup_label)
+        cleanups_to_remove = self._process_pending_cleanups(
+            pending_cleanups, reviewed_pr_numbers, ", ".join(cleanup_labels)
+        )
 
         remaining = [c for c in pending_cleanups if c not in cleanups_to_remove]
         if cleanups_to_remove:
@@ -102,32 +113,48 @@ class CleanupManager:
 
         return remaining
 
-    def _get_cleanup_label(self) -> str | None:
-        """Get the label that indicates review is complete."""
+    def _get_cleanup_labels(self) -> tuple[str, ...]:
+        """The labels that mean this PR's review workflow has finished with it.
+
+        Under tech_lead these are the candidate owner's terminal labels, both
+        of them: a settled candidate is one no batch will look at again,
+        whether it was passed, stopped, or refused.
+        """
         if self.config.tech_lead_enabled:
-            label = self.config.tech_lead_reviewed_label
+            from .tech_lead_candidate_policy import TechLeadCandidatePolicy
+
+            configured = TechLeadCandidatePolicy.terminal_labels_for(self.config)
         elif self.config.code_review_agent:
-            label = self.config.code_reviewed_label
+            configured = (self.config.code_reviewed_label,)
         else:
             logger.warning("[CLEANUP] Found deferred cleanups but no review workflow configured")
-            return None
+            return ()
 
-        if not label:
+        labels = tuple(label for label in configured if label)
+        if not labels:
             logger.warning("[CLEANUP] No cleanup label configured")
-            return None
+            return ()
 
-        return label
+        return labels
 
-    def _get_reviewed_pr_numbers(self, cleanup_label: str) -> set[int] | None:
-        """Get PR numbers that have the cleanup label."""
-        try:
-            reviewed_prs = self.repository_host.get_prs_with_label(cleanup_label)
-            return {pr.number for pr in reviewed_prs}
-        except RepositoryHostError:
-            raise
-        except Exception as e:
-            logger.warning(f"[CLEANUP] Failed to fetch PRs with label {cleanup_label}: {e}")
-            return None
+    def _get_reviewed_pr_numbers(self, cleanup_labels: tuple[str, ...]) -> set[int] | None:
+        """Get PR numbers carrying ANY of the cleanup labels.
+
+        One read per label, and only on a tick that already has deferred
+        cleanups waiting — the tech_lead terminal set is two labels, so this is
+        at most one extra read over the single-label form it replaced.
+        """
+        numbers: set[int] = set()
+        for cleanup_label in cleanup_labels:
+            try:
+                reviewed_prs = self.repository_host.get_prs_with_label(cleanup_label)
+            except RepositoryHostError:
+                raise
+            except Exception as e:
+                logger.warning(f"[CLEANUP] Failed to fetch PRs with label {cleanup_label}: {e}")
+                return None
+            numbers.update(pr.number for pr in reviewed_prs)
+        return numbers
 
     def _get_cleanup_settings(self) -> tuple[bool, bool]:
         """Get cleanup settings (close_tabs, remove_worktrees) based on workflow."""
@@ -247,9 +274,10 @@ class CleanupManager:
         Returns:
             Number of orphaned worktrees cleaned up
         """
-        cleanup_label = self._get_cleanup_label()
-        if not cleanup_label:
+        cleanup_labels = self._get_cleanup_labels()
+        if not cleanup_labels:
             return 0
+        cleanup_label = ", ".join(cleanup_labels)
 
         close_tabs, remove_wt = self._get_cleanup_settings()
 
@@ -257,7 +285,7 @@ class CleanupManager:
             set_startup_message("Checking for orphaned cleanups...")
         print(f"\nChecking for orphaned cleanups (PRs with '{cleanup_label}' label)...")
 
-        reviewed_prs = self._fetch_reviewed_prs(cleanup_label)
+        reviewed_prs = self._fetch_reviewed_prs(cleanup_labels)
         if not reviewed_prs:
             print("  No reviewed PRs found")
             return 0
@@ -276,15 +304,20 @@ class CleanupManager:
 
         return cleaned_count
 
-    def _fetch_reviewed_prs(self, cleanup_label: str) -> list["PRInfo"]:
-        """Fetch PRs with the cleanup label."""
-        try:
-            return self.repository_host.get_prs_with_label(cleanup_label)
-        except RepositoryHostError:
-            raise
-        except Exception as e:
-            logger.warning(f"[CLEANUP] Failed to fetch reviewed PRs: {e}")
-            return []
+    def _fetch_reviewed_prs(self, cleanup_labels: tuple[str, ...]) -> list["PRInfo"]:
+        """Fetch PRs carrying ANY of the cleanup labels, deduplicated by number."""
+        found: dict[int, "PRInfo"] = {}
+        for cleanup_label in cleanup_labels:
+            try:
+                prs = self.repository_host.get_prs_with_label(cleanup_label)
+            except RepositoryHostError:
+                raise
+            except Exception as e:
+                logger.warning(f"[CLEANUP] Failed to fetch reviewed PRs: {e}")
+                return []
+            for pr in prs:
+                found.setdefault(pr.number, pr)
+        return list(found.values())
 
     def _cleanup_orphaned_worktrees(
         self,

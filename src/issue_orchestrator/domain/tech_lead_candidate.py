@@ -23,6 +23,10 @@ Four value objects, each with exactly one job:
 * :class:`CandidateStanding` — what a completion-time re-read of the live head
   found. A verdict is authority only while the candidate it names is still the
   candidate.
+* :class:`CandidateOutcome` — what the run actually concluded about the
+  candidate once standing and the review prerequisite are folded into the
+  disposition. This is the value the watch-set owner keys its label effects on,
+  so "what happened" and "which labels say so" stay one decision apart.
 
 ``head_sha`` may be the empty string, and that is a real state rather than a
 default: it means the orchestrator never observed a usable commit for this pull
@@ -177,6 +181,73 @@ class TechLeadCandidateDisposition(StrEnum):
     def projects_reviewed_label(self) -> bool:
         """Whether this disposition may project the merge-facing label."""
         return self is TechLeadCandidateDisposition.PASS
+
+
+class CandidateOutcome(Enum):
+    """What ONE batch run actually concluded about ONE candidate.
+
+    The disposition is what the tech lead *rendered*; this is what the
+    orchestrator *concluded* after folding in the two facts the agent cannot
+    be trusted for — whether the candidate is still the candidate, and whether
+    an independent reviewer approved that exact commit. Every merge-facing
+    effect and every watch-set label effect keys on this, so "a PASS the
+    orchestrator refused" can never be spelled the same way as a PASS.
+
+    :attr:`settles_membership` is a property of the member for the same reason
+    :attr:`CandidateStanding.permits_authority` is: adding an outcome forces
+    its author to answer whether a candidate holding it is still awaiting a
+    tech-lead answer. Exactly one member answers "yes" — the one where the run
+    could not audit the candidate at all — and that keep is deliberate: a
+    candidate whose head moved must be re-audited at what it now proposes.
+    """
+
+    #: PASS on a still-current, independently reviewed candidate. Merge-facing.
+    AUTHORITY = ("authority", True)
+    #: REWORK: a bounded defect. Back to the ordinary rework lane.
+    REWORK = ("rework", True)
+    #: HUMAN_A: stop. A new Spec/TD/policy decision is required.
+    HUMAN = ("human", True)
+    #: A disposition the orchestrator refused for want of an exact-candidate
+    #: reviewer approval. The run answered, and the answer is "not on this
+    #: batch's authority".
+    UNSETTLED = ("unsettled", True)
+    #: The run could not audit this candidate (moved, unreadable or unbound
+    #: head), so it concluded nothing about it and must see it again.
+    DEFERRED = ("deferred", False)
+
+    def __init__(self, value: str, settles_membership: bool) -> None:
+        self._value_ = value
+        self._settles_membership = settles_membership
+
+    @property
+    def settles_membership(self) -> bool:
+        """Whether this outcome takes the candidate out of the watch set."""
+        return self._settles_membership
+
+    @classmethod
+    def resolve(
+        cls,
+        *,
+        disposition: "TechLeadCandidateDisposition | None",
+        standing: CandidateStanding,
+        review_established: bool,
+    ) -> "CandidateOutcome":
+        """Fold one candidate's three facts into the run's conclusion.
+
+        Order is the contract. Standing is asked first because a verdict about
+        a commit that is no longer proposed is not a verdict about anything
+        this pull request currently holds — including a PASS whose reviewer
+        approval WAS established, since that approval is about the same
+        superseded commit. A missing disposition lands here too: a run that
+        rendered nothing for a candidate concluded nothing about it.
+        """
+        if disposition is None or not standing.permits_authority:
+            return cls.DEFERRED
+        if disposition is TechLeadCandidateDisposition.PASS:
+            return cls.AUTHORITY if review_established else cls.UNSETTLED
+        if disposition is TechLeadCandidateDisposition.REWORK:
+            return cls.REWORK
+        return cls.HUMAN
 
 
 @dataclass(frozen=True, slots=True)
@@ -363,6 +434,7 @@ __all__ = [
     "MAX_CANDIDATE_RATIONALE_CHARS",
     "TECH_LEAD_CANDIDATE_EVIDENCE_FILENAME",
     "TECH_LEAD_CANDIDATE_SCHEMA_VERSION",
+    "CandidateOutcome",
     "CandidateStanding",
     "TechLeadCandidate",
     "TechLeadCandidateDisposition",

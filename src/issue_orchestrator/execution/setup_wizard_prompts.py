@@ -436,7 +436,8 @@ def build_tech_lead_review_prompt_text(
     directory, the agent reads only those files (never `gh`), and completion
     goes through `coding-done` plus the decision artifact pair
     (tech-lead-report.md + tech-lead-decision.json, ADR-0031). On success the
-    orchestrator adds the `reviewed_label` to every PR in the manifest and
+    orchestrator applies the decision's per-candidate verdicts — `reviewed_label`
+    only for a `pass` on a still-current, independently reviewed candidate — and
     executes the decision's proposed actions per its configured authority;
     the agent itself never touches GitHub.
     """
@@ -578,7 +579,10 @@ exact-commit reviewer approval for is refused and projects nothing.
   Your `rationale` is the decision question. This stops the candidate; it is not
   an implementation failure and it is not rework.
 
-Omit a candidate to render no disposition on it - that projects nothing.
+Answer for EVERY candidate the manifest binds to a commit. Silence is not a
+disposition: a candidate you render nothing for stays in the batch set and is
+re-audited identically on the next threshold, so omitting one rejects the WHOLE
+decision exactly as naming a pull request outside the manifest does.
 
 Evaluate:
 - **Code quality**: Clean, maintainable implementation?
@@ -728,10 +732,14 @@ Labels are automatic and PER CANDIDATE. After re-reading each pull request's
 live head, the orchestrator adds `{reviewed_label}` to a candidate you passed
 that still stands at the commit you judged; posts your `rework` rationale as
 candidate-bound feedback and then routes that pull request into the ordinary
-rework lane; escalates a `human_a` candidate to a human and blocks it; and
-applies none of these to a candidate whose head moved, recording the refusal on
-the pull request instead. It also executes your proposed actions per its
-configured authority. You never touch GitHub yourself.
+rework lane, clearing the watch label so it does not re-trip the batch it just
+left; escalates a `human_a` candidate to a human, blocks it, and marks it
+`tech-lead-failed` so a stopped candidate does not re-enter the batch that
+stopped it — as it does for a `pass` refused for want of an exact-candidate
+reviewer approval. It applies no label at all to a candidate whose head moved,
+recording the refusal on the pull request and re-auditing it later at whatever
+it then proposes. It also executes your proposed actions per its configured
+authority. You never touch GitHub yourself.
 
 ```bash
 coding-done completed \\

@@ -31,6 +31,12 @@ Policy summary:
   pull request's head (#345). The blanket "valid artifact -> label every
   manifest PR" projection is gone; what survives it is the FAILURE projection,
   which is about the session rather than about any candidate.
+* A LEGACY authority row — manifest PR numbers recorded before candidate
+  identities existed — takes that failure projection too, even when its
+  session landed a valid decision. Per-candidate authority needs the commit
+  each pull request was audited at, and such a row has none; producing nothing
+  instead would leave every one of its pull requests in the watch set,
+  re-tripping the threshold for a batch that can never settle them.
 * Every COMPLETED tech_lead session (any flavor) must produce a valid
   decision artifact pair — a missing/invalid pair is a contract violation.
   The authoritative classification runs in the completion processing path's
@@ -675,7 +681,12 @@ def generate_tech_lead_completion_actions(
     succeeded = load_result is not None and load_result.ok
 
     if authority.flavor is TechLeadSessionFlavor.BATCH_REVIEW:
-        if succeeded and load_result is not None and load_result.decision is not None:
+        if (
+            succeeded
+            and load_result is not None
+            and load_result.decision is not None
+            and authority.candidates_recorded
+        ):
             # Per CANDIDATE, from the decision's own verdicts and a live
             # re-read of each pull request's head (#345). The old blanket
             # projection said only "a valid artifact was produced over a

@@ -184,10 +184,16 @@ exact-commit reviewer approval for is refused and projects nothing.
   Your `rationale` is the decision question. This stops the candidate; it is
   not an implementation failure and it is not rework.
 
-Omit a candidate to render no disposition on it — that projects nothing. Every
-verdict carries `pr_number`, `candidate_sha` (the exact `head_sha` from the
-manifest), `disposition`, and a non-empty `rationale`; a verdict naming a pull
-request or a commit outside this session's manifest rejects the WHOLE decision.
+Answer for EVERY candidate the manifest binds to a commit. Silence is not a
+disposition: a candidate you render nothing for stays in the batch set and is
+re-audited identically on the next threshold, so omitting one rejects the WHOLE
+decision exactly as naming a pull request outside the manifest does. If a
+candidate's diff is missing because the pull request moved, say that in the
+`rationale` of a `human_a` — the orchestrator refuses dispositions on moved
+candidates anyway, and the receipt says which. Every verdict carries
+`pr_number`, `candidate_sha` (the exact `head_sha` from the manifest),
+`disposition`, and a non-empty `rationale`; a verdict naming a pull request or a
+commit outside this session's manifest rejects the WHOLE decision.
 
 ### 3. Take Action
 
@@ -630,12 +636,16 @@ re-reading each pull request's live head:
 - `pass` on a candidate still standing at the commit you judged -> the
   `tech-lead-reviewed` label plus a receipt naming that commit;
 - `rework` -> your rationale is posted as candidate-bound feedback FIRST, then
-  the pull request enters the ordinary rework lane and its existing budget;
+  the pull request enters the ordinary rework lane and its existing budget, and
+  the watch label comes off so it does not re-trip the batch it just left;
 - `human_a` -> the pull request is escalated to a human and blocked, with no
-  merge or rework authority;
+  merge or rework authority, and marked `tech-lead-failed` so a stopped
+  candidate does not re-enter the batch that stopped it;
+- a `pass` the orchestrator refuses for want of an exact-candidate reviewer
+  approval -> the refusal receipt, and the same `tech-lead-failed`;
 - a candidate whose head MOVED since the manifest was built, or whose head
-  cannot be read, receives NONE of these — the refusal is recorded on the pull
-  request instead.
+  cannot be read, receives NO label at all — the refusal is recorded on the pull
+  request and the candidate is re-audited later at whatever it then proposes.
 
 It also executes your proposed actions per its configured authority. You do NOT
 add labels yourself.

@@ -23,21 +23,43 @@ moved candidate that silently receives nothing is indistinguishable from a
 review that was never run, and #345's whole point is that the disposition is
 the authority-bearing fact rather than the label.
 
-Where each disposition routes, and why nothing new was built for it:
+Those three facts are folded into ONE
+:class:`~..domain.tech_lead_candidate.CandidateOutcome` per candidate, and the
+outcome decides both halves of what happens: the receipt this module writes,
+and — through :class:`~.tech_lead_candidate_policy.TechLeadCandidatePolicy` —
+the labels that settle the candidate's watch-set membership. This module never
+spells a watch-set label itself. It did once, and the locally-derived spelling
+was wrong for every repository whose watch label is not
+``code_reviewed_label``; worse, nothing at all was spelled for the outcomes
+that produce no merge authority, so those candidates kept re-tripping the
+threshold and re-running an identical audit forever.
 
-* PASS -> the existing merge-facing label, and only for a still-current
-  candidate.
+Where each outcome routes, and why nothing new was built for it:
+
+* AUTHORITY (PASS on a still-current, independently reviewed candidate) -> the
+  existing merge-facing label.
 * REWORK -> the actionable feedback comment lands FIRST, then the existing
   ``needs-rework`` lane picks the pull request up with its existing cycle
   budget and escalation. #295 forbids a bare label with no candidate-bound
-  feedback, so the ordering is the contract, not a nicety. The tech-lead watch
-  label comes off with it, exactly as the post-publish rework path does, so a
-  candidate sent back for work does not immediately re-trip the batch
-  threshold it just left.
-* HUMAN_A -> the existing tech-lead escalation surface (needs-human label plus
-  an explanatory comment), unchanged from what an ``escalate_to_human``
-  proposal already reaches. This verdict means only that the already-defined
-  boundary was reached; it invents no new human authority.
+  feedback, so the ordering is the contract, not a nicety. The watch label and
+  the review-approval marker come off with it, exactly as the post-publish
+  rework path does, so a candidate sent back for work does not immediately
+  re-trip the batch threshold it just left.
+* HUMAN (HUMAN_A) -> the existing tech-lead escalation surface (needs-human
+  label plus an explanatory comment), unchanged from what an
+  ``escalate_to_human`` proposal already reaches. This verdict means only that
+  the already-defined boundary was reached; it invents no new human authority.
+* UNSETTLED (a PASS the orchestrator refused for want of an exact-candidate
+  reviewer approval) -> the refusal receipt, and nothing merge-facing.
+* DEFERRED (the candidate moved, could not be read, or was never bound) -> the
+  refusal receipt if a verdict was rendered, and deliberately no label at all:
+  this is the one outcome that leaves the candidate in the watch set, because
+  it is the one the run could not audit.
+
+HUMAN and UNSETTLED leave ``tech-lead-failed`` behind. That is the same
+sentence the failure projection already writes — "this run produced no
+tech-lead authority for this pull request" — and it is what stops a stopped or
+refused candidate from re-entering the very batch that stopped or refused it.
 """
 
 from __future__ import annotations
@@ -47,6 +69,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable
 
 from ..domain.tech_lead_candidate import (
+    CandidateOutcome,
     CandidateStanding,
     TechLeadCandidate,
     TechLeadCandidateDisposition,
@@ -54,6 +77,7 @@ from ..domain.tech_lead_candidate import (
 )
 from .actions import Action, AddCommentAction, AddLabelAction, RemoveLabelAction
 from .needs_human_block import NeedsHumanCause
+from .tech_lead_candidate_policy import TechLeadCandidatePolicy
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from ..domain.tech_lead_artifacts import TechLeadDecision
@@ -124,21 +148,24 @@ class TechLeadCandidateEffects:
     candidate: TechLeadCandidate
     standing: CandidateStanding
     disposition: TechLeadCandidateDisposition | None
+    outcome: CandidateOutcome
     actions: tuple[Action, ...]
 
     @property
     def projected_reviewed_label(self) -> bool:
         """Whether this candidate received merge-facing tech-lead authority.
 
-        Read off the ACTIONS rather than re-derived from the inputs: the
-        planner already weighed standing and the review prerequisite, and a
-        second derivation here could disagree with what was actually planned.
+        Read off the OUTCOME, which is the one value the planner and the
+        watch-set owner both keyed their answers on. Re-deriving it from the
+        disposition would answer a different question — what the agent asked
+        for rather than what the orchestrator concluded.
         """
-        return any(
-            isinstance(action, AddLabelAction)
-            and self.disposition is TechLeadCandidateDisposition.PASS
-            for action in self.actions
-        )
+        return self.outcome is CandidateOutcome.AUTHORITY
+
+    @property
+    def leaves_watch_set(self) -> bool:
+        """Whether this run settled the candidate's watch-set membership."""
+        return self.outcome.settles_membership
 
 
 def plan_candidate_dispositions(
@@ -182,18 +209,19 @@ def candidate_effects(
     run_identity: str,
 ) -> list[TechLeadCandidateEffects]:
     """One :class:`TechLeadCandidateEffects` per candidate this run audited."""
+    policy = TechLeadCandidatePolicy.from_config(config)
     planned: list[TechLeadCandidateEffects] = []
     for candidate in authority.manifest_candidates:
         verdict = decision.verdict_for(candidate.pr_number)
         standing, observed = candidate_standing(candidate, heads)
         planned.append(
             _effects_for(
-                config,
                 candidate,
                 verdict,
                 standing,
                 observed,
                 expected,
+                policy=policy,
                 labels=labels,
                 run_identity=run_identity,
                 reviewed=authority.review_established(candidate),
@@ -203,18 +231,63 @@ def candidate_effects(
 
 
 def _effects_for(
-    config: "Config",
     candidate: TechLeadCandidate,
     verdict: TechLeadCandidateVerdict | None,
     standing: CandidateStanding,
     observed_head: str,
     expected: "ExpectedState",
     *,
+    policy: TechLeadCandidatePolicy,
     labels: "LabelManager",
     run_identity: str,
     reviewed: bool,
 ) -> TechLeadCandidateEffects:
-    """The effects for ONE candidate, in the order they must be applied."""
+    """The effects for ONE candidate, in the order they must be applied.
+
+    Two questions, answered in order and by different owners. What this run
+    CONCLUDED about the candidate is
+    :meth:`~..domain.tech_lead_candidate.CandidateOutcome.resolve`'s; what that
+    conclusion does to the candidate's watch-set membership is the policy's.
+    This function owns only the receipt and the lane label — the two things
+    that are about THIS pull request rather than about the set it belongs to.
+    """
+    outcome = CandidateOutcome.resolve(
+        disposition=verdict.disposition if verdict is not None else None,
+        standing=standing,
+        review_established=reviewed,
+    )
+    _log_outcome(candidate, verdict, standing, outcome)
+    receipt = _receipt_for(
+        outcome,
+        candidate,
+        verdict,
+        standing,
+        observed_head,
+        expected,
+        run_identity=run_identity,
+    )
+    return TechLeadCandidateEffects(
+        candidate,
+        standing,
+        verdict.disposition if verdict is not None else None,
+        outcome,
+        # The receipt lands FIRST on every path (#295): a projection with
+        # nothing actionable behind it is forbidden for rework and pointless
+        # for the rest, and a candidate that silently receives nothing is
+        # indistinguishable from a review that never ran.
+        receipt
+        + _watch_set_actions(candidate, outcome, expected, policy=policy)
+        + _lane_actions(candidate, outcome, expected, labels=labels),
+    )
+
+
+def _log_outcome(
+    candidate: TechLeadCandidate,
+    verdict: TechLeadCandidateVerdict | None,
+    standing: CandidateStanding,
+    outcome: CandidateOutcome,
+) -> None:
+    """Say why a candidate reached a non-merge-facing conclusion."""
     if verdict is None:
         logger.info(
             "[tech_lead] No candidate verdict for PR #%d @ %s; projecting no"
@@ -222,8 +295,8 @@ def _effects_for(
             candidate.pr_number,
             candidate.short_sha,
         )
-        return TechLeadCandidateEffects(candidate, standing, None, ())
-    if not standing.permits_authority:
+        return
+    if outcome is CandidateOutcome.DEFERRED:
         logger.warning(
             "[tech_lead] Refusing the %s disposition for PR #%d @ %s: %s",
             verdict.disposition.value,
@@ -231,17 +304,7 @@ def _effects_for(
             candidate.short_sha,
             standing.value,
         )
-        return _refused(
-            candidate,
-            standing,
-            verdict,
-            expected,
-            comment=_stale_receipt(
-                candidate, verdict, standing, observed_head, run_identity
-            ),
-            detail=standing.value,
-        )
-    if verdict.disposition is TechLeadCandidateDisposition.PASS and not reviewed:
+    elif outcome is CandidateOutcome.UNSETTLED:
         # The prerequisite the merge contract assumes, checked where the agent
         # cannot reach it (#345). The prompt tells the tech lead not to pass a
         # candidate whose staged evidence carries a gap; this is what makes
@@ -253,86 +316,125 @@ def _effects_for(
             candidate.pr_number,
             candidate.short_sha,
         )
-        return _refused(
-            candidate,
-            standing,
-            verdict,
-            expected,
-            comment=_unreviewed_receipt(candidate, verdict, run_identity),
-            detail="unreviewed candidate",
+
+
+def _receipt_for(
+    outcome: CandidateOutcome,
+    candidate: TechLeadCandidate,
+    verdict: TechLeadCandidateVerdict | None,
+    standing: CandidateStanding,
+    observed_head: str,
+    expected: "ExpectedState",
+    *,
+    run_identity: str,
+) -> tuple[Action, ...]:
+    """The one comment this outcome publishes on the pull request, if any.
+
+    The empty tuple is reachable only through a candidate this run rendered no
+    verdict for. That is a decision-contract violation for every candidate the
+    run could bind to (``_candidate_coverage_violation``), so in a landed batch
+    it survives only for a candidate whose head was never observed — and there
+    is no disposition to report the refusal of.
+    """
+    if verdict is None:
+        return ()
+    if outcome is CandidateOutcome.DEFERRED:
+        comment = _stale_receipt(
+            candidate, verdict, standing, observed_head, run_identity
         )
-    if verdict.disposition is TechLeadCandidateDisposition.PASS:
-        return TechLeadCandidateEffects(
-            candidate,
-            standing,
-            verdict.disposition,
-            (
-                AddCommentAction(
-                    number=candidate.pr_number,
-                    is_pr=True,
-                    comment=_pass_receipt(candidate, verdict, run_identity),
-                    reason="tech_lead candidate PASS receipt",
-                    expected=expected,
-                ),
-                AddLabelAction(
-                    issue_number=candidate.pr_number,
-                    label=config.tech_lead_reviewed_label or "tech-lead-reviewed",
-                    reason=(
-                        "Tech Lead PASS on the exact candidate"
-                        f" {candidate.short_sha}"
-                    ),
-                    expected=expected,
-                ),
-            ),
-        )
-    if verdict.disposition is TechLeadCandidateDisposition.REWORK:
-        return TechLeadCandidateEffects(
-            candidate,
-            standing,
-            verdict.disposition,
-            (
-                # The feedback lands BEFORE the projection (#295): a
-                # ``needs-rework`` label with nothing actionable behind it is
-                # forbidden, and the rework agent reads its instructions here.
-                AddCommentAction(
-                    number=candidate.pr_number,
-                    is_pr=True,
-                    comment=_rework_feedback(candidate, verdict, run_identity),
-                    reason="tech_lead candidate REWORK feedback",
-                    expected=expected,
-                ),
-                RemoveLabelAction(
-                    issue_number=candidate.pr_number,
-                    label=labels.code_reviewed,
-                    reason=(
-                        "Tech Lead REWORK on candidate"
-                        f" {candidate.short_sha}; the review that approved it"
-                        " no longer stands"
-                    ),
-                    expected=expected,
-                ),
-                AddLabelAction(
-                    issue_number=candidate.pr_number,
-                    label=labels.needs_rework,
-                    reason=(
-                        f"Tech Lead REWORK on candidate {candidate.short_sha}"
-                    ),
-                    expected=expected,
-                ),
-            ),
-        )
-    return TechLeadCandidateEffects(
-        candidate,
-        standing,
-        verdict.disposition,
-        (
+        reason_detail = standing.value
+    elif outcome is CandidateOutcome.UNSETTLED:
+        comment = _unreviewed_receipt(candidate, verdict, run_identity)
+        reason_detail = "unreviewed candidate"
+    else:
+        return (
             AddCommentAction(
                 number=candidate.pr_number,
                 is_pr=True,
-                comment=_human_escalation(candidate, verdict, run_identity),
-                reason="tech_lead candidate HUMAN_A escalation",
+                comment=_SETTLED_RECEIPTS[outcome](
+                    candidate, verdict, run_identity
+                ),
+                reason=(
+                    f"tech_lead candidate {verdict.disposition.value} receipt"
+                ),
                 expected=expected,
             ),
+        )
+    return (
+        AddCommentAction(
+            number=candidate.pr_number,
+            is_pr=True,
+            comment=comment,
+            reason=(
+                f"tech_lead candidate {candidate.pr_number}@"
+                f"{candidate.short_sha} {verdict.disposition.value} refused:"
+                f" {reason_detail}"
+            ),
+            expected=expected,
+        ),
+    )
+
+
+def _watch_set_actions(
+    candidate: TechLeadCandidate,
+    outcome: CandidateOutcome,
+    expected: "ExpectedState",
+    *,
+    policy: TechLeadCandidatePolicy,
+) -> tuple[Action, ...]:
+    """Ask the watch-set owner what this outcome does to membership.
+
+    Removals precede additions so a mid-apply crash cannot leave a candidate
+    both terminalized and still selected.
+    """
+    exit_rule = policy.settle(outcome)
+    reason = (
+        f"Tech Lead {outcome.value} on candidate {candidate.short_sha}"
+    )
+    return tuple(
+        RemoveLabelAction(
+            issue_number=candidate.pr_number,
+            label=label,
+            reason=f"{reason}; it no longer awaits a tech-lead answer",
+            expected=expected,
+        )
+        for label in exit_rule.remove
+    ) + tuple(
+        AddLabelAction(
+            issue_number=candidate.pr_number,
+            label=label,
+            reason=reason,
+            expected=expected,
+        )
+        for label in exit_rule.add
+    )
+
+
+def _lane_actions(
+    candidate: TechLeadCandidate,
+    outcome: CandidateOutcome,
+    expected: "ExpectedState",
+    *,
+    labels: "LabelManager",
+) -> tuple[Action, ...]:
+    """The lane a settled candidate enters, which is not a watch-set fact.
+
+    ``needs-rework`` and ``needs-human`` say where the pull request goes NEXT;
+    the watch-set labels say only that this batch is done with it. Keeping them
+    apart is why the policy never learns about lanes and this module never
+    learns about the threshold.
+    """
+    if outcome is CandidateOutcome.REWORK:
+        return (
+            AddLabelAction(
+                issue_number=candidate.pr_number,
+                label=labels.needs_rework,
+                reason=f"Tech Lead REWORK on candidate {candidate.short_sha}",
+                expected=expected,
+            ),
+        )
+    if outcome is CandidateOutcome.HUMAN:
+        return (
             AddLabelAction(
                 issue_number=candidate.pr_number,
                 label=labels.needs_human,
@@ -344,43 +446,8 @@ def _effects_for(
                 needs_human_cause=NeedsHumanCause.SESSION_LIFECYCLE,
                 expected=expected,
             ),
-        ),
-    )
-
-
-def _refused(
-    candidate: TechLeadCandidate,
-    standing: CandidateStanding,
-    verdict: TechLeadCandidateVerdict,
-    expected: "ExpectedState",
-    *,
-    comment: str,
-    detail: str,
-) -> TechLeadCandidateEffects:
-    """A disposition that reaches the pull request as a receipt and nothing else.
-
-    Every refusal takes this shape on purpose: a candidate that silently
-    receives nothing is indistinguishable from a review that never ran, so the
-    refusal is published even though no label follows it.
-    """
-    return TechLeadCandidateEffects(
-        candidate,
-        standing,
-        verdict.disposition,
-        (
-            AddCommentAction(
-                number=candidate.pr_number,
-                is_pr=True,
-                comment=comment,
-                reason=(
-                    f"tech_lead candidate {candidate.pr_number}@"
-                    f"{candidate.short_sha} {verdict.disposition.value} refused:"
-                    f" {detail}"
-                ),
-                expected=expected,
-            ),
-        ),
-    )
+        )
+    return ()
 
 
 def _findings_line(verdict: TechLeadCandidateVerdict) -> str:
@@ -436,6 +503,27 @@ def _human_escalation(
         f"{verdict.rationale}"
         f"{_findings_line(verdict)}"
     )
+
+
+#: The receipt each SETTLED outcome publishes. A map rather than a branch, for
+#: the reason ``CandidateOutcome`` is an enum in the first place: a new settled
+#: outcome must state what it tells the pull request, and raises here until it
+#: does. The two refusal receipts are not here — they need the standing and the
+#: head that was observed instead.
+_SETTLED_RECEIPTS: dict[
+    CandidateOutcome,
+    Callable[[TechLeadCandidate, TechLeadCandidateVerdict, str], str],
+] = {
+    CandidateOutcome.AUTHORITY: lambda candidate, verdict, run: _pass_receipt(
+        candidate, verdict, run
+    ),
+    CandidateOutcome.REWORK: lambda candidate, verdict, run: _rework_feedback(
+        candidate, verdict, run
+    ),
+    CandidateOutcome.HUMAN: lambda candidate, verdict, run: _human_escalation(
+        candidate, verdict, run
+    ),
+}
 
 
 def _unreviewed_receipt(

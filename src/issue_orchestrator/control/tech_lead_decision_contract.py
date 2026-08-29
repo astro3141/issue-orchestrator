@@ -19,8 +19,11 @@ The axes, in the order they are judged:
    issue-only scope so a manifest PR number never reaches the issue reset owner
    as an ``issue_number`` (#6764 re-review F1).
 3. **Candidate scope** — may it render a merge-facing disposition on THIS
-   exact candidate? A per-candidate verdict binds to a pull request AND a
-   commit, and both must match what the run was launched auditing (#345).
+   exact candidate, and did it render one for EVERY candidate it was launched
+   auditing? A per-candidate verdict binds to a pull request AND a commit, and
+   both must match what the run was launched auditing; silence about an
+   audited candidate is refused the same way, because that candidate would
+   otherwise stay in the batch that re-audits it identically (#345).
 4. **Flavor duties** — a failure investigation must publish its diagnosis to
    the originating issue (#6761 F2).
 5. **Label truth** — ``create_issue`` proposals may not carry protected
@@ -225,6 +228,44 @@ def _candidate_verdict_violation(
     return None
 
 
+def _candidate_coverage_violation(
+    decision: "TechLeadDecision", authority: TechLeadLaunchAuthority
+) -> str | None:
+    """A candidate this run was launched to audit and answered nothing for.
+
+    The dual of :func:`_candidate_verdict_violation`, and the same severity.
+    That one refuses a verdict about work the run never audited; this one
+    refuses SILENCE about work it did. A batch is launched over an exact set
+    of candidates, and the set that trips the threshold is the set a review
+    has to settle — a run that answers for two of three leaves the third
+    counting toward the very threshold that would re-run this identical audit
+    over identical evidence, forever, with no operator-visible reason.
+
+    Only BOUND candidates carry the duty. A pull request the orchestrator
+    selected without an observable head cannot receive an admissible verdict at
+    all — a verdict must name a commit, and no commit was ever observed for
+    this one — so demanding one would make such a batch impossible to complete
+    rather than making it answer. Those candidates stay in the watch set and
+    are re-audited at whatever head can next be read, which is the same
+    treatment a moved candidate gets.
+    """
+    answered = {verdict.pr_number for verdict in decision.candidate_verdicts}
+    unanswered = [
+        candidate.pr_number
+        for candidate in authority.manifest_candidates
+        if candidate.is_bound and candidate.pr_number not in answered
+    ]
+    if not unanswered:
+        return None
+    return (
+        "the decision renders no candidate verdict for pull request(s)"
+        f" {unanswered}, which this session WAS launched to audit; every"
+        " audited candidate needs a pass/rework/human_a disposition, because a"
+        " candidate nobody answered for stays in the batch that will re-audit"
+        " it identically"
+    )
+
+
 def validate_decision_for_authority(
     decision: "TechLeadDecision",
     authority: TechLeadLaunchAuthority,
@@ -242,6 +283,7 @@ def validate_decision_for_authority(
         _capability_violation(decision, authority)
         or _target_scope_violation(decision, authority)
         or _candidate_verdict_violation(decision, authority)
+        or _candidate_coverage_violation(decision, authority)
         or _diagnosis_duty_violation(decision, authority)
         or _protected_label_violation(decision, config=config, labels=labels)
     )

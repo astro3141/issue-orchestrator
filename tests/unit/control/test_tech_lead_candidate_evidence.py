@@ -22,6 +22,8 @@ from issue_orchestrator.control.publication_authority import (
 from issue_orchestrator.control.tech_lead_candidate_evidence import (
     DurableCandidateEvidence,
     build_candidate_evidence,
+)
+from issue_orchestrator.execution.tech_lead_downloader import (
     write_candidate_evidence,
 )
 from issue_orchestrator.ports.tech_lead_candidate_evidence import (

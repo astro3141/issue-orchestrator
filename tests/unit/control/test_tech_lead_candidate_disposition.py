@@ -13,6 +13,9 @@ The proof directions of the leaf, one class each:
   surface, with the question preserved.
 * **F. Multi-candidate isolation** — two candidates in one batch reach
   independent answers.
+* **G. Watch-set exit** — every candidate this run could audit stops awaiting a
+  tech-lead answer, including the outcomes that produce no merge authority.
+  Removing the exit makes the batch re-fire over unchanged evidence forever.
 
 Plus the prerequisite B rests on at THIS seam: a PASS is refused unless the
 launch authority records an independent reviewer approval of that exact commit,
@@ -37,7 +40,11 @@ from issue_orchestrator.control.tech_lead_candidate_disposition import (
     repository_candidate_heads,
 )
 from issue_orchestrator.domain.tech_lead_artifacts import TechLeadDecision
+from issue_orchestrator.control.tech_lead_candidate_policy import (
+    TechLeadCandidatePolicy,
+)
 from issue_orchestrator.domain.tech_lead_candidate import (
+    CandidateOutcome,
     CandidateStanding,
     TechLeadCandidate,
 )
@@ -526,3 +533,133 @@ def test_every_disposition_leaves_a_receipt_naming_its_candidate(
     [comment] = _comments(actions, 101)
     assert CANDIDATE_A in comment.comment
     assert RUN_IDENTITY in comment.comment
+
+
+class TestWatchSetExit:
+    """G: every candidate this run COULD audit stops awaiting an answer.
+
+    Before #345 a landed batch review projected ``tech-lead-reviewed`` onto
+    every manifest pull request. That was wrong as merge authority, but it was
+    also the only thing that ever removed a pull request from the tech-lead
+    watch set. These fix its replacement: the disposition that produces no
+    merge authority still has to settle the candidate, or the same batch fires
+    again on the next tick over the same unchanged evidence, forever.
+    """
+
+    def test_human_a_stops_the_candidate_counting_toward_the_threshold(
+        self, tmp_path: Path
+    ) -> None:
+        actions = _plan(
+            tmp_path,
+            _authority(TechLeadCandidate(101, CANDIDATE_A)),
+            _decision(_verdict(101, "human_a", rationale="Whose call is this?")),
+            {101: CANDIDATE_A},
+        )
+
+        assert [l.issue_number for l in _labels(actions, "tech-lead-failed")] == [101]
+
+    def test_a_refused_pass_stops_the_candidate_too(self, tmp_path: Path) -> None:
+        """Otherwise the refusal comment is re-posted every batch, forever."""
+        actions = _plan(
+            tmp_path,
+            _authority(TechLeadCandidate(101, CANDIDATE_A), reviewed=()),
+            _decision(_verdict(101, "pass")),
+            {101: CANDIDATE_A},
+        )
+
+        assert [l.issue_number for l in _labels(actions, "tech-lead-failed")] == [101]
+        assert _labels(actions, "tech-lead-reviewed") == []
+
+    def test_a_moved_candidate_deliberately_stays_in_the_watch_set(
+        self, tmp_path: Path
+    ) -> None:
+        """The one keep: it must be re-audited at what it NOW proposes."""
+        actions = _plan(
+            tmp_path,
+            _authority(TechLeadCandidate(101, CANDIDATE_A)),
+            _decision(_verdict(101, "human_a", rationale="Whose call?")),
+            {101: CANDIDATE_B},
+        )
+
+        assert not [a for a in actions if isinstance(a, AddLabelAction)]
+        assert not [a for a in actions if isinstance(a, RemoveLabelAction)]
+
+    def test_the_rework_removal_targets_the_configured_watch_label(
+        self, tmp_path: Path
+    ) -> None:
+        """F1: the batch is keyed on the watch label, not on ``code_reviewed``.
+
+        Removing a locally-derived label leaves the real watch label in place,
+        so the candidate re-trips the very threshold the rework just left.
+        """
+        config = _config(tmp_path)
+        config.tech_lead_review_label = "awaiting-tech-lead"
+        config.code_reviewed_label = "code-reviewed"
+
+        actions = plan_candidate_dispositions(
+            config,
+            _authority(TechLeadCandidate(101, CANDIDATE_A)),
+            _decision(_verdict(101, "rework", rationale="Extract the owner.")),
+            expected=None,
+            labels=LabelManager(config),
+            heads=lambda pr_number: CANDIDATE_A,
+            run_identity=RUN_IDENTITY,
+        )
+
+        removed = {
+            action.label
+            for action in actions
+            if isinstance(action, RemoveLabelAction)
+        }
+        assert removed == {"awaiting-tech-lead", "code-reviewed"}
+
+    def test_a_settled_candidate_is_no_longer_a_batch_candidate(
+        self, tmp_path: Path
+    ) -> None:
+        """The invariant, stated end to end through the owner that holds it."""
+        config = _config(tmp_path)
+        policy = TechLeadCandidatePolicy.from_config(config)
+        actions = _plan(
+            tmp_path,
+            _authority(TechLeadCandidate(101, CANDIDATE_A)),
+            _decision(_verdict(101, "human_a", rationale="Whose call?")),
+            {101: CANDIDATE_A},
+        )
+        settled_labels = [config.tech_lead_watch_label] + [
+            action.label for action in actions if isinstance(action, AddLabelAction)
+        ]
+
+        assert policy.is_candidate([config.tech_lead_watch_label]) is True
+        assert policy.is_candidate(settled_labels) is False
+
+    @pytest.mark.parametrize(
+        ("disposition", "reviewed", "expected"),
+        [
+            ("pass", True, CandidateOutcome.AUTHORITY),
+            ("pass", False, CandidateOutcome.UNSETTLED),
+            ("rework", True, CandidateOutcome.REWORK),
+            ("human_a", True, CandidateOutcome.HUMAN),
+        ],
+    )
+    def test_the_outcome_is_what_the_orchestrator_concluded(
+        self,
+        tmp_path: Path,
+        disposition: str,
+        reviewed: bool,
+        expected: CandidateOutcome,
+    ) -> None:
+        candidate = TechLeadCandidate(101, CANDIDATE_A)
+        config = _config(tmp_path)
+        effects = candidate_effects(
+            config,
+            _authority(candidate, reviewed=(candidate,) if reviewed else ()),
+            _decision(_verdict(101, disposition, rationale="Stated reason.")),
+            expected=None,
+            labels=LabelManager(config),
+            heads=lambda pr_number: CANDIDATE_A,
+            run_identity=RUN_IDENTITY,
+        )
+
+        [planned] = effects
+        assert planned.outcome is expected
+        assert planned.leaves_watch_set is True
