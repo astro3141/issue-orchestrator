@@ -377,7 +377,15 @@ class StartupWorktreeReconciler:
         )
 
     def recover(self, state: OrchestratorState) -> WorktreeRecoverySummary:
-        """Remove proven disposable orphans, then run review-gated issue cleanup."""
+        """Remove proven disposable orphans, then run review-gated issue cleanup.
+
+        Deliberately NOT a tech_lead evidence-capture seam (#360). A worktree
+        only becomes a cleanup candidate here once no active session holds it,
+        which means the seam that owned that session — the completion handoff or
+        the termination owner — has already captured whatever it staged. Capture
+        belongs to the owner that ends the session, not to the sweeper that
+        finds what it left behind, which has no run identity to key a capture by.
+        """
         disposable_removed = 0
         retained = 0
         for entry in self.audit(state):

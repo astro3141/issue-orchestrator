@@ -25,6 +25,14 @@ A failure of one effect never aborts the others, and the result is a typed
 failed one-shot cleanup. On a scratch-worktree removal failure the outcome
 carries the exact ``leaked_worktree`` path so the caller can require explicit
 operator removal; there is no second, tick-based retry mechanism to defer to.
+
+Because this owner PERFORMS a reap, it also owns the rule that a tech_lead
+run's staged evidence is durable before its checkout is destroyed (#360). The
+completion handoff captures before the cleanup fact it files turns into a
+removal; termination captures before the removal it performs itself. Neither
+seam delegates the rule to the other, so a run reaped here — the drive-loop
+timeout, and the lost-ownership stop — is not the one case where the evidence
+silently goes away.
 """
 
 from __future__ import annotations
@@ -34,6 +42,7 @@ from typing import TYPE_CHECKING, Callable, Optional, Protocol
 
 if TYPE_CHECKING:
     from ..domain.models import OrchestratorState, Session
+    from ..infra.config import Config
     from .tech_lead_trigger import TechLeadTerminationOutcome
 
 logger = logging.getLogger(__name__)
@@ -48,6 +57,9 @@ class TechLeadTerminationHost(Protocol):
 
     @property
     def state(self) -> "OrchestratorState": ...
+
+    @property
+    def config(self) -> "Config": ...
 
     @property
     def deps(self) -> object: ...
@@ -72,6 +84,23 @@ def terminate_tech_lead_session(
     )
     terminal_stopped = attempt(
         _void(lambda: host.kill_session(session.terminal_id)), "stop terminal"
+    )
+    # #360: preserve the run's staged evidence here, after the terminal is
+    # stopped (so the agent is no longer writing into the tree) and before ANY
+    # effect that can take the tree away. Unconditionally, not only when the
+    # checkout is disposable: a non-scratch worktree dropped from
+    # ``active_sessions`` below is force-removed by orphan recovery on a later
+    # tick, so "not disposable" only means the loss is delayed.
+    #
+    # Deliberately NOT one of the outcome's fields. Those report leaks an
+    # operator must clean up by hand; a capture reports itself in full (ERROR
+    # log, receipt at the keyed destination, ``tech_lead.evidence_captured``
+    # with ``preserved``), and a run terminated before it staged anything has
+    # nothing to preserve — which is an ordinary outcome, not an unclean
+    # teardown. It is still run through ``attempt`` so that it can never abort
+    # the coordination releases that follow.
+    attempt(
+        _void(lambda: _capture_evidence(host, session)), "capture staged evidence"
     )
     host.state.drop_active_session(session.terminal_id)  # pure in-memory owner op
 
@@ -119,6 +148,24 @@ def terminate_tech_lead_session(
             if (disposable and not worktree_removed)
             else None
         ),
+    )
+
+
+def _capture_evidence(host: TechLeadTerminationHost, session: "Session") -> None:
+    """Copy the run's staged evidence out of the checkout about to be reaped.
+
+    The same owner the completion handoff uses, asked the same identity
+    question, so a run captured on one path is exactly a run captured on the
+    other; a session no tech_lead owner governs costs one identity check and
+    nothing else. The capture reports its own success or failure, so there is
+    no verdict to return here.
+    """
+    from .tech_lead_evidence_capture import capture_tech_lead_session_evidence
+
+    capture_tech_lead_session_evidence(
+        config=host.config,
+        session=session,
+        events=getattr(host.deps, "events", None),
     )
 
 

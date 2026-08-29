@@ -519,6 +519,70 @@ The seam is now typed end to end:
 Failure is per candidate: one unreadable pull request records its own gap and
 leaves its siblings' staged evidence and PASS eligibility untouched.
 
+#### A run's staged evidence outlives its worktree (#360)
+
+Everything above is staged inside the run's own worktree, under
+`<run_dir>/tech-lead-data`. Supported teardown removes that worktree — a
+focused run's scratch checkout is force-removed the moment it completes,
+regardless of the cleanup config — so once disposal has run, the manifest, the
+staged candidate evidence and contracts, each candidate's materialized diff,
+the board snapshot and the decision/report pair no longer exist anywhere. R29
+proof #354 lost exactly that set for anchor #358 and could only preserve
+paraphrase of it.
+
+`control/tech_lead_evidence_capture.py` copies the staged tree out before that
+happens:
+
+- it runs from every seam that owns a reap, each before the removal that seam
+  is responsible for, so the rule is not a convention one call site happens to
+  follow:
+  - the completion handoff (`control/session_completion.py`), BEFORE completion
+    processing and long before the planner turns the cleanup fact into a
+    removal — so a FAILED or TIMED_OUT run, which never reaches the
+    decision-artifact seams at all, still has its launch inputs preserved;
+  - the termination owner (`control/tech_lead_termination.py`), before the
+    force-removal it performs itself — the on-demand drive loop hitting its
+    timeout, and the stop of a run this engine can no longer prove it owns.
+    That path reaches no completion handoff at all, and it runs whether or not
+    the checkout is disposable: a surviving worktree whose session was dropped
+    is force-removed by orphan recovery on a later tick, so "not disposable"
+    only delays the loss;
+  - orphan recovery (`control/worktree_reconciliation.py`) is deliberately not
+    a capture seam. By the time a worktree is a cleanup candidate there, no
+    active session holds it and the owning seam has already captured;
+- the capture lands in the HOST repository at
+  `.issue-orchestrator/tech-lead-evidence/<session_name>/<run_id>/`, keyed by
+  the run's own `SessionRunIdentity`, so two runs of one anchor issue — or the
+  several sessions a single worktree hosts — never overwrite each other;
+- a `capture.json` receipt beside the tree records every file with its size
+  and SHA-256, so a later reader can prove the bytes it holds are the bytes the
+  run staged;
+- **teardown is unchanged.** Nothing is withheld and no worktree is retained;
+  the capture reads the worktree and writes outside it;
+- **a failed capture says so.** `TechLeadEvidenceCapture` cannot hold no
+  artifacts and record no failure at the same time, the receipt is written on
+  both paths, the log line is ERROR on the failing one, and
+  `tech_lead.evidence_captured` carries `preserved` either way. A capture that
+  did not happen is never reported as evidence preserved — and it never fails
+  the session that produced it.
+
+The staging directory is agent-writable, which sets two rules the copy does not
+bend: symlinked entries are recorded as skipped rather than followed, and a
+staged tree above `MAX_CAPTURE_BYTES` is refused outright instead of copied
+into the host repository.
+
+**Retention is an explicit operator responsibility.** Nothing prunes
+`.issue-orchestrator/tech-lead-evidence/`, and that is deliberate rather than an
+oversight: a capture is the only surviving account of a run whose worktree is
+gone, so expiring it on a timer would recreate the loss this path exists to
+repair. Captures are small — manifests, JSON descriptors and a handful of
+diffs — and reclaiming the space means deleting the `<session_name>/<run_id>/`
+directories you no longer want to keep.
+
+A promotion-grade proof should still capture and verify what it needs
+explicitly rather than assume this path ran; what this removes is the case
+where nothing durable holds the run's evidence at all.
+
 #### Leaving the watch set
 
 The set that trips the batch threshold has to be the set a review settles, or

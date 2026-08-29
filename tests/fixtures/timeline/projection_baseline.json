@@ -971,6 +971,12 @@
     "status": "completed",
     "step": "tech_lead.decision_rejected"
   },
+  "tech_lead.evidence_captured": {
+    "level": "detail",
+    "phase": "system",
+    "status": "completed",
+    "step": "tech_lead.evidence_captured"
+  },
   "tech_lead.issue_created": {
     "level": "detail",
     "phase": "system",
