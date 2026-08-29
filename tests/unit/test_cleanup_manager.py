@@ -188,7 +188,7 @@ class TestProcessDeferredCleanups:
             result = cleanup_manager.process_deferred_cleanups(pending)
 
         assert result == pending
-        assert "no review workflow configured" in caplog.text
+        assert "no cleanup label is configured" in caplog.text
 
     def test_tech_lead_workflow_cleans_up_reviewed_prs(
         self, cleanup_manager, mock_config, mock_repository_host

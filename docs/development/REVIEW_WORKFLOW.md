@@ -452,13 +452,16 @@ the same batch re-fires over the same evidence forever. One owner —
 halves: which watch-labelled PRs are candidates, and what each concluded
 candidate's labels become.
 
-| The run concluded | Labels | Still a candidate? |
-|---|---|---|
-| `pass`, head unmoved, exact-candidate approval established | `+tech-lead-reviewed` | no (terminal) |
-| `rework` | `-` watch label, `-` review-approval label, `+needs-rework` | no |
-| `human_a` | `+tech-lead-failed`, `+needs-human` | no |
-| `pass` refused — no exact-candidate reviewer approval | `+tech-lead-failed` | no |
-| head moved, unreadable, or never observed | none | **yes, deliberately** — re-audited at whatever it then proposes |
+| The run concluded | Labels | Still a candidate? | How it gets back in |
+|---|---|---|---|
+| `pass`, head unmoved, exact-candidate approval established | `+tech-lead-reviewed` | no (terminal) | n/a — it passed |
+| `rework` | `-` watch label, `-` review-approval label, `+needs-rework` | no | automatically, on the next review that approves it |
+| `human_a` | `+tech-lead-failed`, `+needs-human` | no | operator removes `tech-lead-failed` |
+| `pass` refused — no exact-candidate reviewer approval | `+tech-lead-failed` | no | operator removes `tech-lead-failed` |
+| head moved, unreadable, or never observed | none | **yes, deliberately** | it never left — re-audited at whatever it then proposes |
+
+Each row's last column is owned by `CandidateWatchExit.readmission` and is
+repeated verbatim in the receipt on the pull request, so the two cannot drift.
 
 The watch label is always `Config.tech_lead_watch_label`, the single owner the
 threshold trigger and the manifest builder already share. `tech-lead-failed`
@@ -490,8 +493,27 @@ startup rather than leaving it to be inferred from refusal receipts.
 The same applies transitionally to pull requests already open when exact-
 candidate binding was introduced: their attempts carry no recorded verdict, so
 the first batch after upgrade refuses their `pass` and marks them
-`tech-lead-failed` with a receipt explaining why. They re-enter the lane through
-an ordinary review, which files the verdict the next batch needs.
+`tech-lead-failed` with a receipt explaining why.
+
+**`tech-lead-failed` is a one-way door.** Nothing in the orchestrator removes
+it — its only readers are the candidate predicate and the deferred-cleanup gate
+— so a pull request carrying it stays out of batch review, and out of any merge
+queue gated on `tech-lead-reviewed`, until **an operator removes the label by
+hand**. That has always been true of the whole-session failure projection; what
+is new is that individual candidates now reach it, through `human_a` and
+through a refused `pass`. Each such pull request gets a receipt naming the
+label and this manual step, so the state is discoverable from the pull request
+rather than from this page.
+
+At rollout, that means the first batch after upgrade will mark every open
+code-reviewed pull request `tech-lead-failed`. To re-admit one: get a review
+that files a candidate-bound verdict for its current head (i.e. a review through
+the exchange), then remove `tech-lead-failed`. Removing the label before such a
+verdict exists only produces the same refusal on the next batch.
+
+The rework exit is the opposite kind of door and needs no operator: it clears
+the watch label, and the next review that approves the pull request puts it back
+in the batch set.
 
 ```mermaid
 flowchart TD

@@ -16,6 +16,9 @@ The proof directions of the leaf, one class each:
 * **G. Watch-set exit** — every candidate this run could audit stops awaiting a
   tech-lead answer, including the outcomes that produce no merge authority.
   Removing the exit makes the batch re-fire over unchanged evidence forever.
+* **H. Exit receipts** — the pull request itself says which door it went
+  through: a cleared watch label re-opens on the next approval, a terminal
+  label does not re-open at all until an operator removes it.
 
 Plus the prerequisite B rests on at THIS seam: a PASS is refused unless the
 launch authority records an independent reviewer approval of that exact commit,
@@ -663,3 +666,103 @@ class TestWatchSetExit:
         [planned] = effects
         assert planned.outcome is expected
         assert planned.leaves_watch_set is True
+
+
+class TestTheReceiptSaysWhatLeavingTheSetMeant:
+    """H: the operator learns from the PULL REQUEST that it left the batch set.
+
+    ``tech-lead-failed`` is a one-way door — nothing in this codebase removes
+    it — and this leaf now sends candidates through it one at a time rather
+    than only whole dead sessions. A receipt that reported the disposition but
+    not the label, or the label but not the manual step that undoes it, would
+    leave the pull request looking merely un-passed when it is in fact out of
+    batch review until a human intervenes.
+    """
+
+    @pytest.mark.parametrize(
+        ("disposition", "reviewed"),
+        [("human_a", True), ("pass", False)],
+    )
+    def test_a_terminal_exit_names_its_label_and_the_manual_step(
+        self, tmp_path: Path, disposition: str, reviewed: bool
+    ) -> None:
+        candidate = TechLeadCandidate(101, CANDIDATE_A)
+        actions = _plan(
+            tmp_path,
+            _authority(candidate, reviewed=(candidate,) if reviewed else ()),
+            _decision(_verdict(101, disposition, rationale="Stated reason.")),
+            {101: CANDIDATE_A},
+        )
+
+        [receipt] = _comments(actions, 101)
+        assert "tech-lead-failed" in receipt.comment
+        assert "left the Tech Lead batch set" in receipt.comment
+        assert "an operator must remove it" in receipt.comment
+
+    def test_the_rework_receipt_says_re_review_puts_it_back(
+        self, tmp_path: Path
+    ) -> None:
+        """The other door, and it swings both ways — say which one this is."""
+        actions = _plan(
+            tmp_path,
+            _authority(TechLeadCandidate(101, CANDIDATE_A)),
+            _decision(_verdict(101, "rework", rationale="Extract the owner.")),
+            {101: CANDIDATE_A},
+        )
+
+        [receipt] = _comments(actions, 101)
+        assert "code-reviewed" in receipt.comment
+        assert "re-enters automatically" in receipt.comment
+        assert "an operator must remove it" not in receipt.comment
+
+    def test_a_pass_receipt_claims_no_exit_it_did_not_take(
+        self, tmp_path: Path
+    ) -> None:
+        actions = _plan(
+            tmp_path,
+            _authority(TechLeadCandidate(101, CANDIDATE_A)),
+            _decision(_verdict(101, "pass")),
+            {101: CANDIDATE_A},
+        )
+
+        [receipt] = _comments(actions, 101)
+        assert "Batch review status" not in receipt.comment
+
+    def test_a_deferred_candidate_is_not_told_it_left_the_set(
+        self, tmp_path: Path
+    ) -> None:
+        """It did not leave: the stale receipt already says it stays eligible."""
+        actions = _plan(
+            tmp_path,
+            _authority(TechLeadCandidate(101, CANDIDATE_A)),
+            _decision(_verdict(101, "human_a", rationale="Whose call?")),
+            {101: CANDIDATE_B},
+        )
+
+        [receipt] = _comments(actions, 101)
+        assert "left the Tech Lead batch set" not in receipt.comment
+        assert "stays eligible" in receipt.comment
+
+    def test_the_receipt_names_the_label_the_exit_actually_applied(
+        self, tmp_path: Path
+    ) -> None:
+        """One resolution feeds both, so the two can never disagree."""
+        config = _config(tmp_path)
+        config.tech_lead_failed_label = "my-failed"
+
+        actions = plan_candidate_dispositions(
+            config,
+            _authority(TechLeadCandidate(101, CANDIDATE_A)),
+            _decision(_verdict(101, "human_a", rationale="Whose call?")),
+            expected=None,
+            labels=LabelManager(config),
+            heads=lambda pr_number: CANDIDATE_A,
+            run_identity=RUN_IDENTITY,
+        )
+
+        applied = {
+            action.label for action in actions if isinstance(action, AddLabelAction)
+        }
+        [receipt] = _comments(actions, 101)
+        assert "my-failed" in applied
+        assert "my-failed" in receipt.comment

@@ -26,6 +26,12 @@ Two ways a deployment lands here, and both are reported:
   ever files a candidate verdict;
 * an exchange mode that WOULD file one, but a coder agent with no reviewer
   configured, whose reviews fall back to the classic lane per agent.
+
+Both questions are asked exactly as ``resolve_review_exchange_mode`` asks them
+— falsiness for the reviewer, the mode set for the transport — and only of the
+agents that take the CODER side, so doctor and the runtime cannot disagree
+about a configuration and no operator is sent to change a setting that would
+change nothing.
 """
 
 from __future__ import annotations
@@ -78,8 +84,12 @@ def tech_lead_merge_authority_readiness(
         )
     unpaired = sorted(
         label
-        for label in config.agents
-        if config.get_reviewer_for_agent(label) is None
+        for label in _coder_agent_labels(config)
+        # Falsiness, not ``is None``: ``resolve_review_exchange_mode`` tests
+        # ``if not configured_reviewer``, so an empty-string reviewer is
+        # unpaired at runtime, and a doctor that called it paired would approve
+        # a configuration whose reviews take the classic lane.
+        if not config.get_reviewer_for_agent(label)
     )
     if unpaired:
         problems.append(
@@ -89,6 +99,26 @@ def tech_lead_merge_authority_readiness(
             " their pull requests are reviewed outside the exchange"
         )
     return TechLeadMergeAuthorityReadiness(active=True, problems=tuple(problems))
+
+
+def _coder_agent_labels(config: "Config") -> set[str]:
+    """The agents whose pull requests a batch review would later audit.
+
+    Only those take the CODER side of an exchange, so only their pairing
+    decides whether a candidate-bound verdict ever gets filed. Reviewers and
+    the tech lead itself are excluded: naming an agent whose pairing is
+    irrelevant would send an operator to change a setting that changes nothing.
+    """
+    reviewers = {
+        label
+        for label in (
+            config.code_review_agent,
+            config.tech_lead_review_agent,
+            *(agent.reviewer for agent in config.agents.values()),
+        )
+        if label
+    }
+    return set(config.agents) - reviewers
 
 
 __all__ = [

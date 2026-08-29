@@ -107,3 +107,33 @@ def test_the_readiness_owner_and_the_check_cannot_disagree() -> None:
 
     assert readiness.reachable is False
     assert all(problem in check.detail for problem in readiness.problems)
+
+
+class TestThePairingQuestionMatchesTheRuntimes:
+    """N3: doctor asks it the way `resolve_review_exchange_mode` asks it."""
+
+    def test_an_empty_string_reviewer_is_unpaired_here_too(self) -> None:
+        """The runtime tests falsiness; `is None` would call this paired."""
+        config = _config(review_exchange_mode="via-local-loop")
+        config.code_review_agent = ""
+
+        readiness = tech_lead_merge_authority_readiness(config)
+
+        assert readiness.reachable is False
+        assert any("agent:backend" in problem for problem in readiness.problems)
+
+    def test_reviewer_and_tech_lead_agents_are_not_asked_about_pairing(self) -> None:
+        """They never take the coder side, so their pairing changes nothing."""
+        config = _config(review_exchange_mode="via-local-loop")
+        config.agents = {
+            "agent:backend": AgentConfig(
+                prompt_path="prompts/backend.md", reviewer="agent:reviewer"
+            ),
+            "agent:reviewer": AgentConfig(prompt_path="prompts/review.md"),
+            "agent:tech-lead": AgentConfig(prompt_path="prompts/tech-lead.md"),
+        }
+        config.code_review_agent = None
+
+        [check] = check_tech_lead_merge_authority(config)
+
+        assert check.status == "ok"

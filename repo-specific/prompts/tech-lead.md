@@ -640,9 +640,11 @@ re-reading each pull request's live head:
   the watch label comes off so it does not re-trip the batch it just left;
 - `human_a` -> the pull request is escalated to a human and blocked, with no
   merge or rework authority, and marked `tech-lead-failed` so a stopped
-  candidate does not re-enter the batch that stopped it;
+  candidate does not re-enter the batch that stopped it. That label is a one-way
+  door: an operator has to remove it before the pull request is audited again,
+  and the receipt says so;
 - a `pass` the orchestrator refuses for want of an exact-candidate reviewer
-  approval -> the refusal receipt, and the same `tech-lead-failed`;
+  approval -> the refusal receipt, and the same one-way `tech-lead-failed`;
 - a candidate whose head MOVED since the manifest was built, or whose head
   cannot be read, receives NO label at all — the refusal is recorded on the pull
   request and the candidate is re-audited later at whatever it then proposes.

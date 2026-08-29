@@ -153,3 +153,68 @@ class TestTerminalLabels:
 
         assert policy.is_candidate(["code-reviewed", "tech-lead-reviewed"]) is False
         assert policy.is_candidate(["code-reviewed", "tech-lead-failed"]) is False
+
+
+class TestTheOwnerSaysHowEachExitIsUndone:
+    """Leaving the set and getting back in are one rule, so one owner holds it.
+
+    Nothing in this codebase removes ``tech_lead_failed_label``: an exit that
+    adds it is a one-way door and an exit that clears the watch label is not.
+    The receipt on the pull request is built from this string, so a wrong or
+    missing answer here is a pull request whose operator cannot tell whether
+    anything will ever look at it again.
+    """
+
+    def test_a_terminal_exit_says_an_operator_must_undo_it(
+        self, tmp_path: Path
+    ) -> None:
+        config = _config(tmp_path)
+        config.tech_lead_failed_label = "my-failed"
+
+        exit_rule = TechLeadCandidatePolicy.from_config(config).settle(
+            CandidateOutcome.HUMAN
+        )
+
+        assert "my-failed" in exit_rule.readmission
+        assert "an operator must remove it" in exit_rule.readmission
+
+    def test_a_cleared_watch_label_says_a_review_undoes_it(
+        self, tmp_path: Path
+    ) -> None:
+        config = _config(tmp_path)
+        config.tech_lead_review_label = "awaiting-tech-lead"
+
+        exit_rule = TechLeadCandidatePolicy.from_config(config).settle(
+            CandidateOutcome.REWORK
+        )
+
+        assert "awaiting-tech-lead" in exit_rule.readmission
+        assert "re-enters automatically" in exit_rule.readmission
+
+    @pytest.mark.parametrize(
+        "outcome", [CandidateOutcome.AUTHORITY, CandidateOutcome.DEFERRED]
+    )
+    def test_an_exit_with_nothing_to_undo_says_nothing(
+        self, tmp_path: Path, outcome: CandidateOutcome
+    ) -> None:
+        exit_rule = TechLeadCandidatePolicy.from_config(_config(tmp_path)).settle(
+            outcome
+        )
+
+        assert exit_rule.readmission == ""
+
+    @pytest.mark.parametrize("outcome", list(CandidateOutcome))
+    def test_the_sentence_names_every_label_the_exit_applies(
+        self, tmp_path: Path, outcome: CandidateOutcome
+    ) -> None:
+        """A pass needs no re-admission; everything else must name its labels."""
+        exit_rule = TechLeadCandidatePolicy.from_config(_config(tmp_path)).settle(
+            outcome
+        )
+        if outcome is CandidateOutcome.AUTHORITY:
+            return
+
+        assert all(
+            label in exit_rule.readmission
+            for label in (*exit_rule.add, *exit_rule.remove)
+        )

@@ -91,9 +91,10 @@ Use for investigation; they may be incomplete, rotated, or stale.
   (default `tech-lead-failed`). So does any single candidate this run could not
   settle — a `human_a`, or a `pass` refused for want of an exact-candidate
   reviewer approval — because a candidate left in the watch set would re-trip
-  the threshold and re-run this identical audit. A candidate whose head MOVED
-  is the deliberate exception: it keeps the watch label and is re-audited at
-  whatever it then proposes.
+  the threshold and re-run this identical audit. Nothing removes that label
+  automatically, so the receipt tells the operator to. A candidate whose head
+  MOVED is the deliberate exception: it keeps the watch label and is re-audited
+  at whatever it then proposes.
 - Each candidate receives ONE receipt comment naming the exact commit your
   verdict was about and this run's identity — including the refusals, so a
   disposition that could not be applied is visible rather than silent. Nothing

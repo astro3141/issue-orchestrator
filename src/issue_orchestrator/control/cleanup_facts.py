@@ -34,7 +34,11 @@ logger = logging.getLogger(__name__)
 class CleanupPolicy(NamedTuple):
     """How this repository's configuration says cleanup behaves."""
 
-    reviewed_label: Optional[str]
+    #: Every label that means "the review workflow has finished with this PR".
+    #: A tuple rather than one label because under tech_lead there are two, and
+    #: a gate that waited on the merge-facing one alone would wait forever on
+    #: every candidate a batch stopped or refused (#345).
+    reviewed_labels: tuple[str, ...]
     close_tabs: bool
     remove_worktrees: bool
 
@@ -42,24 +46,37 @@ class CleanupPolicy(NamedTuple):
 def cleanup_policy(config: "Config") -> CleanupPolicy:
     """Read the workflow's cleanup configuration exactly once.
 
-    Which review workflow is configured decides both the label a deferred
+    Which review workflow is configured decides both the labels a deferred
     cleanup waits for and the tab/worktree settings every cleanup obeys.
+
+    The tech_lead labels are ASKED of
+    :class:`~.tech_lead_candidate_policy.TechLeadCandidatePolicy` rather than
+    read from config here. That owner already decides which labels take a pull
+    request out of the batch watch set; deriving "tech_lead is done with this
+    PR" a second time is how the per-tick cleanup gate and the disposition
+    planner would come to disagree about the same pull request.
     """
+    from .tech_lead_candidate_policy import TechLeadCandidatePolicy
+
     if config.tech_lead_enabled:
         return CleanupPolicy(
-            config.tech_lead_reviewed_label,
+            tuple(
+                label
+                for label in TechLeadCandidatePolicy.terminal_labels_for(config)
+                if label
+            ),
             config.cleanup.with_tech_lead.close_ai_session_tabs,
             config.cleanup.with_tech_lead.remove_worktrees,
         )
     without = config.cleanup.without_tech_lead
     if config.code_review_agent:
         return CleanupPolicy(
-            config.code_reviewed_label,
+            tuple(label for label in (config.code_reviewed_label,) if label),
             without.close_ai_session_tabs,
             without.remove_worktrees,
         )
     # No review workflow: nothing to defer on, defaults for immediate cleanup.
-    return CleanupPolicy(None, without.close_ai_session_tabs, without.remove_worktrees)
+    return CleanupPolicy((), without.close_ai_session_tabs, without.remove_worktrees)
 
 
 def gather_cleanup_facts(
@@ -81,9 +98,9 @@ def gather_cleanup_facts(
 
     policy = cleanup_policy(config)
     reviewed_pr_numbers: frozenset[int] = frozenset()
-    if has_pending and policy.reviewed_label:
+    if has_pending and policy.reviewed_labels:
         reviewed_pr_numbers = _reviewed_pr_numbers(
-            repository_host, policy.reviewed_label
+            repository_host, policy.reviewed_labels
         )
 
     return CleanupFacts(
@@ -131,18 +148,26 @@ def gather_terminal_disposal_facts(
 
 
 def _reviewed_pr_numbers(
-    repository_host: "RepositoryHost", reviewed_label: str
+    repository_host: "RepositoryHost", reviewed_labels: tuple[str, ...]
 ) -> frozenset[int]:
-    """PRs carrying the cleanup label; an unreadable board reviews nothing.
+    """PRs carrying ANY cleanup label; an unreadable board reviews nothing.
+
+    One read per label, and only on a tick that already has deferred cleanups
+    waiting, so the tech_lead pair costs one extra read over the single-label
+    form — bounded, and the alternative is a queue entry that can never drain.
 
     A repository-host failure propagates — the caller's resilience owns it —
     while any other failure leaves the deferred cleanups waiting rather than
     releasing them on an answer nobody obtained.
     """
-    try:
-        return frozenset(pr.number for pr in repository_host.get_prs_with_label(reviewed_label))
-    except RepositoryHostError:
-        raise
-    except Exception as e:
-        logger.warning(f"[CLEANUP] Failed to fetch PRs with label {reviewed_label}: {e}")
-        return frozenset()
+    numbers: set[int] = set()
+    for reviewed_label in reviewed_labels:
+        try:
+            prs = repository_host.get_prs_with_label(reviewed_label)
+        except RepositoryHostError:
+            raise
+        except Exception as e:
+            logger.warning(f"[CLEANUP] Failed to fetch PRs with label {reviewed_label}: {e}")
+            return frozenset()
+        numbers.update(pr.number for pr in prs)
+    return frozenset(numbers)

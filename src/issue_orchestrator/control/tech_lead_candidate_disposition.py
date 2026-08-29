@@ -77,7 +77,10 @@ from ..domain.tech_lead_candidate import (
 )
 from .actions import Action, AddCommentAction, AddLabelAction, RemoveLabelAction
 from .needs_human_block import NeedsHumanCause
-from .tech_lead_candidate_policy import TechLeadCandidatePolicy
+from .tech_lead_candidate_policy import (
+    CandidateWatchExit,
+    TechLeadCandidatePolicy,
+)
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from ..domain.tech_lead_artifacts import TechLeadDecision
@@ -257,6 +260,10 @@ def _effects_for(
         review_established=reviewed,
     )
     _log_outcome(candidate, verdict, standing, outcome)
+    # Resolved ONCE and handed to both halves: the receipt describes exactly
+    # the labels the same rule is about to apply, so it can never announce a
+    # projection that did not happen or stay silent about one that did.
+    exit_rule = policy.settle(outcome)
     receipt = _receipt_for(
         outcome,
         candidate,
@@ -265,6 +272,7 @@ def _effects_for(
         observed_head,
         expected,
         run_identity=run_identity,
+        readmission=exit_rule.readmission,
     )
     return TechLeadCandidateEffects(
         candidate,
@@ -276,7 +284,7 @@ def _effects_for(
         # for the rest, and a candidate that silently receives nothing is
         # indistinguishable from a review that never ran.
         receipt
-        + _watch_set_actions(candidate, outcome, expected, policy=policy)
+        + _watch_set_actions(candidate, exit_rule, outcome, expected)
         + _lane_actions(candidate, outcome, expected, labels=labels),
     )
 
@@ -327,8 +335,16 @@ def _receipt_for(
     expected: "ExpectedState",
     *,
     run_identity: str,
+    readmission: str,
 ) -> tuple[Action, ...]:
     """The one comment this outcome publishes on the pull request, if any.
+
+    ``readmission`` is the watch-set owner's own sentence about the labels this
+    outcome applies and how the pull request gets back into the batch set. It
+    is appended to every receipt that has one, because a candidate that has
+    just been taken out of batch review — permanently, where a terminal label
+    was applied — learning that from the pull request is the same standard the
+    dispositions themselves are held to here.
 
     The empty tuple is reachable only through a candidate this run rendered no
     verdict for. That is a decision-contract violation for every candidate the
@@ -351,8 +367,9 @@ def _receipt_for(
             AddCommentAction(
                 number=candidate.pr_number,
                 is_pr=True,
-                comment=_SETTLED_RECEIPTS[outcome](
-                    candidate, verdict, run_identity
+                comment=_with_readmission(
+                    _SETTLED_RECEIPTS[outcome](candidate, verdict, run_identity),
+                    readmission,
                 ),
                 reason=(
                     f"tech_lead candidate {verdict.disposition.value} receipt"
@@ -364,7 +381,7 @@ def _receipt_for(
         AddCommentAction(
             number=candidate.pr_number,
             is_pr=True,
-            comment=comment,
+            comment=_with_readmission(comment, readmission),
             reason=(
                 f"tech_lead candidate {candidate.pr_number}@"
                 f"{candidate.short_sha} {verdict.disposition.value} refused:"
@@ -375,19 +392,24 @@ def _receipt_for(
     )
 
 
+def _with_readmission(comment: str, readmission: str) -> str:
+    """Append the watch-set owner's re-admission sentence, when there is one."""
+    if not readmission:
+        return comment
+    return f"{comment}\n\n**Batch review status.** {readmission}"
+
+
 def _watch_set_actions(
     candidate: TechLeadCandidate,
+    exit_rule: CandidateWatchExit,
     outcome: CandidateOutcome,
     expected: "ExpectedState",
-    *,
-    policy: TechLeadCandidatePolicy,
 ) -> tuple[Action, ...]:
-    """Ask the watch-set owner what this outcome does to membership.
+    """Turn the watch-set owner's answer into the actions that apply it.
 
     Removals precede additions so a mid-apply crash cannot leave a candidate
     both terminalized and still selected.
     """
-    exit_rule = policy.settle(outcome)
     reason = (
         f"Tech Lead {outcome.value} on candidate {candidate.short_sha}"
     )

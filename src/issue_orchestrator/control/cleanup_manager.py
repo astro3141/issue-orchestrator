@@ -116,25 +116,20 @@ class CleanupManager:
     def _get_cleanup_labels(self) -> tuple[str, ...]:
         """The labels that mean this PR's review workflow has finished with it.
 
-        Under tech_lead these are the candidate owner's terminal labels, both
-        of them: a settled candidate is one no batch will look at again,
-        whether it was passed, stopped, or refused.
+        Read from ``cleanup_facts.cleanup_policy`` — the SAME derivation the
+        per-tick Observer/Planner path uses, which in turn asks the tech_lead
+        candidate owner. This method and that path are two entry points into
+        one gate; spelling the answer twice is how they would come to release
+        different pull requests from the same queue.
         """
-        if self.config.tech_lead_enabled:
-            from .tech_lead_candidate_policy import TechLeadCandidatePolicy
+        from .cleanup_facts import cleanup_policy
 
-            configured = TechLeadCandidatePolicy.terminal_labels_for(self.config)
-        elif self.config.code_review_agent:
-            configured = (self.config.code_reviewed_label,)
-        else:
-            logger.warning("[CLEANUP] Found deferred cleanups but no review workflow configured")
-            return ()
-
-        labels = tuple(label for label in configured if label)
+        labels = cleanup_policy(self.config).reviewed_labels
         if not labels:
-            logger.warning("[CLEANUP] No cleanup label configured")
-            return ()
-
+            logger.warning(
+                "[CLEANUP] Found deferred cleanups but no cleanup label is"
+                " configured (no review workflow, or its label is unset)"
+            )
         return labels
 
     def _get_reviewed_pr_numbers(self, cleanup_labels: tuple[str, ...]) -> set[int] | None:

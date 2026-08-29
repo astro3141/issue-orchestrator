@@ -44,6 +44,16 @@ authority — ``tech-lead-failed`` there means "this batch produced no tech-lead
 authority for this candidate", which is the same thing it means when a session
 dies, and it is the label
 :meth:`~TechLeadCandidatePolicy.is_candidate` already reads as terminal.
+
+The two ways out are not the same door, and :attr:`CandidateWatchExit.
+readmission` is where that is said out loud. Clearing the watch label is
+reversible by the ordinary review lane, which re-adds it on the next approval.
+Adding ``tech_lead_failed_label`` is NOT: nothing in this codebase removes it,
+so a stopped or refused candidate stays out until an operator takes it off.
+That was already true of the whole-session failure projection; what this module
+adds is candidates reaching it one at a time, which is exactly why every such
+receipt has to name the label and the manual step rather than leave the reader
+to discover the door only swings one way.
 """
 
 from __future__ import annotations
@@ -66,11 +76,21 @@ class CandidateWatchExit:
     projection), and the ``ExpectedState`` every action carries. What it does
     not own — and could not own without re-deriving the watch label — is which
     labels say "this candidate is settled".
+
+    ``readmission`` travels with them because leaving the set and getting back
+    into it are one rule, and only this owner knows both halves. The two exits
+    are not symmetric: clearing the watch label is undone by the next review
+    that approves the pull request, while adding a terminal label is a ONE-WAY
+    door — nothing in this codebase removes ``tech_lead_failed_label``, so an
+    operator has to. A receipt that did not say which of those happened would
+    leave the reader to guess whether anything will ever pick the pull request
+    up again.
     """
 
     add: tuple[str, ...] = ()
     remove: tuple[str, ...] = ()
     keeps_membership: bool = False
+    readmission: str = ""
 
 
 @dataclass(frozen=True)
@@ -169,11 +189,27 @@ def _rework_exit(policy: TechLeadCandidatePolicy) -> CandidateWatchExit:
     # Ordered dedup: the default configuration spells both of these the same
     # way, and asking twice to remove one label is noise on the pull request.
     removed = dict.fromkeys((policy.watch_label, policy.review_approved_label))
-    return CandidateWatchExit(remove=tuple(removed))
+    return CandidateWatchExit(
+        remove=tuple(removed),
+        readmission=(
+            f"`{policy.watch_label}` has been cleared, so this pull request has"
+            " left the Tech Lead batch set. It re-enters automatically when a"
+            " review approves it again."
+        ),
+    )
 
 
 def _no_authority_exit(policy: TechLeadCandidatePolicy) -> CandidateWatchExit:
-    return CandidateWatchExit(add=(policy.tech_lead_failed_label,))
+    return CandidateWatchExit(
+        add=(policy.tech_lead_failed_label,),
+        readmission=(
+            f"`{policy.tech_lead_failed_label}` has been applied, so this pull"
+            " request has left the Tech Lead batch set. Nothing removes that"
+            " label automatically: once the condition above is resolved, an"
+            " operator must remove it to re-admit the pull request to batch"
+            " review."
+        ),
+    )
 
 
 def _deferred_exit(_policy: TechLeadCandidatePolicy) -> CandidateWatchExit:
