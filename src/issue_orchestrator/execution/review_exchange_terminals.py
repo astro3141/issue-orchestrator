@@ -126,7 +126,10 @@ def complete_with_reviewer_decision(
     session_name: str,
     validation_record_path: Path,
     presented_head_sha: str | None,
-    execution_identities: CandidateExecutionIdentityRecorder,
+    # Named for what the recorder owns rather than for one of its two halves:
+    # the identities that executed this candidate AND the reviewer's verdict
+    # about it are one exchange's durable evidence.
+    candidate_evidence: CandidateExecutionIdentityRecorder,
 ) -> ReviewExchangeOutcome:
     """Close the exchange at the terminal the reviewer decided."""
     status, reason = terminal
@@ -141,7 +144,7 @@ def complete_with_reviewer_decision(
     # The orchestrator's single derivation, passed in rather than assumed
     # here: binding states what it concluded, and never promotes the
     # reviewer's own claim to authority.
-    bind_review_verdict(
+    binding = bind_review_verdict(
         exchange_dir=exchange_dir,
         verdict=verdict,
         presented_head_sha=presented_head_sha,
@@ -149,7 +152,13 @@ def complete_with_reviewer_decision(
     )
     # §4's other half, bound to the same observation and therefore to the same
     # commit: who executed this candidate, as the orchestrator launched them.
-    execution_identities.record(presented_head_sha)
+    candidate_evidence.record(presented_head_sha)
+    # And the binding itself, promoted out of the exchange directory into the
+    # durable candidate record (#345). The copy above dies with the coder
+    # worktree; a later exact-candidate gate — the Tech Lead's, the
+    # continuation's — has to be able to read what the independent reviewer
+    # decided about THIS commit long after that.
+    candidate_evidence.record_verdict(binding)
     emit_built_event(emit, make_review_exchange_round_completed_event({
         "issue_number": issue_number,
         "session_name": session_name,

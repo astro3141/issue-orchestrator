@@ -1,64 +1,23 @@
 """Tech Lead manifest builder - creates manifests for tech_lead sessions.
 
 Queries GitHub to find PRs that need tech_lead (carry the tech_lead watch label
-but not tech-lead-reviewed or tech-lead-failed labels). The watch label must come
-from ``Config.tech_lead_watch_label`` — the single owner shared with the
-threshold trigger — and candidate eligibility from
-:class:`TechLeadCandidatePolicy` — the single owner shared with threshold fact
-gathering — so the PR set that trips the threshold is exactly the set the
-session audits.
+but not tech-lead-reviewed or tech-lead-failed labels). Both halves of that
+question — which label selects a pull request, and whether a selected pull
+request is still a candidate — come from :class:`~.tech_lead_candidate_policy.
+TechLeadCandidatePolicy`, the single owner shared with threshold fact gathering
+and with the completion-time disposition planner, so the PR set that trips the
+threshold is exactly the set the session audits and exactly the set the review
+settles.
 """
 
 import logging
 import time
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Sequence
 
 from ..domain.tech_lead_manifest import TechLeadManifest, PRToReview, PRFiles
 from ..ports import RepositoryHost
-
-if TYPE_CHECKING:
-    from ..infra.config import Config
+from .tech_lead_candidate_policy import TechLeadCandidatePolicy
 
 logger = logging.getLogger(__name__)
-
-
-@dataclass(frozen=True)
-class TechLeadCandidatePolicy:
-    """Single owner for which watch-labeled PRs are tech_lead batch candidates.
-
-    Threshold fact gathering (``FactGatherer._fetch_tech_lead_prs``) and manifest
-    construction (:class:`TechLeadManifestBuilder`) must apply THIS predicate so
-    the count that trips a batch and the set the session audits never diverge
-    (#6768 round 5: terminally-triaged PRs counted toward the threshold but
-    were manifest-filtered, creating endless empty-batch tracking issues).
-
-    A PR stops being a candidate once tech_lead terminalized it
-    (``tech_lead_reviewed_label``/``tech_lead_failed_label``) and, on filtered runs,
-    when it lies outside the active repository filter label scope.
-    """
-
-    tech_lead_reviewed_label: str = "tech-lead-reviewed"
-    tech_lead_failed_label: str = "tech-lead-failed"
-    required_label: str | None = None
-
-    @classmethod
-    def from_config(cls, config: "Config") -> "TechLeadCandidatePolicy":
-        """Derive the policy from configuration (custom labels + filter scope)."""
-        return cls(
-            tech_lead_reviewed_label=config.tech_lead_reviewed_label or "tech-lead-reviewed",
-            tech_lead_failed_label=config.tech_lead_failed_label or "tech-lead-failed",
-            required_label=config.filtering.label,
-        )
-
-    def is_candidate(self, labels: Sequence[str]) -> bool:
-        """True when a watch-labeled PR still needs a tech_lead batch review."""
-        label_set = set(labels)
-        terminalized = bool(
-            {self.tech_lead_reviewed_label, self.tech_lead_failed_label} & label_set
-        )
-        in_scope = self.required_label is None or self.required_label in label_set
-        return not terminalized and in_scope
 
 
 class TechLeadManifestBuilder:
@@ -67,12 +26,14 @@ class TechLeadManifestBuilder:
     def __init__(
         self,
         repository_host: RepositoryHost,
-        watch_label: str = "code-reviewed",
         *,
         candidate_policy: TechLeadCandidatePolicy,
     ):
         self._host = repository_host
-        self._watch_label = watch_label
+        # The selecting label is the POLICY's, not a second parameter beside
+        # it: a builder that could be handed a watch label the policy does not
+        # know about is a builder that can audit a set nobody counted.
+        self._watch_label = candidate_policy.watch_label
         self._policy = candidate_policy
 
     def build(self, data_dir: str) -> TechLeadManifest:
@@ -98,6 +59,12 @@ class TechLeadManifestBuilder:
                 title=pr.title,
                 url=pr.url,
                 branch=pr.branch,
+                # The candidate identity, read from the SAME observation that
+                # selected the PR (#345). An unreadable head stays "" — the PR
+                # is still audited, it simply cannot receive a merge-facing
+                # disposition later — rather than dropping out of the manifest
+                # and re-opening the threshold/manifest divergence #6768 closed.
+                head_sha=pr.head_sha or "",
                 files=PRFiles(),
             )
             for pr in prs

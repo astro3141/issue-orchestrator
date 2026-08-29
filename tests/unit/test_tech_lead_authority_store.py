@@ -17,6 +17,12 @@ from issue_orchestrator.domain.tech_lead_findings import (
     PendingCaseFile,
     PendingPromotion,
 )
+from issue_orchestrator.domain.tech_lead_candidate import (
+    CandidatePassPrerequisite,
+    CandidatePrerequisiteGap,
+    TechLeadCandidate,
+    UnmetPassPrerequisite,
+)
 from issue_orchestrator.domain.tech_lead_session import (
     StoredTechLeadOp,
     TechLeadLaunchAuthority,
@@ -248,6 +254,249 @@ def test_a_non_string_launch_base_fails_loudly() -> None:
 def test_a_padded_launch_base_is_refused_at_construction() -> None:
     with pytest.raises(ValueError, match="launch_base_sha"):
         _planning(launch_base_sha=" " + "a" * 40 + "\n")
+
+
+def _bound_batch() -> TechLeadLaunchAuthority:
+    return TechLeadLaunchAuthority(
+        flavor=TechLeadSessionFlavor.BATCH_REVIEW,
+        anchor_issue_number=7,
+        manifest_pr_numbers=(101, 102),
+        manifest_candidates=(
+            TechLeadCandidate(101, "a" * 40),
+            TechLeadCandidate(102, "b" * 40),
+        ),
+    )
+
+
+def test_manifest_candidates_survive_the_store(tmp_path: Path) -> None:
+    """The exact candidates outlive the process that observed them (#345)."""
+    store = SqliteTechLeadAuthorityStore.for_repo(tmp_path)
+    store.record(run_id="r1", session_name="issue-7", authority=_bound_batch())
+
+    loaded = SqliteTechLeadAuthorityStore.for_repo(tmp_path).load(
+        run_id="r1", session_name="issue-7"
+    )
+
+    assert loaded is not None
+    assert loaded.manifest_candidates == _bound_batch().manifest_candidates
+    assert loaded.candidate_for(101) == TechLeadCandidate(101, "a" * 40)
+    assert loaded.candidate_for(999) is None
+
+
+def test_a_row_written_before_candidates_existed_carries_none(tmp_path: Path) -> None:
+    """A legacy row keeps its scope and simply proves no candidate identity.
+
+    That is the fail-closed direction: nothing can be shown still-current, so
+    the run projects no merge-facing authority rather than binding the review
+    to whatever the heads have since become.
+    """
+    legacy = _bound_batch().to_dict()
+    del legacy["manifest_candidates"]
+
+    restored = TechLeadLaunchAuthority.from_dict(legacy)
+
+    assert restored.manifest_candidates == ()
+    assert restored.manifest_pr_numbers == (101, 102)
+    assert restored.candidate_for(101) is None
+    # ...and says so, so the completion owner routes it to the whole-manifest
+    # failure projection. Producing NOTHING would leave both pull requests in
+    # the watch set, re-tripping the threshold for a batch that can never
+    # settle them.
+    assert restored.candidates_recorded is False
+    assert _bound_batch().candidates_recorded is True
+
+
+def test_a_run_with_no_manifest_at_all_can_still_settle_itself() -> None:
+    """An empty batch has nothing to bind, and nothing left unsettled either."""
+    empty = TechLeadLaunchAuthority(
+        flavor=TechLeadSessionFlavor.BATCH_REVIEW,
+        anchor_issue_number=7,
+    )
+
+    assert empty.candidates_recorded is True
+
+
+def test_candidates_that_disagree_with_the_manifest_set_are_refused() -> None:
+    """One PR set, two spellings, is a bug the record must not be able to hold."""
+    with pytest.raises(ValueError, match="manifest_candidates"):
+        TechLeadLaunchAuthority(
+            flavor=TechLeadSessionFlavor.BATCH_REVIEW,
+            anchor_issue_number=7,
+            manifest_pr_numbers=(101, 102),
+            manifest_candidates=(TechLeadCandidate(101, "a" * 40),),
+        )
+
+
+def test_the_pass_prerequisites_survive_the_store(tmp_path: Path) -> None:
+    """Both halves of what a PASS rests on outlive the launch (#345).
+
+    The record is the one thing a completing session cannot have touched, so
+    the answer to "may this candidate be passed" must come back off disk
+    exactly as it was written before the session spawned.
+    """
+    reviewed_only = TechLeadCandidate(101, "a" * 40)
+    both = TechLeadCandidate(102, "b" * 40)
+    authority = TechLeadLaunchAuthority(
+        flavor=TechLeadSessionFlavor.BATCH_REVIEW,
+        anchor_issue_number=7,
+        manifest_pr_numbers=(101, 102),
+        manifest_candidates=(reviewed_only, both),
+        reviewed_candidates=(reviewed_only, both),
+        contracted_candidates=(both,),
+        prerequisite_gaps=(
+            CandidatePrerequisiteGap(
+                candidate=reviewed_only,
+                prerequisite=CandidatePassPrerequisite.LEAF_CONTRACT,
+                reason="issue #41 declares a governing source nothing could read",
+            ),
+        ),
+    )
+    store = SqliteTechLeadAuthorityStore.for_repo(tmp_path)
+    store.record(run_id="r1", session_name="issue-7", authority=authority)
+
+    loaded = SqliteTechLeadAuthorityStore.for_repo(tmp_path).load(
+        run_id="r1", session_name="issue-7"
+    )
+
+    assert loaded is not None
+    assert loaded.unmet_pass_prerequisites(both) == ()
+    # The reason survives the store beside the refusal it explains: the file
+    # that recorded it is in a worktree cleanup deletes.
+    assert loaded.unmet_pass_prerequisites(reviewed_only) == (
+        UnmetPassPrerequisite(
+            prerequisite=CandidatePassPrerequisite.LEAF_CONTRACT,
+            recorded_reason=(
+                "issue #41 declares a governing source nothing could read"
+            ),
+        ),
+    )
+
+
+def test_a_row_written_before_leaf_contracts_existed_holds_none() -> None:
+    """The fail-closed direction: a legacy row proves no contract was staged."""
+    legacy = _bound_batch().to_dict()
+    del legacy["contracted_candidates"]
+
+    restored = TechLeadLaunchAuthority.from_dict(legacy)
+
+    assert restored.contracted_candidates == ()
+    # Both refusals, and neither invents a reason it was never told.
+    assert restored.unmet_pass_prerequisites(TechLeadCandidate(101, "a" * 40)) == (
+        UnmetPassPrerequisite(CandidatePassPrerequisite.INDEPENDENT_REVIEW),
+        UnmetPassPrerequisite(CandidatePassPrerequisite.LEAF_CONTRACT),
+    )
+
+
+def test_contracted_candidates_outside_the_manifest_are_refused() -> None:
+    """A prerequisite may only be recorded for work this run actually audited."""
+    with pytest.raises(ValueError, match="contracted_candidates"):
+        TechLeadLaunchAuthority(
+            flavor=TechLeadSessionFlavor.BATCH_REVIEW,
+            anchor_issue_number=7,
+            manifest_pr_numbers=(101,),
+            manifest_candidates=(TechLeadCandidate(101, "a" * 40),),
+            contracted_candidates=(TechLeadCandidate(999, "c" * 40),),
+        )
+
+
+def test_a_reason_for_a_prerequisite_the_candidate_holds_is_refused() -> None:
+    """The drift that would print a false cause on a pull request.
+
+    The receipt is built from this record, and nothing in this codebase removes
+    the terminal label the refusal applies — so a reason recorded against a
+    prerequisite that WAS established is refused where it is written, not
+    discovered by an operator chasing a fact already on file.
+    """
+    candidate = TechLeadCandidate(101, "a" * 40)
+
+    with pytest.raises(ValueError, match="established that prerequisite"):
+        TechLeadLaunchAuthority(
+            flavor=TechLeadSessionFlavor.BATCH_REVIEW,
+            anchor_issue_number=7,
+            manifest_pr_numbers=(101,),
+            manifest_candidates=(candidate,),
+            contracted_candidates=(candidate,),
+            prerequisite_gaps=(
+                CandidatePrerequisiteGap(
+                    candidate=candidate,
+                    prerequisite=CandidatePassPrerequisite.LEAF_CONTRACT,
+                    reason="issue #41 could not be staged",
+                ),
+            ),
+        )
+
+
+def test_a_reason_for_a_candidate_this_run_never_audited_is_refused() -> None:
+    with pytest.raises(ValueError, match="prerequisite_gaps must name"):
+        TechLeadLaunchAuthority(
+            flavor=TechLeadSessionFlavor.BATCH_REVIEW,
+            anchor_issue_number=7,
+            manifest_pr_numbers=(101,),
+            manifest_candidates=(TechLeadCandidate(101, "a" * 40),),
+            prerequisite_gaps=(
+                CandidatePrerequisiteGap(
+                    candidate=TechLeadCandidate(999, "c" * 40),
+                    prerequisite=CandidatePassPrerequisite.LEAF_CONTRACT,
+                    reason="some other run's refusal",
+                ),
+            ),
+        )
+
+
+def test_two_reasons_for_one_refusal_are_refused() -> None:
+    """Nothing picks between them, so neither may be published as the reason."""
+    candidate = TechLeadCandidate(101, "a" * 40)
+
+    with pytest.raises(ValueError, match="twice"):
+        TechLeadLaunchAuthority(
+            flavor=TechLeadSessionFlavor.BATCH_REVIEW,
+            anchor_issue_number=7,
+            manifest_pr_numbers=(101,),
+            manifest_candidates=(candidate,),
+            prerequisite_gaps=(
+                CandidatePrerequisiteGap(
+                    candidate=candidate,
+                    prerequisite=CandidatePassPrerequisite.LEAF_CONTRACT,
+                    reason="the issue could not be read",
+                ),
+                CandidatePrerequisiteGap(
+                    candidate=candidate,
+                    prerequisite=CandidatePassPrerequisite.LEAF_CONTRACT,
+                    reason="a governing source could not be read",
+                ),
+            ),
+        )
+
+
+def test_a_gap_with_no_reason_is_not_a_record() -> None:
+    with pytest.raises(ValueError, match="requires the reason"):
+        CandidatePrerequisiteGap(
+            candidate=TechLeadCandidate(101, "a" * 40),
+            prerequisite=CandidatePassPrerequisite.LEAF_CONTRACT,
+            reason="   ",
+        )
+
+
+def test_a_corrupt_prerequisite_gap_row_fails_loudly() -> None:
+    corrupt = _bound_batch().to_dict()
+    corrupt["prerequisite_gaps"] = [
+        {
+            "candidate": {"pr_number": 101, "head_sha": "a" * 40},
+            "prerequisite": "vibes",
+            "reason": "unreadable",
+        }
+    ]
+
+    with pytest.raises(ValueError, match="unknown prerequisite"):
+        TechLeadLaunchAuthority.from_dict(corrupt)
+
+
+def test_a_corrupt_candidate_row_fails_loudly() -> None:
+    corrupt = _bound_batch().to_dict()
+    corrupt["manifest_candidates"] = [{"pr_number": "101", "head_sha": "a" * 40}]
+
+    with pytest.raises(ValueError, match="pr_number"):
+        TechLeadLaunchAuthority.from_dict(corrupt)
 
 
 def test_discard_removes_only_the_named_run(tmp_path: Path) -> None:

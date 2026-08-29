@@ -542,11 +542,17 @@ def test_both_governing_keywords_are_documented_for_humans(doc: Path):
         ("Governed-by-optional: #23", True),
         ("Governed-by: #21  # a trailing comment", True),
         ("  governed-by: #21", True),
+        ("Governed-by: #21, #295, #335, #18", True),
+        ("Governed-by: #21 #295", True),
+        ("Governed-by: #21, #295  # both of them", True),
         ("Governed-by: 21", False),
         ("Governed-by: M1-010", False),
         ("Governed-by: org/other-repo#5", False),
         (f"Governed-by: #{SUBJECT}", False),
         ("Governed-by: #21\nGoverned-by-optional: #21", False),
+        ("Governed-by: #21, #21", False),
+        ("Governed-by: #21, oops", False),
+        ("Governed-by: #21,", False),
     ],
 )
 def test_the_documented_syntax_rules_are_the_parser_s_actual_rules(line, accepted):

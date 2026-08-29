@@ -5,9 +5,16 @@
 2026-07-14: §4 reaction model, #6780; accepted 2026-07-23: the model shipped —
 typed decision artifact, board-snapshot observation surface, periodic + storm
 health-review triggers, and per-action graduated authority are live, with the
-``reset_retry`` executor wired (#6764) and act-level ``execute`` startup-guarded)
+``reset_retry`` executor wired (#6764) and act-level ``execute`` startup-guarded;
+2026-08-29: §"Context" 1 superseded — a batch review's completion act is no
+longer "adding ``tech-lead-reviewed``/``tech-lead-failed`` to the manifest PRs".
+A verdict is now rendered and applied PER CANDIDATE — one pull request bound to
+the exact commit the orchestrator observed — and a merge-facing ``pass`` also
+requires that candidate to still stand at that commit and to hold both staged
+prerequisites. See ``docs/development/REVIEW_WORKFLOW.md`` for the operational
+truth (#345))
 **Milestone:** P1
-**Tracks:** Issues #6760, #6761, #6762, #6763, #6764, #6778, #6780
+**Tracks:** Issues #6760, #6761, #6762, #6763, #6764, #6778, #6780, #345
 
 ## TL;DR
 

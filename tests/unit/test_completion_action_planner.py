@@ -53,6 +53,7 @@ from issue_orchestrator.domain.models import (
 )
 from issue_orchestrator.domain.session_key import SessionKey, TaskKind
 from issue_orchestrator.domain.tech_lead_manifest import PRToReview, TechLeadManifest
+from issue_orchestrator.domain.tech_lead_candidate import TechLeadCandidate
 from issue_orchestrator.domain.tech_lead_session import (
     TECH_LEAD_ASSIGNMENT_FILENAME,
     TECH_LEAD_OBSERVATION_LABEL,
@@ -128,6 +129,11 @@ def make_session(
     )
 
 
+def pr_candidate_sha(pr_number: int) -> str:
+    """The exact head commit these fixtures pin each manifest PR to (#345)."""
+    return f"{pr_number:03d}".ljust(40, "a")
+
+
 def make_planner(
     config: Config,
     *,
@@ -143,7 +149,15 @@ def make_planner(
     """
     issue = SimpleNamespace(labels=issue_labels or [])
     repository_host = repository_host or cast(
-        RepositoryHost, SimpleNamespace(get_issue=lambda _number: issue)
+        RepositoryHost,
+        SimpleNamespace(
+            get_issue=lambda _number: issue,
+            # The completion-time candidate re-read (#345): by default every
+            # manifest PR still stands at the commit the fixtures pinned it to.
+            get_pr=lambda number: SimpleNamespace(
+                head_sha=pr_candidate_sha(number)
+            ),
+        ),
     )
     tech_lead_authority = (
         SqliteTechLeadAuthorityStore.for_repo(config.repo_root)
@@ -304,6 +318,30 @@ def arm_batch_session(
             flavor=TechLeadSessionFlavor.BATCH_REVIEW,
             anchor_issue_number=session.issue.number,
             manifest_pr_numbers=(101, 102) if with_manifest else (),
+            manifest_candidates=(
+                (
+                    TechLeadCandidate(101, pr_candidate_sha(101)),
+                    TechLeadCandidate(102, pr_candidate_sha(102)),
+                )
+                if with_manifest
+                else ()
+            ),
+            reviewed_candidates=(
+                (
+                    TechLeadCandidate(101, pr_candidate_sha(101)),
+                    TechLeadCandidate(102, pr_candidate_sha(102)),
+                )
+                if with_manifest
+                else ()
+            ),
+            contracted_candidates=(
+                (
+                    TechLeadCandidate(101, pr_candidate_sha(101)),
+                    TechLeadCandidate(102, pr_candidate_sha(102)),
+                )
+                if with_manifest
+                else ()
+            ),
         ),
     )
 
@@ -417,8 +455,20 @@ def plant_tech_lead_manifest(tmp_path: Path, session: Session) -> None:
     """Write a two-PR tech_lead manifest discoverable via the run manifest."""
     manifest = TechLeadManifest(
         prs=[
-            PRToReview(number=101, title="PR 101", url="https://example/pr/101", branch="b1"),
-            PRToReview(number=102, title="PR 102", url="https://example/pr/102", branch="b2"),
+            PRToReview(
+                number=101,
+                title="PR 101",
+                url="https://example/pr/101",
+                branch="b1",
+                head_sha=pr_candidate_sha(101),
+            ),
+            PRToReview(
+                number=102,
+                title="PR 102",
+                url="https://example/pr/102",
+                branch="b2",
+                head_sha=pr_candidate_sha(102),
+            ),
         ]
     )
     manifest_path = tmp_path / "tech-lead-manifest.json"
@@ -429,8 +479,25 @@ def plant_tech_lead_manifest(tmp_path: Path, session: Session) -> None:
     run_manifest_path.write_text(json.dumps(run_manifest))
 
 
+def pass_verdicts(*pr_numbers: int) -> list[dict[str, object]]:
+    """PASS verdicts for the exact candidates these fixtures pinned (#345)."""
+    return [
+        {
+            "pr_number": pr_number,
+            "candidate_sha": pr_candidate_sha(pr_number),
+            "disposition": "pass",
+            "rationale": f"PR #{pr_number} conforms to the governing contract.",
+            "finding_ids": ["T1"],
+        }
+        for pr_number in pr_numbers
+    ]
+
+
 def plant_tech_lead_decision_pair(
-    session: Session, *, comment_targets: tuple[int, ...] = (101,)
+    session: Session,
+    *,
+    comment_targets: tuple[int, ...] = (101,),
+    candidate_verdicts: list[dict[str, object]] | None = None,
 ) -> None:
     """Write a valid decision + report pair into the session's tech-lead-data dir.
 
@@ -465,6 +532,7 @@ def plant_tech_lead_decision_pair(
                     }
                 ],
                 "proposed_actions": proposed_actions,
+                "candidate_verdicts": candidate_verdicts or [],
             }
         )
     )
@@ -487,7 +555,9 @@ def test_completed_tech_lead_session_labels_manifest_prs_and_plans_decision(
     config = make_tech_lead_config(tmp_path)
     session = make_tech_lead_session(tmp_path)
     arm_batch_session(config, session, tmp_path)
-    plant_tech_lead_decision_pair(session)
+    plant_tech_lead_decision_pair(
+        session, candidate_verdicts=pass_verdicts(101, 102)
+    )
 
     actions = make_planner(config).generate_completion_actions(
         session,
@@ -498,11 +568,21 @@ def test_completed_tech_lead_session_labels_manifest_prs_and_plans_decision(
     assert "in-progress" in removed_labels(actions)
     decision_comments = [
         action for action in actions
-        if isinstance(action, AddCommentAction) and action.number == 101
+        if isinstance(action, AddCommentAction)
+        and action.number == 101
+        and action.comment.startswith("Diagnosis for #101: flaky CI.")
     ]
     assert len(decision_comments) == 1
-    assert decision_comments[0].comment.startswith("Diagnosis for #101: flaky CI.")
     assert "ADR-0031" in decision_comments[0].comment
+    # The candidate's PASS receipt is a SECOND comment on the same PR, and it
+    # names the exact commit the disposition is authority for (#345).
+    receipts = [
+        action for action in actions
+        if isinstance(action, AddCommentAction)
+        and action.number == 101
+        and pr_candidate_sha(101) in action.comment
+    ]
+    assert len(receipts) == 1
 
 
 def test_completed_tech_lead_session_missing_pair_fails_labels_and_surfaces_rejection(
@@ -1684,7 +1764,9 @@ def test_successful_batch_completion_closes_tracking_issue(tmp_path: Path) -> No
     config = make_tech_lead_config(tmp_path)
     session = make_tech_lead_session(tmp_path)
     arm_batch_session(config, session, tmp_path)
-    plant_tech_lead_decision_pair(session)
+    plant_tech_lead_decision_pair(
+        session, candidate_verdicts=pass_verdicts(101, 102)
+    )
 
     actions = make_planner(config).generate_completion_actions(
         session,
@@ -1806,7 +1888,12 @@ class TestFailureInvestigationDiagnosisRequired:
         assert diagnosis and "Diagnosis" in diagnosis[0].comment
 
 
-def _plant_decision_with_actions(session: Session, proposed: list[dict]) -> None:
+def _plant_decision_with_actions(
+    session: Session,
+    proposed: list[dict],
+    *,
+    candidate_verdicts: list[dict[str, object]] | None = None,
+) -> None:
     """Write a decision pair with explicit proposed actions (T1 evidence set)."""
     data_dir = session.run_dir / "tech-lead-data"
     data_dir.mkdir(parents=True, exist_ok=True)
@@ -1824,6 +1911,7 @@ def _plant_decision_with_actions(session: Session, proposed: list[dict]) -> None
                     }
                 ],
                 "proposed_actions": proposed,
+                "candidate_verdicts": candidate_verdicts or [],
             }
         )
     )
@@ -1863,6 +1951,7 @@ class TestDecisionTargetScope:
                     "body": "Needs a human.",
                 },
             ],
+            candidate_verdicts=pass_verdicts(101, 102),
         )
 
         actions = make_planner(config).generate_completion_actions(
@@ -2360,7 +2449,16 @@ class TestFlavorActionKindCapabilities:
         """
         config, session = self._armed(tmp_path, flavor)
         _plant_decision_with_actions(
-            session, _capability_probe_actions(flavor, action_type)
+            session,
+            _capability_probe_actions(flavor, action_type),
+            # A batch review owes a verdict for every candidate it was armed
+            # with (#345); without them the coverage axis rejects the decision
+            # before this test's own axis is reached.
+            candidate_verdicts=(
+                pass_verdicts(101, 102)
+                if flavor is TechLeadSessionFlavor.BATCH_REVIEW
+                else None
+            ),
         )
 
         assert self._processing_error(config, session) is None
@@ -2592,7 +2690,10 @@ class TestFlavorActionKindCapabilities:
         valid_actions = _capability_probe_actions(
             TechLeadSessionFlavor.BATCH_REVIEW, "post_comment"
         )
-        _plant_decision_with_actions(session, valid_actions)
+        verdicts = pass_verdicts(101, 102)
+        _plant_decision_with_actions(
+            session, valid_actions, candidate_verdicts=verdicts
+        )
 
         assert self._processing_error(config, session) is None
 
@@ -2607,6 +2708,7 @@ class TestFlavorActionKindCapabilities:
                     "body": "Smuggled in after the first pass.",
                 },
             ],
+            candidate_verdicts=verdicts,
         )
 
         error = self._processing_error(config, session)
@@ -2880,6 +2982,7 @@ def test_protected_agent_label_on_create_issue_rejects_decision(
                 "finding_ids": ["T1"],
             }
         ],
+        candidate_verdicts=pass_verdicts(101, 102),
     )
 
     actions = make_planner(config).generate_completion_actions(

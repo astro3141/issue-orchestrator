@@ -143,6 +143,9 @@ def create_completion_components(
     from ..execution.attempt_execution_identity_store import (
         AttemptExecutionIdentityStore,
     )
+    from ..execution.attempt_review_verdict_store import (
+        AttemptReviewVerdictStore,
+    )
     from ..execution.persistent_review_exchange_runner import (
         PersistentReviewExchangeRunner,
     )
@@ -220,6 +223,7 @@ def create_completion_components(
             # Foundation admission evidence: both roles' execution
             # identities, bound to the candidate the reviewer was shown (#34).
             AttemptExecutionIdentityStore(attempt_store),
+            AttemptReviewVerdictStore(attempt_store),
             turn_mailbox=turn_mailbox,
             coder_prompt_addendum=coder_prompt_addendum,
         ),

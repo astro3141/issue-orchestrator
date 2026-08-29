@@ -13,11 +13,19 @@ that route's promotions in — the whole filing contract, labels included, since
 verified here rather than at promotion time, because a promotion fires on the
 tick a pattern finally crosses its evidence threshold — discovering a misrouted
 target then means losing the actuation the lane exists to provide.
+
+The batch-review lane (#345) adds a third: a Tech Lead ``pass`` is authority for
+one exact commit, and it rests on an independent reviewer approval of that same
+commit, which only the review exchange files. A deployment whose reviews take
+the classic lane can never satisfy it, so ``check_tech_lead_merge_authority``
+says so at startup instead of leaving the operator to infer it from a growing
+pile of refusal receipts.
 """
 
 from typing import TYPE_CHECKING
 
 from ..types import Check
+from ...tech_lead_merge_authority import tech_lead_merge_authority_readiness
 from ...tech_lead_promotion_activation import promotion_lane_readiness
 
 if TYPE_CHECKING:
@@ -67,6 +75,59 @@ def check_tech_lead_labels(config: "Config | None" = None) -> list[Check]:
             detail=(
                 f"Gate label '{PROPOSED_TECH_LEAD_LABEL}' is missing — tech_lead"
                 " proposals would be ungated. Run `issue-orchestrator init`."
+            ),
+        )
+    ]
+
+
+def check_tech_lead_merge_authority(config: "Config | None" = None) -> list[Check]:
+    """Report a batch review that can never reach ``tech-lead-reviewed`` (#345).
+
+    A Tech Lead ``pass`` requires an independent reviewer approval of the exact
+    commit it audited, and only the review exchange files one. Where reviews
+    take the classic lane, every ``pass`` is refused at completion and the
+    merge-facing label is unreachable — a working-looking pipeline that quietly
+    stops producing merge authority. Local configuration only; no GitHub read.
+
+    A warning rather than an error: the deployment still runs, still reviews,
+    still surfaces `rework` and `human_a`, and a refused `pass` leaves its own
+    receipt on the pull request. What it cannot do is open the merge gate, and
+    that is worth saying at startup rather than at the tenth refusal.
+    """
+    if config is None:
+        return []
+    readiness = tech_lead_merge_authority_readiness(config)
+    if not readiness.active:
+        return []
+    if readiness.problems:
+        from ....control.tech_lead_candidate_policy import TechLeadCandidatePolicy
+
+        # The merge-facing spelling comes from the owner of the terminal pair,
+        # not from a second reading of the config field (#345 review A1) — a
+        # doctor naming a label the projection does not apply is the divergence
+        # this check exists to warn about.
+        reviewed_label, _failed = TechLeadCandidatePolicy.terminal_labels_for(config)
+        return [
+            Check(
+                name="Tech Lead Merge Authority",
+                status="warning",
+                detail=(
+                    "Tech Lead `pass` cannot produce merge authority in this"
+                    " configuration: "
+                    + "; ".join(readiness.problems)
+                    + ". Batch reviews will still run, but every `pass` is"
+                    " refused for want of an exact-candidate reviewer approval"
+                    f" and no PR receives '{reviewed_label}'."
+                ),
+            )
+        ]
+    return [
+        Check(
+            name="Tech Lead Merge Authority",
+            status="ok",
+            detail=(
+                "Reviews file candidate-bound verdicts, so a Tech Lead `pass`"
+                " can reach the merge gate"
             ),
         )
     ]

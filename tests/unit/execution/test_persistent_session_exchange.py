@@ -54,6 +54,9 @@ from issue_orchestrator.domain.issue_key import GitHubIssueKey
 from issue_orchestrator.execution.attempt_execution_identity_store import (
     AttemptExecutionIdentityStore,
 )
+from issue_orchestrator.execution.attempt_review_verdict_store import (
+    AttemptReviewVerdictStore,
+)
 from issue_orchestrator.execution.candidate_execution_identity import (
     CandidateExecutionIdentityRecorder,
 )
@@ -167,6 +170,9 @@ def _identity_recorder(tmp_path: Path) -> CandidateExecutionIdentityRecorder:
     """
     return CandidateExecutionIdentityRecorder(
         store=AttemptExecutionIdentityStore(
+            SidecarAttemptStore(tmp_path / "identity-store")
+        ),
+        review_verdicts=AttemptReviewVerdictStore(
             SidecarAttemptStore(tmp_path / "identity-store")
         ),
         issue_key=GitHubIssueKey(repo="acme/repo", external_id="42"),
@@ -8210,6 +8216,9 @@ class TestCandidateExecutionIdentityBinding:
             store=AttemptExecutionIdentityStore(
                 SidecarAttemptStore(tmp_path / "identity-root")
             ),
+            review_verdicts=AttemptReviewVerdictStore(
+                SidecarAttemptStore(tmp_path / "identity-root")
+            ),
             issue_key=GitHubIssueKey(repo="acme/repo", external_id="42"),
             actor=AgentExecutionIdentity(
                 role=ExecutionRole.ACTOR,
@@ -8277,6 +8286,90 @@ class TestCandidateExecutionIdentityBinding:
             "reviewer_ok",
             1,
         )
+
+    def test_the_verdict_outlives_the_exchange_directory(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """#345: the exchange copy dies with the worktree; this one does not.
+
+        A later exact-candidate gate — the Tech Lead's — runs in another
+        worktree, ticks or hours after this exchange, and has to be able to
+        read what the independent reviewer decided about THIS commit.
+        """
+        repo = _BindingRepo(tmp_path)
+        presented = repo.coder_head()
+        recorder = self._recorder(tmp_path)
+
+        _run_binding_exchange(
+            tmp_path=tmp_path,
+            monkeypatch=monkeypatch,
+            repo=repo,
+            response_script=self._approving_reviewer(),
+            execution_identities=recorder,
+        )
+
+        durable = recorder.review_verdicts.read(
+            AttemptKey(recorder.issue_key, presented)
+        )
+        assert durable is not None
+        assert durable.verdict is ReviewVerdictOutcome.APPROVED
+        assert durable.reviewed_sha == presented
+        assert durable.approves(presented) is True
+
+    def test_a_rejection_is_made_durable_under_its_own_candidate(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        repo = _BindingRepo(tmp_path)
+        presented = repo.coder_head()
+        recorder = self._recorder(tmp_path)
+
+        _run_binding_exchange(
+            tmp_path=tmp_path,
+            monkeypatch=monkeypatch,
+            repo=repo,
+            response_script={
+                "reviewer": [
+                    {
+                        "response_type": "rework",
+                        "response_text": "Needs work",
+                        "getting_closer": False,
+                    }
+                ],
+                "coder": [],
+            },
+            execution_identities=recorder,
+            rework=ReviewExchangeRework.HAND_OFF,
+        )
+
+        durable = recorder.review_verdicts.read(
+            AttemptKey(recorder.issue_key, presented)
+        )
+        assert durable is not None
+        assert durable.verdict is ReviewVerdictOutcome.CHANGES_REQUESTED
+        assert durable.approves(presented) is False
+
+    def test_an_unobservable_candidate_makes_no_durable_verdict(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """An unbound verdict is one no gate can admit — the safe direction."""
+        recorder = self._recorder(tmp_path)
+
+        outcome = _run_binding_exchange(
+            tmp_path=tmp_path,
+            monkeypatch=monkeypatch,
+            unobservable_head=True,
+            response_script=self._approving_reviewer(),
+            execution_identities=recorder,
+        )
+
+        assert load_review_verdict(outcome.run_assets.exchange_dir) is None
+        assert outcome.status == "ok"
 
     def test_identities_bind_to_the_reviewed_commit_not_a_later_head(
         self,

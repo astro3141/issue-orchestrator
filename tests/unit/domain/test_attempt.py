@@ -221,7 +221,7 @@ def test_an_attempt_refuses_a_review_verdict_naming_another_commit() -> None:
     with pytest.raises(ValueError, match="must name the attempt's own commit"):
         Attempt(
             key=AttemptKey(GitHubIssueKey("owner/repo", "180"), SHA),
-            continuation_review_verdict=covers_another_commit,
+            review_verdict=covers_another_commit,
         )
 
 
@@ -236,10 +236,10 @@ def test_an_attempt_accepts_a_changes_requested_verdict_for_its_own_commit() -> 
 
     attempt = Attempt(
         key=AttemptKey(GitHubIssueKey("owner/repo", "180"), SHA)
-    ).with_continuation_review_verdict(rejected)
+    ).with_review_verdict(rejected)
 
-    assert attempt.continuation_review_verdict == rejected
-    assert Attempt.from_dict(attempt.to_dict()).continuation_review_verdict == rejected
+    assert attempt.review_verdict == rejected
+    assert Attempt.from_dict(attempt.to_dict()).review_verdict == rejected
 
 
 def test_a_later_quick_evaluation_does_not_answer_the_publication_question() -> None:

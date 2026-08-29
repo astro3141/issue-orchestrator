@@ -1180,9 +1180,9 @@ class TestDurableReviewVerdict:
 
         stored = harness.attempts.for_key(attempt.key)
         assert stored is not None
-        assert stored.continuation_review_verdict is not None
+        assert stored.review_verdict is not None
         assert (
-            stored.continuation_review_verdict.verdict
+            stored.review_verdict.verdict
             is ReviewVerdictOutcome.CHANGES_REQUESTED
         )
 
@@ -1199,7 +1199,7 @@ class TestDurableReviewVerdict:
 
         stored = harness.attempts.for_key(attempt.key)
         assert stored is not None
-        assert stored.continuation_review_verdict is None
+        assert stored.review_verdict is None
 
     def test_a_run_that_bound_no_verdict_records_none(
         self, harness: Harness
@@ -1214,7 +1214,7 @@ class TestDurableReviewVerdict:
 
         stored = harness.attempts.for_key(attempt.key)
         assert stored is not None
-        assert stored.continuation_review_verdict is None
+        assert stored.review_verdict is None
 
     def test_a_completion_that_ran_no_exchange_records_none(
         self, harness: Harness
@@ -1235,7 +1235,7 @@ class TestDurableReviewVerdict:
 
         stored = harness.attempts.for_key(attempt.key)
         assert stored is not None
-        assert stored.continuation_review_verdict is None
+        assert stored.review_verdict is None
 
     def test_the_verdict_is_read_from_the_exchange_run_not_the_session_run(
         self, harness: Harness
@@ -1268,7 +1268,7 @@ class TestDurableReviewVerdict:
         )
         stored = harness.attempts.for_key(attempt.key)
         assert stored is not None
-        assert stored.continuation_review_verdict is not None
+        assert stored.review_verdict is not None
 
     def test_a_handed_off_rejection_is_durable_after_one_run(
         self, harness: Harness
@@ -1296,8 +1296,8 @@ class TestDurableReviewVerdict:
 
         stored = harness.attempts.for_key(attempt.key)
         assert stored is not None
-        assert stored.continuation_review_verdict is not None
-        assert stored.continuation_review_verdict.verdict is (
+        assert stored.review_verdict is not None
+        assert stored.review_verdict.verdict is (
             ReviewVerdictOutcome.CHANGES_REQUESTED
         )
         assert stored.continuation_settlement is None
@@ -1308,7 +1308,7 @@ class TestDurableReviewVerdict:
 class TestSettlementRestsOnPromotedReviewEvidence:
     """#178: a run that completed a review exchange settles only on its verdict.
 
-    #193's shape is ``continuation_review_verdict = null`` recorded beside
+    #193's shape is ``review_verdict = null`` recorded beside
     ``continuation_settlement = pull_request_opened`` — a terminal outcome
     asserting a review nothing can evidence. The promotion had refused, in one
     of several ways, and the settlement ran anyway because the refusals were
@@ -1346,7 +1346,7 @@ class TestSettlementRestsOnPromotedReviewEvidence:
 
         stored = self._advance(harness, attempt)
 
-        assert stored.continuation_review_verdict is None
+        assert stored.review_verdict is None
         assert stored.continuation_settlement is None
         assert harness.labels.applied == []
 
@@ -1369,7 +1369,7 @@ class TestSettlementRestsOnPromotedReviewEvidence:
 
         stored = harness.attempts.for_key(attempt.key)
         assert stored is not None
-        assert stored.continuation_review_verdict is None
+        assert stored.review_verdict is None
         assert stored.continuation_settlement is None
         assert harness.labels.applied == []
         assert harness.runs.holds(operation.key) is False
@@ -1403,7 +1403,7 @@ class TestSettlementRestsOnPromotedReviewEvidence:
 
         stored = harness.attempts.for_key(attempt.key)
         assert stored is not None
-        assert stored.continuation_review_verdict is None
+        assert stored.review_verdict is None
         assert stored.continuation_settlement is None
         assert harness.labels.applied == []
         assert harness.runs.holds(operation.key) is False
@@ -1429,7 +1429,7 @@ class TestSettlementRestsOnPromotedReviewEvidence:
 
         stored = self._advance(harness, attempt)
 
-        assert stored.continuation_review_verdict is None
+        assert stored.review_verdict is None
         assert stored.continuation_settlement is None
         assert harness.labels.applied == []
 
@@ -1447,7 +1447,7 @@ class TestSettlementRestsOnPromotedReviewEvidence:
 
         stored = self._advance(harness, attempt)
 
-        assert stored.continuation_review_verdict is None
+        assert stored.review_verdict is None
         assert stored.continuation_settlement is None
         assert harness.labels.applied == []
 
@@ -1469,14 +1469,14 @@ class TestSettlementRestsOnPromotedReviewEvidence:
             key: AttemptKey, mutate: Callable[[Attempt], Attempt]
         ) -> Attempt:
             current = harness.attempts.for_key(key)
-            if current is not None and mutate(current).continuation_review_verdict:
+            if current is not None and mutate(current).review_verdict:
                 raise OSError("the attempt sidecar could not be written")
             return real_update(key, mutate)
 
         with patch.object(harness.attempts, "update", _refuse_the_verdict_write):
             stored = self._advance(harness, attempt)
 
-        assert stored.continuation_review_verdict is None
+        assert stored.review_verdict is None
         assert stored.continuation_settlement is None
         assert harness.labels.applied == []
 
@@ -1499,7 +1499,7 @@ class TestSettlementRestsOnPromotedReviewEvidence:
             assert during is not None
             midway.append(
                 (
-                    during.continuation_review_verdict is not None,
+                    during.review_verdict is not None,
                     during.continuation_settlement is not None,
                 )
             )
@@ -1509,8 +1509,8 @@ class TestSettlementRestsOnPromotedReviewEvidence:
         stored = self._advance(harness, attempt)
 
         assert midway == [(True, False)]
-        assert stored.continuation_review_verdict is not None
-        assert stored.continuation_review_verdict.reviewed_sha == SHA_A
+        assert stored.review_verdict is not None
+        assert stored.review_verdict.reviewed_sha == SHA_A
         assert stored.continuation_settlement is not None
         assert (
             stored.continuation_settlement.kind
@@ -1531,7 +1531,7 @@ class TestSettlementRestsOnPromotedReviewEvidence:
 
         stored = self._advance(harness, attempt)
 
-        assert stored.continuation_review_verdict is None
+        assert stored.review_verdict is None
         assert stored.continuation_settlement is not None
         assert (
             stored.continuation_settlement.kind
@@ -1623,7 +1623,7 @@ class TestReEntryAfterPromotionIsIdempotent:
             )
         stored = harness.attempts.for_key(attempt.key)
         assert stored is not None
-        assert stored.continuation_review_verdict is not None
+        assert stored.review_verdict is not None
         assert stored.continuation_settlement is None
         return attempt
 
@@ -1660,7 +1660,7 @@ class TestReEntryAfterPromotionIsIdempotent:
         attempt = self._promoted_but_unsettled(harness)
         before = harness.attempts.for_key(attempt.key)
         assert before is not None
-        assert before.continuation_review_verdict is not None
+        assert before.review_verdict is not None
         harness.labels.result = LabelResult(success=True)
 
         harness.runner.advance(
@@ -1669,14 +1669,14 @@ class TestReEntryAfterPromotionIsIdempotent:
 
         stored = harness.attempts.for_key(attempt.key)
         assert stored is not None
-        assert stored.continuation_review_verdict is not None
+        assert stored.review_verdict is not None
         assert (
-            stored.continuation_review_verdict.verdict
-            is before.continuation_review_verdict.verdict
+            stored.review_verdict.verdict
+            is before.review_verdict.verdict
         )
         assert (
-            stored.continuation_review_verdict.reviewed_sha
-            == before.continuation_review_verdict.reviewed_sha
+            stored.review_verdict.reviewed_sha
+            == before.review_verdict.reviewed_sha
             == SHA_A
         )
 
@@ -2409,7 +2409,7 @@ class TestAnUnrunnableWorktreeOpensNoRun:
 
         stored = self._unrunnable(harness)
 
-        assert stored.continuation_review_verdict is None
+        assert stored.review_verdict is None
         assert stored.continuation_settlement is None
         assert harness.labels.applied == []
 
@@ -2659,8 +2659,8 @@ class TestTheFirstReviewersEvidenceIsGenuinelyProduced:
 
         stored = self._open(harness)
 
-        assert stored.continuation_review_verdict is not None
-        assert stored.continuation_review_verdict.verdict is (
+        assert stored.review_verdict is not None
+        assert stored.review_verdict.verdict is (
             ReviewVerdictOutcome.CHANGES_REQUESTED
         )
         assert harness.labels.applied == []
@@ -2699,7 +2699,7 @@ class TestEvidenceThatCannotBeProducedOpensNoRun:
         assert stored is not None
         assert harness.completion.calls == []
         assert harness.labels.applied == []
-        assert stored.continuation_review_verdict is None
+        assert stored.review_verdict is None
         assert stored.continuation_settlement is None
         return stored
 
@@ -2878,7 +2878,7 @@ def _paused(harness: Harness) -> None:
 
 def _approved(attempt: Attempt) -> Attempt:
     """The candidate after its exact-``A`` review round approved it."""
-    return attempt.with_continuation_review_verdict(
+    return attempt.with_review_verdict(
         BoundReviewVerdict(
             verdict=ReviewVerdictOutcome.APPROVED,
             reviewed_sha=attempt.key.head_sha,
@@ -3584,7 +3584,7 @@ class TestTheEngineHydratesThroughTheOwnerItBuilt:
         stored = orchestrator.deps.attempt_store.for_key(attempt.key)
         assert stored is not None
         assert stored.continuation_runs_used == 0
-        assert stored.continuation_review_verdict is None
+        assert stored.review_verdict is None
         assert stored.continuation_settlement is None
 
 
@@ -3824,7 +3824,7 @@ class TestOwningALiveOperationIsNotWorkActuationAuthority:
         stored = harness.attempts.for_key(operation.attempt.key)
         assert stored is not None
         assert stored.continuation_runs_used == 0
-        assert stored.continuation_review_verdict is None
+        assert stored.review_verdict is None
         assert stored.continuation_settlement is None
         assert harness.labels.applied == []
 

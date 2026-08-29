@@ -1042,6 +1042,63 @@ class TestFactGathererCleanupFacts:
         assert result.close_tabs is True
         assert result.remove_worktrees is True
 
+    def test_a_stopped_candidate_drains_its_deferred_cleanup(
+        self, fact_gatherer, sample_state, mock_config, mock_repository_host
+    ):
+        """The LIVE per-tick gate asks the tech_lead terminal PAIR (#345 F4).
+
+        This is the path production runs: gather_cleanup_facts ->
+        reviewed_pr_numbers -> planner. A candidate the batch stopped
+        (`human_a`) or refused earns tech-lead-failed and never earns
+        tech-lead-reviewed, so a gate keyed on the merge-facing label alone
+        leaves its queue entry — which has no TTL — waiting forever, paying a
+        board read every tick that can never release it.
+        """
+        mock_config.tech_lead_review_agent = "agent:tech-lead"
+        sample_state.pending_cleanups = [
+            PendingCleanup(
+                issue=Issue(number=1, title="Test issue", labels=[]),
+                pr_number=10,
+                pr_url="https://github.com/owner/repo/pull/10",
+                branch_name="1-issue-1",
+                terminal_id="issue-1",
+                worktree_path=Path("/tmp/wt1"),
+            )
+        ]
+        mock_repository_host.get_prs_with_label.side_effect = lambda label: (
+            [
+                PRInfo(
+                    number=10, url="...", title="PR 10", branch="b1",
+                    labels=["code-reviewed", "tech-lead-failed"], body="",
+                    state="open",
+                )
+            ]
+            if label == "tech-lead-failed"
+            else []
+        )
+
+        result = fact_gatherer.gather_cleanup_facts(sample_state)
+
+        assert result is not None
+        assert 10 in result.reviewed_pr_numbers
+
+    def test_the_live_gate_and_the_candidate_owner_name_the_same_labels(
+        self, fact_gatherer, sample_state, mock_config, mock_repository_host
+    ):
+        """A2: one spelling of "tech_lead is done with this PR"."""
+        from issue_orchestrator.control.cleanup_facts import cleanup_policy
+        from issue_orchestrator.control.tech_lead_candidate_policy import (
+            TechLeadCandidatePolicy,
+        )
+
+        mock_config.tech_lead_review_agent = "agent:tech-lead"
+        mock_config.tech_lead_reviewed_label = "my-reviewed"
+        mock_config.tech_lead_failed_label = "my-failed"
+
+        assert cleanup_policy(mock_config).reviewed_labels == (
+            TechLeadCandidatePolicy.from_config(mock_config).terminal_labels
+        )
+
     def test_cleanup_facts_with_code_review_workflow(
         self, fact_gatherer, sample_state, mock_config, mock_repository_host
     ):

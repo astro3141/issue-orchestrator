@@ -41,9 +41,11 @@ from ..ports.planning_command_guard import (
     PlanningCommandGuardError,
 )
 from .completion_pr_collision import NoCommitsBetweenError
+from .tech_lead_candidate_contract import stage_candidate_contracts
 from .tech_lead_canonical_context import stage_canonical_context
 from .tech_lead_evidence import build_evidence_map, write_evidence_map
-from .tech_lead_manifest_builder import TechLeadCandidatePolicy, TechLeadManifestBuilder
+from .tech_lead_candidate_policy import TechLeadCandidatePolicy
+from .tech_lead_manifest_builder import TechLeadManifestBuilder
 
 if TYPE_CHECKING:
     from ..domain.session_run import SessionRunIdentity
@@ -196,8 +198,13 @@ def shape_requested_actions_for_tech_lead(
 ) -> tuple[RequestedAction, ...]:
     """Drop POST_COMMENT from a tech_lead completion's requested actions.
 
-    Tech Lead prompts promise the orchestrator posts no comments; the generic
-    "## Implementation" template would land on the tracking issue otherwise.
+    What is dropped is the COMPLETION RECORD's generic comment intent: the
+    "## Implementation" template would land on the tracking issue otherwise,
+    and tech-lead prompts promise nothing of the sort is posted there. Comments
+    the orchestrator PLANS from the decision are a different thing entirely —
+    the agent's own ``post_comment`` proposals, and since #345 the per-candidate
+    disposition receipts — and they are unaffected by this shaping.
+
     PUSH_BRANCH/CREATE_PR stay: real prompt/doc improvements should publish.
     """
     return tuple(
@@ -230,10 +237,16 @@ def prepare_tech_lead_manifest(
     Returns the populated manifest, or None when no PRs need tech_lead.
     Eligibility comes from the shared candidate owner so the audited set
     matches the threshold set.
+
+    Each selected PR is bound to the exact head commit the orchestrator
+    observed, and two things a stateless review cannot reconstruct for itself
+    are staged beside the manifest (#345): the independent Reviewer's verdict
+    for THAT commit, and the bounded contract of the executable issue the pull
+    request implements. The tech lead's data-source contract forbids it from
+    fetching either, so an unstaged prerequisite would be an unprovable one.
     """
     builder = TechLeadManifestBuilder(
         repository_host=repository_host,
-        watch_label=config.tech_lead_watch_label,
         candidate_policy=TechLeadCandidatePolicy.from_config(config),
     )
 
@@ -246,6 +259,15 @@ def prepare_tech_lead_manifest(
         return None
 
     manifest = manifest_downloader.download(manifest, worktree_path)
+    # The leaf contract each candidate is judged against, staged AFTER the
+    # download so its own answer rides the same manifest entries the reviewer
+    # evidence does, and BEFORE the manifest is written so the file the agent
+    # reads already carries both.
+    stage_candidate_contracts(
+        manifest.prs,
+        repository_host=repository_host,
+        data_path=worktree_path / data_dir,
+    )
 
     manifest_path = worktree_path / data_dir / "manifest.json"
     manifest.write(manifest_path)
@@ -509,6 +531,34 @@ def prepare_tech_lead_session_data(
             manifest_pr_numbers=tuple(pr.number for pr in tech_lead_manifest.prs)
             if tech_lead_manifest
             else (),
+            # The exact candidates, recorded from the manifest the orchestrator
+            # just built (#345). Completion re-reads each PR's live head against
+            # THESE, so a candidate that moves after launch cannot inherit the
+            # review's disposition.
+            manifest_candidates=(
+                tech_lead_manifest.candidates() if tech_lead_manifest else ()
+            ),
+            # Which of them arrived with an independent reviewer's approval of
+            # that exact commit — the prerequisite a PASS rests on (#345).
+            reviewed_candidates=(
+                tech_lead_manifest.reviewed_candidates() if tech_lead_manifest else ()
+            ),
+            # And which of them arrived with a resolved executable-leaf
+            # contract — the other half of what a PASS rests on (#345).
+            contracted_candidates=(
+                tech_lead_manifest.contracted_candidates()
+                if tech_lead_manifest
+                else ()
+            ),
+            # And WHY each candidate that holds neither missed it, as the two
+            # staging owners observed it (#345). Recorded here because the
+            # files that hold the long form live in the tech-lead worktree,
+            # which cleanup disposes of, while the refusal receipt built from
+            # this is the operator's only instruction for undoing a terminal
+            # label.
+            prerequisite_gaps=(
+                tech_lead_manifest.prerequisite_gaps() if tech_lead_manifest else ()
+            ),
             problem_issue_numbers=problem_issue_numbers,
             launch_base_sha=_launch_base_sha(working_copy, ctx.worktree_path),
         ),

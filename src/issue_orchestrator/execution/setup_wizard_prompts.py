@@ -277,10 +277,27 @@ Compact `tech-lead-decision.json` example:
       "area": "ci-runtime",
       "finding_ids": ["T1"]
     }
+  ],
+  "candidate_verdicts": [
+    {
+      "pr_number": 123,
+      "candidate_sha": "4f2a9c1b8e7712d3a5c0b96e4d1f8a2c7b035e91",
+      "disposition": "pass",
+      "rationale": "Conforms to the governing contract; T1 is infrastructure, not this candidate's defect.",
+      "finding_ids": ["T1"]
+    }
   ]
 }
 ```
 
+- `candidate_verdicts` is the batch review's merge-facing output (one entry per
+  manifest candidate, at most 50). Each names `pr_number`, the exact
+  `candidate_sha` from the manifest, a `disposition` of `pass` / `rework` /
+  `human_a`, and a non-empty `rationale` (the pass reason, the actionable rework
+  feedback, or the human decision question). A verdict outside this session's
+  manifest - a pull request it did not audit, or a commit other than the one it
+  audited - rejects the whole decision. The other flavors have no candidates and
+  omit the field entirely.
 - Finding `classification` is one of: `infra`, `task`, `agent`, `systemic`.
 - Ids are canonical: findings are `T<n>` (`T1`, `T2`, ...) and actions are
   `A<n>` (`A1`, `A2`, ...), no leading zeros, unique across both lists. The
@@ -419,7 +436,8 @@ def build_tech_lead_review_prompt_text(
     directory, the agent reads only those files (never `gh`), and completion
     goes through `coding-done` plus the decision artifact pair
     (tech-lead-report.md + tech-lead-decision.json, ADR-0031). On success the
-    orchestrator adds the `reviewed_label` to every PR in the manifest and
+    orchestrator applies the decision's per-candidate verdicts — `reviewed_label`
+    only for a `pass` on a still-current, independently reviewed candidate — and
     executes the decision's proposed actions per its configured authority;
     the agent itself never touches GitHub.
     """
@@ -514,21 +532,83 @@ TECH_LEAD_DIR="$ISSUE_ORCHESTRATOR_RUN_DIR/tech-lead-data"
 cat "$TECH_LEAD_DIR/manifest.json"
 ```
 
-The manifest lists the PRs to review with their pre-fetched file names.
+The manifest lists the PRs to review with their candidate commit
+(`head_sha`) and pre-fetched file names. Each entry names a **candidate**: the
+pull request AND the exact commit the orchestrator observed when it selected
+it. Your verdict is authority for that commit and for no other, so read the
+files whose names carry it and quote the same `head_sha` back in your verdict.
+
+`candidate-evidence.json`, staged beside the manifest, carries per candidate
+what the independent Reviewer decided about that exact commit and whether the
+same commit cleared the publication gate. Read it; do NOT call `gh` to
+reconstruct it. An entry with a non-empty `gap` has NOT established an
+independent approval of this commit and must never receive `pass`.
+
+`candidate-contracts.json` carries, per candidate, the EXECUTABLE ISSUE the pull
+request implements: that issue's current body plus only the governing sources
+that issue itself declares (`Governed-by:` / `Governed-by-optional:`), staged
+under `candidate-contracts/pr-<number>-<sha12>/issue-<issue>/body.md` with a
+`body_sha256` and `updated_at` for each. This is the governing contract you
+judge the candidate against. A bounded issue may legitimately narrow the work
+below the repository's Spec/TD, so a constraint that exists ONLY in the leaf - a
+narrowed scope, an excluded item, a STOP condition - governs your verdict even
+where the repository says nothing about it. Read the staged bodies; do NOT
+reconstruct the contract from the PR description, repository context, or
+anything a previous session knew. An entry with a non-empty `gap` has NO
+resolved contract and must never receive `pass`; a source with `"staged": false`
+was declared but could not be read, so do not assume its content.
 
 {_TECH_LEAD_EMPTY_AUDIT_SECTION}
 
 ### 2. For Each PR, Analyze the Local Files
 
 ```bash
-# Metadata (title, body, branch, ...)
-cat "$TECH_LEAD_DIR/pr-<number>-meta.json"
+# The independent Reviewer's verdict for every candidate
+cat "$TECH_LEAD_DIR/candidate-evidence.json"
 
-# The code changes
-cat "$TECH_LEAD_DIR/pr-<number>-diff.txt"
+# The executable-leaf contract for every candidate, then its staged bytes
+cat "$TECH_LEAD_DIR/candidate-contracts.json"
+cat "$TECH_LEAD_DIR/candidate-contracts/pr-<number>-<sha12>/issue-<issue>/body.md"
+
+# Metadata (title, body, branch, candidate_sha, ...)
+cat "$TECH_LEAD_DIR/pr-<number>-<sha12>-meta.json"
+
+# The code changes of that exact candidate
+cat "$TECH_LEAD_DIR/pr-<number>-<sha12>-diff.txt"
 ```
 
-Evaluate:
+### Render one verdict per candidate
+
+For every manifest candidate, add an entry to `candidate_verdicts` in
+`tech-lead-decision.json`. The verdict is per candidate, never per session: a
+batch carrying two PRs reaches two independent answers.
+
+- `pass` - the candidate conforms to the governing contract and systemic
+  context, and the merge gate may consume that. Judge that conformance against
+  the staged leaf contract - its bounded purpose, acceptance criteria, non-goals
+  and STOP conditions - and against the governing sources it declares, rather
+  than listing patterns. Requires BOTH staged prerequisites for this candidate:
+  an exact-candidate reviewer approval in `candidate-evidence.json` with an
+  empty `gap`, AND a resolved leaf contract in `candidate-contracts.json` with
+  an empty `gap`. Informational findings may coexist with a `pass`; a blocking
+  bounded defect may not. The orchestrator re-checks both prerequisites itself:
+  a `pass` on a candidate whose exact-commit reviewer approval or whose leaf
+  contract it never established is refused and projects nothing.
+- `rework` - a bounded implementation or process defect inside already-settled
+  Spec/TD/policy. Your `rationale` IS the feedback the rework agent works from,
+  so make it specific and actionable. No human decision is implied.
+- `human_a` - a genuinely new Spec/TD/policy/authority decision is required.
+  Your `rationale` is the decision question. This stops the candidate; it is not
+  an implementation failure and it is not rework.
+
+Answer for EVERY candidate the manifest binds to a commit. Silence is not a
+disposition: a candidate you render nothing for stays in the batch set and is
+re-audited identically on the next threshold, so omitting one rejects the WHOLE
+decision exactly as naming a pull request outside the manifest does.
+
+Evaluate, starting from the staged leaf contract:
+- **Contract conformance**: Does the candidate satisfy its leaf issue's
+  acceptance criteria, and honour its non-goals and STOP conditions?
 - **Code quality**: Clean, maintainable implementation?
 - **Completeness**: Fully addresses the issue?
 - **Testing**: Tests present? Edge cases covered?
@@ -672,9 +752,20 @@ The orchestrator closes the anchor issue when your review lands successfully.
 ## Completion (MANDATORY)
 
 Use `coding-done` to report your findings AFTER writing both artifacts.
-Labels are automatic - for a batch review the orchestrator adds
-`{reviewed_label}` to every PR in the manifest when you complete
-successfully - and it executes your proposed actions per its configured
+Labels are automatic and PER CANDIDATE. After re-reading each pull request's
+live head, the orchestrator adds `{reviewed_label}` to a candidate you passed
+that still stands at the commit you judged; posts your `rework` rationale as
+candidate-bound feedback and then routes that pull request into the ordinary
+rework lane, clearing the watch label so it does not re-trip the batch it just
+left; escalates a `human_a` candidate to a human, blocks it, and marks it
+`tech-lead-failed` so a stopped candidate does not re-enter the batch that
+stopped it — as it does for a `pass` refused for want of EITHER staged
+prerequisite, an exact-candidate reviewer approval or a resolved leaf contract.
+That label is a one-way door an operator has to remove before the pull request
+is audited again, and the receipt says which prerequisite it observed missing.
+It applies no label at all to a candidate whose head moved,
+recording the refusal on the pull request and re-auditing it later at whatever
+it then proposes. It also executes your proposed actions per its configured
 authority. You never touch GitHub yourself.
 
 ```bash

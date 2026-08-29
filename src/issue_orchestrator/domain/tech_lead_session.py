@@ -25,6 +25,12 @@ from pathlib import Path
 from typing import Collection, cast
 
 from .tech_lead_artifacts import ACT_LEVEL_TECH_LEAD_ACTIONS
+from .tech_lead_candidate import (
+    CandidatePassPrerequisite,
+    CandidatePrerequisiteGap,
+    TechLeadCandidate,
+    UnmetPassPrerequisite,
+)
 
 TECH_LEAD_ASSIGNMENT_FILENAME = "tech-lead-assignment.json"
 
@@ -452,6 +458,55 @@ class TechLeadLaunchScope:
             )
 
 
+def _manifest_candidates_from(value: object) -> tuple[TechLeadCandidate, ...]:
+    """Parse a persisted candidate list; malformed content raises (#345).
+
+    Extracted rather than inlined into ``from_dict``: the store is
+    orchestrator-owned, so every shape below is a bug rather than agent input,
+    and the reader that decodes them has no business growing a branch per field
+    inside the record's own parser.
+    """
+    if not isinstance(value, list):
+        raise ValueError(
+            f"tech_lead authority manifest_candidates must be a list, got {value!r}"
+        )
+    entries = cast(list[object], value)
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise ValueError(
+                "tech_lead authority manifest_candidates entries must be objects,"
+                f" got {entry!r}"
+            )
+    return tuple(
+        TechLeadCandidate.from_payload(cast(dict[str, object], entry))
+        for entry in entries
+    )
+
+
+def _prerequisite_gaps_from(value: object) -> tuple[CandidatePrerequisiteGap, ...]:
+    """Parse the persisted per-candidate refusal reasons (#345).
+
+    Sibling of :func:`_manifest_candidates_from`, and strict for the same
+    reason: this list is orchestrator-written, so a shape it cannot parse is a
+    bug in this codebase and not something to route around.
+    """
+    if not isinstance(value, list):
+        raise ValueError(
+            f"tech_lead authority prerequisite_gaps must be a list, got {value!r}"
+        )
+    entries = cast(list[object], value)
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise ValueError(
+                "tech_lead authority prerequisite_gaps entries must be objects,"
+                f" got {entry!r}"
+            )
+    return tuple(
+        CandidatePrerequisiteGap.from_payload(cast(dict[str, object], entry))
+        for entry in entries
+    )
+
+
 @dataclass(frozen=True)
 class TechLeadLaunchAuthority:
     """Orchestrator-owned launch scope for one tech_lead session run.
@@ -472,6 +527,54 @@ class TechLeadLaunchAuthority:
     anchor_issue_number: int
     focus_issue_number: int | None = None
     manifest_pr_numbers: tuple[int, ...] = ()
+    # The exact candidates the manifest bound each audited PR to (#345):
+    # pr_number PLUS the head commit the orchestrator observed when it selected
+    # the PR. Recorded BESIDE ``manifest_pr_numbers`` rather than replacing it
+    # because the two answer different questions — which PRs this run audits
+    # (the terminal-failure projection still needs that) versus which exact
+    # commit each merge-facing disposition may be authority for.
+    #
+    # Empty is the LEGACY row, written before this field existed, and it is
+    # kept distinguishable rather than reconstructed: no candidate identity
+    # means no candidate can be proven still-current at completion, so such a
+    # run projects no merge-facing authority at all. That is the fail-closed
+    # direction, and re-deriving the SHAs now would bind the review to whatever
+    # the heads have since become.
+    manifest_candidates: tuple[TechLeadCandidate, ...] = ()
+    # The subset of those candidates whose INDEPENDENT REVIEWER approval of that
+    # exact commit the orchestrator established before the session spawned
+    # (#345). Recorded here rather than re-read at completion because it is a
+    # fact about a fixed ``(issue, commit)`` — a later review would be about a
+    # later commit — and because this record is the one thing a completing
+    # session cannot have touched. A PASS on a candidate absent from this set is
+    # refused: the prompt asks the agent not to render one, and this is what
+    # makes the rule hold when it does anyway.
+    reviewed_candidates: tuple[TechLeadCandidate, ...] = ()
+    # The subset whose EXECUTABLE-LEAF CONTRACT the orchestrator staged before
+    # the session spawned (#345): the bounded issue the pull request implements
+    # plus the governing sources that issue itself declares. Recorded beside
+    # ``reviewed_candidates`` and for the same reason — the merge contract is a
+    # conjunction, and a PASS rendered against a contract no run could resolve
+    # is a claim about a document nobody read. Absence covers every way it
+    # failed (no issue association, an unreadable issue, an unresolvable
+    # declared source, a legacy row), because they all mean the same thing here.
+    contracted_candidates: tuple[TechLeadCandidate, ...] = ()
+    # WHY each candidate missing one of the two prerequisites above missed it,
+    # as the staging owner observed it (#345). The subsets say a candidate does
+    # not hold a prerequisite; a prerequisite covers several ways of failing,
+    # and the refusal receipt is the operator's only instruction for undoing a
+    # terminal label nothing in this codebase removes — so the receipt must be
+    # able to say which way, and the file that recorded it dies with the
+    # tech-lead worktree. Carried here rather than re-derived because the
+    # observation was made at staging time and cannot be made again.
+    #
+    # Empty is a legacy row, and a gap may be absent for an unmet prerequisite:
+    # the receipt then falls back to the prerequisite's own fixed sentence,
+    # which is unspecific but never wrong. ``_validate_candidates`` refuses the
+    # opposite direction — a reason recorded against a prerequisite the
+    # candidate DOES hold — because that is the drift that would put a false
+    # cause on a pull request.
+    prerequisite_gaps: tuple[CandidatePrerequisiteGap, ...] = ()
     # The health review's OWNED problem cohort (#6780), recorded from the
     # producer's ``TechLeadLaunchScope`` grant (or the durable cohort ledger for
     # an anchor launched outside the pending queue) — never inferred from the
@@ -507,6 +610,7 @@ class TechLeadLaunchAuthority:
                 f"TechLeadLaunchAuthority with flavor={self.flavor.value} requires "
                 "focus_issue_number"
             )
+        self._validate_candidates()
         if self.flavor is TechLeadSessionFlavor.HEALTH_REVIEW and (
             self.focus_issue_number is not None or self.manifest_pr_numbers
         ):
@@ -537,6 +641,90 @@ class TechLeadLaunchAuthority:
                 "TechLeadLaunchAuthority problem_issue_numbers must be sorted "
                 "and unique"
             )
+
+    def _validate_candidates(self) -> None:
+        """The candidate axis's own invariants (#345).
+
+        Extracted from ``__post_init__`` because it is one subject with several
+        rules — the audited set, and every per-candidate prerequisite recorded
+        against it — and because a third prerequisite must land in the tuple
+        below rather than as another branch in the record's constructor.
+        """
+        if tuple(
+            candidate.pr_number for candidate in self.manifest_candidates
+        ) not in ((), self.manifest_pr_numbers):
+            raise ValueError(
+                "TechLeadLaunchAuthority manifest_candidates must name exactly"
+                " the manifest PR set, in the same order; got"
+                f" {[candidate.pr_number for candidate in self.manifest_candidates]}"
+                f" against {list(self.manifest_pr_numbers)}"
+            )
+        audited = set(self.manifest_candidates)
+        established: dict[CandidatePassPrerequisite, set[TechLeadCandidate]] = {}
+        for name, prerequisite, subset in (
+            (
+                "reviewed_candidates",
+                CandidatePassPrerequisite.INDEPENDENT_REVIEW,
+                self.reviewed_candidates,
+            ),
+            (
+                "contracted_candidates",
+                CandidatePassPrerequisite.LEAF_CONTRACT,
+                self.contracted_candidates,
+            ),
+        ):
+            if not set(subset) <= audited:
+                raise ValueError(
+                    f"TechLeadLaunchAuthority {name} must be a subset of"
+                    " the manifest candidates this run audited; got"
+                    f" {[c.pr_number for c in subset]} against"
+                    f" {[c.pr_number for c in self.manifest_candidates]}"
+                )
+            established[prerequisite] = set(subset)
+        self._validate_prerequisite_gaps(audited, established)
+
+    def _validate_prerequisite_gaps(
+        self,
+        audited: set[TechLeadCandidate],
+        established: dict[CandidatePassPrerequisite, set[TechLeadCandidate]],
+    ) -> None:
+        """A recorded reason must belong to a candidate that lacks that fact.
+
+        Two directions, both refused, because a receipt built from this record
+        is what an operator acts on. A gap against an unaudited candidate is
+        about some other run's work; a gap against a prerequisite the candidate
+        HOLDS would print a refusal reason under a fact that was established,
+        which is the wrong-cause failure this field exists to prevent. Two
+        reasons for the same pair are refused for the same standard: nothing
+        picks between them, so neither may be published as the reason.
+        """
+        seen: set[tuple[TechLeadCandidate, CandidatePassPrerequisite]] = set()
+        for gap in self.prerequisite_gaps:
+            if gap.candidate not in audited:
+                raise ValueError(
+                    "TechLeadLaunchAuthority prerequisite_gaps must name"
+                    " candidates this run audited; got PR"
+                    f" #{gap.candidate.pr_number} @ {gap.candidate.short_sha}"
+                    f" against {[c.pr_number for c in self.manifest_candidates]}"
+                )
+            if gap.candidate in established[gap.prerequisite]:
+                raise ValueError(
+                    "TechLeadLaunchAuthority recorded a"
+                    f" {gap.prerequisite.value} gap for PR"
+                    f" #{gap.candidate.pr_number} @ {gap.candidate.short_sha},"
+                    " which this run established that prerequisite for; a"
+                    " reason may only explain a prerequisite the candidate"
+                    " does not hold"
+                )
+            pair = (gap.candidate, gap.prerequisite)
+            if pair in seen:
+                raise ValueError(
+                    "TechLeadLaunchAuthority prerequisite_gaps records"
+                    f" {gap.prerequisite.value} twice for PR"
+                    f" #{gap.candidate.pr_number} @ {gap.candidate.short_sha};"
+                    " nothing chooses between two reasons for one refusal"
+                )
+            seen.add(pair)
 
     def allowed_targets(self) -> frozenset[int]:
         """Issue/PR numbers a decision from this session may target.
@@ -585,6 +773,80 @@ class TechLeadLaunchAuthority:
             return frozenset(self.problem_issue_numbers)
         return frozenset()
 
+    @property
+    def candidates_recorded(self) -> bool:
+        """Whether this run can settle its manifest per candidate at all (#345).
+
+        False only for a LEGACY row: manifest PR numbers written before
+        candidate identities existed. Such a run cannot prove which commit it
+        audited for any of them, so it may produce no per-candidate authority —
+        and it must not produce nothing either, or its pull requests stay in
+        the tech-lead watch set forever. The completion owner routes it to the
+        whole-manifest failure projection instead, which is the fail-closed
+        direction and the only one that terminalizes them.
+        """
+        return not self.manifest_pr_numbers or bool(self.manifest_candidates)
+
+    def candidate_for(self, pr_number: int) -> TechLeadCandidate | None:
+        """The exact candidate this run audited for ``pr_number`` (#345).
+
+        ``None`` means this run has no recorded candidate identity for that
+        pull request — a legacy row, or a PR number the decision named that
+        this run was never launched to audit. Both are refusals, and the
+        caller must treat them as such rather than falling back to the number.
+        """
+        for candidate in self.manifest_candidates:
+            if candidate.pr_number == pr_number:
+                return candidate
+        return None
+
+    def unmet_pass_prerequisites(
+        self, candidate: TechLeadCandidate
+    ) -> tuple[UnmetPassPrerequisite, ...]:
+        """Which merge-facing prerequisites this candidate does NOT hold (#345).
+
+        The ONE question asked before any PASS is projected, and deliberately
+        the only one this record answers about the merge contract. Two separate
+        predicates beside it would let a caller ask about the reviewer approval
+        and forget the leaf contract — which is exactly the half-checked gate
+        this leaf exists to close. Empty means the candidate holds them all;
+        anything else is a refusal, and each member says why in its own words.
+
+        Absence covers every way a prerequisite failed — no verdict, a verdict
+        about another commit, a rejection, an uncertified publication, an
+        unreadable record, an unresolvable leaf, or a legacy row that
+        established neither — because they all mean the same thing HERE:
+        nothing proves this candidate holds it. They do not mean the same thing
+        to the operator who has to fix it, which is why each answer carries the
+        reason recorded when the run's inputs were staged.
+        """
+        return tuple(
+            UnmetPassPrerequisite(
+                prerequisite=prerequisite,
+                recorded_reason=self._recorded_gap(candidate, prerequisite),
+            )
+            for prerequisite, established in (
+                (
+                    CandidatePassPrerequisite.INDEPENDENT_REVIEW,
+                    self.reviewed_candidates,
+                ),
+                (
+                    CandidatePassPrerequisite.LEAF_CONTRACT,
+                    self.contracted_candidates,
+                ),
+            )
+            if candidate not in established
+        )
+
+    def _recorded_gap(
+        self, candidate: TechLeadCandidate, prerequisite: CandidatePassPrerequisite
+    ) -> str:
+        """The staging owner's own reason for this refusal, or ``""``."""
+        for gap in self.prerequisite_gaps:
+            if gap.candidate == candidate and gap.prerequisite is prerequisite:
+                return gap.reason
+        return ""
+
     def matches_assignment(self, assignment: TechLeadAssignment) -> bool:
         """True when the agent-visible assignment copy mirrors this authority."""
         return (
@@ -599,6 +861,16 @@ class TechLeadLaunchAuthority:
             "anchor_issue_number": self.anchor_issue_number,
             "focus_issue_number": self.focus_issue_number,
             "manifest_pr_numbers": list(self.manifest_pr_numbers),
+            "manifest_candidates": [
+                candidate.to_payload() for candidate in self.manifest_candidates
+            ],
+            "reviewed_candidates": [
+                candidate.to_payload() for candidate in self.reviewed_candidates
+            ],
+            "contracted_candidates": [
+                candidate.to_payload() for candidate in self.contracted_candidates
+            ],
+            "prerequisite_gaps": [gap.to_payload() for gap in self.prerequisite_gaps],
             "problem_issue_numbers": list(self.problem_issue_numbers),
             "launch_base_sha": self.launch_base_sha,
         }
@@ -636,6 +908,12 @@ class TechLeadLaunchAuthority:
             raise ValueError(
                 f"tech_lead authority manifest_pr_numbers must be a list of ints, got {raw_prs!r}"
             )
+        candidates = _manifest_candidates_from(data.get("manifest_candidates", []))
+        reviewed = _manifest_candidates_from(data.get("reviewed_candidates", []))
+        contracted = _manifest_candidates_from(
+            data.get("contracted_candidates", [])
+        )
+        prerequisite_gaps = _prerequisite_gaps_from(data.get("prerequisite_gaps", []))
         raw_problems = data.get("problem_issue_numbers", [])
         if not isinstance(raw_problems, list) or any(
             isinstance(number, bool) or not isinstance(number, int)
@@ -660,6 +938,10 @@ class TechLeadLaunchAuthority:
             anchor_issue_number=anchor,
             focus_issue_number=focus,
             manifest_pr_numbers=tuple(raw_prs),
+            manifest_candidates=candidates,
+            reviewed_candidates=reviewed,
+            contracted_candidates=contracted,
+            prerequisite_gaps=prerequisite_gaps,
             problem_issue_numbers=tuple(raw_problems),
             launch_base_sha=raw_base_sha,
             schema_version=raw_schema,

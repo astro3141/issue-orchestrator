@@ -422,12 +422,147 @@ comment.
 
 After the review loop approves code, additional stages can run.
 
+### The Tech Lead gate is bound to an exact candidate (#345)
+
+A batch review's merge-facing disposition is authority for **one commit**, not
+for a pull-request number:
+
+1. the manifest records each selected PR's observed `head_sha`, the downloader
+   materializes the diff for that commit (and refuses to file one under the
+   candidate's name when the head moved mid-fetch), and the orchestrator-owned
+   `TechLeadLaunchAuthority` carries those candidates beside the PR numbers;
+2. `candidate-evidence.json` is staged beside the manifest with the independent
+   Reviewer's exact-SHA verdict and the publication certification for the same
+   commit, so the session never has to fetch that context itself. An entry with
+   a non-empty `gap` has not established an approval of this commit;
+3. `candidate-contracts.json` is staged beside it with the **executable leaf
+   contract** each candidate is judged against: the issue the pull request
+   implements (read from the branch, the way every PR-to-issue association in
+   this orchestrator is read), that issue's current body, and only the
+   governing sources the issue itself declares via `Governed-by:` /
+   `Governed-by-optional:`. Each source is recorded by number, `updated_at` and
+   `body_sha256`, staged under
+   `candidate-contracts/pr-<n>-<sha12>/issue-<m>/`. A bounded issue may narrow
+   the work below the repository's Spec/TD, so a constraint that exists only in
+   the leaf governs the verdict; an entry with a non-empty `gap` has no resolved
+   contract;
+4. the decision returns one `candidate_verdicts` entry per candidate — `pass`,
+   `rework`, or `human_a` — validated against the launch authority, and
+   completion re-reads each pull request's live head before applying it.
+
+A merge-facing `pass` rests on **both** staged prerequisites, recorded on the
+launch authority before the session spawns and asked as one question by
+`TechLeadLaunchAuthority.unmet_pass_prerequisites`:
+`CandidatePassPrerequisite.INDEPENDENT_REVIEW` — which covers the reviewer's
+approval of that exact commit *and* that same commit's publication-gate
+certification — and `CandidatePassPrerequisite.LEAF_CONTRACT`. Either one unmet
+refuses the `pass`. Neither gates `rework` or `human_a` — neither of those
+claims the candidate is mergeable.
+
+The refusal receipt names which prerequisite was missing **and the reason the
+staging owner recorded for it**, carried on the launch authority as
+`CandidatePrerequisiteGap`. One prerequisite covers several conditions — no
+verdict at all, a verdict about another commit, a rejection, an uncertified
+publication — and the receipt is the operator's only instruction for removing a
+label nothing here removes for them, so a fixed sentence that guessed would send
+them after a fact that is already on file. The long form lives in
+`candidate-evidence.json` / `candidate-contracts.json`, which cleanup disposes of
+with the tech-lead worktree; the reason travels out of it on the authority
+record. Where nothing was recorded (a legacy row) the prerequisite's own sentence
+stands alone rather than being filled in.
+
+The fetch/write/digest mechanics are shared with the planning lane's canonical
+context (#183) through `control/canonical_source_staging.py`; what differs is
+the failure direction. A planning run whose required source cannot be staged
+fails the launch closed, because it has one subject. A batch review records the
+failure as a gap on the ONE candidate and audits its siblings normally.
+
+`tech-lead-reviewed` therefore means "this exact candidate passed Tech Lead
+contract review", never "a session produced a valid artifact over a manifest
+containing this number". A moved candidate inherits nothing; the refusal is
+recorded on the pull request.
+
+#### Leaving the watch set
+
+The set that trips the batch threshold has to be the set a review settles, or
+the same batch re-fires over the same evidence forever. One owner —
+`control/tech_lead_candidate_policy.TechLeadCandidatePolicy` — answers both
+halves: which watch-labelled PRs are candidates, and what each concluded
+candidate's labels become.
+
+| The run concluded | Labels | Still a candidate? | How it gets back in |
+|---|---|---|---|
+| `pass`, head unmoved, both staged prerequisites established | `+tech-lead-reviewed` | no (terminal) | n/a — it passed |
+| `rework` | `-` watch label, `-` review-approval label, `+needs-rework` | no | automatically, on the next review that approves it |
+| `human_a` | `+tech-lead-failed`, `+needs-human` | no | operator removes `tech-lead-failed` |
+| `pass` refused — a staged prerequisite (exact-candidate reviewer approval and its publication certification, or a resolved leaf contract) is missing; the receipt names which and the reason recorded for it | `+tech-lead-failed` | no | operator removes `tech-lead-failed` |
+| head moved, unreadable, or never observed | none | **yes, deliberately** | it never left — re-audited at whatever it then proposes |
+
+Each row's last column is owned by `CandidateWatchExit.readmission` and is
+repeated verbatim in the receipt on the pull request, so the two cannot drift.
+
+The watch label is always `Config.tech_lead_watch_label`, the single owner the
+threshold trigger and the manifest builder already share. `tech-lead-failed`
+here carries the same meaning it does for a dead session: *this run produced no
+Tech Lead authority for this pull request*. Deferred worktree/session cleanup
+waits on either terminal label, not on `tech-lead-reviewed` alone.
+
+Because omitting a candidate would leave it counting toward the threshold, a
+decision that renders no verdict for a bound manifest candidate is a contract
+violation and rejects the whole decision — the same severity as a verdict about
+a pull request the run never audited.
+
+#### Precondition: `pass` needs a candidate-bound reviewer verdict
+
+A `pass` only projects `tech-lead-reviewed` when the orchestrator itself
+established that an independent reviewer approved **that exact commit**. It
+files that fact only where it concludes a review against a candidate it
+observed — the review exchange (`review.exchange.mode` of `auto`, `via-mcp`, or
+`via-local-loop`, with a reviewer configured for the coder agent).
+
+The classic lane does not: a standalone review session ending in
+`reviewer-done approved` produces the `code-reviewed` label, which is evidence
+about the pull request rather than about a commit. In a deployment whose
+reviews take that lane — `review.exchange.mode: via-draft-pr`, or an agent with
+no reviewer — **every batch `pass` is refused** and `tech-lead-reviewed` is
+unreachable. `doctor` reports this as a `Tech Lead Merge Authority` warning at
+startup rather than leaving it to be inferred from refusal receipts.
+
+The same applies transitionally to pull requests already open when exact-
+candidate binding was introduced: their attempts carry no recorded verdict, so
+the first batch after upgrade refuses their `pass` and marks them
+`tech-lead-failed` with a receipt explaining why.
+
+**`tech-lead-failed` is a one-way door.** Nothing in the orchestrator removes
+it — its only readers are the candidate predicate and the deferred-cleanup gate
+— so a pull request carrying it stays out of batch review, and out of any merge
+queue gated on `tech-lead-reviewed`, until **an operator removes the label by
+hand**. That has always been true of the whole-session failure projection; what
+is new is that individual candidates now reach it, through `human_a` and
+through a refused `pass`. Each such pull request gets a receipt naming the
+label and this manual step, so the state is discoverable from the pull request
+rather than from this page.
+
+At rollout, that means the first batch after upgrade will mark every open
+code-reviewed pull request `tech-lead-failed`. To re-admit one: get a review
+that files a candidate-bound verdict for its current head (i.e. a review through
+the exchange), then remove `tech-lead-failed`. Removing the label before such a
+verdict exists only produces the same refusal on the next batch.
+
+The rework exit is the opposite kind of door and needs no operator: it clears
+the watch label, and the next review that approves the pull request puts it back
+in the batch set.
+
 ```mermaid
 flowchart TD
   LOOP["Review loop approves code"] --> CR["Code-reviewed"]
   CR --> TECH_LEAD{"Tech Lead batch review configured?"}
-  TECH_LEAD -->|yes, threshold met| TR["Tech Lead agent reviews patterns across PRs"]
-  TR --> DONE["Tech-Lead-reviewed — ready for human merge"]
+  TECH_LEAD -->|yes, threshold met| TR["Tech Lead audits each exact candidate"]
+  TR --> PASS{"Per-candidate verdict"}
+  PASS -->|PASS, head unmoved| DONE["Tech-Lead-reviewed — ready for human merge"]
+  PASS -->|REWORK| NR["Feedback posted, then needs-rework"]
+  PASS -->|HUMAN_A| BNH["Escalated to a human, blocked"]
+  PASS -->|head moved / unreadable| REFUSED["Refusal recorded; no authority applied"]
   TECH_LEAD -->|no| DONE2["Ready for human merge"]
 
   FAIL["Session failed / blocked / timeout"] --> TFAIL{"tech_lead_review_on_failure?"}

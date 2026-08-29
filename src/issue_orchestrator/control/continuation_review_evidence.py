@@ -6,7 +6,7 @@ Promotion of that run's :class:`~..domain.review_verdict_binding.BoundReviewVerd
 onto the attempt has worked ever since. What did not follow is the consequence:
 promotion could refuse — no exchange run, no binding, a binding about another
 commit — and settlement ran anyway, because the refusals were logged and
-dropped. #193 is the shape that produces: ``continuation_review_verdict = null``
+dropped. #193 is the shape that produces: ``review_verdict = null``
 recorded beside ``continuation_settlement = pull_request_opened``, a terminal
 outcome asserting a review nothing can evidence.
 
@@ -238,7 +238,7 @@ class ContinuationReviewEvidence:
         try:
             self._attempts.update(
                 operation.attempt.key,
-                lambda attempt: attempt.with_continuation_review_verdict(binding),
+                lambda attempt: attempt.with_review_verdict(binding),
             )
         except (OSError, ValueError) as exc:
             logger.error(

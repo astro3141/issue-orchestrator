@@ -155,7 +155,12 @@ gate report reads them. Their two deliberate differences from `Depends-on:` are:
 - **Malformed declarations fail loudly.** `Depends-on:` skips a value it cannot
   resolve; a governing declaration that cannot be resolved to an issue number
   raises, because a source that cannot be *named* is a defect in the subject's
-  body rather than a source that merely failed to load.
+  body rather than a source that merely failed to load. One directive may name
+  several sources (`Governed-by: #21, #295, #335`), and the whole value is read
+  or refused — a value whose leading reference resolved and whose tail was
+  dropped would let a staged context report itself *resolved* while sources the
+  subject declared were never fetched, which reads identically to a complete
+  one.
 
 The operator-facing syntax lives in
 [`docs/user/faq.md`](../../user/faq.md) (Q26) and

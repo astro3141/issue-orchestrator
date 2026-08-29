@@ -1,4 +1,13 @@
-"""Binds the exchange's two execution identities to the candidate it reviewed.
+"""Binds one exchange's durable evidence to the candidate it reviewed.
+
+Two records, one observation: the two execution identities (§4's I2c half) and
+the reviewer's verdict bound to the same commit (#345). They were already
+"halves of one admission" in the failure directions below; since #345 they are
+also halves of one recorder, because the thing that makes either of them
+evidence is the SAME orchestrator observation of what was put in front of the
+reviewer. A caller that could file one without the other would be a caller able
+to record who reviewed a commit without recording what they decided.
+
 
 The identities themselves are fixed for the whole exchange — they are the
 launcher's own configuration for the two roles. What is *not* fixed is the
@@ -36,6 +45,8 @@ from ..domain.execution_identity import (
     CandidateExecutionIdentities,
 )
 from ..domain.issue_key import IssueKey
+from ..domain.review_verdict_binding import BoundReviewVerdict
+from ..ports.candidate_review_verdicts import CandidateReviewVerdictStore
 from ..ports.execution_identity_store import CandidateExecutionIdentityStore
 
 logger = logging.getLogger(__name__)
@@ -43,12 +54,13 @@ logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class CandidateExecutionIdentityRecorder:
-    """One exchange's actor/reviewer identities, awaiting a candidate to bind to."""
+    """One exchange's durable evidence, awaiting a candidate to bind to."""
 
     store: CandidateExecutionIdentityStore
     issue_key: IssueKey
     actor: AgentExecutionIdentity
     reviewer: AgentExecutionIdentity
+    review_verdicts: CandidateReviewVerdictStore
 
     def record(
         self, presented_head_sha: str | None
@@ -78,3 +90,24 @@ class CandidateExecutionIdentityRecorder:
         )
         self.store.record(AttemptKey(self.issue_key, candidate_sha), identities)
         return identities
+
+    def record_verdict(self, binding: BoundReviewVerdict | None) -> None:
+        """File what the reviewer decided about this candidate, durably (#345).
+
+        ``binding`` is the record the exchange just wrote into its own
+        directory, and it already carries the commit — read from the
+        orchestrator's presentation, never from the reviewer's claim — so this
+        needs no second observation and cannot disagree with the identities
+        filed beside it.
+
+        ``None`` is the exchange's own "no usable presented HEAD", and it writes
+        nothing for the same reason the identities do: an unbound verdict is a
+        verdict no gate can admit, which is the safe direction. A failing WRITE
+        raises, per the repository's fail-fast stance — an unwritable authority
+        artifact is not an absent one.
+        """
+        if binding is None:
+            return
+        self.review_verdicts.record(
+            AttemptKey(self.issue_key, binding.reviewed_sha), binding
+        )

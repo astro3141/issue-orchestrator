@@ -34,18 +34,24 @@ had to change to carry it.
 route consumes it before any external gate work begins, so an interrupted
 revalidation fails closed rather than refunding itself on restart.
 
-The last three facts are the continuation half (#143, #149), and they are here
-for the same reason the receipts are: they are about one ``(issue, commit)``
-and they have to outlive the worktree that produced them.
-``continuation_descriptor`` is the agent's recorded intent, copied at the gate
-seam while the completion record still exists; ``continuation_review_verdict``
-is the orchestrator's exact-``A`` review outcome, which is otherwise written
-only into the exchange directory *inside* the run dir *inside* the worktree —
-durable enough for the session that made it, and gone by the time a
-continuation needs to know whether ``A`` was already reviewed; and
-``continuation_settlement`` is the terminal fact the run itself produced,
-without which every phase meaning "still owes work" is re-derived unchanged
-after a run that already discharged it.
+``review_verdict`` is the orchestrator's exact-``A`` review outcome, which is
+otherwise written only into the exchange directory *inside* the run dir
+*inside* the worktree — durable enough for the session that made it, and gone
+by the time anything needs to know whether ``A`` was already reviewed. It is
+recorded once, by the exchange terminal that concluded the review, and read by
+everything that has to know what an independent reviewer decided about this
+exact commit: the continuation's settlement rule (#149) and the Tech Lead
+exact-candidate gate (#345). ONE field, because there is one fact — a second
+copy filed under a route's name would let two readers disagree about what the
+reviewer said.
+
+The remaining continuation facts (#143, #149) are here for the same reason the
+receipts are: they are about one ``(issue, commit)`` and they have to outlive
+the worktree that produced them. ``continuation_descriptor`` is the agent's
+recorded intent, copied at the gate seam while the completion record still
+exists; ``continuation_settlement`` is the terminal fact the run itself
+produced, without which every phase meaning "still owes work" is re-derived
+unchanged after a run that already discharged it.
 """
 
 from __future__ import annotations
@@ -193,11 +199,12 @@ class Attempt:
     # seam. ``None`` means NO RECORDED INTENT — never empty intent — and the
     # continuation refuses on it rather than proceeding with defaults.
     continuation_descriptor: ContinuationDescriptor | None = None
-    # The orchestrator's exact-``A`` review outcome (#149). Bound to this
+    # The orchestrator's exact-``A`` review outcome (#149, #345). Bound to this
     # attempt's own commit by the same rule the receipts and identities are, so
     # a verdict rendered against ``A'`` can never be read here as a decision
-    # about ``A``. ``None`` means no review has settled on this candidate.
-    continuation_review_verdict: BoundReviewVerdict | None = None
+    # about ``A``. ``None`` means no review has settled on this candidate, and
+    # every reader must treat that as "unreviewed" rather than as permission.
+    review_verdict: BoundReviewVerdict | None = None
     # The terminal outcome of this candidate's continuation run (#149). Written
     # by the run that produced it, never by a board signal: the continuation
     # creates no session and its pull request carries no code-review label, so
@@ -248,17 +255,17 @@ class Attempt:
                 f"commit: key={self.key.head_sha} receipt={receipt.head_sha}"
             )
         if (
-            self.continuation_review_verdict is not None
-            and not self.continuation_review_verdict.covers(self.key.head_sha)
+            self.review_verdict is not None
+            and not self.review_verdict.covers(self.key.head_sha)
         ):
             # The same rule again, and the failure direction it closes is the
             # one #149 names explicitly: ``A'`` must never inherit ``A``'s
             # review. A verdict that does not cover this key is evidence about
             # other work and must not be readable here at all.
             raise ValueError(
-                "Attempt.continuation_review_verdict must name the attempt's "
+                "Attempt.review_verdict must name the attempt's "
                 f"own commit: key={self.key.head_sha} "
-                f"reviewed={self.continuation_review_verdict.reviewed_sha}"
+                f"reviewed={self.review_verdict.reviewed_sha}"
             )
 
     @property
@@ -411,16 +418,21 @@ class Attempt:
         """
         return replace(self, continuation_descriptor=None)
 
-    def with_continuation_review_verdict(
+    def with_review_verdict(
         self, verdict: BoundReviewVerdict
     ) -> "Attempt":
-        """This attempt with the orchestrator's exact-``A`` review outcome (#149).
+        """This attempt with the orchestrator's exact-``A`` review outcome.
+
+        Written by the review exchange as it concludes (#345), and re-written
+        idempotently by the continuation's own promotion of the same binding
+        (#149) — both file the SAME record for the same commit, so the second
+        write cannot change what the reviewer decided.
 
         The binding rule in :meth:`__post_init__` runs on the result, so a
         verdict rendered against another commit is refused here exactly as it is
         on construction.
         """
-        return replace(self, continuation_review_verdict=verdict)
+        return replace(self, review_verdict=verdict)
 
     def with_continuation_settlement(
         self, settlement: ContinuationSettlement
@@ -460,9 +472,9 @@ class Attempt:
                 if self.continuation_descriptor is not None
                 else None
             ),
-            "continuation_review_verdict": (
-                self.continuation_review_verdict.to_payload()
-                if self.continuation_review_verdict is not None
+            "review_verdict": (
+                self.review_verdict.to_payload()
+                if self.review_verdict is not None
                 else None
             ),
             "continuation_settlement": (
@@ -515,8 +527,13 @@ class Attempt:
             continuation_descriptor=_optional_continuation_descriptor(
                 data.get("continuation_descriptor")
             ),
-            continuation_review_verdict=_optional_review_verdict(
-                data.get("continuation_review_verdict")
+            review_verdict=_optional_review_verdict(
+                # A sidecar written before #345 spelled this key
+                # ``continuation_review_verdict``. The record is the same
+                # record — one exact-``A`` reviewer outcome — so an in-flight
+                # candidate keeps its evidence across the rename instead of
+                # reading as unreviewed and re-entering its lane.
+                data.get("review_verdict", data.get("continuation_review_verdict"))
             ),
             continuation_settlement=_optional_settlement(
                 data.get("continuation_settlement")
@@ -638,7 +655,7 @@ def _optional_review_verdict(value: object) -> BoundReviewVerdict | None:
         return None
     if not isinstance(value, dict):
         raise ValueError(
-            "Attempt sidecar continuation_review_verdict must be an object"
+            "Attempt sidecar review_verdict must be an object"
         )
     return BoundReviewVerdict.from_payload(value)
 

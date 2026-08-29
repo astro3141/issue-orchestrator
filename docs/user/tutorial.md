@@ -395,13 +395,17 @@ Rules, all of which fail **loudly** rather than silently dropping the line:
 | What you wrote | What happens |
 |---|---|
 | `Governed-by: #21` | Same-repo issue #21 is staged |
+| `Governed-by: #21, #295, #335` | **All three** are staged, all required — one directive may name several sources |
 | `Governed-by: 21` | **Rejected** — the value must start with `#` |
 | `Governed-by: M1-010` | **Rejected** — external IDs are not governing-source references; use `#<number>` |
 | `Governed-by: org/other-repo#5` | **Rejected** — governing sources must be in the same repository |
 | `Governed-by: #21` on issue #21 | **Rejected** — the subject is always staged as itself |
-| `Governed-by: #21` twice, or `Governed-by: #21` plus `Governed-by-optional: #21` | **Rejected** — one line per source, or "required" is ambiguous |
+| `Governed-by: #21` twice, or `Governed-by: #21` plus `Governed-by-optional: #21` | **Rejected** — one declaration per source, or "required" is ambiguous |
+| `Governed-by: #21, oops` (or `#21,`) | **Rejected** — text after a reference that is not another reference is never dropped |
 
-The keyword is case-insensitive and the line may be indented; a trailing `#` comment after the reference is fine. Unlike `Depends-on:`, there is **no milestone restriction** — a governing source is reading material, not an ordering edge, so it never blocks or schedules anything.
+A list may be separated by commas or spaces, and every reference on the line takes that keyword's failure direction. The line resolves completely or it is rejected: no tail is silently ignored, so a run never reports a resolved context while a source you declared was never staged.
+
+The keyword is case-insensitive and the line may be indented; a trailing `#` comment after the references is fine — `#` followed by a digit is always a reference, anything else starts the comment. Unlike `Depends-on:`, there is **no milestone restriction** — a governing source is reading material, not an ordering edge, so it never blocks or schedules anything.
 
 A rejected declaration is a defect in the issue body: fix the line and request the run again.
 

@@ -33,6 +33,7 @@ from ..domain.review_exchange_run import ReviewExchangeRun
 from ..domain.runtime_config import RuntimeConfigReference
 from ..events import EventContext
 from ..ports.event_sink import EventSink
+from ..ports.candidate_review_verdicts import CandidateReviewVerdictStore
 from ..ports.execution_identity_store import CandidateExecutionIdentityStore
 from .candidate_execution_identity import CandidateExecutionIdentityRecorder
 from ..ports.review_exchange_approval_gate import ReviewExchangeApprovalGate
@@ -115,6 +116,7 @@ class PersistentReviewExchangeRunner:
         session_output: SessionOutput,
         pair_registry: InMemoryPersistentExchangePairRegistry,
         execution_identity_store: CandidateExecutionIdentityStore,
+        review_verdict_store: CandidateReviewVerdictStore,
         *,
         turn_mailbox: "TurnMailbox | None" = None,
         coder_prompt_addendum: CoderPromptAddendumProvider = NO_CODER_PROMPT_ADDENDUM,
@@ -127,6 +129,13 @@ class PersistentReviewExchangeRunner:
         # would produce a review no Foundation gate could ever admit — and it
         # would do so silently. Fail at construction instead (#34).
         self._execution_identity_store = execution_identity_store
+        # Required for the same reason and by the same argument (#345): this
+        # runner is where the orchestrator concludes what the reviewer decided
+        # about the presented commit, and the exchange-directory copy of that
+        # decision dies with the coder worktree. A deployment that forgot to
+        # wire the durable half would silently produce reviews no
+        # exact-candidate gate could ever admit.
+        self._review_verdict_store = review_verdict_store
         self._turn_mailbox = turn_mailbox
         self._coder_prompt_addendum = coder_prompt_addendum
 
@@ -155,6 +164,7 @@ class PersistentReviewExchangeRunner:
         reviewer_launch = launch_config(reviewer_agent)
         return CandidateExecutionIdentityRecorder(
             store=self._execution_identity_store,
+            review_verdicts=self._review_verdict_store,
             issue_key=issue_key,
             actor=AgentExecutionIdentity(
                 role=ExecutionRole.ACTOR,

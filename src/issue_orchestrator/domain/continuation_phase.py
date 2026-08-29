@@ -10,7 +10,7 @@ four existing owners already keep durably:
 the recorded intent              ``Attempt.continuation_descriptor`` (#143)
 the publication evaluations      ``Attempt.completed_evaluations`` (#85, #139)
 the same-SHA allowance           ``Attempt.revalidation_budget_used`` (#139)
-the exact-``A`` review outcome   ``Attempt.continuation_review_verdict``
+the exact-``A`` review outcome   ``Attempt.review_verdict``
 the run's terminal outcome       ``Attempt.continuation_settlement``
 the continuation's own allowance ``Attempt.continuation_runs_used``
 the board                        labels the tick already fetched

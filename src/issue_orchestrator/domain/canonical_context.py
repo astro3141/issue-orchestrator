@@ -111,9 +111,64 @@ _GOVERNING_DIRECTIVE_PATTERN = re.compile(
 # fetches it through ``RepositoryHost.get_issue``, which addresses exactly one
 # repository. A cross-repo or external-id reference is therefore not a source
 # this can honour, and is reported as malformed rather than silently dropped.
-_GOVERNING_REFERENCE_PATTERN = re.compile(r"^#(?P<issue>\d+)(?![\w/#-])")
+_GOVERNING_REFERENCE_PATTERN = re.compile(r"#(?P<issue>\d+)(?![\w/#-])")
+
+# What separates two references on ONE directive line. A directive may name
+# several sources — ``Governed-by: #21, #295, #335, #18`` is the shape the
+# canonical declarations are written in — so the value is a list, not a single
+# reference with a tail nobody reads. Comma-with-or-without-space and plain
+# whitespace both separate, because all three appear in bodies humans wrote.
+_GOVERNING_SEPARATOR_PATTERN = re.compile(r"[ \t]*,[ \t]*|[ \t]+")
+
+# Where a trailing ``# comment`` begins. ``#`` followed by a DIGIT always opens
+# a reference, so the comment convention and the reference list can never be
+# confused for one another: ``#295`` is a source, ``# working notes`` is not.
+_GOVERNING_COMMENT_PATTERN = re.compile(r"#(?!\d)")
 
 _KEYWORD_REQUIRED = {"governed-by": True, "governed-by-optional": False}
+
+
+def _malformed(directive: str, unread: str) -> ValueError:
+    """The one refusal shape for declaration text that cannot be resolved.
+
+    It names the text that could not be read, because the failure this exists
+    to prevent is a declaration that resolves PARTIALLY: a value whose leading
+    reference parses and whose tail is dropped would let a descriptor report a
+    resolved contract while sources the subject declared were never staged.
+    """
+    return ValueError(
+        f"malformed governing-source declaration {directive!r} on the planning"
+        " subject: the value must be same-repo issue references such as '#21'"
+        f" or '#21, #23', and {unread!r} could not be read as one"
+    )
+
+
+def _declared_reference_numbers(value: str, *, directive: str) -> tuple[int, ...]:
+    """Every issue number *value* declares, in declaration order.
+
+    Fails closed on ANY text it did not consume. The whole value is a list of
+    references followed by an optional comment; there is no "rest of the line"
+    the parser is allowed to ignore, so silent truncation is unreachable rather
+    than merely unlikely.
+    """
+    comment = _GOVERNING_COMMENT_PATTERN.search(value)
+    declared = (value[: comment.start()] if comment else value).strip()
+    numbers: list[int] = []
+    position = 0
+    while True:
+        reference = _GOVERNING_REFERENCE_PATTERN.match(declared, position)
+        if reference is None:
+            raise _malformed(directive, declared[position:])
+        numbers.append(int(reference.group("issue")))
+        position = reference.end()
+        if position == len(declared):
+            return tuple(numbers)
+        separator = _GOVERNING_SEPARATOR_PATTERN.match(declared, position)
+        # A separator that runs to the end of the value is a dangling one
+        # (``#21,``): it promises a reference that is not there.
+        if separator is None or separator.end() == len(declared):
+            raise _malformed(directive, declared[position:])
+        position = separator.end()
 
 
 def parse_governing_sources(
@@ -124,6 +179,13 @@ def parse_governing_sources(
     Empty when the subject declares none — the honest answer for the common
     case, and the reason no ``{#21, #23}`` bundle is ever assumed.
 
+    One directive may name SEVERAL sources (``Governed-by: #21, #295, #335``),
+    all of them taking that keyword's failure direction. Every reference on the
+    line is returned; declaration text this cannot resolve raises rather than
+    being dropped, because a partially-read declaration is indistinguishable
+    from a complete one downstream — the descriptor would report a resolved
+    context while sources the subject named were never staged.
+
     A malformed declaration raises :class:`ValueError`, for BOTH keywords and
     regardless of how the failed source would have been treated later. An
     unfetchable optional source degrades (it can still be named); a
@@ -131,37 +193,32 @@ def parse_governing_sources(
     named, so it is a defect in the subject's body, not a degraded source.
     Same reason a self-reference and a repeated reference raise: the first
     asks to stage the subject twice under two kinds, the second leaves
-    "required" ambiguous when the two lines disagree.
+    "required" ambiguous when the two declarations disagree.
     """
     declarations: list[GoverningSourceDeclaration] = []
     seen: set[int] = set()
     for match in _GOVERNING_DIRECTIVE_PATTERN.finditer(body or ""):
         keyword = match.group("keyword").lower()
-        value = match.group("value").strip()
-        reference = _GOVERNING_REFERENCE_PATTERN.match(value)
-        if reference is None:
-            raise ValueError(
-                f"malformed governing-source declaration {match.group(0).strip()!r}"
-                " on the planning subject: the value must begin with a same-repo"
-                " issue reference such as '#21'"
-            )
-        issue_number = int(reference.group("issue"))
-        if issue_number == subject_issue_number:
-            raise ValueError(
-                f"the planning subject #{subject_issue_number} declares itself as a"
-                " governing source; it is always staged as the subject"
-            )
-        if issue_number in seen:
-            raise ValueError(
-                f"governing source #{issue_number} is declared more than once on"
-                " the planning subject"
-            )
-        seen.add(issue_number)
-        declarations.append(
-            GoverningSourceDeclaration(
-                issue_number=issue_number, required=_KEYWORD_REQUIRED[keyword]
-            )
+        numbers = _declared_reference_numbers(
+            match.group("value").strip(), directive=match.group(0).strip()
         )
+        for issue_number in numbers:
+            if issue_number == subject_issue_number:
+                raise ValueError(
+                    f"the planning subject #{subject_issue_number} declares itself"
+                    " as a governing source; it is always staged as the subject"
+                )
+            if issue_number in seen:
+                raise ValueError(
+                    f"governing source #{issue_number} is declared more than once"
+                    " on the planning subject"
+                )
+            seen.add(issue_number)
+            declarations.append(
+                GoverningSourceDeclaration(
+                    issue_number=issue_number, required=_KEYWORD_REQUIRED[keyword]
+                )
+            )
     return tuple(declarations)
 
 

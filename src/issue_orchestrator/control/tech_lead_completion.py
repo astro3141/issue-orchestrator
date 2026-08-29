@@ -9,7 +9,8 @@ this module on the completion side) lives in one cohesive seam.
 The dead-or-rejected half lives in ``tech_lead_terminal_effects``: what a
 FAILED/TIMED_OUT session, or a COMPLETED session whose decision the contract
 refused, does to its anchor and to its subject. It shares this module's trusted
-reads (``resolve_launch_authority_for_session``, ``manifest_label_actions``,
+reads (``resolve_launch_authority_for_session``,
+``manifest_failure_label_actions``,
 ``split_tech_lead_decision_error``) so the two halves cannot disagree about
 what a run was.
 
@@ -24,6 +25,18 @@ Policy summary:
 * Only batch-review sessions label PRs (the authority manifest set they were
   launched to audit); failure investigations and health reviews never touch
   manifest labels (#6768 B4 / ADR-0031 §4).
+* A landed batch review's merge-facing effects are decided PER CANDIDATE, by
+  ``tech_lead_candidate_disposition``: the decision's own PASS/REWORK/HUMAN_A
+  verdict for that exact commit, applied only while the commit is still the
+  pull request's head (#345). The blanket "valid artifact -> label every
+  manifest PR" projection is gone; what survives it is the FAILURE projection,
+  which is about the session rather than about any candidate.
+* A LEGACY authority row — manifest PR numbers recorded before candidate
+  identities existed — takes that failure projection too, even when its
+  session landed a valid decision. Per-candidate authority needs the commit
+  each pull request was audited at, and such a row has none; producing nothing
+  instead would leave every one of its pull requests in the watch set,
+  re-tripping the threshold for a batch that can never settle them.
 * Every COMPLETED tech_lead session (any flavor) must produce a valid
   decision artifact pair — a missing/invalid pair is a contract violation.
   The authoritative classification runs in the completion processing path's
@@ -97,6 +110,11 @@ from .tech_lead_decision_loader import (
     load_tech_lead_artifact_pair_for_run,
 )
 from .subject_recovery_authority import SubjectRecoveryAuthority
+from .tech_lead_candidate_disposition import (
+    CandidateHeadReader,
+    plan_candidate_dispositions,
+)
+from .tech_lead_candidate_policy import TechLeadCandidatePolicy
 from .tech_lead_case_files import build_pattern_ledger
 from .tech_lead_decision_contract import validate_decision_for_authority
 from .tech_lead_proposals import build_op_ledger
@@ -561,27 +579,34 @@ def discard_tech_lead_authority_after_completion(
     tech_lead_authority.discard_storm_cohort(anchor_issue_number=session.issue.number)
 
 
-def manifest_label_actions(
+def manifest_failure_label_actions(
     config: "Config",
     authority: TechLeadLaunchAuthority,
     expected: "ExpectedState",
-    *,
-    success: bool,
 ) -> list[Action]:
-    """Label the AUTHORITY manifest PRs tech-lead-reviewed/-failed.
+    """Label the AUTHORITY manifest PRs tech-lead-failed.
 
     The PR set comes exclusively from the launch authority record — a
     tampered worktree manifest with substituted PR numbers never receives
     labels (#6761 re-review finding 1).
+
+    Whole-manifest and failure-only, which is the pair of properties that
+    survived #345. A dead session says nothing about any individual candidate,
+    so its projection is about the SESSION and covers every PR it was launched
+    auditing. Success is the opposite: it is decided per candidate by
+    ``tech_lead_candidate_disposition``, from the verdict rendered for that
+    exact commit, so there is no "label them all reviewed" branch here to
+    reach for.
+
+    The failure spelling is asked of :class:`TechLeadCandidatePolicy`, the owner
+    of the terminal pair, rather than derived here (#345 review A1). This
+    projection and the per-candidate watch-set exit are precisely the two paths
+    whose disagreement over a configured label spelling would strand a pull
+    request in the batch forever.
     """
     if not authority.manifest_pr_numbers:
         return []
-    if success:
-        tech_lead_label = config.tech_lead_reviewed_label or "tech-lead-reviewed"
-        reason = "Tech Lead completed successfully"
-    else:
-        tech_lead_label = config.tech_lead_failed_label or "tech-lead-failed"
-        reason = "Tech Lead session failed"
+    _reviewed, tech_lead_label = TechLeadCandidatePolicy.terminal_labels_for(config)
     logger.info(
         "[tech_lead] Adding '%s' label to %d PRs",
         tech_lead_label,
@@ -591,7 +616,7 @@ def manifest_label_actions(
         AddLabelAction(
             issue_number=pr_number,
             label=tech_lead_label,
-            reason=reason,
+            reason="Tech Lead session failed",
             expected=expected,
         )
         for pr_number in authority.manifest_pr_numbers
@@ -608,13 +633,21 @@ def generate_tech_lead_completion_actions(
     tech_lead_authority: "TechLeadAuthorityStore",
     open_issue_corpus: "OpenIssueCorpusManager",
     active_session_run_id: "Callable[[int], str | None]",
+    current_candidate_head: CandidateHeadReader,
 ) -> list[Action]:
     """Plan all completion effects for a tech_lead session (see module docstring).
 
-    Pure planning — no GitHub reads. ``tech_lead.milestone_strategy.explicit``
-    travels as intent on :class:`CreateTechLeadIssueAction` and is resolved at
-    the create-issue execution boundary (#6769 finding 4), so a shadow-mode
-    ``create_issue`` proposal plans zero API calls.
+    ``tech_lead.milestone_strategy.explicit`` travels as intent on
+    :class:`CreateTechLeadIssueAction` and is resolved at the create-issue
+    execution boundary (#6769 finding 4), so a shadow-mode ``create_issue``
+    proposal plans zero API calls.
+
+    The one fact planning cannot hold is whether each audited candidate is
+    STILL the candidate, so it is supplied as a reader rather than assumed:
+    ``current_candidate_head`` re-observes one pull request's live head, the
+    same shape ``active_session_run_id`` already has. Nothing else here reads
+    GitHub, and a candidate whose head cannot be read receives no merge-facing
+    effect (#345).
     """
     actions: list[Action] = []
 
@@ -655,9 +688,35 @@ def generate_tech_lead_completion_actions(
     succeeded = load_result is not None and load_result.ok
 
     if authority.flavor is TechLeadSessionFlavor.BATCH_REVIEW:
-        actions.extend(
-            manifest_label_actions(config, authority, expected, success=succeeded)
-        )
+        if (
+            succeeded
+            and load_result is not None
+            and load_result.decision is not None
+            and authority.candidates_recorded
+        ):
+            # Per CANDIDATE, from the decision's own verdicts and a live
+            # re-read of each pull request's head (#345). The old blanket
+            # projection said only "a valid artifact was produced over a
+            # manifest containing this number", which #335 forbids reading as
+            # merge authority.
+            actions.extend(
+                plan_candidate_dispositions(
+                    config,
+                    authority,
+                    load_result.decision,
+                    expected,
+                    labels=labels,
+                    heads=current_candidate_head,
+                    run_identity=(
+                        f"{session.run_assets.run_id}/"
+                        f"{session.run_assets.session_name}"
+                    ),
+                )
+            )
+        else:
+            actions.extend(
+                manifest_failure_label_actions(config, authority, expected)
+            )
 
     if load_result is None:
         return actions

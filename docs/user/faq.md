@@ -246,10 +246,14 @@ A source that was declared and could not be staged is a *different fact* from a 
 | What you wrote | What happens | Fix |
 |---|---|---|
 | `Governed-by: #21` | Same-repo issue #21 is staged | — |
+| `Governed-by: #21, #295, #335` | **All three** are staged, all required — one directive may name several sources | — |
 | `Governed-by: 21` | **Rejected** — the value must begin with `#` | `Governed-by: #21` |
 | `Governed-by: M1-010` | **Rejected** — external IDs are not governing-source references | Look up that issue's number and write `Governed-by: #42` |
 | `Governed-by: org/other-repo#5` | **Rejected** — governing sources must live in the same repository | Copy the text into a same-repo issue |
 | `Governed-by: #21` on issue #21 | **Rejected** — the subject is always staged as itself | Delete the line |
 | `Governed-by: #21` and `Governed-by-optional: #21` | **Rejected** — two lines for one source leave "required" ambiguous | Keep exactly one |
+| `Governed-by: #21, oops` (or `#21,`) | **Rejected** — text after a reference that is not another reference is never dropped | Delete it, or turn it into a `# comment` |
 
-The keyword is case-insensitive, the line may be indented, and a trailing `# comment` after the reference is fine. Unlike `Depends-on:` (Q22) there is **no milestone restriction** and no scheduling effect at all: a governing source is reading material, never an ordering edge, so it neither blocks the issue nor changes when it runs.
+**Lists.** References on one line may be separated by a comma or by a space (`#21, #295` and `#21 #295` both work), and every reference on the line takes that keyword's failure direction. Nothing after the last reference is ignored: a directive resolves completely or it is rejected, so a run can never report a resolved context while a source you declared was silently never staged.
+
+The keyword is case-insensitive, the line may be indented, and a trailing `# comment` after the references is fine — `#` followed by a digit is always a reference, anything else starts the comment. Unlike `Depends-on:` (Q22) there is **no milestone restriction** and no scheduling effect at all: a governing source is reading material, never an ordering edge, so it neither blocks the issue nor changes when it runs.

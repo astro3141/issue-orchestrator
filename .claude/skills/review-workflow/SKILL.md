@@ -118,7 +118,9 @@ Approved   Changes Requested
   Rework loop uses rework-cycle labels up to max_rework_cycles
        │
 [Tech Lead Review] (batch, threshold-triggered)
-  Label: code-reviewed → tech-lead-reviewed
+  Labels are projected PER CANDIDATE from the verdict for that exact commit:
+  tech-lead-reviewed (pass, prerequisites held) | needs-rework | tech-lead-failed | none (head moved)
+  Full table: docs/development/REVIEW_WORKFLOW.md, "Leaving the watch set"
        │
    Manual merge
 
