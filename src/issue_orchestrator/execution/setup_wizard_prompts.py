@@ -317,7 +317,13 @@ Compact `tech-lead-decision.json` example:
   are rejected as a contract violation: anything like `in-progress`,
   `needs-*`, `*-reviewed`, `*-failed`, `publish-*`, `blocked*`, `agent:*`,
   or `tech_lead:*` corrupts orchestrator label truth (matching is
-  case-insensitive).
+  case-insensitive). A `planning_investigation` is forgiven for exactly one
+  of these and no others: an `agent:*` or configured worker-agent label does
+  not reject the decision, because that proposal is filed UNSCHEDULED with
+  the label **withheld** and recorded on the issue as what you asked for.
+  Every other workflow label still rejects the whole decision, so do not
+  propose one. Either way the rule is the same: prepare work, never
+  schedule it.
 - Targets are scoped to what you were launched to audit, and the scope
   splits by action kind:
   - `post_comment` and `escalate_to_human` may only target the manifest
@@ -380,6 +386,11 @@ __CAPABILITY_ROWS__
   runs directly with the same execution-time re-check. Never propose or
   touch the `proposed-tech-lead` label yourself; it is orchestrator-owned and
   rejected like other workflow labels.
+- A `planning_investigation` `create_issue` is ALWAYS filed as a gated,
+  UNSCHEDULED proposal — carrying `proposed-tech-lead` and no `agent:*`
+  label — whatever `tech_lead.authority.create_issue` says. Planning may
+  prepare exactly one bounded issue; admitting an Actor to it is a separate,
+  explicit human act (remove the gate, then route it to a worker agent).
 - A completed session missing either artifact — or violating any rule
   above — is recorded as FAILED and marked tech-lead-failed.
 """

@@ -20,6 +20,12 @@ GitHub label names are case-insensitive, so every comparison in this module
 casefolds — an agent must not bypass protection (or defeat inheritance or
 dedup) by case-flipping a name.
 
+This module also owns whether a created issue may project SCHEDULING at all
+(#332). :class:`TechLeadIssueAdmission` is the typed decision the caller
+constructs; a planning proposal pending Human approval is gated AND unscheduled,
+and :func:`is_scheduler_projection_label` is what "unscheduled" means here —
+no ``agent:*``/configured-agent label reaches such an issue from any source.
+
 The module is pure policy: the milestone strategy becomes a typed
 :class:`TechLeadMilestoneIntent` at planning time (:func:`tech_lead_issue_milestone_intent`),
 and the explicit NAME -> number resolution runs ONCE at the create-issue
@@ -33,6 +39,7 @@ from __future__ import annotations
 import logging
 import re
 from collections.abc import Callable, Collection, Iterable, Sequence
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Mapping
 
 from ..domain.tech_lead_naming import TECH_LEAD_DISPLAY_NAME
@@ -112,6 +119,151 @@ def protected_tech_lead_label_violations(
         for label in proposed
         if is_protected_tech_lead_label(label, config=config, labels=labels)
     ]
+
+
+# The scheduler/admission label FAMILY, matched case-insensitively like every
+# other comparison here. Membership is also derived from config at call time so
+# a deployment whose worker labels do not use this prefix is still covered.
+_AGENT_LABEL_PATTERN = re.compile(r"agent:", re.IGNORECASE)
+
+
+def is_scheduler_projection_label(label: str, *, config: "Config") -> bool:
+    """True when *label* projects Actor scheduling/admission onto an issue (#332).
+
+    Discovery fetches one query per configured agent label
+    (``FactGatherer.fetch_issues``), so an agent label IS the admission surface:
+    an issue that carries one is a work item some lane will pick up, and an
+    issue that carries none is structurally unreachable by every Actor lane.
+    That is a narrower question than :func:`is_protected_tech_lead_label`, which
+    also covers scope/lifecycle names the orchestrator legitimately attaches.
+    """
+    if _AGENT_LABEL_PATTERN.match(label):
+        return True
+    folded = label.casefold()
+    configured = {name.casefold() for name in config.agents}
+    if config.tech_lead_review_agent:
+        configured.add(config.tech_lead_review_agent.casefold())
+    return folded in configured
+
+
+def pending_proposal_protected_label_violations(
+    proposed: Iterable[str], *, config: "Config", labels: LabelManager
+) -> list[str]:
+    """Protected labels a PENDING-PROPOSAL creation would still project (#332).
+
+    The two predicates in this module answer different questions and both must
+    hold on every path: :func:`is_scheduler_projection_label` governs ADMISSION
+    ("does this admit an Actor?"), :func:`is_protected_tech_lead_label` governs
+    LABEL TRUTH ("does this touch orchestrator-owned state?"). A planning
+    proposal is exempt from the label-truth rule only where the creation
+    boundary provably withholds the name: :func:`_pending_proposal_labels`
+    filters out exactly the scheduler-projection labels, so those cannot reach
+    the issue and rejecting the whole decision over one would destroy the single
+    bounded proposal the run exists to produce (#261, #295 §4-5).
+
+    Every OTHER protected label is projected verbatim by that boundary, so it
+    stays fatal here exactly as it is for every other role — the owner's rule is
+    enforced once, on both paths, with no cross-path drift.
+    """
+    return protected_tech_lead_label_violations(
+        [
+            label
+            for label in proposed
+            if not is_scheduler_projection_label(label, config=config)
+        ],
+        config=config,
+        labels=labels,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class TechLeadIssueAdmission:
+    """How a tech-lead-created issue is admitted to the execution plane (#332).
+
+    Issue creation used to take a ``destination_agent`` plus a ``gate`` boolean,
+    which let one combination exist that must not: gated (pending approval) AND
+    routed to a worker (admitted). #323 is the live evidence — a planning-created
+    proposal carrying ``proposed-tech-lead`` and ``agent:backend`` at once
+    projects "Human approval pending" and "Actor scheduling" simultaneously.
+
+    So admission is a CONSTRUCTED decision, never a pair of fields a caller
+    assembles by hand:
+
+    * :meth:`scheduled` — execute-authority create: routed to the orchestrator's
+      worker agent now, no gate.
+    * :meth:`gated` — propose-authority create for a role that HOLDS scheduling
+      authority: gated, but already routed, so removing the gate alone lands
+      schedulable work (#6779 R5).
+    * :meth:`for_planning_proposal` — a planning proposal (#23 Phase 1.5,
+      #295 §4-5): gated AND unscheduled. It projects no scheduler/admission
+      label at all, so pending-proposal state and Actor admission can never
+      coexist. Scheduling authority belongs to the later Human/Control act,
+      not to Planning.
+    """
+
+    #: The worker agent label the issue is routed to; "" when unscheduled.
+    destination_agent: str
+    #: Whether the orchestrator-attached approval gate is projected.
+    gate: bool
+    #: Whether this creation is a proposal still pending explicit Human approval.
+    pending_human_approval: bool
+
+    def __post_init__(self) -> None:
+        # Self-validating type: the invariant this class exists for is that
+        # "pending" and "admitted" are mutually exclusive states, so the
+        # combination cannot be constructed at all.
+        if self.pending_human_approval and self.destination_agent:
+            raise ValueError(
+                "a proposal pending Human approval must not be routed to"
+                f" {self.destination_agent!r}; a pending proposal is unscheduled"
+                " and the scheduler label is the later Human/Control act (#332)"
+            )
+        if self.pending_human_approval and not self.gate:
+            raise ValueError(
+                "a proposal pending Human approval must carry the approval gate;"
+                " without it there is nothing for the Human act to remove (#332)"
+            )
+        if not self.pending_human_approval and not self.destination_agent:
+            raise ValueError(
+                "a scheduled tech_lead issue creation requires the"
+                " orchestrator-owned destination worker agent (#6779 R5)"
+            )
+
+    @classmethod
+    def scheduled(cls, destination_agent: str) -> "TechLeadIssueAdmission":
+        """Execute-authority creation: routed now, ungated."""
+        return cls(
+            destination_agent=destination_agent,
+            gate=False,
+            pending_human_approval=False,
+        )
+
+    @classmethod
+    def gated(cls, destination_agent: str) -> "TechLeadIssueAdmission":
+        """Propose-authority creation: gated, and already routed (#6779 R5)."""
+        return cls(
+            destination_agent=destination_agent,
+            gate=True,
+            pending_human_approval=False,
+        )
+
+    @classmethod
+    def for_planning_proposal(cls) -> "TechLeadIssueAdmission":
+        """Planning proposal: gated, unscheduled, no scheduler projection."""
+        return cls(destination_agent="", gate=True, pending_human_approval=True)
+
+
+@dataclass(frozen=True, slots=True)
+class TechLeadIssueLabelProjection:
+    """What a tech-lead issue creation projects onto GitHub, and what it withheld.
+
+    ``withheld`` is never dropped silently: the create boundary renders it into
+    the operator-facing body, so a planning model that asked for a scheduler
+    label can be seen asking for it without the label ever reaching the issue.
+    """
+
+    labels: tuple[str, ...]
+    withheld: tuple[str, ...] = ()
 
 
 def apply_tech_lead_priority_prefix(config: "Config", title: str) -> str:
@@ -332,29 +484,45 @@ def decision_issue_labels(
     anchor_labels: Collection[str],
     agent_labels: Iterable[str],
     labels: LabelManager,
-    destination_agent: str,
-    gate: bool = False,
+    admission: TechLeadIssueAdmission,
     area: str | None = None,
-) -> tuple[str, ...]:
+) -> TechLeadIssueLabelProjection:
     """Labels for a decision-driven follow-up issue.
 
     Config policy first (filtering scope label, explicit labels, labels
     inherited from the tech_lead session's anchor issue), then the agent's
-    proposed labels. Protected agent labels are a bug at this point — the
-    decision must have been rejected as a contract violation upstream
-    (``tech_lead_completion``) — so fail loudly instead of silently filtering.
+    proposed labels, then whatever ``admission`` authorizes the orchestrator to
+    attach itself.
 
-    ``destination_agent`` is the orchestrator-owned worker agent label the
-    created issue is routed to (#6779 R5): appended AFTER the protection check
-    (exempt like the gate — it is orchestrator-attached, not agent-proposed)
-    so that removing the gate alone lands a fully schedulable issue. It must
-    be a configured worker agent, else the issue would still be unschedulable.
+    ``admission`` is the single typed decision (:class:`TechLeadIssueAdmission`)
+    that says whether this creation may project scheduling at all:
 
-    ``gate=True`` (propose-authority ``create_issue``, #6778) appends the
-    orchestrator-attached ``proposed-tech-lead`` gate AFTER the protection
-    check: the gate is exempt from the agent-label allowlist here and ONLY
-    here — an agent proposing it is still a contract violation.
+    * SCHEDULED / GATED — the historical shape. Protected agent labels are a bug
+      at this point (the decision must have been rejected as a contract
+      violation upstream in ``tech_lead_completion``), so fail loudly instead of
+      silently filtering. The orchestrator-owned ``destination_agent`` and the
+      ``proposed-tech-lead`` gate are appended AFTER the protection check —
+      both are orchestrator-attached, not agent-proposed, so they are exempt
+      from the agent-label allowlist here and ONLY here.
+    * PENDING HUMAN APPROVAL — a planning proposal (#332). No destination agent
+      is attached, and every scheduler-projection label is WITHHELD from the
+      composed set no matter which source contributed it (model-proposed,
+      ``tech_lead.explicit_labels``, or inherited from the anchor). Those, and
+      ONLY those, are sanitized rather than fatal — a planning run's whole
+      purpose is to leave exactly one bounded proposal (#261, #295 §4-5), and
+      the boundary was always going to withhold the label. Every other protected
+      agent label is still a contract violation upstream
+      (:func:`pending_proposal_protected_label_violations`), because this path
+      projects it verbatim just like the scheduled one.
     """
+    if admission.pending_human_approval:
+        return _pending_proposal_labels(
+            config,
+            anchor_labels=anchor_labels,
+            agent_labels=agent_labels,
+            labels=labels,
+            area=area,
+        )
     violations = protected_tech_lead_label_violations(
         agent_labels, config=config, labels=labels
     )
@@ -363,19 +531,97 @@ def decision_issue_labels(
             "protected labels must be rejected at decision validation, got: "
             + ", ".join(violations)
         )
-    if destination_agent not in config.agents:
+    if admission.destination_agent not in config.agents:
         raise ValueError(
             "decision_issue_labels destination_agent must be a configured worker"
-            f" agent, got {destination_agent!r} (agents:"
+            f" agent, got {admission.destination_agent!r} (agents:"
             f" {sorted(config.agents)})"
         )
+    composed = _composed_decision_labels(config, anchor_labels=anchor_labels)
+    area_labels = _area_labels(area)
+    gate_labels = (labels.proposed_tech_lead,) if admission.gate else ()
+    return TechLeadIssueLabelProjection(
+        labels=_deduped(
+            (
+                *composed,
+                *agent_labels,
+                *area_labels,
+                admission.destination_agent,
+                *gate_labels,
+            )
+        )
+    )
+
+
+def _pending_proposal_labels(
+    config: "Config",
+    *,
+    anchor_labels: Collection[str],
+    agent_labels: Iterable[str],
+    labels: LabelManager,
+    area: str | None,
+) -> TechLeadIssueLabelProjection:
+    """Project a planning proposal that is pending explicit Human approval (#332).
+
+    The invariant: pending-proposal state and Actor-admission projection never
+    coexist. Enforcement is structural rather than a list of forbidden names —
+    the whole composed set is filtered through
+    :func:`is_scheduler_projection_label`, so a scheduler label reaches the
+    issue from NO source: not the model's requested labels, not
+    ``tech_lead.explicit_labels``, not ``tech_lead.inherit_labels`` copying one
+    off the tech-lead anchor.
+
+    Informational labels survive untouched; the gate is appended last and is the
+    only orchestrator-attached name a pending proposal carries. Any OTHER
+    protected label is projected verbatim from here, which is why it stays a
+    fatal contract violation upstream rather than being sanitized in this
+    function (:func:`pending_proposal_protected_label_violations`).
+    """
+    composed = _composed_decision_labels(config, anchor_labels=anchor_labels)
+    candidates = _deduped((*composed, *agent_labels, *_area_labels(area)))
+    projected = tuple(
+        label
+        for label in candidates
+        if not is_scheduler_projection_label(label, config=config)
+    )
+    withheld = tuple(label for label in candidates if label not in projected)
+    if withheld:
+        logger.warning(
+            "[tech_lead] Withheld scheduler label(s) %s from a planning proposal"
+            " pending Human approval; a pending proposal is unscheduled (#332)",
+            ", ".join(withheld),
+        )
+    result = TechLeadIssueLabelProjection(
+        labels=_deduped((*projected, labels.proposed_tech_lead)),
+        withheld=withheld,
+    )
+    # Fail loudly rather than file an ungated or schedulable "pending" proposal:
+    # every later gate in the system reads these labels as the pending state.
+    leaked = [
+        label
+        for label in result.labels
+        if is_scheduler_projection_label(label, config=config)
+    ]
+    if leaked:
+        raise ValueError(
+            f"planning proposal would project scheduler label(s) {leaked};"
+            " a proposal pending Human approval must be unscheduled (#332)"
+        )
+    return result
+
+
+def _composed_decision_labels(
+    config: "Config", *, anchor_labels: Collection[str]
+) -> tuple[str, ...]:
+    """Config policy (scope, explicit, inherited), shared by every creation."""
     base: list[str] = []
     if config.filtering.label:
         base.append(config.filtering.label)
-    composed = _with_configured_labels(config, base, source_labels=anchor_labels)
-    area_labels = (f"{TECH_LEAD_AREA_LABEL_PREFIX}{area}",) if area else ()
-    gate_labels = (labels.proposed_tech_lead,) if gate else ()
-    return _deduped((*composed, *agent_labels, *area_labels, destination_agent, *gate_labels))
+    return _with_configured_labels(config, base, source_labels=anchor_labels)
+
+
+def _area_labels(area: str | None) -> tuple[str, ...]:
+    return (f"{TECH_LEAD_AREA_LABEL_PREFIX}{area}",) if area else ()
 
 
 def _with_configured_labels(

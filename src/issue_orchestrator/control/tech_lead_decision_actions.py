@@ -12,6 +12,10 @@ emits the orchestrator's action vocabulary:
   with ``proposed-tech-lead`` (#6778): removing the label flows it into normal
   scheduling. The gate label is orchestrator-attached by the
   ``tech_lead_issue_policy`` owner and rejected by the agent-label allowlist.
+- ``create_issue`` from a ``planning_investigation`` -> a proposal PENDING
+  Human approval (#332), whatever the configured authority says: gated AND
+  unscheduled, projecting no ``agent:*``/scheduler label from any source.
+  Planning prepares work; admitting an Actor to it is a separate Human act.
 - ``flag_pattern`` with ``execute`` authority -> surfaced with
   ``mode="pattern"`` PLUS the durable case-file ledger (#6781): a signature
   absent from the pattern ledger plans a
@@ -71,7 +75,7 @@ from ..domain.tech_lead_artifacts import (
     TechLeadDecision,
 )
 from ..domain.tech_lead_findings import PatternClassificationConflictError
-from ..domain.tech_lead_session import TechLeadCreationOrigin
+from ..domain.tech_lead_session import TechLeadCreationOrigin, TechLeadSessionFlavor
 from ..ports.issue import Issue
 from .actions import (
     Action,
@@ -95,9 +99,11 @@ from .tech_lead_gate_notes import (
     batch_duplicate_note,
     compose_gate_note,
     outcome_gate_note,
+    pending_human_approval_note,
 )
 from .tech_lead_case_files import PatternCaseFilePlanner
 from .tech_lead_issue_policy import (
+    TechLeadIssueAdmission,
     apply_tech_lead_priority_prefix,
     decision_issue_labels,
     tech_lead_follow_up_agent_label,
@@ -150,6 +156,111 @@ def _surface(
     )
 
 
+def _issue_admission(
+    config: "Config", *, flavor: TechLeadSessionFlavor, gated: bool
+) -> TechLeadIssueAdmission:
+    """The typed admission a ``create_issue`` decision is filed under (#332).
+
+    A ``planning_investigation`` prepares work it may not schedule, so its
+    creation is a proposal PENDING Human approval: gated and unscheduled, with
+    no destination agent resolved at all. That is a role property, so no
+    ``tech_lead.authority.create_issue`` value, dedup outcome, or model-supplied
+    label can turn it into a scheduled creation. Every other role keeps the
+    shipped shape — routed to the orchestrator-owned worker, gated or not.
+    """
+    if flavor is TechLeadSessionFlavor.PLANNING_INVESTIGATION:
+        return TechLeadIssueAdmission.for_planning_proposal()
+    destination = tech_lead_follow_up_agent_label(config)
+    return (
+        TechLeadIssueAdmission.gated(destination)
+        if gated
+        else TechLeadIssueAdmission.scheduled(destination)
+    )
+
+
+def _create_issue_action(
+    action: ProposedTechLeadAction,
+    *,
+    config: "Config",
+    labels: LabelManager,
+    anchor_issue: Issue,
+    expected: "ExpectedState",
+    flavor: TechLeadSessionFlavor,
+    gate_reason: str | None,
+    body: str,
+) -> CreateTechLeadIssueAction:
+    """Compose the follow-up issue a ``create_issue`` decision files.
+
+    Config policy (labels/priority/milestone strategy) is the single
+    ``tech_lead_issue_policy`` owner, shared with the planner's batch tracking
+    issue. The milestone travels as INTENT — name resolution happens in the
+    applier at creation time, so planning makes zero GitHub reads (#6769 F4).
+    Whether this creation may project scheduling at all is the typed
+    :class:`TechLeadIssueAdmission`, resolved once here (#332).
+    """
+    anchor_milestones = (
+        [(anchor_issue.milestone_number, anchor_issue.milestone or "")]
+        if anchor_issue.milestone_number is not None
+        else []
+    )
+    admission = _issue_admission(
+        config, flavor=flavor, gated=gate_reason is not None
+    )
+    projection = decision_issue_labels(
+        config,
+        anchor_labels=anchor_issue.labels,
+        agent_labels=action.labels,
+        labels=labels,
+        admission=admission,
+        area=action.area,
+    )
+    # A gate both gates the issue and explains itself in the operator-facing
+    # body — never a bare boolean whose meaning callers must guess. A pending
+    # planning proposal ALWAYS explains itself, because its approval is two
+    # explicit Human acts (ungate, then route) rather than one; when a dedup
+    # outcome ALSO has something to say, both notes are kept.
+    planning_note = (
+        pending_human_approval_note(
+            withheld=projection.withheld,
+            # Named as GUIDANCE only, so an unconfigured follow-up agent is not
+            # something a planning proposal needs to be filed: planning never
+            # routes work, it only tells the approver where routing would go.
+            suggested_agent=config.tech_lead_follow_up_agent or "",
+        )
+        if admission.pending_human_approval
+        else ""
+    )
+    note = "\n>\n> ".join(
+        part for part in (planning_note, gate_reason or "") if part
+    )
+    qualifier = (
+        " (pending Human approval, unscheduled)"
+        if admission.pending_human_approval
+        else " (gated)" if note else ""
+    )
+    return CreateTechLeadIssueAction(
+        title=apply_tech_lead_priority_prefix(config, action.title or ""),
+        body=f"{body}\n\n---\n> {note}" if note else body,
+        labels=projection.labels,
+        pr_count=0,
+        # DECIDED by a session working this anchor — so the anchor's pause label
+        # gates the creation, and the ExpectedState below is what the gate
+        # checks (#6957 F3/A3, R2 F6/A6).
+        origin=TechLeadCreationOrigin.derived_from_anchor(anchor_issue.number),
+        milestone=tech_lead_issue_milestone_intent(config, anchor_milestones),
+        # Expedite intent (#6870) rides the action so the applier's create
+        # boundary can front-queue the new issue. It composes with the gate:
+        # gated creations defer expediting to gate removal, ungated creations
+        # expedite at once.
+        expedite=action.expedite,
+        reason=(
+            f"tech_lead decision action {action.id}: create follow-up issue"
+            + qualifier
+        ),
+        expected=expected,
+    )
+
+
 def _concrete_actions(
     action: ProposedTechLeadAction,
     *,
@@ -158,6 +269,7 @@ def _concrete_actions(
     anchor_issue: Issue,
     expected: "ExpectedState",
     needs_human_label: str,
+    flavor: TechLeadSessionFlavor,
     gate_reason: str | None = None,
 ) -> list[Action]:
     body = (action.body or "") + _provenance_footer(action)
@@ -173,53 +285,16 @@ def _concrete_actions(
             )
         ]
     if action.action_type == "create_issue":
-        # Config policy (tech_lead: labels/priority/milestone strategy) is the
-        # single tech_lead_issue_policy owner, shared with the planner's batch
-        # tracking issue; agent labels passed the protected-set contract
-        # check at decision validation time (#6761 finding 4). The milestone
-        # travels as INTENT — name resolution happens in the applier at
-        # creation time, so planning makes zero GitHub reads (#6769 F4).
-        anchor_milestones = (
-            [(anchor_issue.milestone_number, anchor_issue.milestone or "")]
-            if anchor_issue.milestone_number is not None
-            else []
-        )
-        # A gate reason both gates the issue and explains itself in the operator-
-        # facing body — never a bare boolean whose meaning callers must guess.
-        gated = gate_reason is not None
-        gated_body = f"{body}\n\n---\n> {gate_reason}" if gated else body
         return [
-            CreateTechLeadIssueAction(
-                title=apply_tech_lead_priority_prefix(config, action.title or ""),
-                body=gated_body,
-                labels=decision_issue_labels(
-                    config,
-                    anchor_labels=anchor_issue.labels,
-                    agent_labels=action.labels,
-                    labels=labels,
-                    # Orchestrator-owned routing label so removing the gate
-                    # alone lands a schedulable issue (#6779 R5); attached for
-                    # execute-authority create_issue too — both need an agent.
-                    destination_agent=tech_lead_follow_up_agent_label(config),
-                    gate=gated,
-                    area=action.area,
-                ),
-                pr_count=0,
-                # DECIDED by a session working this anchor — so the anchor's
-                # pause label gates the creation, and the ExpectedState below is
-                # what the gate checks (#6957 F3/A3, R2 F6/A6).
-                origin=TechLeadCreationOrigin.derived_from_anchor(anchor_issue.number),
-                milestone=tech_lead_issue_milestone_intent(config, anchor_milestones),
-                # Expedite intent (#6870) rides the action so the applier's
-                # create boundary can front-queue the new issue. It composes
-                # with the gate: gated (propose) creations defer expediting to
-                # gate removal, ungated (execute) creations expedite at once.
-                expedite=action.expedite,
-                reason=(
-                    f"tech_lead decision action {action.id}: create follow-up"
-                    f" issue{' (gated)' if gated else ''}"
-                ),
+            _create_issue_action(
+                action,
+                config=config,
+                labels=labels,
+                anchor_issue=anchor_issue,
                 expected=expected,
+                flavor=flavor,
+                gate_reason=gate_reason,
+                body=body,
             )
         ]
     if action.action_type == "escalate_to_human":
@@ -267,6 +342,7 @@ def plan_tech_lead_decision_actions(
     *,
     anchor_issue: Issue,
     expected: "ExpectedState",
+    flavor: TechLeadSessionFlavor,
     op_ledger: Mapping[tuple[str, int], int],
     pattern_ledger: Mapping[str, "PatternEvidence"],
     source_run_id: str,
@@ -290,13 +366,17 @@ def plan_tech_lead_decision_actions(
     on each :class:`StoredTechLeadOp` and in each case-file observation.
     ``active_session_run_id`` resolves the target issue's live session run id
     so a ``kill_hung_session`` proposal binds approval to that exact
-    generation (#6779 R1).
+    generation (#6779 R1). ``flavor`` is the orchestrator-owned launch
+    authority's role, which decides whether a ``create_issue`` may project
+    scheduling at all: a ``planning_investigation`` files an UNSCHEDULED
+    proposal pending Human approval (#332).
     """
     planner = _DecisionActionPlanner(
         config=config,
         labels=labels,
         anchor_issue=anchor_issue,
         expected=expected,
+        flavor=flavor,
         op_ledger=op_ledger,
         pattern_ledger=pattern_ledger,
         findings={finding.id: finding for finding in decision.findings},
@@ -342,6 +422,11 @@ class _DecisionActionPlanner:
     labels: LabelManager
     anchor_issue: Issue
     expected: "ExpectedState"
+    # The ORCHESTRATOR-OWNED launch authority's flavor, never the agent-writable
+    # assignment copy: it decides whether a create_issue may project scheduling
+    # at all (#332). Required — a defaulted flavor would silently hand planning
+    # the scheduling authority this leaf exists to withhold.
+    flavor: TechLeadSessionFlavor
     op_ledger: Mapping[tuple[str, int], int]
     # signature -> its FULL durable row: planning preflights a new
     # observation's classification against it, which a bare issue number
@@ -537,6 +622,7 @@ class _DecisionActionPlanner:
             anchor_issue=self.anchor_issue,
             expected=self.expected,
             needs_human_label=self.labels.needs_human,
+            flavor=self.flavor,
             gate_reason=gate_reason,
         )
 

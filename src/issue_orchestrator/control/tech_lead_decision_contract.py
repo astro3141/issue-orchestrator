@@ -42,7 +42,10 @@ from ..domain.tech_lead_artifacts import ACT_LEVEL_TECH_LEAD_ACTIONS
 from ..domain.tech_lead_capabilities import TECH_LEAD_ACTION_CAPABILITIES
 from ..domain.tech_lead_session import TechLeadLaunchAuthority, TechLeadSessionFlavor
 from .label_manager import LabelManager
-from .tech_lead_issue_policy import protected_tech_lead_label_violations
+from .tech_lead_issue_policy import (
+    pending_proposal_protected_label_violations,
+    protected_tech_lead_label_violations,
+)
 
 if TYPE_CHECKING:
     from ..domain.tech_lead_artifacts import TechLeadDecision
@@ -171,19 +174,36 @@ def _diagnosis_duty_violation(
 
 
 def _protected_label_violation(
-    decision: "TechLeadDecision", *, config: "Config", labels: LabelManager
+    decision: "TechLeadDecision",
+    authority: TechLeadLaunchAuthority,
+    *,
+    config: "Config",
+    labels: LabelManager,
 ) -> str | None:
     """``create_issue`` proposals may not touch orchestrator label truth (#6761 F4).
 
     Checked here rather than in the domain contract so the artifact contract
     stays config-free.
+
+    ``planning_investigation`` is exempt for exactly the labels its creation
+    boundary provably withholds, and no wider (#332). That role files an
+    UNSCHEDULED proposal pending Human approval, dropping every
+    scheduler-projection label from the composed set, so rejecting the whole
+    decision over one would destroy the single bounded proposal the run exists
+    to produce (#261, #295 §4-5) over a name that could never reach the issue.
+    Every other protected label IS projected verbatim by that boundary, so it
+    stays fatal for planning exactly as it is for every other role — the
+    label-truth owner in ``tech_lead_issue_policy`` decides in both cases.
     """
+    violations_for = (
+        pending_proposal_protected_label_violations
+        if authority.flavor is TechLeadSessionFlavor.PLANNING_INVESTIGATION
+        else protected_tech_lead_label_violations
+    )
     for action in decision.proposed_actions:
         if action.action_type != "create_issue":
             continue
-        violations = protected_tech_lead_label_violations(
-            action.labels, config=config, labels=labels
-        )
+        violations = violations_for(action.labels, config=config, labels=labels)
         if violations:
             return (
                 f"proposed action {action.id} (create_issue) carries protected"
@@ -285,5 +305,7 @@ def validate_decision_for_authority(
         or _candidate_verdict_violation(decision, authority)
         or _candidate_coverage_violation(decision, authority)
         or _diagnosis_duty_violation(decision, authority)
-        or _protected_label_violation(decision, config=config, labels=labels)
+        or _protected_label_violation(
+            decision, authority, config=config, labels=labels
+        )
     )

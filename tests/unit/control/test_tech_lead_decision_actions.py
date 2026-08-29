@@ -33,6 +33,7 @@ from issue_orchestrator.domain.tech_lead_findings import PatternEvidence
 from issue_orchestrator.domain.tech_lead_session import (
     PROPOSED_TECH_LEAD_LABEL,
     TECH_LEAD_OBSERVATION_LABEL,
+    TechLeadSessionFlavor,
 )
 from issue_orchestrator.infra.config import Config
 
@@ -117,6 +118,7 @@ def _plan(
     pattern_ledger: dict[str, PatternEvidence] | None = None,
     dedup_corpus: OpenIssueCorpus | None = None,
     dedup_grant: DuplicateTargetGrant | None = None,
+    flavor: TechLeadSessionFlavor = TechLeadSessionFlavor.BATCH_REVIEW,
 ):
     config = config or _config()
     return plan_tech_lead_decision_actions(
@@ -125,6 +127,7 @@ def _plan(
         LabelManager(config),
         anchor_issue=anchor or _anchor(),
         expected=EXPECTED,
+        flavor=flavor,
         op_ledger=op_ledger or {},
         active_session_run_id=active_session_run_id,
         pattern_ledger=pattern_ledger or {},

@@ -223,6 +223,59 @@ contract already enforced (its act-level target scope has always been empty,
 so such a proposal was never accepted); stating it as a capability reports the
 role rather than a missing target. The other flavors are unchanged.
 
+### 2b. A planning proposal is unscheduled until the Human act (#332 amendment)
+
+A gated `create_issue` (§2) is created carrying `proposed-tech-lead` **and** the
+orchestrator-owned destination worker label, so that removing the gate alone
+lands schedulable work. #323 showed why that shape is wrong for one role: a real
+`planning_investigation` produced a proposal carrying `proposed-tech-lead` and
+`agent:backend` at once, projecting "Human approval pending" and "Actor
+scheduling" simultaneously. Planning may prepare exactly one bounded issue; it
+holds no authority to schedule it.
+
+The invariant: **a planning-created proposal that is still pending Human
+approval is unscheduled.** Pending-proposal state and Actor-admission projection
+never coexist.
+
+Properties:
+
+- **Admission is a constructed decision, not a pair of fields.**
+  `control/tech_lead_issue_policy.py::TechLeadIssueAdmission` has three
+  constructors — `scheduled`, `gated`, `for_planning_proposal` — and rejects the
+  combination "pending approval AND routed to a worker" at construction. The
+  planner resolves it once, from the orchestrator-owned launch authority's
+  flavor, so no `tech_lead.authority.create_issue` value, dedup outcome, or
+  model-supplied label can turn a planning creation into a scheduled one.
+- **Withholding is structural, not a list of forbidden names.** The whole
+  composed label set — model-proposed, `tech_lead.explicit_labels`, and labels
+  inherited from the anchor alike — is filtered through
+  `is_scheduler_projection_label`, which matches the `agent:` family and every
+  configured agent label. Nothing schedulable reaches a pending proposal from
+  any source, and the boundary raises rather than filing one that would.
+- **Informational labels survive; the request is recorded.** `bug`, `area:*`
+  and peers are kept, and whatever was withheld is named in the issue body, so
+  an erroneous or hostile planning label is visible to the approver instead of
+  silently dropped.
+- **Planning's scheduler labels are sanitized, not fatal — and only those.**
+  A protected `create_issue` label invalidates the whole decision for every
+  role (§2a's fail-closed treatment of untrusted input). Planning is forgiven
+  for exactly the subset the creation boundary provably withholds, the
+  scheduler-projection labels: the run exists to leave exactly one bounded
+  proposal, and that label was never going to reach the issue. Every other
+  protected label IS projected verbatim by the same boundary, so it stays
+  fatal for planning too. The two predicates hold on every path —
+  `is_scheduler_projection_label` governs admission, `is_protected_tech_lead_label`
+  governs label truth — and the pairing lives with them in
+  `tech_lead_issue_policy`, so neither rule drifts by flavor.
+- **Approval is two explicit Human acts.** Remove the gate, then route the issue
+  to a worker agent. Discovery queries per configured agent label, so an
+  unrouted proposal is unreachable by every Actor lane — and the gate's
+  blocking-label layer refuses it independently. Both refusals are re-read from
+  GitHub each tick, so they survive restart. Nothing infers approval from issue
+  contents, model prose, creation success, label absence, or elapsed time.
+
+Non-planning `create_issue` keeps its shipped shape exactly, gate included.
+
 ### 3. Observation surface: the board-snapshot manifest
 
 The manifest pattern extends beyond PR diffs. Tech Lead sessions receive, in

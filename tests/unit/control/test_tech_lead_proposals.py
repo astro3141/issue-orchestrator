@@ -45,6 +45,7 @@ from issue_orchestrator.domain.tech_lead_session import (
     ApprovedTechLeadOp,
     StoredTechLeadOp,
     TechLeadCreationOrigin,
+    TechLeadSessionFlavor,
 )
 from issue_orchestrator.infra.config import Config
 from issue_orchestrator.domain.tech_lead_findings import (
@@ -1497,6 +1498,7 @@ def test_end_to_end_gated_reset_proposal_executes_once() -> None:
         labels,
         anchor_issue=anchor,
         expected=EXPECTED,
+        flavor=TechLeadSessionFlavor.FAILURE_INVESTIGATION,
         op_ledger=build_op_ledger(ops.list_ops()),
         pattern_ledger={},
         source_run_id="run-1",
@@ -1522,6 +1524,7 @@ def test_end_to_end_gated_reset_proposal_executes_once() -> None:
         labels,
         anchor_issue=anchor,
         expected=EXPECTED,
+        flavor=TechLeadSessionFlavor.FAILURE_INVESTIGATION,
         op_ledger=build_op_ledger(ops.list_ops()),
         pattern_ledger={},
         source_run_id="run-2",

@@ -5,6 +5,7 @@ import pytest
 from issue_orchestrator.control.label_manager import LabelManager
 from issue_orchestrator.control.actions import TechLeadMilestoneIntent
 from issue_orchestrator.control.tech_lead_issue_policy import (
+    TechLeadIssueAdmission,
     apply_tech_lead_priority_prefix,
     batch_review_issue_labels,
     case_file_issue_labels,
@@ -245,9 +246,9 @@ class TestSharedComposition:
             anchor_labels=[],
             agent_labels=("bug", "docs"),
             labels=LabelManager(config),
-            destination_agent=DEST_AGENT,
+            admission=TechLeadIssueAdmission.scheduled(DEST_AGENT),
         )
-        assert labels == ("Bug", "docs", DEST_AGENT)
+        assert labels.labels == ("Bug", "docs", DEST_AGENT)
 
     def test_inherit_match_is_case_insensitive(self) -> None:
         config = make_config()
@@ -257,9 +258,9 @@ class TestSharedComposition:
             anchor_labels=["team:backend"],
             agent_labels=(),
             labels=LabelManager(config),
-            destination_agent=DEST_AGENT,
+            admission=TechLeadIssueAdmission.scheduled(DEST_AGENT),
         )
-        assert labels == ("Team:Backend", DEST_AGENT)
+        assert labels.labels == ("Team:Backend", DEST_AGENT)
 
     def test_decision_labels_never_include_the_tech_lead_agent(self) -> None:
         """A decision-created follow-up must not loop back into tech_lead."""
@@ -269,10 +270,10 @@ class TestSharedComposition:
             anchor_labels=["agent:tech-lead"],
             agent_labels=("bug",),
             labels=LabelManager(config),
-            destination_agent=DEST_AGENT,
+            admission=TechLeadIssueAdmission.scheduled(DEST_AGENT),
         )
-        assert "agent:tech-lead" not in labels
-        assert labels == ("bug", DEST_AGENT)
+        assert "agent:tech-lead" not in labels.labels
+        assert labels.labels == ("bug", DEST_AGENT)
 
     def test_decision_labels_route_to_the_orchestrator_owned_worker(self) -> None:
         """R5: the created issue carries a valid worker agent label so removing
@@ -283,12 +284,11 @@ class TestSharedComposition:
             anchor_labels=[],
             agent_labels=("bug",),
             labels=LabelManager(config),
-            destination_agent=DEST_AGENT,
-            gate=True,
+            admission=TechLeadIssueAdmission.gated(DEST_AGENT),
         )
-        assert DEST_AGENT in gated
+        assert DEST_AGENT in gated.labels
         # After the operator removes only the gate, a schedulable agent remains.
-        after_approval = tuple(l for l in gated if l != "proposed-tech-lead")
+        after_approval = tuple(l for l in gated.labels if l != "proposed-tech-lead")
         assert DEST_AGENT in after_approval
 
     def test_decision_labels_reject_unknown_destination_agent(self) -> None:
@@ -299,7 +299,7 @@ class TestSharedComposition:
                 anchor_labels=[],
                 agent_labels=("bug",),
                 labels=LabelManager(config),
-                destination_agent="agent:not-configured",
+                admission=TechLeadIssueAdmission.scheduled("agent:not-configured"),
             )
 
     def test_decision_labels_reject_protected_agent_labels_loudly(self) -> None:
@@ -310,7 +310,7 @@ class TestSharedComposition:
                 anchor_labels=[],
                 agent_labels=("needs-human",),
                 labels=LabelManager(config),
-                destination_agent=DEST_AGENT,
+                admission=TechLeadIssueAdmission.scheduled(DEST_AGENT),
             )
 
     def test_priority_prefix_applied_once(self) -> None:
@@ -472,12 +472,11 @@ class TestProposedTechLeadGate:
             anchor_labels=("agent:tech-lead",),
             agent_labels=("ci",),
             labels=labels,
-            destination_agent=DEST_AGENT,
-            gate=True,
+            admission=TechLeadIssueAdmission.gated(DEST_AGENT),
         )
 
-        assert composed[-1] == "proposed-tech-lead"
-        assert "ci" in composed
+        assert composed.labels[-1] == "proposed-tech-lead"
+        assert "ci" in composed.labels
 
     def test_gate_flag_defaults_off(self) -> None:
         config = make_config()
@@ -488,10 +487,10 @@ class TestProposedTechLeadGate:
             anchor_labels=("agent:tech-lead",),
             agent_labels=("ci",),
             labels=labels,
-            destination_agent=DEST_AGENT,
+            admission=TechLeadIssueAdmission.scheduled(DEST_AGENT),
         )
 
-        assert "proposed-tech-lead" not in composed
+        assert "proposed-tech-lead" not in composed.labels
 
     def test_gate_flag_never_launders_an_agent_proposed_gate(self) -> None:
         """Even with gate=True, an agent-proposed gate label still fails."""
@@ -504,8 +503,7 @@ class TestProposedTechLeadGate:
                 anchor_labels=(),
                 agent_labels=("proposed-tech-lead",),
                 labels=labels,
-                destination_agent=DEST_AGENT,
-                gate=True,
+                admission=TechLeadIssueAdmission.gated(DEST_AGENT),
             )
 
 

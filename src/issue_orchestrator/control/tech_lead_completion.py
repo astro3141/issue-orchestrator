@@ -732,6 +732,10 @@ def generate_tech_lead_completion_actions(
                 labels,
                 anchor_issue=session.issue,
                 expected=expected,
+                # The ORCHESTRATOR-OWNED role, not the agent-writable assignment
+                # copy: it decides whether a create_issue may project scheduling
+                # (#332). Planning files an unscheduled, Human-gated proposal.
+                flavor=authority.flavor,
                 op_ledger=build_op_ledger(tech_lead_authority.list_ops()),
                 pattern_ledger=build_pattern_ledger(
                     tech_lead_authority.list_pattern_evidence()
