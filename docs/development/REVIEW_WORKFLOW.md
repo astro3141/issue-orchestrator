@@ -533,10 +533,23 @@ paraphrase of it.
 `control/tech_lead_evidence_capture.py` copies the staged tree out before that
 happens:
 
-- it runs from the completion handoff (`control/session_completion.py`),
-  BEFORE completion processing and long before the planner turns the cleanup
-  fact into a removal — so a FAILED or TIMED_OUT run, which never reaches the
-  decision-artifact seams at all, still has its launch inputs preserved;
+- it runs from every seam that owns a reap, each before the removal that seam
+  is responsible for, so the rule is not a convention one call site happens to
+  follow:
+  - the completion handoff (`control/session_completion.py`), BEFORE completion
+    processing and long before the planner turns the cleanup fact into a
+    removal — so a FAILED or TIMED_OUT run, which never reaches the
+    decision-artifact seams at all, still has its launch inputs preserved;
+  - the termination owner (`control/tech_lead_termination.py`), before the
+    force-removal it performs itself — the on-demand drive loop hitting its
+    timeout, and the stop of a run this engine can no longer prove it owns.
+    That path reaches no completion handoff at all, and it runs whether or not
+    the checkout is disposable: a surviving worktree whose session was dropped
+    is force-removed by orphan recovery on a later tick, so "not disposable"
+    only delays the loss;
+  - orphan recovery (`control/worktree_reconciliation.py`) is deliberately not
+    a capture seam. By the time a worktree is a cleanup candidate there, no
+    active session holds it and the owning seam has already captured;
 - the capture lands in the HOST repository at
   `.issue-orchestrator/tech-lead-evidence/<session_name>/<run_id>/`, keyed by
   the run's own `SessionRunIdentity`, so two runs of one anchor issue — or the
@@ -557,6 +570,14 @@ The staging directory is agent-writable, which sets two rules the copy does not
 bend: symlinked entries are recorded as skipped rather than followed, and a
 staged tree above `MAX_CAPTURE_BYTES` is refused outright instead of copied
 into the host repository.
+
+**Retention is an explicit operator responsibility.** Nothing prunes
+`.issue-orchestrator/tech-lead-evidence/`, and that is deliberate rather than an
+oversight: a capture is the only surviving account of a run whose worktree is
+gone, so expiring it on a timer would recreate the loss this path exists to
+repair. Captures are small — manifests, JSON descriptors and a handful of
+diffs — and reclaiming the space means deleting the `<session_name>/<run_id>/`
+directories you no longer want to keep.
 
 A promotion-grade proof should still capture and verify what it needs
 explicitly rather than assume this path ran; what this removes is the case

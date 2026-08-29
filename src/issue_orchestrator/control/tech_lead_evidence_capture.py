@@ -15,16 +15,32 @@ paraphrase.
 
 This module is the single owner of the repair, and it is deliberately small:
 
-* **When.** The capture runs from the completion handoff, BEFORE completion
-  processing touches anything and long before the planner turns the cleanup
-  fact into a removal. Running it there rather than at teardown is what makes
-  it cover the runs that need it most — a FAILED or TIMED_OUT tech_lead
-  session, which never reaches the decision-artifact seams at all, still
-  staged a full set of launch inputs worth keeping.
+* **When.** From every seam that owns a reap of a tech_lead checkout, each
+  before the removal it is responsible for — the rule is not a convention one
+  call site happens to follow. There are two:
+
+  - :func:`~.session_completion.handle_session_completion`, BEFORE completion
+    processing touches anything and long before the planner turns the cleanup
+    fact into a removal;
+  - :func:`~.tech_lead_termination.terminate_tech_lead_session`, before the
+    force-removal it performs itself — the drive-loop timeout, which reaches no
+    completion handoff at all, and the stop of a run this engine can no longer
+    prove it owns.
+
+  Between them they cover the runs that need it most: a FAILED, TIMED_OUT or
+  terminated tech_lead session never reaches the decision-artifact seams, and
+  staged a full set of launch inputs worth keeping anyway. Orphan recovery
+  (:meth:`~.worktree_reconciliation.WorktreeRecoveryOwner.recover`) is
+  deliberately NOT a capture seam: by the time it runs the session is no longer
+  active and the owning seam has already captured.
 * **Where.** :func:`~..domain.tech_lead_evidence_capture.tech_lead_evidence_capture_dir`,
   under the HOST repository rather than any worktree, keyed by the run's own
   identity so two runs of one anchor issue — or the several sessions one
-  worktree hosts — never overwrite each other.
+  worktree hosts — never overwrite each other. Nothing prunes that root: a
+  capture is evidence about a run that no longer exists anywhere else, so
+  expiring it on a timer would quietly recreate the loss this module repairs.
+  Reclaiming the space is an explicit operator decision — delete the run
+  directories you no longer want — and that is a decision, not an oversight.
 * **What teardown it changes.** None. The capture is a read of the worktree and
   a write outside it; no disposal is withheld, no worktree is retained, and a
   capture that fails does not fail the session.
@@ -186,6 +202,13 @@ def _copy_staged_tree(
     Raises :class:`TechLeadEvidenceCaptureError` when there is nothing to
     preserve or when the staged tree is too large to hold, so the caller records
     a failure rather than an empty success.
+
+    The size budget is a pre-flight, checked once against the surveyed total.
+    Both capture seams run with the session already terminal — the completion
+    handoff after the agent exited, termination after ``kill_session`` — so the
+    tree is static by the time it is measured, and each artifact's recorded size
+    and digest are taken from the COPY rather than the source, which keeps the
+    receipt honest about the bytes actually held either way.
     """
     if not source_dir.is_dir():
         raise TechLeadEvidenceCaptureError(
