@@ -53,8 +53,16 @@ from issue_orchestrator.domain.tech_lead_session import (
 LEAF = 345
 SPEC = 335
 POLICY = 295
+PROCEDURE = 21
+TD = 18
 CANDIDATE_SHA = "a" * 40
 OTHER_SHA = "b" * 40
+
+# The shape #345's own body declares: one directive, four same-repo pointers.
+# A fixture that declares a single source cannot tell a parser that reads the
+# whole list from one that reads its first entry and drops the rest.
+CANONICAL_DECLARATION = f"Governed-by: #{PROCEDURE}, #{POLICY}, #{SPEC}, #{TD}"
+CANONICAL_POINTERS = (PROCEDURE, POLICY, SPEC, TD)
 
 # The kind of constraint that exists ONLY in the executable issue: the leaf
 # admits part of the Spec and defers the rest. Nothing in the repository's
@@ -179,6 +187,42 @@ class TestIdentityAndProvenance:
         assert governing.issue_number == SPEC
         assert [source.issue_number for source in contract.sources] == [LEAF, SPEC]
         assert POLICY not in host.issue_calls
+
+    def test_every_pointer_the_leaf_declares_on_one_line_is_staged(
+        self, tmp_path: Path
+    ) -> None:
+        """A multi-pointer declaration resolves to ALL of its pointers.
+
+        The descriptor's whole claim is that a resolved contract is the
+        contract the executable issue declared. A parser that read only the
+        leading pointer would report exactly the same ``resolved`` answer
+        while three of the four sources were never fetched — so the assertion
+        that matters is the fetch calls, not the verdict.
+        """
+        host = _Host(
+            issues={
+                LEAF: _issue(LEAF, body=_leaf_body(governs=CANONICAL_DECLARATION)),
+                **{
+                    number: _issue(number, body=f"Governing source {number}.")
+                    for number in CANONICAL_POINTERS
+                },
+            }
+        )
+
+        contracts, data_path = _stage(tmp_path, host, _entry())
+
+        (contract,) = contracts.entries
+        assert contract.gap == ""
+        assert [source.issue_number for source in contract.sources] == [
+            LEAF,
+            *CANONICAL_POINTERS,
+        ]
+        assert host.issue_calls == [LEAF, *CANONICAL_POINTERS]
+        bundle = data_path / contract.sources_dir
+        for number in CANONICAL_POINTERS:
+            assert (bundle / f"issue-{number}" / "body.md").read_text() == (
+                f"Governing source {number}."
+            )
 
     def test_every_digest_attributes_exactly_one_staged_file(
         self, tmp_path: Path
@@ -373,6 +417,58 @@ class TestFailClosed:
         assert expected in contract.gap
         assert entry.contract_established is False
         assert contracts.contracted_pr_numbers() == frozenset()
+
+    def test_an_unreadable_pointer_in_the_tail_of_a_list_is_still_a_gap(
+        self, tmp_path: Path
+    ) -> None:
+        """The last pointer on a line is as load-bearing as the first.
+
+        This is the direction a leading-reference-only parser got wrong in the
+        one way that cannot be seen from the outside: the tail was never
+        fetched, so nothing failed, and the candidate was reported as holding
+        a resolved contract it had never read.
+        """
+        host = _Host(
+            issues={
+                LEAF: _issue(LEAF, body=_leaf_body(governs=CANONICAL_DECLARATION)),
+                **{
+                    number: _issue(number, body=f"Governing source {number}.")
+                    for number in CANONICAL_POINTERS
+                    if number != TD
+                },
+            },
+            errors={TD: RuntimeError("boom")},
+        )
+        entry = _entry()
+
+        contracts, _ = _stage(tmp_path, host, entry)
+
+        (contract,) = contracts.entries
+        assert contract.establishes_leaf_contract is False
+        assert f"#{TD}" in contract.gap
+        assert entry.contract_established is False
+
+    def test_a_declaration_with_unreadable_text_after_a_pointer_is_a_gap(
+        self, tmp_path: Path
+    ) -> None:
+        """Partial resolution is refused rather than reported as resolved."""
+        host = _Host(
+            issues={
+                LEAF: _issue(
+                    LEAF,
+                    body=_leaf_body(governs=f"Governed-by: #{SPEC}, acme/other#5"),
+                ),
+                SPEC: _issue(SPEC, body="The settled gate contract."),
+            }
+        )
+        entry = _entry()
+
+        contracts, _ = _stage(tmp_path, host, entry)
+
+        (contract,) = contracts.entries
+        assert contract.establishes_leaf_contract is False
+        assert "could not resolve" in contract.gap
+        assert "acme/other#5" in contract.gap
 
     def test_a_gap_makes_pass_structurally_unreachable(
         self, tmp_path: Path

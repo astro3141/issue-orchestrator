@@ -115,6 +115,85 @@ class TestParseGoverningSources:
         with pytest.raises(ValueError, match=match):
             parse_governing_sources(body, subject_issue_number=183)
 
+    def test_every_reference_on_one_directive_is_declared(self) -> None:
+        """The exact canonical shape resolves to every pointer it names.
+
+        This is the failure direction that matters most: the parser used to
+        match only the LEADING reference and drop the rest of the line, so
+        ``#21, #295, #335, #18`` resolved as ``[#21]`` and three declared
+        sources were never staged — while the descriptor still reported a
+        resolved context, which is indistinguishable from a complete one.
+        """
+        body = "Governed-by: #21, #295, #335, #18\n"
+
+        assert parse_governing_sources(body, subject_issue_number=345) == (
+            GoverningSourceDeclaration(issue_number=21, required=True),
+            GoverningSourceDeclaration(issue_number=295, required=True),
+            GoverningSourceDeclaration(issue_number=335, required=True),
+            GoverningSourceDeclaration(issue_number=18, required=True),
+        )
+
+    @pytest.mark.parametrize(
+        "value",
+        ["#21, #295", "#21,#295", "#21 #295", "#21,  #295  # both of them"],
+        ids=["comma-space", "comma", "space", "comma-and-comment"],
+    )
+    def test_the_separators_humans_write_all_separate(self, value: str) -> None:
+        assert parse_governing_sources(
+            f"Governed-by: {value}\n", subject_issue_number=345
+        ) == (
+            GoverningSourceDeclaration(issue_number=21, required=True),
+            GoverningSourceDeclaration(issue_number=295, required=True),
+        )
+
+    def test_a_list_takes_its_own_keyword_s_failure_direction(self) -> None:
+        """Required and optional lists do not bleed into one another."""
+        body = "Governed-by: #21, #295\nGoverned-by-optional: #335, #18\n"
+
+        assert parse_governing_sources(body, subject_issue_number=345) == (
+            GoverningSourceDeclaration(issue_number=21, required=True),
+            GoverningSourceDeclaration(issue_number=295, required=True),
+            GoverningSourceDeclaration(issue_number=335, required=False),
+            GoverningSourceDeclaration(issue_number=18, required=False),
+        )
+
+    @pytest.mark.parametrize(
+        ("body", "match"),
+        [
+            ("Governed-by: #21, oops", "could not be read"),
+            ("Governed-by: #21,", "could not be read"),
+            ("Governed-by: #21 #295-ish", "could not be read"),
+            ("Governed-by: #21 and also #295", "could not be read"),
+            ("Governed-by: #21, acme/other#5", "could not be read"),
+        ],
+    )
+    def test_declaration_text_the_parser_cannot_read_fails_closed(
+        self, body: str, match: str
+    ) -> None:
+        """No tail of a directive is silently dropped.
+
+        The refusal names the unread text, so an author is told which part of
+        their line the run could not honour rather than being handed a run
+        that quietly honoured less than they declared.
+        """
+        with pytest.raises(ValueError, match=match):
+            parse_governing_sources(body, subject_issue_number=345)
+
+    @pytest.mark.parametrize(
+        ("body", "match"),
+        [
+            ("Governed-by: #7, #7", "more than once"),
+            ("Governed-by: #7, #21\nGoverned-by-optional: #7", "more than once"),
+            ("Governed-by: #21, #183", "declares itself"),
+        ],
+    )
+    def test_a_list_does_not_escape_the_duplicate_and_self_rules(
+        self, body: str, match: str
+    ) -> None:
+        """The list is a shorthand for lines, not a way around their rules."""
+        with pytest.raises(ValueError, match=match):
+            parse_governing_sources(body, subject_issue_number=183)
+
 
 class TestCanonicalSourceStates:
     def test_absent_is_a_recorded_fact_with_a_reason(self) -> None:
