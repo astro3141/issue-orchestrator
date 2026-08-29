@@ -623,6 +623,64 @@ def test_get_issue_uses_etag_cache() -> None:
     assert second == payload
 
 
+def test_get_pr_diff_requests_the_diff_media_type() -> None:
+    """The diff comes from the supported REST transport, not a CLI (#359)."""
+    seen: list[tuple[str, str, str | None]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append((request.method, request.url.path, request.headers.get("Accept")))
+        return httpx.Response(200, text="diff --git a/a.py b/a.py\n+x\n")
+
+    client = _client_with_transport(httpx.MockTransport(handler))
+
+    diff = client.get_pr_diff(318)
+
+    assert diff == "diff --git a/a.py b/a.py\n+x\n"
+    assert seen == [
+        ("GET", "/repos/owner/repo/pulls/318", "application/vnd.github.v3.diff")
+    ]
+
+
+def test_get_pr_diff_raises_on_an_error_status() -> None:
+    """The failure is an exception, never a body the caller might file."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(403, text="Resource not accessible by integration")
+
+    client = _client_with_transport(httpx.MockTransport(handler))
+
+    with pytest.raises(GitHubHttpError):
+        client.get_pr_diff(318)
+
+
+def test_get_pr_diff_does_not_share_a_cache_entry_with_get_pr() -> None:
+    """The same URL under two media types is two representations (#359).
+
+    ``get_pr`` and ``get_pr_diff`` read ``/pulls/318``. Keyed on method+URL
+    alone, the JSON ETag would be revalidated for the diff request and a 304
+    would hand the caller a serialized object as the candidate's diff.
+    """
+    calls: list[tuple[str | None, str | None]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        accept = request.headers.get("Accept")
+        calls.append((accept, request.headers.get("If-None-Match")))
+        if accept == "application/vnd.github.v3.diff":
+            return httpx.Response(200, text="diff --git a/a.py b/a.py\n")
+        return httpx.Response(
+            200, json={"number": 318}, headers={"ETag": 'W/"json-etag"'}
+        )
+
+    client = _client_with_transport(httpx.MockTransport(handler))
+    client.get_pr(318)
+
+    diff = client.get_pr_diff(318)
+
+    assert diff.startswith("diff --git")
+    # The diff request carried no revalidator from the JSON read.
+    assert calls[1] == ("application/vnd.github.v3.diff", None)
+
+
 def test_create_label_force_updates_on_422() -> None:
     calls: list[tuple[str, str]] = []
 

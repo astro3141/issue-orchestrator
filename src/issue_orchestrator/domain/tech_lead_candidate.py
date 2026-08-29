@@ -26,12 +26,13 @@ Four value objects, each with exactly one job:
   is not, however unchanged its head (#352).
 * :class:`CandidatePassPrerequisite` — the staged facts a merge-facing PASS
   rests on: an exact-commit reviewer approval that cleared the publication
-  gate, and the candidate's staged executable-leaf contract. Both are
-  established by the orchestrator before the session spawns and recorded where
-  the agent cannot reach them. :class:`CandidatePrerequisiteGap` records WHY a
-  candidate missed one, and :class:`UnmetPassPrerequisite` is the pair a
-  refusal receipt is written from, so the receipt never asserts a cause the
-  orchestrator did not observe.
+  gate, the candidate's staged executable-leaf contract, and the candidate's
+  own diff, materialized through the supported GitHub transport and bound to
+  that commit (#359). All three are established by the orchestrator before the
+  session spawns and recorded where the agent cannot reach them.
+  :class:`CandidatePrerequisiteGap` records WHY a candidate missed one, and
+  :class:`UnmetPassPrerequisite` is the pair a refusal receipt is written from,
+  so the receipt never asserts a cause the orchestrator did not observe.
 * :class:`CandidateOutcome` — what the run actually concluded about the
   candidate once standing and those prerequisites are folded into the
   disposition. This is the value the watch-set owner keys its label effects on,
@@ -214,11 +215,11 @@ class TechLeadCandidateDisposition(StrEnum):
 class CandidatePassPrerequisite(Enum):
     """A staged fact a merge-facing PASS rests on, and its absence sentence.
 
-    Both members name something the ORCHESTRATOR established before the session
-    spawned and recorded outside the agent's reach. The prompt tells the tech
-    lead not to pass a candidate missing either; these are what make that hold
-    when it does anyway, and what let one refusal receipt say which of them was
-    missing rather than "something".
+    Every member names something the ORCHESTRATOR established before the
+    session spawned and recorded outside the agent's reach. The prompt tells
+    the tech lead not to pass a candidate missing any of them; these are what
+    make that hold when it does anyway, and what let one refusal receipt say
+    which of them was missing rather than "something".
 
     Neither gates REWORK or HUMAN_A: neither of those claims the candidate is
     mergeable, so neither rests on the merge contract's prerequisites.
@@ -246,6 +247,21 @@ class CandidatePassPrerequisite(Enum):
         " could not be staged, so no run could show which contract the candidate"
         " was judged against; repository Spec/TD does not stand in for a leaf's"
         " own narrowed scope or STOP conditions",
+    )
+    #: The candidate's own code changes were materialized through the supported
+    #: GitHub transport and bound to this exact commit (#359 direction A). The
+    #: third member rather than a permissive boolean beside the other two
+    #: because it fails the same way and must be refused the same way: the R29
+    #: live batch wrote a transport refusal into ``pr-<n>-<sha>-diff.txt`` and
+    #: the manifest advertised it as the candidate's diff, so a PASS could rest
+    #: on an error message. A diff nobody could read is not a diff, and a
+    #: review of no code is authority for nothing.
+    CANDIDATE_DIFF = (
+        "candidate_diff",
+        "this candidate's code changes were not materialized through the"
+        " supported GitHub transport and bound to this exact commit, so no run"
+        " could show what was reviewed; a file under the candidate's name is"
+        " not a diff unless the read that produced it succeeded",
     )
 
     def __init__(self, value: str, description: str) -> None:

@@ -559,7 +559,17 @@ class TechLeadLaunchAuthority:
     # failed (no issue association, an unreadable issue, an unresolvable
     # declared source, a legacy row), because they all mean the same thing here.
     contracted_candidates: tuple[TechLeadCandidate, ...] = ()
-    # WHY each candidate missing one of the two prerequisites above missed it,
+    # The subset whose OWN DIFF the orchestrator materialized through its
+    # supported GitHub transport and bound to that exact commit before the
+    # session spawned (#359). Recorded beside the other two and for the same
+    # reason: the merge contract is a conjunction, and a PASS rendered on a
+    # candidate whose code changes no run could read is a claim about nothing.
+    # Absence covers every way materialization failed — a transport error, an
+    # HTTP error status, an empty success, a head that moved across the
+    # materialization boundary, a legacy row — because they all mean the same
+    # thing here.
+    diffed_candidates: tuple[TechLeadCandidate, ...] = ()
+    # WHY each candidate missing one of the prerequisites above missed it,
     # as the staging owner observed it (#345). The subsets say a candidate does
     # not hold a prerequisite; a prerequisite covers several ways of failing,
     # and the refusal receipt is the operator's only instruction for undoing a
@@ -642,13 +652,48 @@ class TechLeadLaunchAuthority:
                 "and unique"
             )
 
+    def _prerequisite_subsets(
+        self,
+    ) -> tuple[
+        tuple[str, CandidatePassPrerequisite, tuple[TechLeadCandidate, ...]], ...
+    ]:
+        """Every merge prerequisite, and the subset this run established it for.
+
+        The ONE place the axis is enumerated. Validation and
+        :meth:`unmet_pass_prerequisites` both read it, so a prerequisite that
+        is checked on one path and forgotten on the other — a subset validated
+        as in-manifest but never consulted before a PASS, or the reverse — is
+        not expressible. Adding the next one is a single tuple entry here.
+
+        The field name rides along because it is what the validation error has
+        to name for the caller to find the row it rejected.
+        """
+        return (
+            (
+                "reviewed_candidates",
+                CandidatePassPrerequisite.INDEPENDENT_REVIEW,
+                self.reviewed_candidates,
+            ),
+            (
+                "contracted_candidates",
+                CandidatePassPrerequisite.LEAF_CONTRACT,
+                self.contracted_candidates,
+            ),
+            (
+                "diffed_candidates",
+                CandidatePassPrerequisite.CANDIDATE_DIFF,
+                self.diffed_candidates,
+            ),
+        )
+
     def _validate_candidates(self) -> None:
         """The candidate axis's own invariants (#345).
 
         Extracted from ``__post_init__`` because it is one subject with several
         rules — the audited set, and every per-candidate prerequisite recorded
-        against it — and because a third prerequisite must land in the tuple
-        below rather than as another branch in the record's constructor.
+        against it — and because the next prerequisite must land in
+        :meth:`_prerequisite_subsets` rather than as another branch in the
+        record's constructor.
         """
         if tuple(
             candidate.pr_number for candidate in self.manifest_candidates
@@ -661,18 +706,7 @@ class TechLeadLaunchAuthority:
             )
         audited = set(self.manifest_candidates)
         established: dict[CandidatePassPrerequisite, set[TechLeadCandidate]] = {}
-        for name, prerequisite, subset in (
-            (
-                "reviewed_candidates",
-                CandidatePassPrerequisite.INDEPENDENT_REVIEW,
-                self.reviewed_candidates,
-            ),
-            (
-                "contracted_candidates",
-                CandidatePassPrerequisite.LEAF_CONTRACT,
-                self.contracted_candidates,
-            ),
-        ):
+        for name, prerequisite, subset in self._prerequisite_subsets():
             if not set(subset) <= audited:
                 raise ValueError(
                     f"TechLeadLaunchAuthority {name} must be a subset of"
@@ -806,16 +840,19 @@ class TechLeadLaunchAuthority:
         """Which merge-facing prerequisites this candidate does NOT hold (#345).
 
         The ONE question asked before any PASS is projected, and deliberately
-        the only one this record answers about the merge contract. Two separate
+        the only one this record answers about the merge contract. Separate
         predicates beside it would let a caller ask about the reviewer approval
-        and forget the leaf contract — which is exactly the half-checked gate
-        this leaf exists to close. Empty means the candidate holds them all;
-        anything else is a refusal, and each member says why in its own words.
+        and forget the leaf contract — or forget, as the R29 live batch did,
+        that the candidate's diff was never read at all — which is exactly the
+        half-checked gate this leaf exists to close. Empty means the candidate
+        holds them all; anything else is a refusal, and each member says why in
+        its own words.
 
         Absence covers every way a prerequisite failed — no verdict, a verdict
         about another commit, a rejection, an uncertified publication, an
-        unreadable record, an unresolvable leaf, or a legacy row that
-        established neither — because they all mean the same thing HERE:
+        unreadable record, an unresolvable leaf, a failed diff read, or a
+        legacy row that established none of them — because they all mean the
+        same thing HERE:
         nothing proves this candidate holds it. They do not mean the same thing
         to the operator who has to fix it, which is why each answer carries the
         reason recorded when the run's inputs were staged.
@@ -825,16 +862,7 @@ class TechLeadLaunchAuthority:
                 prerequisite=prerequisite,
                 recorded_reason=self._recorded_gap(candidate, prerequisite),
             )
-            for prerequisite, established in (
-                (
-                    CandidatePassPrerequisite.INDEPENDENT_REVIEW,
-                    self.reviewed_candidates,
-                ),
-                (
-                    CandidatePassPrerequisite.LEAF_CONTRACT,
-                    self.contracted_candidates,
-                ),
-            )
+            for _, prerequisite, established in self._prerequisite_subsets()
             if candidate not in established
         )
 
@@ -869,6 +897,9 @@ class TechLeadLaunchAuthority:
             ],
             "contracted_candidates": [
                 candidate.to_payload() for candidate in self.contracted_candidates
+            ],
+            "diffed_candidates": [
+                candidate.to_payload() for candidate in self.diffed_candidates
             ],
             "prerequisite_gaps": [gap.to_payload() for gap in self.prerequisite_gaps],
             "problem_issue_numbers": list(self.problem_issue_numbers),
@@ -913,6 +944,10 @@ class TechLeadLaunchAuthority:
         contracted = _manifest_candidates_from(
             data.get("contracted_candidates", [])
         )
+        # Absent is the LEGACY row (written before #359) and it establishes
+        # nothing, which is the fail-closed direction: a run that never
+        # recorded whether it staged a diff cannot show that it did.
+        diffed = _manifest_candidates_from(data.get("diffed_candidates", []))
         prerequisite_gaps = _prerequisite_gaps_from(data.get("prerequisite_gaps", []))
         raw_problems = data.get("problem_issue_numbers", [])
         if not isinstance(raw_problems, list) or any(
@@ -941,6 +976,7 @@ class TechLeadLaunchAuthority:
             manifest_candidates=candidates,
             reviewed_candidates=reviewed,
             contracted_candidates=contracted,
+            diffed_candidates=diffed,
             prerequisite_gaps=prerequisite_gaps,
             problem_issue_numbers=tuple(raw_problems),
             launch_base_sha=raw_base_sha,

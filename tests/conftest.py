@@ -1047,10 +1047,7 @@ def build_test_orchestrator_deps(
     event_hub = EventHub()
     # Create manifest downloader for tech_lead sessions
     from issue_orchestrator.execution.tech_lead_downloader import TechLeadDownloader
-    manifest_downloader = TechLeadDownloader(
-        repository_host=repo_host,
-        command_runner=command_runner,
-    )
+    manifest_downloader = TechLeadDownloader(repository_host=repo_host)
 
     # Create claim components (NullClaimManager by default for tests)
     from issue_orchestrator.ports.claim_manager import NullClaimManager

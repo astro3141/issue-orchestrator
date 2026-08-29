@@ -26,6 +26,7 @@ from issue_orchestrator.ports.pull_request_tracker import (
     MergeQueueEntry,
     MergeQueueRead,
     PRInfo,
+    PullRequestDiffRead,
     StatusCheckRollupRead,
 )
 from issue_orchestrator.ports.repository_host import DependencyIssueSnapshot
@@ -2388,6 +2389,113 @@ class TestMergeQueue:
         )
         with pytest.raises(GitHubHttpError):
             adapter.enqueue_to_merge_queue(318)
+
+
+class TestPullRequestDiffReadValueObject:
+    """The read outcome cannot be constructed into an ambiguous state (#359)."""
+
+    def test_readable_bytes_carry_no_reason(self):
+        read = PullRequestDiffRead.readable("diff --git a/a.py b/a.py\n")
+
+        assert read.is_readable
+        assert read.reason == ""
+
+    def test_an_unavailable_read_carries_no_bytes(self):
+        read = PullRequestDiffRead.unavailable("502 Bad Gateway")
+
+        assert not read.is_readable
+        assert read.diff == ""
+
+    def test_empty_bytes_cannot_be_called_readable(self):
+        """An empty diff is an ambiguity, not a changeset of zero files."""
+        with pytest.raises(ValueError, match="readable bytes or a reason"):
+            PullRequestDiffRead.readable("")
+
+    def test_an_unexplained_absence_is_unrepresentable(self):
+        with pytest.raises(ValueError, match="readable bytes or a reason"):
+            PullRequestDiffRead.unavailable("")
+
+    def test_bytes_and_a_reason_together_are_unrepresentable(self):
+        with pytest.raises(ValueError, match="readable bytes or a reason"):
+            PullRequestDiffRead(diff="diff --git", reason="502 Bad Gateway")
+
+
+class TestCandidateDiffRead:
+    """`read_pr_diff` is a typed outcome, never bytes-or-message (#359).
+
+    The production defect this closes staged a transport refusal under a
+    candidate's ``*-diff.txt`` name. Every failure direction here must produce
+    an ``unavailable`` outcome with a reason and NO bytes, so no caller can
+    file the failure as evidence.
+    """
+
+    def test_a_successful_read_carries_the_bytes(self, adapter, mock_http_client):
+        mock_http_client.get_pr_diff.return_value = (
+            "diff --git a/a.py b/a.py\n+x\n"
+        )
+
+        read = adapter.read_pr_diff(318)
+
+        mock_http_client.get_pr_diff.assert_called_once_with(318)
+        assert read.is_readable
+        assert read.diff.startswith("diff --git")
+        assert read.reason == ""
+
+    def test_an_http_error_is_unavailable_not_content(
+        self, adapter, mock_http_client
+    ):
+        mock_http_client.get_pr_diff.side_effect = GitHubHttpError(
+            "GitHub GET /repos/owner/repo/pulls/318 failed: 403",
+            status_code=403,
+        )
+
+        read = adapter.read_pr_diff(318)
+
+        assert not read.is_readable
+        assert read.diff == ""
+        assert "403" in read.reason
+
+    def test_a_transport_error_is_unavailable_not_content(
+        self, adapter, mock_http_client
+    ):
+        mock_http_client.get_pr_diff.side_effect = GitHubTransportError(
+            "GitHub transport error for GET /pulls/318"
+        )
+
+        read = adapter.read_pr_diff(318)
+
+        assert not read.is_readable
+        assert read.diff == ""
+        assert "transport error" in read.reason
+
+    def test_an_empty_success_is_unavailable(self, adapter, mock_http_client):
+        """A body carrying nothing cannot be shown to be the changes.
+
+        "This pull request changes no files" and "the response body was lost"
+        are indistinguishable here, and a merge-facing PASS may not rest on the
+        difference being guessed.
+        """
+        mock_http_client.get_pr_diff.return_value = "   \n"
+
+        read = adapter.read_pr_diff(318)
+
+        assert not read.is_readable
+        assert read.diff == ""
+        assert "empty body" in read.reason
+
+    def test_an_error_body_shaped_like_a_diff_is_still_an_error(
+        self, adapter, mock_http_client
+    ):
+        """Success is the transport's answer, never a property of the bytes."""
+        mock_http_client.get_pr_diff.side_effect = GitHubHttpError(
+            "GitHub GET failed: 500 — diff --git a/spoof.py b/spoof.py",
+            status_code=500,
+        )
+
+        read = adapter.read_pr_diff(318)
+
+        assert not read.is_readable
+        assert read.diff == ""
 
 
 class TestMarkerRecoveryContracts:

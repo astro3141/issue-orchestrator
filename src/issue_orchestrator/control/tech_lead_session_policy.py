@@ -550,8 +550,16 @@ def prepare_tech_lead_session_data(
                 if tech_lead_manifest
                 else ()
             ),
-            # And WHY each candidate that holds neither missed it, as the two
-            # staging owners observed it (#345). Recorded here because the
+            # And which of them arrived with their own code changes staged —
+            # read through the supported GitHub transport and bound to that
+            # exact commit (#359). A `pass` on a candidate whose diff the run
+            # never materialized is a claim about code no run ever saw, so it
+            # is refused here rather than trusted from the agent's prose.
+            diffed_candidates=(
+                tech_lead_manifest.diffed_candidates() if tech_lead_manifest else ()
+            ),
+            # And WHY each candidate that holds one of them missed it, as the
+            # staging owners observed it (#345, #359). Recorded here because the
             # files that hold the long form live in the tech-lead worktree,
             # which cleanup disposes of, while the refusal receipt built from
             # this is the operator's only instruction for undoing a terminal

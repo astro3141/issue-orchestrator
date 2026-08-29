@@ -697,7 +697,7 @@ def build_orchestrator(
     publication_verdict = PublicationVerdictReader.over(UnrecordedRefusals(pending_work.claims), attempt_store, _validation_attempt_key_factory(config))
     # Batch-review manifest data, staged with the exact-candidate evidence (#345).
     manifest_downloader = TechLeadDownloader(
-        repository_host=github, command_runner=command_runner,
+        repository_host=github,
         candidate_evidence=candidate_review_evidence(config, attempt_store, publication_verdict),
     ) if github else None
 
@@ -1092,7 +1092,7 @@ def build_orchestrator_for_testing(
     publication_verdict = PublicationVerdictReader.over(UnrecordedRefusals(pending_work.claims), attempt_store, _validation_attempt_key_factory(config))
     from ..execution.tech_lead_downloader import TechLeadDownloader
     manifest_downloader = TechLeadDownloader(
-        repository_host=github, command_runner=command_runner,
+        repository_host=github,
         candidate_evidence=candidate_review_evidence(config, attempt_store, publication_verdict))
 
     # Create PRScanner for testing (after the refusals record it reads)

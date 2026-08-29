@@ -13,6 +13,18 @@ the candidate's name at all. A tech lead reading a diff for a commit that had
 already moved is exactly the evidence this leaf refuses to manufacture, and the
 completion-time re-read refuses the disposition for the same candidate anyway.
 
+Nothing but a SUCCESSFUL read is ever written under a candidate's name (#359).
+The diff comes from the repository host's own supported transport — the same
+authenticated GitHub client every other read here uses — and its outcome is a
+typed answer, not a body to inspect: readable bytes, or a reason there are
+none. This module used to shell out to ``gh pr diff`` and write whatever came
+back, so when the repository's direct-``gh`` guard refused the invocation, the
+refusal text itself was filed as ``pr-<n>-<sha12>-diff.txt`` and the manifest
+advertised it as the candidate's diff. A transport failure is an explicit
+unavailable FACT, recorded on the manifest entry as
+``diff_established=False`` with the reason observed, and carried from there
+into the launch authority so a ``pass`` on that candidate is refused.
+
 Filenames carry the candidate's short SHA for the same reason: a file called
 ``pr-123-diff.txt`` claims to be about PR #123 forever, while
 ``pr-123-a1b2c3d4e5f6-diff.txt`` claims only what it can prove.
@@ -33,6 +45,7 @@ This is an adapter implementing the ManifestDownloader port.
 
 import json
 import logging
+from dataclasses import dataclass
 from pathlib import Path
 
 from ..control.tech_lead_candidate_evidence import build_candidate_evidence
@@ -42,13 +55,42 @@ from ..domain.tech_lead_candidate import (
     TechLeadCandidateEvidenceSet,
 )
 from ..domain.tech_lead_manifest import TechLeadManifest, PRFiles, PRToReview
-from ..ports import RepositoryHost, CommandRunner
+from ..ports import RepositoryHost
 from ..ports.tech_lead_candidate_evidence import (
     NO_TECH_LEAD_CANDIDATE_EVIDENCE,
     TechLeadCandidateEvidenceSource,
 )
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True, slots=True)
+class CandidateMaterialization:
+    """What ONE candidate's staging pass actually produced (#359).
+
+    The files that were written, and — when the candidate's own diff was not
+    among them — the reason it was not. ``gap`` is the whole point: a
+    materialization that produced no diff must say so in words the refusal
+    receipt can print, long after this run's ``tech-lead-data`` directory is
+    gone. An empty ``gap`` and an empty ``files.diff`` together are
+    unrepresentable, which is what stops "we wrote nothing and recorded no
+    reason" from reading as a met prerequisite.
+    """
+
+    files: PRFiles
+    gap: str = ""
+
+    def __post_init__(self) -> None:
+        if bool(self.files.diff) == bool(self.gap):
+            raise ValueError(
+                "CandidateMaterialization either staged a diff or recorded why"
+                f" it did not; got diff={self.files.diff!r}, gap={self.gap!r}"
+            )
+
+    @property
+    def establishes_candidate_diff(self) -> bool:
+        """Whether a merge-facing PASS may rest on this candidate's diff."""
+        return not self.gap
 
 
 def write_candidate_evidence(
@@ -80,20 +122,22 @@ class TechLeadDownloader:
     """Downloads PR data based on a tech_lead manifest.
 
     Implements ManifestDownloader port.
-    Uses RepositoryHost for PR metadata and CommandRunner for diffs
-    (since diff isn't in the protocol yet).
+
+    Every external read goes through :class:`~..ports.RepositoryHost` — the
+    metadata, and (since #359) the diff. There is deliberately no command
+    runner here: a downloader that cannot spawn a subprocess cannot spawn a
+    forbidden one, and cannot turn what a refused subprocess printed into
+    candidate evidence.
     """
 
     def __init__(
         self,
         repository_host: RepositoryHost,
-        command_runner: CommandRunner,
         candidate_evidence: TechLeadCandidateEvidenceSource = (
             NO_TECH_LEAD_CANDIDATE_EVIDENCE
         ),
     ):
         self._host = repository_host
-        self._runner = command_runner
         # Defaults to the explicitly-named "nothing was wired" source, which
         # stages that FACT for every candidate — refusing every merge-facing
         # PASS — instead of staging silence (#345).
@@ -117,15 +161,33 @@ class TechLeadDownloader:
 
         for pr in manifest.prs:
             try:
-                pr.files = self._download_pr_data(pr, data_path)
-                logger.info(
-                    "[tech_lead] Downloaded data for PR #%d @ %s",
-                    pr.number,
-                    pr.candidate().short_sha,
-                )
+                staged = self._download_pr_data(pr, data_path)
+                if staged.establishes_candidate_diff:
+                    # Only on the path that actually staged a diff: the refusal
+                    # path logs its own reason at WARNING, and a run that says
+                    # "downloaded" beside it reads as a success it was not.
+                    logger.info(
+                        "[tech_lead] Downloaded data for PR #%d @ %s",
+                        pr.number,
+                        pr.candidate().short_sha,
+                    )
             except Exception as e:
                 logger.warning("[tech_lead] Failed to download PR #%d: %s", pr.number, e)
-                # Continue with other PRs even if one fails
+                # Continue with other PRs even if one fails — and record the
+                # failure AS the candidate's own, so an unstaged candidate is a
+                # refused one rather than a silent one (#359). Isolation is the
+                # point: this candidate's gap says nothing about its siblings,
+                # and cannot erase what they staged.
+                staged = CandidateMaterialization(
+                    files=PRFiles(),
+                    gap=(
+                        f"staging PR #{pr.number} failed before its candidate"
+                        f" diff could be materialized: {e}"
+                    ),
+                )
+            pr.files = staged.files
+            pr.diff_established = staged.establishes_candidate_diff
+            pr.diff_gap = staged.gap
 
         evidence = build_candidate_evidence(
             manifest.prs, source=self._candidate_evidence, repository_host=self._host
@@ -145,18 +207,24 @@ class TechLeadDownloader:
             pr.review_gap = answer.gap
         return manifest
 
-    def _download_pr_data(self, entry: PRToReview, data_path: Path) -> PRFiles:
-        """Download the candidate's diff and metadata for a single PR."""
+    def _download_pr_data(
+        self, entry: PRToReview, data_path: Path
+    ) -> CandidateMaterialization:
+        """Materialize one candidate's diff and metadata.
+
+        Two independent questions, asked in that order and both able to refuse:
+
+        1. did the supported transport actually return a diff (#359), and
+        2. is the pull request still at the commit the manifest bound (#345).
+
+        A diff file is written, and the manifest names it, only when both
+        answer yes. Either "no" produces no file at all and a recorded reason —
+        both of them when both failed, because an operator reading the receipt
+        has to know which conditions were observed, not merely that one was.
+        """
         candidate = entry.candidate()
         stem = f"pr-{candidate.pr_number}-{candidate.short_sha}"
-        diff_filename = f"{stem}-diff.txt"
-        diff_path = data_path / diff_filename
-        diff_result = self._runner.run(["gh", "pr", "diff", str(candidate.pr_number)])
-        diff_text = (
-            diff_result.stdout
-            if diff_result.returncode == 0
-            else f"# Error fetching diff: {diff_result.stderr}"
-        )
+        diff_read = self._host.read_pr_diff(candidate.pr_number)
 
         # The closing half of the bracket, and the metadata read in one call:
         # what the head is NOW, right after the bytes above were produced.
@@ -164,6 +232,7 @@ class TechLeadDownloader:
         meta_path = data_path / meta_filename
         pr = self._host.get_pr(candidate.pr_number)
         binding = self._binding_detail(candidate, pr.head_sha if pr else None)
+        gap = "; ".join(reason for reason in (diff_read.reason, binding) if reason)
         if pr:
             metadata: dict[str, object] = {
                 "number": pr.number,
@@ -180,21 +249,33 @@ class TechLeadDownloader:
         metadata["candidate_bound"] = not binding
         if binding:
             metadata["candidate_binding_gap"] = binding
+        # The agent reads this file, so it must be able to see that a candidate
+        # it was asked to audit has no code to audit — rather than inferring it
+        # from a filename that is simply not there.
+        metadata["diff_staged"] = not gap
+        if gap:
+            metadata["diff_gap"] = gap
         meta_path.write_text(json.dumps(metadata, indent=2))
 
-        if binding:
-            # Refusing to file unbound bytes under the candidate's name: the
-            # diff would be evidence about some other commit, and a review of
-            # it could not be authority for this one.
+        if gap:
+            # Refusing to file anything under the candidate's name: an
+            # unreadable diff is not a diff, and unbound bytes are evidence
+            # about some other commit. Either way a review of what would be
+            # written here could not be authority for this candidate.
             logger.warning(
                 "[tech_lead] No diff staged for PR #%d @ %s: %s",
                 candidate.pr_number,
                 candidate.short_sha,
-                binding,
+                gap,
             )
-            return PRFiles(diff="", metadata=meta_filename)
-        diff_path.write_text(diff_text)
-        return PRFiles(diff=diff_filename, metadata=meta_filename)
+            return CandidateMaterialization(
+                files=PRFiles(diff="", metadata=meta_filename), gap=gap
+            )
+        diff_filename = f"{stem}-diff.txt"
+        (data_path / diff_filename).write_text(diff_read.diff)
+        return CandidateMaterialization(
+            files=PRFiles(diff=diff_filename, metadata=meta_filename)
+        )
 
     @staticmethod
     def _binding_detail(

@@ -6,6 +6,7 @@ import json as _json
 import logging
 import time
 from dataclasses import dataclass
+from enum import Enum
 from typing import Any, Iterator, Literal, cast
 from urllib.parse import quote
 
@@ -34,6 +35,49 @@ from .tokens import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+class _ResponseMedia(Enum):
+    """What a request asks GitHub for, and therefore how its body is read.
+
+    One member per representation rather than a bare ``Accept`` string beside a
+    ``parse_json`` flag: the two always move together, and a request that asked
+    for a diff but decoded JSON (or the reverse) is the kind of mismatch this
+    enum makes unrepresentable.
+    """
+
+    #: The default REST representation: a JSON object or array.
+    JSON = ("application/vnd.github+json", True)
+    #: A pull request's unified diff, returned as ``text/plain`` bytes.
+    DIFF = ("application/vnd.github.v3.diff", False)
+
+    def __init__(self, accept: str, is_json: bool) -> None:
+        self._value_ = accept
+        self._accept = accept
+        self._is_json = is_json
+
+    @property
+    def accept(self) -> str:
+        """The ``Accept`` header this representation is requested with."""
+        return self._accept
+
+    @property
+    def is_json(self) -> bool:
+        """Whether the response body is decoded as JSON."""
+        return self._is_json
+
+    def decode(self, response: httpx.Response, response_text: str) -> Any:
+        """Read a success body as this representation.
+
+        Beside :attr:`accept` rather than in the request path, because "what we
+        asked for" and "how we read what came back" are one decision and a
+        request that decoded the other way is the mismatch this enum exists to
+        make unrepresentable.
+        """
+        if not self.is_json:
+            return response_text
+        return response.json() if response_text else {}
+
 
 # Operational backstop for the comment-marker pagination loop. At 100 comments
 # per page this covers 2,000 comments; hitting it means GitHub never returned a
@@ -388,6 +432,21 @@ def _extract_rate_limit_headers(response: httpx.Response) -> dict[str, Any] | No
     return result if result else None
 
 
+def _http_error(
+    response: httpx.Response, *, method: str, path: str, response_text: str
+) -> GitHubHttpError:
+    """The typed failure an error status becomes, with GitHub's own summary."""
+    summary = _summarize_github_error(response_text)
+    detail = f" — {summary}" if summary else ""
+    return GitHubHttpError(
+        f"GitHub {method.upper()} {path} failed: {response.status_code}{detail}",
+        method=method,
+        url=str(response.url),
+        status_code=response.status_code,
+        response_text=response_text,
+    )
+
+
 class GitHubHttpClient:
     """Minimal GitHub REST client for issue-orchestrator."""
 
@@ -441,11 +500,23 @@ class GitHubHttpClient:
     def _auth_headers(self) -> dict[str, str]:
         return self._auth.authorization_headers()
 
-    def _cache_key(self, method: str, url: str, params: dict[str, Any] | None) -> str:
+    def _cache_key(
+        self,
+        method: str,
+        url: str,
+        params: dict[str, Any] | None,
+        media: _ResponseMedia,
+    ) -> str:
+        # The media type is part of the key because it is part of the REQUEST:
+        # ``GET /pulls/42`` returns a JSON object under the default Accept and a
+        # unified diff under the diff Accept. Keyed on method+url alone, one
+        # would revalidate against the other's ETag and a 304 would hand back
+        # the wrong representation entirely.
+        prefix = f"{method} [{media.accept}] {url}"
         if not params:
-            return f"{method} {url}"
+            return prefix
         ordered = "&".join(f"{k}={params[k]}" for k in sorted(params))
-        return f"{method} {url}?{ordered}"
+        return f"{prefix}?{ordered}"
 
     def _request_json(
         self,
@@ -457,9 +528,69 @@ class GitHubHttpClient:
         use_cache: bool = True,
         caller: str = "github_http",
     ) -> Any:
+        return self._request(
+            method,
+            path,
+            params=params,
+            json_body=json_body,
+            use_cache=use_cache,
+            caller=caller,
+            media=_ResponseMedia.JSON,
+        )
+
+    def _request_text(
+        self,
+        method: str,
+        path: str,
+        *,
+        media: _ResponseMedia,
+        use_cache: bool = True,
+        caller: str = "github_http",
+    ) -> str:
+        """Request a representation GitHub returns as text rather than JSON.
+
+        Same transport, auditing and error contract as :meth:`_request_json`;
+        only the ``Accept`` header and the decoding differ. ``media`` is
+        required rather than defaulted so a caller cannot ask for text under
+        the JSON media type and get a serialized object back.
+        """
+        if media.is_json:
+            raise ValueError(
+                f"_request_text requires a text media type, got {media.accept}"
+            )
+        body = self._request(
+            method,
+            path,
+            params=None,
+            json_body=None,
+            use_cache=use_cache,
+            caller=caller,
+            media=media,
+        )
+        if not isinstance(body, str):
+            raise GitHubHttpError(
+                f"GitHub {method.upper()} {path} returned"
+                f" {type(body).__name__} for {media.accept}, expected text",
+                method=method,
+                url=path,
+            )
+        return body
+
+    def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: dict[str, Any] | None = None,
+        json_body: dict[str, Any] | None = None,
+        use_cache: bool = True,
+        caller: str = "github_http",
+        media: _ResponseMedia = _ResponseMedia.JSON,
+    ) -> Any:
         url = path
         headers = self._auth_headers()
-        cache_key = self._cache_key(method, url, params)
+        headers["Accept"] = media.accept
+        cache_key = self._cache_key(method, url, params, media)
         if use_cache and method.upper() == "GET":
             cached = self._etag_cache.get(cache_key)
             if cached:
@@ -501,22 +632,10 @@ class GitHubHttpClient:
                     return payload
             if status_code >= 400:
                 error = f"{status_code} {response_text.strip()}"
-                summary = _summarize_github_error(response_text)
-                detail = f" — {summary}" if summary else ""
-                raise GitHubHttpError(
-                    (
-                        f"GitHub {method.upper()} {path} failed: "
-                        f"{status_code}{detail}"
-                    ),
-                    method=method,
-                    url=str(response.url),
-                    status_code=status_code,
-                    response_text=response_text,
+                raise _http_error(
+                    response, method=method, path=path, response_text=response_text
                 )
-            if response_text:
-                payload = response.json()
-            else:
-                payload = {}
+            payload = media.decode(response, response_text)
             if use_cache and method.upper() == "GET":
                 etag = response.headers.get("ETag")
                 if etag:
@@ -1048,13 +1167,19 @@ class GitHubHttpClient:
         subsequent GETs fetch fresh data.
         """
         url = f"/repos/{self._config.repo}/labels"
-        key = self._cache_key("GET", url, {"per_page": 100})  # Match list_labels params
+        key = self._cache_key(
+            "GET", url, {"per_page": 100}, _ResponseMedia.JSON
+        )  # Match list_labels params
         self._etag_cache.pop(key, None)
 
     def invalidate_pr_etag(self, pr_number: int) -> None:
-        """Invalidate ETag cache for a PR endpoint."""
+        """Invalidate ETag cache for a PR endpoint.
+
+        Only the JSON representation is cached — ``get_pr_diff`` is read
+        uncached — so there is one entry to drop.
+        """
         url = f"/repos/{self._config.repo}/pulls/{pr_number}"
-        key = self._cache_key("GET", url, None)
+        key = self._cache_key("GET", url, None, _ResponseMedia.JSON)
         self._etag_cache.pop(key, None)
 
     def list_milestones(self, state: str = "open") -> list[dict[str, Any]]:
@@ -1524,6 +1649,28 @@ class GitHubHttpClient:
             caller="get_pr",
         )
         return payload if isinstance(payload, dict) else None
+
+    def get_pr_diff(self, pr_number: int) -> str:
+        """Fetch a pull request's unified diff for its CURRENT head (#359).
+
+        The same ``/pulls/{n}`` resource :meth:`get_pr` reads, asked for under
+        the diff media type. Uncached deliberately: this is materialized once
+        per tech-lead run and staged as merge-facing evidence, and a
+        revalidated body from an earlier run would be one more thing standing
+        between the bytes on disk and the commit they are claimed to be about.
+
+        Raises:
+            GitHubHttpError / GitHubTransportError: the read failed. Callers
+                turn that into an explicit "unavailable" fact; the text of the
+                failure is never the diff.
+        """
+        return self._request_text(
+            "GET",
+            f"/repos/{self._config.repo}/pulls/{pr_number}",
+            media=_ResponseMedia.DIFF,
+            use_cache=False,
+            caller="get_pr_diff",
+        )
 
     def get_pr_status_check_rollup(self, pr_number: int) -> str | None:
         """Fetch the aggregated status-check rollup for a PR's head commit.
