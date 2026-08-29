@@ -2441,7 +2441,7 @@ class TestReconciliationVisibilityIsNotWorkAdmissionAuthority:
         a narrowing that had not been tested at all.
         """
         scoped = _engine(tmp_path, scoped_to=ISSUE_NUMBER)
-        self._held_exit_ready(scoped)
+        held_pr = self._held_exit_ready(scoped)
         target_pr = _open_pr()
         scoped.pull_requests.prs[ISSUE_NUMBER] = target_pr
         _exhausted(scoped, RequestedAction.CREATE_PR)
@@ -2462,7 +2462,21 @@ class TestReconciliationVisibilityIsNotWorkAdmissionAuthority:
         assert SHA_A in feedback
         # The held issue's own failure output is filed under the held issue's
         # key, and none of it may leak into another candidate's correction.
-        assert str(HELD_ISSUE_NUMBER) not in feedback
+        #
+        # Every channel that could carry it is named, rather than scanning the
+        # feedback for a bare "293". The feedback quotes the TARGET candidate's
+        # own diagnostics directory, whose name ends in a microsecond stamp
+        # (``%Y%m%dT%H%M%S.%fZ``, gate_failure_diagnostics.py:324), and those
+        # digits can spell the held issue's number by coincidence — CI hit
+        # ``...T231836.029319Z`` and failed a test that has nothing to say
+        # about digits. Each token below is one the held candidate's identity
+        # would have to travel in, and none of them is a clock.
+        assert HELD_SHA not in feedback
+        assert f"--{HELD_ISSUE_NUMBER}--" not in feedback  # its diagnostics key
+        assert f"#{HELD_ISSUE_NUMBER}" not in feedback
+        assert held_pr.branch not in feedback
+        assert f"#{held_pr.number}" not in feedback
+        assert held_pr.url not in feedback
 
     def test_the_shared_cycle_budget_is_still_the_only_arithmetic(
         self, tmp_path: Path
