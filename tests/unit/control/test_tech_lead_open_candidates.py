@@ -22,18 +22,36 @@ The proof directions of this leaf, one class each:
 * **D. Existing policy preserved** — the configured watch label still narrows
   which OPEN pull requests are candidates, and is still not required in order
   to exclude closed history.
+* **E. Post-manifest lifecycle race** — a candidate the manifest bound while
+  open, which then merges at the exact commit that was audited, receives no
+  candidate-bound effect when the batch completes. This is the direction a
+  head-only completion re-read cannot see, because the head is unchanged.
 
-Both seams are exercised because the point of the repair is that they are ONE
-rule: ``FactGatherer`` counts toward the threshold, ``TechLeadManifestBuilder``
-writes the set the batch audits, and neither may hold a lifecycle rule of its
-own.
+All three seams are exercised because the point of the repair is that they are
+ONE rule: ``FactGatherer`` counts toward the threshold,
+``TechLeadManifestBuilder`` writes the set the batch audits, and
+``tech_lead_candidate_disposition`` settles it — and none of them may hold a
+lifecycle rule of its own.
 """
 
 from __future__ import annotations
 
 from unittest.mock import MagicMock
 
+import pytest
+
+from issue_orchestrator.control.actions import (
+    AddCommentAction,
+    AddLabelAction,
+    RemoveLabelAction,
+)
 from issue_orchestrator.control.fact_gatherer import FactGatherer
+from issue_orchestrator.control.label_manager import LabelManager
+from issue_orchestrator.control.tech_lead_candidate_disposition import (
+    candidate_standing,
+    plan_candidate_dispositions,
+    repository_candidate_observations,
+)
 from issue_orchestrator.control.tech_lead_candidate_policy import (
     TechLeadCandidatePolicy,
 )
@@ -41,6 +59,15 @@ from issue_orchestrator.control.tech_lead_manifest_builder import (
     TechLeadManifestBuilder,
 )
 from issue_orchestrator.domain.models import OrchestratorState
+from issue_orchestrator.domain.tech_lead_artifacts import TechLeadDecision
+from issue_orchestrator.domain.tech_lead_candidate import (
+    CandidateStanding,
+    TechLeadCandidate,
+)
+from issue_orchestrator.domain.tech_lead_session import (
+    TechLeadLaunchAuthority,
+    TechLeadSessionFlavor,
+)
 from issue_orchestrator.infra.config import Config
 from issue_orchestrator.ports import PRInfo
 
@@ -75,10 +102,30 @@ class FakeRepositoryHost:
             if label in pr.labels and state in ("all", pr.state)
         ]
 
+    def get_pr(self, number: int) -> PRInfo | None:
+        """The single-pull-request read the completion-time observation makes."""
+        for pr in self.prs:
+            if pr.number == number:
+                return pr
+        return None
+
     def merge(self, number: int) -> None:
-        """The pull request merges between two observations."""
+        """The pull request merges between two observations.
+
+        At the head it already had: ``_pr`` derives the head from the number,
+        so a merged pull request keeps the exact commit that was audited. That
+        is what makes the completion-time direction below a real proof rather
+        than a restatement of the moved-head one.
+        """
+        self.settle(number, "merged")
+
+    def close(self, number: int) -> None:
+        """The pull request is closed unmerged between two observations."""
+        self.settle(number, "closed")
+
+    def settle(self, number: int, state: str) -> None:
         self.prs = [
-            _pr(pr.number, state="merged", labels=pr.labels)
+            _pr(pr.number, state=state, labels=pr.labels)
             if pr.number == number
             else pr
             for pr in self.prs
@@ -291,3 +338,174 @@ class TestConfiguredWatchLabelIsPreserved:
         manifest = _manifest(config, host)
 
         assert [pr.number for pr in manifest.prs] == [1]
+
+
+RUN_IDENTITY = "20260829T000000Z/tech-lead-1"
+
+
+def _bound_authority(config: Config, host: FakeRepositoryHost):
+    """The launch authority a batch built from THIS manifest carries (#345).
+
+    Built from the manifest rather than hand-written, so the candidates whose
+    dispositions are planned below are exactly the ones the open-only
+    observation admitted — including the head each was bound at.
+    """
+    manifest = _manifest(config, host)
+    candidates = tuple(
+        TechLeadCandidate(pr.number, pr.head_sha) for pr in manifest.prs
+    )
+    return TechLeadLaunchAuthority(
+        flavor=TechLeadSessionFlavor.BATCH_REVIEW,
+        anchor_issue_number=7,
+        manifest_pr_numbers=tuple(candidate.pr_number for candidate in candidates),
+        manifest_candidates=candidates,
+        reviewed_candidates=candidates,
+        contracted_candidates=candidates,
+    )
+
+
+def _decision(pr_number: int, disposition: str) -> TechLeadDecision:
+    return TechLeadDecision.from_agent_payload(
+        {
+            "schema_version": 1,
+            "summary": "Contract review of the batch.",
+            "findings": [],
+            "proposed_actions": [],
+            "candidate_verdicts": [
+                {
+                    "pr_number": pr_number,
+                    "candidate_sha": f"{pr_number:040d}",
+                    "disposition": disposition,
+                    "rationale": "Stated reason.",
+                }
+            ],
+        }
+    )
+
+
+def _dispositions(
+    config: Config, host: FakeRepositoryHost, authority, decision: TechLeadDecision
+) -> list[object]:
+    """Completion-time planning, through the reader production builds."""
+    return plan_candidate_dispositions(
+        config,
+        authority,
+        decision,
+        expected=None,
+        labels=LabelManager(config),
+        observations=repository_candidate_observations(host),  # type: ignore[arg-type]
+        run_identity=RUN_IDENTITY,
+    )
+
+
+class TestPostManifestLifecycleRace:
+    """E: a candidate that settles AFTER the manifest bound it settles nothing.
+
+    The direction the first repair missed. Threshold and manifest are open-only
+    now, but a batch review runs for as long as it runs, and the completion-time
+    re-read that applies each verdict asked only whether the head was still the
+    audited one. A pull request MERGES at that head, so the answer was yes and
+    merge-facing effects projected onto a pull request that had already merged.
+    """
+
+    def test_the_manifest_binds_the_candidate_while_it_is_open(self) -> None:
+        """The premise: the pull request really was a candidate (#345 binding)."""
+        manifest = _manifest(_config(), FakeRepositoryHost([_pr(1)]))
+
+        assert [(pr.number, pr.head_sha) for pr in manifest.prs] == [
+            (1, f"{1:040d}")
+        ]
+
+    def test_the_completion_read_asks_the_lifecycle_not_only_the_head(self) -> None:
+        """The mutation this leaf rests on, stated as an assertion.
+
+        The head is UNCHANGED — ``covers`` says so — and the standing is still
+        not CURRENT. Restore the head-only completion observation and the
+        standing becomes CURRENT, which is what fails here.
+        """
+        config = _config()
+        host = FakeRepositoryHost([_pr(1)])
+        authority = _bound_authority(config, host)
+        [candidate] = authority.manifest_candidates
+        host.merge(1)
+
+        standing, observed = candidate_standing(
+            candidate,
+            repository_candidate_observations(host),  # type: ignore[arg-type]
+        )
+
+        assert candidate.covers(observed) is True
+        assert standing is CandidateStanding.TERMINAL
+
+    @pytest.mark.parametrize("settle", ["merge", "close"])
+    def test_a_pass_produces_no_merge_facing_authority(self, settle: str) -> None:
+        config = _config()
+        host = FakeRepositoryHost([_pr(1)])
+        authority = _bound_authority(config, host)
+        getattr(host, settle)(1)
+
+        actions = _dispositions(config, host, authority, _decision(1, "pass"))
+
+        assert [
+            action
+            for action in actions
+            if isinstance(action, AddLabelAction)
+            and action.label == "tech-lead-reviewed"
+        ] == []
+
+    @pytest.mark.parametrize("disposition", ["pass", "rework", "human_a"])
+    def test_no_candidate_bound_effect_of_any_kind_is_applied(
+        self, disposition: str
+    ) -> None:
+        """REWORK admission and HUMAN_A escalation are authority too.
+
+        So is a terminal or watch-set label: writing one onto a merged pull
+        request settles history that this batch may not settle. The receipt is
+        the only thing that may land, and it asserts nothing about lifecycle
+        that the observation did not show.
+        """
+        config = _config()
+        host = FakeRepositoryHost([_pr(1)])
+        authority = _bound_authority(config, host)
+        host.merge(1)
+
+        actions = _dispositions(config, host, authority, _decision(1, disposition))
+
+        assert not [a for a in actions if isinstance(a, AddLabelAction)]
+        assert not [a for a in actions if isinstance(a, RemoveLabelAction)]
+        [receipt] = [a for a in actions if isinstance(a, AddCommentAction)]
+        assert receipt.number == 1
+        assert "no longer open" in receipt.comment
+
+    def test_an_open_sibling_in_the_same_batch_is_unaffected(self) -> None:
+        """The refusal is per candidate, not per batch (#345 independence)."""
+        config = _config()
+        host = FakeRepositoryHost([_pr(1), _pr(2)])
+        authority = _bound_authority(config, host)
+        host.merge(1)
+        decision = TechLeadDecision.from_agent_payload(
+            {
+                "schema_version": 1,
+                "summary": "Contract review of the batch.",
+                "findings": [],
+                "proposed_actions": [],
+                "candidate_verdicts": [
+                    {
+                        "pr_number": number,
+                        "candidate_sha": f"{number:040d}",
+                        "disposition": "pass",
+                        "rationale": "Stated reason.",
+                    }
+                    for number in (1, 2)
+                ],
+            }
+        )
+
+        actions = _dispositions(config, host, authority, decision)
+
+        assert [
+            action.issue_number
+            for action in actions
+            if isinstance(action, AddLabelAction)
+            and action.label == "tech-lead-reviewed"
+        ] == [2]

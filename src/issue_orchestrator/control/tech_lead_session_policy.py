@@ -532,9 +532,9 @@ def prepare_tech_lead_session_data(
             if tech_lead_manifest
             else (),
             # The exact candidates, recorded from the manifest the orchestrator
-            # just built (#345). Completion re-reads each PR's live head against
-            # THESE, so a candidate that moves after launch cannot inherit the
-            # review's disposition.
+            # just built (#345). Completion re-reads each PR's lifecycle and
+            # live head against THESE, so a candidate that moves — or that
+            # merges — after launch cannot inherit the review's disposition.
             manifest_candidates=(
                 tech_lead_manifest.candidates() if tech_lead_manifest else ()
             ),

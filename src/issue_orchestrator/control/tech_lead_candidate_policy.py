@@ -74,6 +74,15 @@ redundancy, it is the race: threshold observation and manifest construction are
 two separate reads, and a candidate that merges between them must be gone from
 the second. The later observation wins, and openness is never carried forward
 from the earlier one.
+
+There is a THIRD read, later still, and it is the one #352's first attempt
+missed: completion, where the audited candidate's disposition is applied. A
+pull request can merge while the batch review is running, at exactly the commit
+that was audited — so a completion re-read that asked only "is the head still
+``A``" answered yes and projected merge-facing authority onto a pull request
+that could no longer merge. The lifecycle question is therefore asked at that
+seam too, through :meth:`TechLeadCandidatePolicy.is_open`, so all three reads
+spell "may this pull request bear tech-lead authority" exactly once.
 """
 
 from __future__ import annotations
@@ -237,6 +246,26 @@ class TechLeadCandidatePolicy:
         prs = host.get_prs_with_label(self.watch_label, state=OPEN_PR_STATE)
         return [pr for pr in prs if self.is_candidate(pr)]
 
+    @staticmethod
+    def is_open(state: str) -> bool:
+        """Whether an observed pull-request lifecycle state may bear authority.
+
+        The lifecycle rule's ONE spelling, asked by every seam that has to
+        answer it: entry, through :meth:`is_candidate`, and exit, through the
+        completion-time standing in ``tech_lead_candidate_disposition``. It is
+        a static rule rather than a configured one — no repository may opt into
+        auditing merged pull requests — and it is spelled here beside
+        :meth:`is_candidate` for the reason the watch label is: a second
+        derivation is how two seams start disagreeing about the same set (#352).
+
+        The comparison is exact because both production adapter paths normalize
+        state before it reaches here (``GitHubAdapter._pr_state_from_api``
+        lowercases, and the GraphQL list path writes ``state.lower()``), so a
+        differently-cased state means an observation source this rule has never
+        been shown to hold for.
+        """
+        return state == OPEN_PR_STATE
+
     def is_candidate(self, pr: ObservedPullRequest) -> bool:
         """True when an observed PR still needs a tech_lead batch review.
 
@@ -246,7 +275,7 @@ class TechLeadCandidatePolicy:
         candidate that reached a terminal state since it was counted drops out
         of the set the batch actually audits.
         """
-        if pr.state != OPEN_PR_STATE:
+        if not self.is_open(pr.state):
             return False
         label_set = set(pr.labels)
         terminalized = bool(set(self.terminal_labels) & label_set)

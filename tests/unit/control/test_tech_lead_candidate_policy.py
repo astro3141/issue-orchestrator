@@ -149,6 +149,50 @@ class TestEveryOutcomeSettlesOrDeliberatelyDoesNot:
         ) is exit_rule.keeps_membership
 
 
+class TestTheLifecycleRuleHasOneOwner:
+    """#352: entry and exit ask the same question about the same states.
+
+    The completion-time standing (``tech_lead_candidate_disposition``) asks
+    :meth:`TechLeadCandidatePolicy.is_open` rather than comparing a state of
+    its own, so a third spelling cannot appear at the seam that applies
+    verdicts. These pin what that one spelling answers.
+    """
+
+    @pytest.mark.parametrize(
+        ("state", "expected"),
+        [("open", True), ("merged", False), ("closed", False), ("", False)],
+    )
+    def test_only_an_open_pull_request_may_bear_authority(
+        self, state: str, expected: bool
+    ) -> None:
+        assert TechLeadCandidatePolicy.is_open(state) is expected
+
+    def test_candidacy_is_decided_by_that_same_rule(self, tmp_path: Path) -> None:
+        policy = TechLeadCandidatePolicy.from_config(_config(tmp_path))
+
+        assert policy.is_candidate(ObservedPR(labels=["code-reviewed"])) is True
+        for state in ("merged", "closed"):
+            assert (
+                policy.is_candidate(
+                    ObservedPR(labels=["code-reviewed"], state=state)
+                )
+                is TechLeadCandidatePolicy.is_open(state)
+            )
+
+    def test_the_rule_is_not_configurable(self, tmp_path: Path) -> None:
+        """No repository may opt into auditing pull requests it cannot merge."""
+        config = _config(tmp_path)
+        config.tech_lead_review_label = "awaiting-tech-lead"
+        policy = TechLeadCandidatePolicy.from_config(config)
+
+        assert (
+            policy.is_candidate(
+                ObservedPR(labels=["awaiting-tech-lead"], state="merged")
+            )
+            is False
+        )
+
+
 class TestTerminalLabels:
     def test_both_terminal_labels_are_named(self, tmp_path: Path) -> None:
         config = _config(tmp_path)

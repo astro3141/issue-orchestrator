@@ -12,8 +12,11 @@ So the projection is now a consequence of two facts, and both are per candidate:
    REWORK, or HUMAN_A (:class:`~..domain.tech_lead_candidate.
    TechLeadCandidateDisposition`), never a session-wide success flag;
 2. **whether that candidate is still the candidate** — re-read from the live
-   pull-request head at completion, because a verdict is authority only for the
-   commit it was rendered against;
+   pull request at completion: its LIFECYCLE and its head. A verdict is
+   authority only for the commit it was rendered against, and only for a pull
+   request that can still merge. The head alone does not answer the second
+   question, because a pull request merges at exactly the commit that was
+   audited (#352);
 3. **whether the candidate holds the prerequisites a merge-facing PASS rests
    on** — an independent Reviewer's approval of that exact commit, and the
    staged bounded contract of the executable issue it implements. Both are
@@ -55,10 +58,13 @@ Where each outcome routes, and why nothing new was built for it:
 * UNSETTLED (a PASS the orchestrator refused for want of a staged
   prerequisite) -> the refusal receipt naming which one was missing, and
   nothing merge-facing.
-* DEFERRED (the candidate moved, could not be read, or was never bound) -> the
-  refusal receipt if a verdict was rendered, and deliberately no label at all:
-  this is the one outcome that leaves the candidate in the watch set, because
-  it is the one the run could not audit.
+* DEFERRED (the candidate moved, reached a terminal lifecycle state, could not
+  be read, or was never bound) -> the refusal receipt if a verdict was
+  rendered, and deliberately no label at all: this is the one outcome that
+  leaves the candidate in the watch set, because it is the one the run could
+  not audit. For a merged or closed pull request that is also the only correct
+  answer: nothing may be projected onto history, and the open-only observation
+  the batch now makes (#352) means it can never be selected again anyway.
 
 HUMAN and UNSETTLED leave ``tech-lead-failed`` behind. That is the same
 sentence the failure projection already writes — "this run produced no
@@ -70,7 +76,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING, Callable, Protocol
 
 from ..domain.tech_lead_candidate import (
     CandidateOutcome,
@@ -97,56 +103,94 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 
 logger = logging.getLogger(__name__)
 
-#: Reads the CURRENT head commit of one pull request, or ``None`` when it
-#: cannot be observed. ``None`` is "unknown", never "unchanged".
-CandidateHeadReader = Callable[[int], str | None]
 
+class ObservedCandidatePullRequest(Protocol):
+    """The completion-time facts a candidate's standing is decided from.
 
-def repository_candidate_heads(
-    repository_host: "RepositoryHost | None",
-) -> CandidateHeadReader:
-    """The live-head reader over the repository host.
+    Both of them, and deliberately not the head alone: a pull request MERGES at
+    the commit that was audited, so a reader that carried only ``head_sha``
+    reported "unchanged" for the one transition that removes every reason to
+    project merge authority (#352).
 
-    One targeted read per audited candidate at completion, not a scan: a batch
-    is threshold-sized, and the alternative — trusting the head the manifest
-    recorded before the session ran — is precisely the staleness this leaf
-    exists to remove.
-
-    A transport failure answers ``None`` rather than raising, because "we could
-    not look" and "it moved" have the same consequence here (no merge-facing
-    authority) and neither should take down completion planning.
+    Narrower than :class:`~.tech_lead_candidate_policy.ObservedPullRequest`,
+    whose question is candidacy (state + labels) rather than standing (state +
+    the commit). Any pull-request observation the repository host returns
+    satisfies both structurally, and neither makes this module depend on the
+    concrete port type.
     """
 
-    def current_head(pr_number: int) -> str | None:
+    @property
+    def head_sha(self) -> str | None: ...
+
+    @property
+    def state(self) -> str: ...
+
+
+#: Re-observes one pull request at completion, or answers ``None`` when it
+#: cannot be observed at all. ``None`` is "unknown", never "unchanged".
+CandidateObservationReader = Callable[[int], ObservedCandidatePullRequest | None]
+
+
+def repository_candidate_observations(
+    repository_host: "RepositoryHost | None",
+) -> CandidateObservationReader:
+    """The live pull-request reader over the repository host.
+
+    One targeted read per audited candidate at completion, not a scan: a batch
+    is threshold-sized, and the alternative — trusting what the manifest
+    recorded before the session ran — is precisely the staleness this leaf
+    exists to remove. The read the host already performs carries the pull
+    request's lifecycle state beside its head, so asking both questions costs
+    no additional GitHub call.
+
+    A transport failure answers ``None`` rather than raising, because "we could
+    not look", "it moved" and "it is no longer open" have the same consequence
+    here (no merge-facing authority) and none should take down completion
+    planning.
+    """
+
+    def observe(pr_number: int) -> ObservedCandidatePullRequest | None:
         if repository_host is None:
             return None
         try:
-            pr = repository_host.get_pr(pr_number)
+            return repository_host.get_pr(pr_number)
         except Exception as exc:  # pragma: no cover - transport specific
             logger.warning(
-                "[tech_lead] Could not re-read the head of PR #%d before"
-                " applying a tech-lead disposition: %s",
+                "[tech_lead] Could not re-read PR #%d before applying a"
+                " tech-lead disposition: %s",
                 pr_number,
                 exc,
             )
             return None
-        return pr.head_sha if pr is not None else None
 
-    return current_head
+    return observe
 
 
 def candidate_standing(
-    candidate: TechLeadCandidate, heads: CandidateHeadReader
+    candidate: TechLeadCandidate, observations: CandidateObservationReader
 ) -> tuple[CandidateStanding, str]:
-    """Whether ``candidate`` is still the candidate, and what was observed."""
+    """Whether ``candidate`` is still the candidate, and what was observed.
+
+    Lifecycle is asked BEFORE the commit, the same order
+    :meth:`~.tech_lead_candidate_policy.TechLeadCandidatePolicy.is_candidate`
+    asks it in at the other two seams: a merged or closed pull request is
+    historical evidence whatever its head still says, and the head it merged at
+    is normally the audited one, so a commit-first reading would answer
+    :attr:`~..domain.tech_lead_candidate.CandidateStanding.CURRENT` for exactly
+    the case that must never be current (#352).
+    """
     if not candidate.is_bound:
         return CandidateStanding.UNBOUND, ""
-    observed = heads(candidate.pr_number)
-    if not observed:
+    observed = observations(candidate.pr_number)
+    if observed is None:
         return CandidateStanding.UNREADABLE, ""
-    if not candidate.covers(observed):
-        return CandidateStanding.MOVED, observed
-    return CandidateStanding.CURRENT, observed
+    if not TechLeadCandidatePolicy.is_open(observed.state):
+        return CandidateStanding.TERMINAL, observed.head_sha or ""
+    if not observed.head_sha:
+        return CandidateStanding.UNREADABLE, ""
+    if not candidate.covers(observed.head_sha):
+        return CandidateStanding.MOVED, observed.head_sha
+    return CandidateStanding.CURRENT, observed.head_sha
 
 
 @dataclass(frozen=True, slots=True)
@@ -183,7 +227,7 @@ def plan_candidate_dispositions(
     expected: "ExpectedState",
     *,
     labels: "LabelManager",
-    heads: CandidateHeadReader,
+    observations: CandidateObservationReader,
     run_identity: str,
 ) -> list[Action]:
     """Plan every audited candidate's effects, independently of its siblings.
@@ -199,7 +243,7 @@ def plan_candidate_dispositions(
         decision,
         expected,
         labels=labels,
-        heads=heads,
+        observations=observations,
         run_identity=run_identity,
     ):
         actions.extend(effects.actions)
@@ -213,7 +257,7 @@ def candidate_effects(
     expected: "ExpectedState",
     *,
     labels: "LabelManager",
-    heads: CandidateHeadReader,
+    observations: CandidateObservationReader,
     run_identity: str,
 ) -> list[TechLeadCandidateEffects]:
     """One :class:`TechLeadCandidateEffects` per candidate this run audited."""
@@ -221,7 +265,7 @@ def candidate_effects(
     planned: list[TechLeadCandidateEffects] = []
     for candidate in authority.manifest_candidates:
         verdict = decision.verdict_for(candidate.pr_number)
-        standing, observed = candidate_standing(candidate, heads)
+        standing, observed = candidate_standing(candidate, observations)
         planned.append(
             _effects_for(
                 candidate,
@@ -608,6 +652,96 @@ def _unproven_receipt(
     )
 
 
+@dataclass(frozen=True, slots=True)
+class _Refusal:
+    """What ONE non-authority standing tells the pull request.
+
+    Three parts because a refusal is three statements and they do not all
+    follow from each other: what happened (``headline``), what was observed
+    (``reason``), and what the pull request may now expect (``aftermath``).
+    The last one is why this is not a single sentence with a variable middle:
+    a moved candidate stays eligible for a fresh review of what it now
+    proposes, and a merged one never will be.
+    """
+
+    headline: str
+    reason: str
+    aftermath: str
+
+
+#: The aftermath every HEAD-family refusal shares: the pull request is still
+#: open, so the ordinary batch set will pick it up again at whatever it now
+#: proposes. A terminal pull request does not get this sentence.
+_STILL_ELIGIBLE = (
+    "No tech-lead review, rework or escalation authority has been applied to"
+    " the current head; the pull request stays eligible for a fresh review of"
+    " what it now proposes."
+)
+
+
+def _moved_refusal(observed_head: str) -> _Refusal:
+    return _Refusal(
+        headline="candidate is no longer current",
+        reason=(
+            "the head of this pull request is now"
+            f" `{observed_head or 'unknown'}`, so the review is about work this"
+            " pull request no longer proposes"
+        ),
+        aftermath=_STILL_ELIGIBLE,
+    )
+
+
+def _unreadable_refusal(_observed_head: str) -> _Refusal:
+    return _Refusal(
+        headline="candidate is no longer current",
+        reason=(
+            "the current head of this pull request could not be read, and an"
+            " unknown head is not an unchanged one"
+        ),
+        aftermath=_STILL_ELIGIBLE,
+    )
+
+
+def _unbound_refusal(_observed_head: str) -> _Refusal:
+    return _Refusal(
+        headline="candidate is no longer current",
+        reason=(
+            "no head commit was observed for this pull request when the review"
+            " was prepared, so nothing can be shown to have been audited"
+        ),
+        aftermath=_STILL_ELIGIBLE,
+    )
+
+
+def _terminal_refusal(observed_head: str) -> _Refusal:
+    return _Refusal(
+        headline="this pull request is no longer open",
+        reason=(
+            "it was merged or closed after the batch manifest bound the"
+            f" candidate (its head is `{observed_head or 'unknown'}`), so it is"
+            " historical evidence rather than a merge-facing candidate — an"
+            " unchanged head does not make a settled pull request current"
+        ),
+        aftermath=(
+            "No tech-lead review, rework or escalation authority has been"
+            " applied, and none can be: a pull request that can no longer merge"
+            " is not something a batch review produces merge authority for."
+        ),
+    )
+
+
+#: What each refused standing is told, one entry per member that can reach a
+#: receipt. A map rather than a branch, for the reason ``_SETTLED_RECEIPTS`` is
+#: one: a new standing raises here until its author says what the pull request
+#: learns, instead of silently inheriting another standing's sentence.
+_REFUSALS: dict[CandidateStanding, Callable[[str], _Refusal]] = {
+    CandidateStanding.MOVED: _moved_refusal,
+    CandidateStanding.UNREADABLE: _unreadable_refusal,
+    CandidateStanding.UNBOUND: _unbound_refusal,
+    CandidateStanding.TERMINAL: _terminal_refusal,
+}
+
+
 def _stale_receipt(
     candidate: TechLeadCandidate,
     verdict: TechLeadCandidateVerdict,
@@ -615,37 +749,22 @@ def _stale_receipt(
     observed_head: str,
     run_identity: str,
 ) -> str:
-    reason = {
-        CandidateStanding.MOVED: (
-            "the head of this pull request is now"
-            f" `{observed_head or 'unknown'}`, so the review is about work this"
-            " pull request no longer proposes"
-        ),
-        CandidateStanding.UNREADABLE: (
-            "the current head of this pull request could not be read, and an"
-            " unknown head is not an unchanged one"
-        ),
-        CandidateStanding.UNBOUND: (
-            "no head commit was observed for this pull request when the review"
-            " was prepared, so nothing can be shown to have been audited"
-        ),
-    }[standing]
+    refusal = _REFUSALS[standing](observed_head)
     return (
-        "## ⛔ Tech Lead disposition refused — candidate is no longer current\n\n"
+        f"## ⛔ Tech Lead disposition refused — {refusal.headline}\n\n"
         f"{_identity_lines(candidate, run_identity)}\n"
         f"- Refused disposition: `{verdict.disposition.value}`\n\n"
         f"The Tech Lead review reached `{verdict.disposition.value}` for the"
-        f" candidate above, but {reason}. No tech-lead review, rework or"
-        " escalation authority has been applied to the current head; the pull"
-        " request stays eligible for a fresh review of what it now proposes."
+        f" candidate above, but {refusal.reason}. {refusal.aftermath}"
     )
 
 
 __all__ = [
-    "CandidateHeadReader",
+    "CandidateObservationReader",
+    "ObservedCandidatePullRequest",
     "TechLeadCandidateEffects",
     "candidate_effects",
     "candidate_standing",
     "plan_candidate_dispositions",
-    "repository_candidate_heads",
+    "repository_candidate_observations",
 ]

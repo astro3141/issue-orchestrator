@@ -152,10 +152,12 @@ def make_planner(
         RepositoryHost,
         SimpleNamespace(
             get_issue=lambda _number: issue,
-            # The completion-time candidate re-read (#345): by default every
-            # manifest PR still stands at the commit the fixtures pinned it to.
+            # The completion-time candidate re-read (#345, #352): by default
+            # every manifest PR is still OPEN and still stands at the commit
+            # the fixtures pinned it to. Both halves are read — a merged pull
+            # request bears no disposition however unchanged its head.
             get_pr=lambda number: SimpleNamespace(
-                head_sha=pr_candidate_sha(number)
+                head_sha=pr_candidate_sha(number), state="open"
             ),
         ),
     )
@@ -583,6 +585,49 @@ def test_completed_tech_lead_session_labels_manifest_prs_and_plans_decision(
         and pr_candidate_sha(101) in action.comment
     ]
     assert len(receipts) == 1
+
+
+def test_a_manifest_pr_that_merged_since_the_manifest_receives_no_disposition(
+    tmp_path: Path,
+) -> None:
+    """#352: the planner's completion re-read carries lifecycle, not just head.
+
+    PR 101 merges while the batch review is running, at exactly the commit that
+    was audited — so a head-only re-read answers "unchanged" and projects
+    merge-facing authority onto a pull request that has already merged. The
+    open sibling is unaffected: the refusal is per candidate.
+    """
+    config = make_tech_lead_config(tmp_path)
+    session = make_tech_lead_session(tmp_path)
+    arm_batch_session(config, session, tmp_path)
+    plant_tech_lead_decision_pair(
+        session, candidate_verdicts=pass_verdicts(101, 102)
+    )
+    issue = SimpleNamespace(labels=[])
+    merged_since_the_manifest = cast(
+        RepositoryHost,
+        SimpleNamespace(
+            get_issue=lambda _number: issue,
+            get_pr=lambda number: SimpleNamespace(
+                head_sha=pr_candidate_sha(number),
+                state="merged" if number == 101 else "open",
+            ),
+        ),
+    )
+
+    actions = make_planner(
+        config, repository_host=merged_since_the_manifest
+    ).generate_completion_actions(
+        session,
+        SessionStatus.COMPLETED,
+    )
+
+    assert {action.issue_number for action in _tech_lead_labels(actions)} == {102}
+    assert 101 not in {
+        action.issue_number
+        for action in actions
+        if isinstance(action, AddLabelAction)
+    }
 
 
 def test_completed_tech_lead_session_missing_pair_fails_labels_and_surfaces_rejection(

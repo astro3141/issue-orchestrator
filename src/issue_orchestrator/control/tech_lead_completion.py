@@ -111,7 +111,7 @@ from .tech_lead_decision_loader import (
 )
 from .subject_recovery_authority import SubjectRecoveryAuthority
 from .tech_lead_candidate_disposition import (
-    CandidateHeadReader,
+    CandidateObservationReader,
     plan_candidate_dispositions,
 )
 from .tech_lead_candidate_policy import TechLeadCandidatePolicy
@@ -633,7 +633,7 @@ def generate_tech_lead_completion_actions(
     tech_lead_authority: "TechLeadAuthorityStore",
     open_issue_corpus: "OpenIssueCorpusManager",
     active_session_run_id: "Callable[[int], str | None]",
-    current_candidate_head: CandidateHeadReader,
+    current_candidate_observation: CandidateObservationReader,
 ) -> list[Action]:
     """Plan all completion effects for a tech_lead session (see module docstring).
 
@@ -644,10 +644,11 @@ def generate_tech_lead_completion_actions(
 
     The one fact planning cannot hold is whether each audited candidate is
     STILL the candidate, so it is supplied as a reader rather than assumed:
-    ``current_candidate_head`` re-observes one pull request's live head, the
-    same shape ``active_session_run_id`` already has. Nothing else here reads
-    GitHub, and a candidate whose head cannot be read receives no merge-facing
-    effect (#345).
+    ``current_candidate_observation`` re-observes one pull request — its
+    lifecycle state and its head — the same shape ``active_session_run_id``
+    already has. Nothing else here reads GitHub, and a candidate that cannot be
+    read, that moved, or that is no longer open receives no merge-facing effect
+    (#345, #352).
     """
     actions: list[Action] = []
 
@@ -695,10 +696,10 @@ def generate_tech_lead_completion_actions(
             and authority.candidates_recorded
         ):
             # Per CANDIDATE, from the decision's own verdicts and a live
-            # re-read of each pull request's head (#345). The old blanket
-            # projection said only "a valid artifact was produced over a
-            # manifest containing this number", which #335 forbids reading as
-            # merge authority.
+            # re-read of each pull request — its lifecycle and its head
+            # (#345, #352). The old blanket projection said only "a valid
+            # artifact was produced over a manifest containing this number",
+            # which #335 forbids reading as merge authority.
             actions.extend(
                 plan_candidate_dispositions(
                     config,
@@ -706,7 +707,7 @@ def generate_tech_lead_completion_actions(
                     load_result.decision,
                     expected,
                     labels=labels,
-                    heads=current_candidate_head,
+                    observations=current_candidate_observation,
                     run_identity=(
                         f"{session.run_assets.run_id}/"
                         f"{session.run_assets.session_name}"
