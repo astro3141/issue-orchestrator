@@ -279,7 +279,7 @@ def _facts(
 ) -> ContinuationFacts:
     """The durable facts one attempt states, reduced to the decision's shape."""
     latest = attempt.latest_publication_evaluation
-    verdict = attempt.continuation_review_verdict
+    verdict = attempt.review_verdict
     return ContinuationFacts(
         descriptor=attempt.continuation_descriptor,
         has_publication_evaluation=latest is not None,

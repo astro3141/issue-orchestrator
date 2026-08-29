@@ -20,6 +20,7 @@ class MockPR:
     labels: list[str]
     body: Optional[str] = None
     state: str = "open"
+    head_sha: Optional[str] = "a" * 40
 
 
 class MockRepositoryHost:
@@ -318,3 +319,75 @@ class TestTechLeadCandidatePolicy:
         assert policy.is_candidate(["code-reviewed"]) is True
         assert policy.is_candidate(["code-reviewed", "tech-lead-reviewed"]) is False
         assert policy.is_candidate(["code-reviewed", "tech-lead-failed"]) is False
+
+
+class TestExactCandidateBinding:
+    """Every selected PR carries the head commit that selected it (#345).
+
+    The manifest is where candidate identity is established: the same
+    observation that decided the PR is a batch candidate records WHICH commit
+    it was a candidate at. Deriving it later would bind the review to whatever
+    the head has since become.
+    """
+
+    def test_the_selecting_observation_is_what_binds_the_candidate(self):
+        host = MockRepositoryHost(prs=[
+            MockPR(
+                number=42,
+                title="Test PR",
+                url="u",
+                branch="42-thing",
+                labels=["code-reviewed"],
+                head_sha="c" * 40,
+            ),
+        ])
+        builder = TechLeadManifestBuilder(host, candidate_policy=TechLeadCandidatePolicy())
+
+        manifest = builder.build(data_dir="data")
+
+        assert manifest.prs[0].head_sha == "c" * 40
+        assert manifest.candidates()[0].pr_number == 42
+        assert manifest.candidates()[0].is_bound is True
+
+    def test_an_unreadable_head_stays_in_the_batch_but_binds_nothing(self):
+        """The audited set must stay the set that tripped the threshold (#6768).
+
+        Dropping the PR here would recreate the divergence that produced endless
+        empty batches; carrying it unbound is what makes it unpassable instead.
+        """
+        host = MockRepositoryHost(prs=[
+            MockPR(
+                number=42,
+                title="Test PR",
+                url="u",
+                branch="42-thing",
+                labels=["code-reviewed"],
+                head_sha=None,
+            ),
+        ])
+        builder = TechLeadManifestBuilder(host, candidate_policy=TechLeadCandidatePolicy())
+
+        manifest = builder.build(data_dir="data")
+
+        assert [pr.number for pr in manifest.prs] == [42]
+        assert manifest.candidates()[0].is_bound is False
+
+    def test_the_manifest_round_trips_its_candidates(self, tmp_path):
+        host = MockRepositoryHost(prs=[
+            MockPR(
+                number=42,
+                title="Test PR",
+                url="u",
+                branch="42-thing",
+                labels=["code-reviewed"],
+                head_sha="d" * 40,
+            ),
+        ])
+        builder = TechLeadManifestBuilder(host, candidate_policy=TechLeadCandidatePolicy())
+        manifest = builder.build(data_dir="data")
+        path = tmp_path / "manifest.json"
+        manifest.write(path)
+
+        from issue_orchestrator.domain.tech_lead_manifest import TechLeadManifest
+
+        assert TechLeadManifest.read(path).candidates() == manifest.candidates()

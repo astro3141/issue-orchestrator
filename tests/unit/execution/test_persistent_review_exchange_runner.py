@@ -43,6 +43,9 @@ from issue_orchestrator.infra.config import Config
 from issue_orchestrator.execution.attempt_execution_identity_store import (
     AttemptExecutionIdentityStore,
 )
+from issue_orchestrator.execution.attempt_review_verdict_store import (
+    AttemptReviewVerdictStore,
+)
 from issue_orchestrator.domain.review_exchange import ReviewExchangeOutcome
 from issue_orchestrator.domain.review_exchange_rework import ReviewExchangeRework
 from issue_orchestrator.domain.review_exchange_run import (
@@ -188,11 +191,17 @@ def _identity_store(tmp_path: Path) -> AttemptExecutionIdentityStore:
     return AttemptExecutionIdentityStore(SidecarAttemptStore(tmp_path / "repo-root"))
 
 
+def _review_verdict_store(tmp_path: Path) -> AttemptReviewVerdictStore:
+    """The verdict half of the same durable candidate record (#345)."""
+    return AttemptReviewVerdictStore(SidecarAttemptStore(tmp_path / "repo-root"))
+
+
 def _make_runner(tmp_path: Path) -> "prer.PersistentReviewExchangeRunner":
     return prer.PersistentReviewExchangeRunner(
         MagicMock(name="session_output"),
         MagicMock(name="pair_registry"),
         _identity_store(tmp_path),
+        _review_verdict_store(tmp_path),
     )
 
 
@@ -270,6 +279,7 @@ def test_run_passes_per_agent_response_channels(
         MagicMock(name="session_output"),
         MagicMock(name="pair_registry"),
         _identity_store(tmp_path),
+        _review_verdict_store(tmp_path),
         turn_mailbox=MagicMock(name="turn_mailbox"),
     )
     reviewer = _make_agent(
@@ -361,6 +371,7 @@ def test_run_resolves_coder_addendum_for_coder_worktree_only(
         MagicMock(name="session_output"),
         MagicMock(name="pair_registry"),
         _identity_store(tmp_path),
+        _review_verdict_store(tmp_path),
         coder_prompt_addendum=provider,
     )
 

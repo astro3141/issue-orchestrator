@@ -98,6 +98,12 @@ class TechLeadManifestBuilder:
                 title=pr.title,
                 url=pr.url,
                 branch=pr.branch,
+                # The candidate identity, read from the SAME observation that
+                # selected the PR (#345). An unreadable head stays "" — the PR
+                # is still audited, it simply cannot receive a merge-facing
+                # disposition later — rather than dropping out of the manifest
+                # and re-opening the threshold/manifest divergence #6768 closed.
+                head_sha=pr.head_sha or "",
                 files=PRFiles(),
             )
             for pr in prs

@@ -18,9 +18,12 @@ The axes, in the order they are judged:
    batch review), while act-level reset/kill proposals are held to the stricter
    issue-only scope so a manifest PR number never reaches the issue reset owner
    as an ``issue_number`` (#6764 re-review F1).
-3. **Flavor duties** — a failure investigation must publish its diagnosis to
+3. **Candidate scope** — may it render a merge-facing disposition on THIS
+   exact candidate? A per-candidate verdict binds to a pull request AND a
+   commit, and both must match what the run was launched auditing (#345).
+4. **Flavor duties** — a failure investigation must publish its diagnosis to
    the originating issue (#6761 F2).
-4. **Label truth** — ``create_issue`` proposals may not carry protected
+5. **Label truth** — ``create_issue`` proposals may not carry protected
    workflow labels (#6761 F4).
 
 Every one of them returns a human-readable detail rather than raising: the
@@ -187,6 +190,41 @@ def _protected_label_violation(
     return None
 
 
+def _candidate_verdict_violation(
+    decision: "TechLeadDecision", authority: TechLeadLaunchAuthority
+) -> str | None:
+    """Out-of-scope or misbound per-candidate verdict detail, or None (#345).
+
+    The fifth axis, and the one that decides merge-facing authority. A verdict
+    is admissible only when it names a candidate THIS run was launched to audit
+    — the pull request AND the exact commit the orchestrator recorded for it.
+    Everything else is refused for the whole decision rather than dropped,
+    because a decision that renders a disposition on work it never audited is
+    not a decision with one bad row in it.
+
+    A run whose authority records no candidates (a legacy row, or a non-batch
+    flavor) may carry no verdicts at all: with nothing to bind to, a verdict
+    would be a claim about a commit nobody observed.
+    """
+    for verdict in decision.candidate_verdicts:
+        recorded = authority.candidate_for(verdict.pr_number)
+        if recorded is None:
+            return (
+                f"candidate verdict for PR #{verdict.pr_number} names a pull"
+                " request this session was not launched to audit; its recorded"
+                " candidates are"
+                f" {[candidate.pr_number for candidate in authority.manifest_candidates]}"
+            )
+        if not recorded.covers(verdict.candidate.head_sha):
+            return (
+                f"candidate verdict for PR #{verdict.pr_number} is rendered"
+                f" against {verdict.candidate.short_sha}, which is not the"
+                f" candidate this session was launched to audit"
+                f" ({recorded.short_sha})"
+            )
+    return None
+
+
 def validate_decision_for_authority(
     decision: "TechLeadDecision",
     authority: TechLeadLaunchAuthority,
@@ -203,6 +241,7 @@ def validate_decision_for_authority(
     return (
         _capability_violation(decision, authority)
         or _target_scope_violation(decision, authority)
+        or _candidate_verdict_violation(decision, authority)
         or _diagnosis_duty_violation(decision, authority)
         or _protected_label_violation(decision, config=config, labels=labels)
     )

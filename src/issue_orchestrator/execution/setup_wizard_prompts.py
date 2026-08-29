@@ -277,10 +277,27 @@ Compact `tech-lead-decision.json` example:
       "area": "ci-runtime",
       "finding_ids": ["T1"]
     }
+  ],
+  "candidate_verdicts": [
+    {
+      "pr_number": 123,
+      "candidate_sha": "4f2a9c1b8e7712d3a5c0b96e4d1f8a2c7b035e91",
+      "disposition": "pass",
+      "rationale": "Conforms to the governing contract; T1 is infrastructure, not this candidate's defect.",
+      "finding_ids": ["T1"]
+    }
   ]
 }
 ```
 
+- `candidate_verdicts` is the batch review's merge-facing output (one entry per
+  manifest candidate, at most 50). Each names `pr_number`, the exact
+  `candidate_sha` from the manifest, a `disposition` of `pass` / `rework` /
+  `human_a`, and a non-empty `rationale` (the pass reason, the actionable rework
+  feedback, or the human decision question). A verdict outside this session's
+  manifest - a pull request it did not audit, or a commit other than the one it
+  audited - rejects the whole decision. The other flavors have no candidates and
+  omit the field entirely.
 - Finding `classification` is one of: `infra`, `task`, `agent`, `systemic`.
 - Ids are canonical: findings are `T<n>` (`T1`, `T2`, ...) and actions are
   `A<n>` (`A1`, `A2`, ...), no leading zeros, unique across both lists. The
@@ -514,19 +531,54 @@ TECH_LEAD_DIR="$ISSUE_ORCHESTRATOR_RUN_DIR/tech-lead-data"
 cat "$TECH_LEAD_DIR/manifest.json"
 ```
 
-The manifest lists the PRs to review with their pre-fetched file names.
+The manifest lists the PRs to review with their candidate commit
+(`head_sha`) and pre-fetched file names. Each entry names a **candidate**: the
+pull request AND the exact commit the orchestrator observed when it selected
+it. Your verdict is authority for that commit and for no other, so read the
+files whose names carry it and quote the same `head_sha` back in your verdict.
+
+`candidate-evidence.json`, staged beside the manifest, carries per candidate
+what the independent Reviewer decided about that exact commit and whether the
+same commit cleared the publication gate. Read it; do NOT call `gh` to
+reconstruct it. An entry with a non-empty `gap` has NOT established an
+independent approval of this commit and must never receive `pass`.
 
 {_TECH_LEAD_EMPTY_AUDIT_SECTION}
 
 ### 2. For Each PR, Analyze the Local Files
 
 ```bash
-# Metadata (title, body, branch, ...)
-cat "$TECH_LEAD_DIR/pr-<number>-meta.json"
+# The independent Reviewer's verdict for every candidate
+cat "$TECH_LEAD_DIR/candidate-evidence.json"
 
-# The code changes
-cat "$TECH_LEAD_DIR/pr-<number>-diff.txt"
+# Metadata (title, body, branch, candidate_sha, ...)
+cat "$TECH_LEAD_DIR/pr-<number>-<sha12>-meta.json"
+
+# The code changes of that exact candidate
+cat "$TECH_LEAD_DIR/pr-<number>-<sha12>-diff.txt"
 ```
+
+### Render one verdict per candidate
+
+For every manifest candidate, add an entry to `candidate_verdicts` in
+`tech-lead-decision.json`. The verdict is per candidate, never per session: a
+batch carrying two PRs reaches two independent answers.
+
+- `pass` - the candidate conforms to the governing contract and systemic
+  context, and the merge gate may consume that. Requires an exact-candidate
+  reviewer approval in `candidate-evidence.json` with an empty `gap`.
+  Informational findings may coexist with a `pass`; a blocking bounded defect
+  may not. The orchestrator re-checks this
+prerequisite itself: a `pass` on a candidate it never established an
+exact-commit reviewer approval for is refused and projects nothing.
+- `rework` - a bounded implementation or process defect inside already-settled
+  Spec/TD/policy. Your `rationale` IS the feedback the rework agent works from,
+  so make it specific and actionable. No human decision is implied.
+- `human_a` - a genuinely new Spec/TD/policy/authority decision is required.
+  Your `rationale` is the decision question. This stops the candidate; it is not
+  an implementation failure and it is not rework.
+
+Omit a candidate to render no disposition on it - that projects nothing.
 
 Evaluate:
 - **Code quality**: Clean, maintainable implementation?
@@ -672,10 +724,14 @@ The orchestrator closes the anchor issue when your review lands successfully.
 ## Completion (MANDATORY)
 
 Use `coding-done` to report your findings AFTER writing both artifacts.
-Labels are automatic - for a batch review the orchestrator adds
-`{reviewed_label}` to every PR in the manifest when you complete
-successfully - and it executes your proposed actions per its configured
-authority. You never touch GitHub yourself.
+Labels are automatic and PER CANDIDATE. After re-reading each pull request's
+live head, the orchestrator adds `{reviewed_label}` to a candidate you passed
+that still stands at the commit you judged; posts your `rework` rationale as
+candidate-bound feedback and then routes that pull request into the ordinary
+rework lane; escalates a `human_a` candidate to a human and blocks it; and
+applies none of these to a candidate whose head moved, recording the refusal on
+the pull request instead. It also executes your proposed actions per its
+configured authority. You never touch GitHub yourself.
 
 ```bash
 coding-done completed \\

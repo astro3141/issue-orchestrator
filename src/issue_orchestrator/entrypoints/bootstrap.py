@@ -116,6 +116,7 @@ from ..control.workflows import ReviewWorkflow, RetrospectiveReviewWorkflow, Rew
 from ..control.worktree_manager import extract_issue_branches
 from ..infra import gh_audit, runtime_identity
 from .bootstrap_tech_lead import (
+    candidate_review_evidence,
     create_board_snapshot_builder,
     create_tech_lead_composition,
     wire_tech_lead_act_executors,
@@ -599,12 +600,6 @@ def build_orchestrator(
     goal_pilot_store = SqliteGoalPilotStore(repo_root=config.repo_root)
     attempt_store = create_attempt_store(config)
 
-    # Create manifest downloader for tech_lead sessions
-    manifest_downloader = TechLeadDownloader(
-        repository_host=github,
-        command_runner=command_runner,
-    ) if github else None
-
     # Create cache-bypassing reader
     fresh_issue_reader = GitHubFreshIssueReader(repo=config.repo, config=config) if github else None
 
@@ -700,6 +695,11 @@ def build_orchestrator(
     # store and rebuild from it, so a refusal nothing could write to the issue
     # still withholds review after a restart.
     publication_verdict = PublicationVerdictReader.over(UnrecordedRefusals(pending_work.claims), attempt_store, _validation_attempt_key_factory(config))
+    # Batch-review manifest data, staged with the exact-candidate evidence (#345).
+    manifest_downloader = TechLeadDownloader(
+        repository_host=github, command_runner=command_runner,
+        candidate_evidence=candidate_review_evidence(config, attempt_store, publication_verdict),
+    ) if github else None
 
     # Create PR scanner (after the refusals record it reads)
     pr_scanner = (
@@ -983,12 +983,7 @@ def build_orchestrator_for_testing(
     goal_pilot_store = SqliteGoalPilotStore(repo_root=config.repo_root)
     attempt_store = create_attempt_store(config)
 
-    from ..execution.tech_lead_downloader import TechLeadDownloader
     from unittest.mock import MagicMock
-    manifest_downloader = TechLeadDownloader(
-        repository_host=github,
-        command_runner=command_runner,
-    )
 
     class _TestFreshIssueReader:
         """Fallback FreshIssueReader for tests without network dependencies."""
@@ -1046,6 +1041,7 @@ def build_orchestrator_for_testing(
     from ..control.pre_publish_gate import PrePublishGate
     from ..control.publication_gate import build_publication_gate
     from ..execution.attempt_execution_identity_store import AttemptExecutionIdentityStore
+    from ..execution.attempt_review_verdict_store import AttemptReviewVerdictStore
     from ..execution.persistent_review_exchange_runner import (
         PersistentReviewExchangeRunner,
     )
@@ -1094,6 +1090,10 @@ def build_orchestrator_for_testing(
     # rebuilt from it, so a test composition exercises the same restart
     # behaviour production gets (#51).
     publication_verdict = PublicationVerdictReader.over(UnrecordedRefusals(pending_work.claims), attempt_store, _validation_attempt_key_factory(config))
+    from ..execution.tech_lead_downloader import TechLeadDownloader
+    manifest_downloader = TechLeadDownloader(
+        repository_host=github, command_runner=command_runner,
+        candidate_evidence=candidate_review_evidence(config, attempt_store, publication_verdict))
 
     # Create PRScanner for testing (after the refusals record it reads)
     from ..control.pr_scanner import PRScanner
@@ -1116,6 +1116,7 @@ def build_orchestrator_for_testing(
             session_output,
             pair_registry_for_testing,
             AttemptExecutionIdentityStore(attempt_store),
+            AttemptReviewVerdictStore(attempt_store),
             turn_mailbox=turn_mailbox,
             coder_prompt_addendum=coder_prompt_addendum,
         ),

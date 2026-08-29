@@ -23,6 +23,7 @@ class MockPR:
     labels: list[str]
     body: Optional[str] = None
     state: str = "open"
+    head_sha: Optional[str] = None
 
 
 @dataclass
@@ -63,6 +64,11 @@ class MockCommandRunner:
         return CommandResult(returncode=0, stdout="", stderr="")
 
 
+def _sha(pr_number: int) -> str:
+    """A distinct full-length candidate commit per PR."""
+    return f"{pr_number:03d}".ljust(40, "a")
+
+
 class TestTechLeadDownloader:
     """Tests for TechLeadDownloader."""
 
@@ -86,7 +92,7 @@ class TestTechLeadDownloader:
         downloader = TechLeadDownloader(host, runner)
 
         manifest = TechLeadManifest(data_dir="", prs=[
-            PRToReview(number=1, title="PR", url="u", branch="b"),
+            PRToReview(number=1, title="PR", url="u", branch="b", head_sha=_sha(1)),
         ])
 
         try:
@@ -98,13 +104,7 @@ class TestTechLeadDownloader:
     def test_download_creates_diff_file(self, tmp_path: Path):
         """Downloads and writes diff for each PR."""
         host = MockRepositoryHost(prs={
-            42: MockPR(
-                number=42,
-                title="Test PR",
-                url="https://github.com/org/repo/pull/42",
-                branch="test",
-                labels=[],
-            ),
+            42: MockPR(number=42, title="Test PR", url="https://github.com/org/repo/pull/42", branch="test", labels=[], head_sha=_sha(42)),
         })
         runner = MockCommandRunner(results={
             "42": CommandResult(
@@ -117,17 +117,17 @@ class TestTechLeadDownloader:
 
         manifest = TechLeadManifest(
             data_dir="tech-lead-data",
-            prs=[PRToReview(number=42, title="Test PR", url="u", branch="b")],
+            prs=[PRToReview(number=42, title="Test PR", url="u", branch="b", head_sha=_sha(42))],
         )
         result = downloader.download(manifest, tmp_path)
 
         # Check diff file was created
-        diff_path = tmp_path / "tech-lead-data" / "pr-42-diff.txt"
+        diff_path = tmp_path / "tech-lead-data" / "pr-42-042aaaaaaaaa-diff.txt"
         assert diff_path.exists()
         assert "diff --git" in diff_path.read_text()
 
         # Check manifest was updated
-        assert result.prs[0].files.diff == "pr-42-diff.txt"
+        assert result.prs[0].files.diff == "pr-42-042aaaaaaaaa-diff.txt"
 
     def test_download_creates_metadata_file(self, tmp_path: Path):
         """Downloads and writes metadata for each PR."""
@@ -140,6 +140,7 @@ class TestTechLeadDownloader:
                 labels=["bug", "priority"],
                 body="PR description here",
                 state="open",
+                head_sha=_sha(42),
             ),
         })
         runner = MockCommandRunner()
@@ -147,12 +148,12 @@ class TestTechLeadDownloader:
 
         manifest = TechLeadManifest(
             data_dir="tech-lead-data",
-            prs=[PRToReview(number=42, title="Test PR", url="u", branch="b")],
+            prs=[PRToReview(number=42, title="Test PR", url="u", branch="b", head_sha=_sha(42))],
         )
         result = downloader.download(manifest, tmp_path)
 
         # Check metadata file was created
-        meta_path = tmp_path / "tech-lead-data" / "pr-42-meta.json"
+        meta_path = tmp_path / "tech-lead-data" / "pr-42-042aaaaaaaaa-meta.json"
         assert meta_path.exists()
 
         metadata = json.loads(meta_path.read_text())
@@ -164,12 +165,12 @@ class TestTechLeadDownloader:
         assert metadata["state"] == "open"
 
         # Check manifest was updated
-        assert result.prs[0].files.metadata == "pr-42-meta.json"
+        assert result.prs[0].files.metadata == "pr-42-042aaaaaaaaa-meta.json"
 
     def test_download_handles_diff_error(self, tmp_path: Path):
         """Writes error message when diff fetch fails."""
         host = MockRepositoryHost(prs={
-            99: MockPR(number=99, title="PR", url="u", branch="b", labels=[]),
+            99: MockPR(number=99, title="PR", url="u", branch="b", labels=[], head_sha=_sha(99)),
         })
         runner = MockCommandRunner(results={
             "99": CommandResult(
@@ -182,11 +183,11 @@ class TestTechLeadDownloader:
 
         manifest = TechLeadManifest(
             data_dir="data",
-            prs=[PRToReview(number=99, title="PR", url="u", branch="b")],
+            prs=[PRToReview(number=99, title="PR", url="u", branch="b", head_sha=_sha(99))],
         )
         downloader.download(manifest, tmp_path)
 
-        diff_path = tmp_path / "data" / "pr-99-diff.txt"
+        diff_path = tmp_path / "data" / "pr-99-099aaaaaaaaa-diff.txt"
         assert diff_path.exists()
         content = diff_path.read_text()
         assert "Error fetching diff" in content
@@ -200,11 +201,11 @@ class TestTechLeadDownloader:
 
         manifest = TechLeadManifest(
             data_dir="data",
-            prs=[PRToReview(number=999, title="Missing", url="u", branch="b")],
+            prs=[PRToReview(number=999, title="Missing", url="u", branch="b", head_sha=_sha(999))],
         )
         downloader.download(manifest, tmp_path)
 
-        meta_path = tmp_path / "data" / "pr-999-meta.json"
+        meta_path = tmp_path / "data" / "pr-999-999aaaaaaaaa-meta.json"
         assert meta_path.exists()
         metadata = json.loads(meta_path.read_text())
         assert "error" in metadata
@@ -213,9 +214,9 @@ class TestTechLeadDownloader:
     def test_download_multiple_prs(self, tmp_path: Path):
         """Downloads data for multiple PRs."""
         host = MockRepositoryHost(prs={
-            1: MockPR(number=1, title="PR 1", url="u1", branch="b1", labels=[]),
-            2: MockPR(number=2, title="PR 2", url="u2", branch="b2", labels=[]),
-            3: MockPR(number=3, title="PR 3", url="u3", branch="b3", labels=[]),
+            1: MockPR(number=1, title="PR 1", url="u1", branch="b1", labels=[], head_sha=_sha(1)),
+            2: MockPR(number=2, title="PR 2", url="u2", branch="b2", labels=[], head_sha=_sha(2)),
+            3: MockPR(number=3, title="PR 3", url="u3", branch="b3", labels=[], head_sha=_sha(3)),
         })
         runner = MockCommandRunner(results={
             "1": CommandResult(0, "diff1", ""),
@@ -227,32 +228,32 @@ class TestTechLeadDownloader:
         manifest = TechLeadManifest(
             data_dir="data",
             prs=[
-                PRToReview(number=1, title="PR 1", url="u1", branch="b1"),
-                PRToReview(number=2, title="PR 2", url="u2", branch="b2"),
-                PRToReview(number=3, title="PR 3", url="u3", branch="b3"),
+                PRToReview(number=1, title="PR 1", url="u1", branch="b1", head_sha=_sha(1)),
+                PRToReview(number=2, title="PR 2", url="u2", branch="b2", head_sha=_sha(2)),
+                PRToReview(number=3, title="PR 3", url="u3", branch="b3", head_sha=_sha(3)),
             ],
         )
         result = downloader.download(manifest, tmp_path)
 
         # Check all files created
-        assert (tmp_path / "data" / "pr-1-diff.txt").exists()
-        assert (tmp_path / "data" / "pr-2-diff.txt").exists()
-        assert (tmp_path / "data" / "pr-3-diff.txt").exists()
-        assert (tmp_path / "data" / "pr-1-meta.json").exists()
-        assert (tmp_path / "data" / "pr-2-meta.json").exists()
-        assert (tmp_path / "data" / "pr-3-meta.json").exists()
+        assert (tmp_path / "data" / "pr-1-001aaaaaaaaa-diff.txt").exists()
+        assert (tmp_path / "data" / "pr-2-002aaaaaaaaa-diff.txt").exists()
+        assert (tmp_path / "data" / "pr-3-003aaaaaaaaa-diff.txt").exists()
+        assert (tmp_path / "data" / "pr-1-001aaaaaaaaa-meta.json").exists()
+        assert (tmp_path / "data" / "pr-2-002aaaaaaaaa-meta.json").exists()
+        assert (tmp_path / "data" / "pr-3-003aaaaaaaaa-meta.json").exists()
 
         # Check manifest updated
-        assert result.prs[0].files.diff == "pr-1-diff.txt"
-        assert result.prs[1].files.diff == "pr-2-diff.txt"
-        assert result.prs[2].files.diff == "pr-3-diff.txt"
+        assert result.prs[0].files.diff == "pr-1-001aaaaaaaaa-diff.txt"
+        assert result.prs[1].files.diff == "pr-2-002aaaaaaaaa-diff.txt"
+        assert result.prs[2].files.diff == "pr-3-003aaaaaaaaa-diff.txt"
 
     def test_download_continues_on_pr_failure(self, tmp_path: Path):
         """Continues downloading other PRs even if one fails."""
         host = MockRepositoryHost(prs={
-            1: MockPR(number=1, title="PR 1", url="u1", branch="b1", labels=[]),
+            1: MockPR(number=1, title="PR 1", url="u1", branch="b1", labels=[], head_sha=_sha(1)),
             # PR 2 missing
-            3: MockPR(number=3, title="PR 3", url="u3", branch="b3", labels=[]),
+            3: MockPR(number=3, title="PR 3", url="u3", branch="b3", labels=[], head_sha=_sha(3)),
         })
         runner = MockCommandRunner(results={
             "1": CommandResult(0, "diff1", ""),
@@ -264,49 +265,233 @@ class TestTechLeadDownloader:
         manifest = TechLeadManifest(
             data_dir="data",
             prs=[
-                PRToReview(number=1, title="PR 1", url="u1", branch="b1"),
-                PRToReview(number=2, title="PR 2", url="u2", branch="b2"),
-                PRToReview(number=3, title="PR 3", url="u3", branch="b3"),
+                PRToReview(number=1, title="PR 1", url="u1", branch="b1", head_sha=_sha(1)),
+                PRToReview(number=2, title="PR 2", url="u2", branch="b2", head_sha=_sha(2)),
+                PRToReview(number=3, title="PR 3", url="u3", branch="b3", head_sha=_sha(3)),
             ],
         )
         downloader.download(manifest, tmp_path)
 
         # PR 1 and 3 should have proper files
-        assert (tmp_path / "data" / "pr-1-diff.txt").exists()
-        assert (tmp_path / "data" / "pr-3-diff.txt").exists()
-        assert "diff1" in (tmp_path / "data" / "pr-1-diff.txt").read_text()
-        assert "diff3" in (tmp_path / "data" / "pr-3-diff.txt").read_text()
+        assert (tmp_path / "data" / "pr-1-001aaaaaaaaa-diff.txt").exists()
+        assert (tmp_path / "data" / "pr-3-003aaaaaaaaa-diff.txt").exists()
+        assert "diff1" in (tmp_path / "data" / "pr-1-001aaaaaaaaa-diff.txt").read_text()
+        assert "diff3" in (tmp_path / "data" / "pr-3-003aaaaaaaaa-diff.txt").read_text()
 
     def test_download_creates_data_directory(self, tmp_path: Path):
         """Creates data directory if it doesn't exist."""
         host = MockRepositoryHost(prs={
-            1: MockPR(number=1, title="PR", url="u", branch="b", labels=[]),
+            1: MockPR(number=1, title="PR", url="u", branch="b", labels=[], head_sha=_sha(1)),
         })
         runner = MockCommandRunner()
         downloader = TechLeadDownloader(host, runner)
 
         manifest = TechLeadManifest(
             data_dir="deep/nested/tech-lead-data",
-            prs=[PRToReview(number=1, title="PR", url="u", branch="b")],
+            prs=[PRToReview(number=1, title="PR", url="u", branch="b", head_sha=_sha(1))],
         )
         downloader.download(manifest, tmp_path)
 
         assert (tmp_path / "deep" / "nested" / "tech-lead-data").exists()
-        assert (tmp_path / "deep" / "nested" / "tech-lead-data" / "pr-1-diff.txt").exists()
+        assert (tmp_path / "deep" / "nested" / "tech-lead-data" / "pr-1-001aaaaaaaaa-diff.txt").exists()
 
     def test_download_calls_gh_pr_diff(self, tmp_path: Path):
         """Calls gh pr diff with correct arguments."""
         host = MockRepositoryHost(prs={
-            42: MockPR(number=42, title="PR", url="u", branch="b", labels=[]),
+            42: MockPR(number=42, title="PR", url="u", branch="b", labels=[], head_sha=_sha(42)),
         })
         runner = MockCommandRunner()
         downloader = TechLeadDownloader(host, runner)
 
         manifest = TechLeadManifest(
             data_dir="data",
-            prs=[PRToReview(number=42, title="PR", url="u", branch="b")],
+            prs=[PRToReview(number=42, title="PR", url="u", branch="b", head_sha=_sha(42))],
         )
         downloader.download(manifest, tmp_path)
 
         assert len(runner.run_calls) == 1
         assert runner.run_calls[0] == ["gh", "pr", "diff", "42"]
+
+
+class TestCandidateBinding:
+    """Materialized content is bound to the manifest's candidate commit (#345).
+
+    The diff transport names a pull request, not a commit, so the binding is
+    proved by bracketing: the manifest recorded the head that selected the PR,
+    and the metadata read that follows the fetch observes it again. When the two
+    disagree, the bytes are about other work and are not filed under this
+    candidate's name at all.
+    """
+
+    def test_a_head_that_moved_during_the_fetch_stages_no_diff(
+        self, tmp_path: Path
+    ) -> None:
+        host = MockRepositoryHost(prs={
+            7: MockPR(
+                number=7,
+                title="PR",
+                url="u",
+                branch="b",
+                labels=[],
+                head_sha=_sha(8),  # moved away from the manifest's candidate
+            ),
+        })
+        runner = MockCommandRunner(results={"7": CommandResult(0, "diff7", "")})
+        downloader = TechLeadDownloader(host, runner)
+
+        manifest = TechLeadManifest(
+            data_dir="data",
+            prs=[PRToReview(number=7, title="PR", url="u", branch="b", head_sha=_sha(7))],
+        )
+        result = downloader.download(manifest, tmp_path)
+
+        assert result.prs[0].files.diff == ""
+        assert not list((tmp_path / "data").glob("*-diff.txt"))
+
+    def test_the_metadata_records_why_the_content_could_not_be_bound(
+        self, tmp_path: Path
+    ) -> None:
+        host = MockRepositoryHost(prs={
+            7: MockPR(
+                number=7, title="PR", url="u", branch="b", labels=[], head_sha=_sha(8)
+            ),
+        })
+        downloader = TechLeadDownloader(host, MockCommandRunner())
+
+        manifest = TechLeadManifest(
+            data_dir="data",
+            prs=[PRToReview(number=7, title="PR", url="u", branch="b", head_sha=_sha(7))],
+        )
+        downloader.download(manifest, tmp_path)
+
+        metadata = json.loads(
+            (tmp_path / "data" / f"pr-7-{_sha(7)[:12]}-meta.json").read_text()
+        )
+        assert metadata["candidate_bound"] is False
+        assert metadata["candidate_sha"] == _sha(7)
+        assert "moved" in metadata["candidate_binding_gap"]
+
+    def test_a_still_current_head_binds_the_content_to_the_candidate(
+        self, tmp_path: Path
+    ) -> None:
+        host = MockRepositoryHost(prs={
+            7: MockPR(
+                number=7, title="PR", url="u", branch="b", labels=[], head_sha=_sha(7)
+            ),
+        })
+        downloader = TechLeadDownloader(host, MockCommandRunner())
+
+        manifest = TechLeadManifest(
+            data_dir="data",
+            prs=[PRToReview(number=7, title="PR", url="u", branch="b", head_sha=_sha(7))],
+        )
+        downloader.download(manifest, tmp_path)
+
+        metadata = json.loads(
+            (tmp_path / "data" / f"pr-7-{_sha(7)[:12]}-meta.json").read_text()
+        )
+        assert metadata["candidate_bound"] is True
+        assert "candidate_binding_gap" not in metadata
+
+    def test_a_pull_request_selected_without_a_head_stages_no_diff(
+        self, tmp_path: Path
+    ) -> None:
+        host = MockRepositoryHost(prs={
+            7: MockPR(
+                number=7, title="PR", url="u", branch="b", labels=[], head_sha=_sha(7)
+            ),
+        })
+        downloader = TechLeadDownloader(host, MockCommandRunner())
+
+        manifest = TechLeadManifest(
+            data_dir="data",
+            prs=[PRToReview(number=7, title="PR", url="u", branch="b")],
+        )
+        result = downloader.download(manifest, tmp_path)
+
+        assert result.prs[0].files.diff == ""
+        metadata = json.loads((tmp_path / "data" / "pr-7-unknown-meta.json").read_text())
+        assert metadata["candidate_bound"] is False
+
+
+class TestStagedReviewEvidence:
+    """The reviewer's exact-commit verdict is staged, and its answer recorded.
+
+    The agent may not fetch this context itself, and the orchestrator may not
+    take the agent's word for it later — so the same staging pass writes the
+    file the session reads AND the fact the launch authority carries (#345).
+    """
+
+    class _Source:
+        def __init__(self, established: bool) -> None:
+            self._established = established
+            self.asked: list[int] = []
+
+        def evidence_for(self, entry, *, repository_host):
+            from issue_orchestrator.domain.tech_lead_candidate import (
+                TechLeadCandidateEvidence,
+            )
+
+            self.asked.append(entry.number)
+            return TechLeadCandidateEvidence(
+                candidate=entry.candidate(),
+                gap="" if self._established else "no verdict for this commit",
+            )
+
+    def _download(self, tmp_path: Path, source) -> TechLeadManifest:
+        host = MockRepositoryHost(prs={
+            7: MockPR(
+                number=7, title="PR", url="u", branch="b", labels=[], head_sha=_sha(7)
+            ),
+        })
+        downloader = TechLeadDownloader(host, MockCommandRunner(), source)
+        manifest = TechLeadManifest(
+            data_dir="data",
+            prs=[PRToReview(number=7, title="PR", url="u", branch="b", head_sha=_sha(7))],
+        )
+        return downloader.download(manifest, tmp_path)
+
+    def test_the_evidence_file_is_staged_beside_the_manifest(
+        self, tmp_path: Path
+    ) -> None:
+        source = self._Source(established=True)
+
+        self._download(tmp_path, source)
+
+        staged = json.loads((tmp_path / "data" / "candidate-evidence.json").read_text())
+        assert source.asked == [7]
+        assert staged["candidates"][0]["candidate_sha"] == _sha(7)
+
+    def test_an_established_approval_is_recorded_on_the_manifest_entry(
+        self, tmp_path: Path
+    ) -> None:
+        manifest = self._download(tmp_path, self._Source(established=True))
+
+        assert manifest.prs[0].review_established is True
+        assert manifest.reviewed_candidates() == manifest.candidates()
+
+    def test_a_gap_leaves_the_candidate_unreviewed(self, tmp_path: Path) -> None:
+        manifest = self._download(tmp_path, self._Source(established=False))
+
+        assert manifest.prs[0].review_established is False
+        assert manifest.reviewed_candidates() == ()
+
+    def test_a_composition_with_no_source_stages_the_omission(
+        self, tmp_path: Path
+    ) -> None:
+        host = MockRepositoryHost(prs={
+            7: MockPR(
+                number=7, title="PR", url="u", branch="b", labels=[], head_sha=_sha(7)
+            ),
+        })
+        downloader = TechLeadDownloader(host, MockCommandRunner())
+        manifest = TechLeadManifest(
+            data_dir="data",
+            prs=[PRToReview(number=7, title="PR", url="u", branch="b", head_sha=_sha(7))],
+        )
+
+        result = downloader.download(manifest, tmp_path)
+
+        staged = json.loads((tmp_path / "data" / "candidate-evidence.json").read_text())
+        assert "no exact-candidate review evidence source" in staged["candidates"][0]["gap"]
+        assert result.prs[0].review_established is False

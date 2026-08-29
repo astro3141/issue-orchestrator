@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Collection, cast
 
 from .tech_lead_artifacts import ACT_LEVEL_TECH_LEAD_ACTIONS
+from .tech_lead_candidate import TechLeadCandidate
 
 TECH_LEAD_ASSIGNMENT_FILENAME = "tech-lead-assignment.json"
 
@@ -452,6 +453,31 @@ class TechLeadLaunchScope:
             )
 
 
+def _manifest_candidates_from(value: object) -> tuple[TechLeadCandidate, ...]:
+    """Parse a persisted candidate list; malformed content raises (#345).
+
+    Extracted rather than inlined into ``from_dict``: the store is
+    orchestrator-owned, so every shape below is a bug rather than agent input,
+    and the reader that decodes them has no business growing a branch per field
+    inside the record's own parser.
+    """
+    if not isinstance(value, list):
+        raise ValueError(
+            f"tech_lead authority manifest_candidates must be a list, got {value!r}"
+        )
+    entries = cast(list[object], value)
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise ValueError(
+                "tech_lead authority manifest_candidates entries must be objects,"
+                f" got {entry!r}"
+            )
+    return tuple(
+        TechLeadCandidate.from_payload(cast(dict[str, object], entry))
+        for entry in entries
+    )
+
+
 @dataclass(frozen=True)
 class TechLeadLaunchAuthority:
     """Orchestrator-owned launch scope for one tech_lead session run.
@@ -472,6 +498,29 @@ class TechLeadLaunchAuthority:
     anchor_issue_number: int
     focus_issue_number: int | None = None
     manifest_pr_numbers: tuple[int, ...] = ()
+    # The exact candidates the manifest bound each audited PR to (#345):
+    # pr_number PLUS the head commit the orchestrator observed when it selected
+    # the PR. Recorded BESIDE ``manifest_pr_numbers`` rather than replacing it
+    # because the two answer different questions — which PRs this run audits
+    # (the terminal-failure projection still needs that) versus which exact
+    # commit each merge-facing disposition may be authority for.
+    #
+    # Empty is the LEGACY row, written before this field existed, and it is
+    # kept distinguishable rather than reconstructed: no candidate identity
+    # means no candidate can be proven still-current at completion, so such a
+    # run projects no merge-facing authority at all. That is the fail-closed
+    # direction, and re-deriving the SHAs now would bind the review to whatever
+    # the heads have since become.
+    manifest_candidates: tuple[TechLeadCandidate, ...] = ()
+    # The subset of those candidates whose INDEPENDENT REVIEWER approval of that
+    # exact commit the orchestrator established before the session spawned
+    # (#345). Recorded here rather than re-read at completion because it is a
+    # fact about a fixed ``(issue, commit)`` — a later review would be about a
+    # later commit — and because this record is the one thing a completing
+    # session cannot have touched. A PASS on a candidate absent from this set is
+    # refused: the prompt asks the agent not to render one, and this is what
+    # makes the rule hold when it does anyway.
+    reviewed_candidates: tuple[TechLeadCandidate, ...] = ()
     # The health review's OWNED problem cohort (#6780), recorded from the
     # producer's ``TechLeadLaunchScope`` grant (or the durable cohort ledger for
     # an anchor launched outside the pending queue) — never inferred from the
@@ -506,6 +555,22 @@ class TechLeadLaunchAuthority:
             raise ValueError(
                 f"TechLeadLaunchAuthority with flavor={self.flavor.value} requires "
                 "focus_issue_number"
+            )
+        if tuple(
+            candidate.pr_number for candidate in self.manifest_candidates
+        ) not in ((), self.manifest_pr_numbers):
+            raise ValueError(
+                "TechLeadLaunchAuthority manifest_candidates must name exactly"
+                " the manifest PR set, in the same order; got"
+                f" {[candidate.pr_number for candidate in self.manifest_candidates]}"
+                f" against {list(self.manifest_pr_numbers)}"
+            )
+        if not set(self.reviewed_candidates) <= set(self.manifest_candidates):
+            raise ValueError(
+                "TechLeadLaunchAuthority reviewed_candidates must be a subset of"
+                " the manifest candidates this run audited; got"
+                f" {[c.pr_number for c in self.reviewed_candidates]} against"
+                f" {[c.pr_number for c in self.manifest_candidates]}"
             )
         if self.flavor is TechLeadSessionFlavor.HEALTH_REVIEW and (
             self.focus_issue_number is not None or self.manifest_pr_numbers
@@ -585,6 +650,30 @@ class TechLeadLaunchAuthority:
             return frozenset(self.problem_issue_numbers)
         return frozenset()
 
+    def candidate_for(self, pr_number: int) -> TechLeadCandidate | None:
+        """The exact candidate this run audited for ``pr_number`` (#345).
+
+        ``None`` means this run has no recorded candidate identity for that
+        pull request — a legacy row, or a PR number the decision named that
+        this run was never launched to audit. Both are refusals, and the
+        caller must treat them as such rather than falling back to the number.
+        """
+        for candidate in self.manifest_candidates:
+            if candidate.pr_number == pr_number:
+                return candidate
+        return None
+
+    def review_established(self, candidate: TechLeadCandidate) -> bool:
+        """Whether an independent reviewer approved THIS exact commit (#345).
+
+        Asked before any merge-facing PASS is projected. False covers every
+        way the prerequisite failed — no verdict, a verdict about another
+        commit, a rejection, an unreadable record, or a legacy row that never
+        established one — because they all mean the same thing here: nothing
+        proves this candidate was independently approved.
+        """
+        return candidate in self.reviewed_candidates
+
     def matches_assignment(self, assignment: TechLeadAssignment) -> bool:
         """True when the agent-visible assignment copy mirrors this authority."""
         return (
@@ -599,6 +688,12 @@ class TechLeadLaunchAuthority:
             "anchor_issue_number": self.anchor_issue_number,
             "focus_issue_number": self.focus_issue_number,
             "manifest_pr_numbers": list(self.manifest_pr_numbers),
+            "manifest_candidates": [
+                candidate.to_payload() for candidate in self.manifest_candidates
+            ],
+            "reviewed_candidates": [
+                candidate.to_payload() for candidate in self.reviewed_candidates
+            ],
             "problem_issue_numbers": list(self.problem_issue_numbers),
             "launch_base_sha": self.launch_base_sha,
         }
@@ -636,6 +731,8 @@ class TechLeadLaunchAuthority:
             raise ValueError(
                 f"tech_lead authority manifest_pr_numbers must be a list of ints, got {raw_prs!r}"
             )
+        candidates = _manifest_candidates_from(data.get("manifest_candidates", []))
+        reviewed = _manifest_candidates_from(data.get("reviewed_candidates", []))
         raw_problems = data.get("problem_issue_numbers", [])
         if not isinstance(raw_problems, list) or any(
             isinstance(number, bool) or not isinstance(number, int)
@@ -660,6 +757,8 @@ class TechLeadLaunchAuthority:
             anchor_issue_number=anchor,
             focus_issue_number=focus,
             manifest_pr_numbers=tuple(raw_prs),
+            manifest_candidates=candidates,
+            reviewed_candidates=reviewed,
             problem_issue_numbers=tuple(raw_problems),
             launch_base_sha=raw_base_sha,
             schema_version=raw_schema,

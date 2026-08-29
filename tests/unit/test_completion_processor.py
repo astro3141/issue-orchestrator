@@ -1373,6 +1373,9 @@ class TestReviewExchangeExecution:
         from issue_orchestrator.execution.attempt_execution_identity_store import (
             AttemptExecutionIdentityStore,
         )
+        from issue_orchestrator.execution.attempt_review_verdict_store import (
+            AttemptReviewVerdictStore,
+        )
         from issue_orchestrator.entrypoints.bootstrap import create_attempt_store
 
         session_output = FileSystemSessionOutput()
@@ -1386,6 +1389,7 @@ class TestReviewExchangeExecution:
                 session_output,
                 InMemoryPersistentExchangePairRegistry(),
                 AttemptExecutionIdentityStore(create_attempt_store(config)),
+                AttemptReviewVerdictStore(create_attempt_store(config)),
             ),
             event_bus=EventBus(),
             label_config={},

@@ -977,3 +977,46 @@ def test_generic_target_rule_names_the_planning_focus_scope() -> None:
     assert "planning investigation" in normalized, (
         "the generic target-scope rule does not name the planning focus scope"
     )
+
+
+# --- Exact-candidate verdict axis (#345) -----------------------------------
+#
+# The orchestrator projects merge-facing authority from `candidate_verdicts`
+# alone. A prompt variant that does not teach the axis produces sessions whose
+# every candidate silently receives no disposition, which looks exactly like a
+# clean audit — so each variant is held to teaching it.
+
+
+@pytest.mark.parametrize("variant", sorted(PROMPT_VARIANTS))
+def test_batch_flow_teaches_the_per_candidate_verdict(variant: str) -> None:
+    batch = _flow_section(PROMPT_VARIANTS[variant], "Batch Review Flow")
+
+    assert "candidate_verdicts" in batch
+    for disposition in ("`pass`", "`rework`", "`human_a`"):
+        assert disposition in batch, f"{variant} batch flow omits {disposition}"
+
+
+@pytest.mark.parametrize("variant", sorted(PROMPT_VARIANTS))
+def test_batch_flow_names_the_staged_reviewer_evidence(variant: str) -> None:
+    """The prerequisite is staged; the agent may not go and fetch it."""
+    batch = _flow_section(PROMPT_VARIANTS[variant], "Batch Review Flow")
+
+    assert "candidate-evidence.json" in batch
+    assert "gap" in batch
+    assert "head_sha" in batch
+
+
+@pytest.mark.parametrize("variant", sorted(PROMPT_VARIANTS))
+def test_the_decision_example_renders_a_candidate_verdict(variant: str) -> None:
+    text = PROMPT_VARIANTS[variant]
+    blocks = [
+        block
+        for block in re.findall(r"```json\n(.*?)\n```", text, re.DOTALL)
+        if "proposed_actions" in block
+    ]
+    decision = TechLeadDecision.from_agent_payload(json.loads(blocks[0]))
+
+    assert decision.candidate_verdicts, "example renders no candidate verdict"
+    verdict = decision.candidate_verdicts[0]
+    assert verdict.candidate.is_bound
+    assert verdict.rationale

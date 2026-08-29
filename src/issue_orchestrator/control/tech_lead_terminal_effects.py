@@ -51,7 +51,7 @@ from .subject_recovery_authority import (
     SubjectRecoveryAuthority,
 )
 from .tech_lead_completion import (
-    manifest_label_actions,
+    manifest_failure_label_actions,
     resolve_launch_authority_for_session,
     split_tech_lead_decision_error,
 )
@@ -125,7 +125,7 @@ def generate_tech_lead_decision_failure_actions(
         and authority.flavor is TechLeadSessionFlavor.BATCH_REVIEW
     ):
         actions.extend(
-            manifest_label_actions(config, authority, expected, success=False)
+            manifest_failure_label_actions(config, authority, expected)
         )
     actions.append(
         plan_tech_lead_rejection_action(
@@ -381,7 +381,7 @@ def _anchor_terminal_actions(
                 expected=expected,
             )
         ]
-    actions = manifest_label_actions(config, authority, expected, success=False)
+    actions = manifest_failure_label_actions(config, authority, expected)
     actions.append(
         CloseIssueAction(
             issue_number=session.issue.number,

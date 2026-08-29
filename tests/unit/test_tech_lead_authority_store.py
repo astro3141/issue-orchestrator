@@ -17,6 +17,7 @@ from issue_orchestrator.domain.tech_lead_findings import (
     PendingCaseFile,
     PendingPromotion,
 )
+from issue_orchestrator.domain.tech_lead_candidate import TechLeadCandidate
 from issue_orchestrator.domain.tech_lead_session import (
     StoredTechLeadOp,
     TechLeadLaunchAuthority,
@@ -248,6 +249,69 @@ def test_a_non_string_launch_base_fails_loudly() -> None:
 def test_a_padded_launch_base_is_refused_at_construction() -> None:
     with pytest.raises(ValueError, match="launch_base_sha"):
         _planning(launch_base_sha=" " + "a" * 40 + "\n")
+
+
+def _bound_batch() -> TechLeadLaunchAuthority:
+    return TechLeadLaunchAuthority(
+        flavor=TechLeadSessionFlavor.BATCH_REVIEW,
+        anchor_issue_number=7,
+        manifest_pr_numbers=(101, 102),
+        manifest_candidates=(
+            TechLeadCandidate(101, "a" * 40),
+            TechLeadCandidate(102, "b" * 40),
+        ),
+    )
+
+
+def test_manifest_candidates_survive_the_store(tmp_path: Path) -> None:
+    """The exact candidates outlive the process that observed them (#345)."""
+    store = SqliteTechLeadAuthorityStore.for_repo(tmp_path)
+    store.record(run_id="r1", session_name="issue-7", authority=_bound_batch())
+
+    loaded = SqliteTechLeadAuthorityStore.for_repo(tmp_path).load(
+        run_id="r1", session_name="issue-7"
+    )
+
+    assert loaded is not None
+    assert loaded.manifest_candidates == _bound_batch().manifest_candidates
+    assert loaded.candidate_for(101) == TechLeadCandidate(101, "a" * 40)
+    assert loaded.candidate_for(999) is None
+
+
+def test_a_row_written_before_candidates_existed_carries_none(tmp_path: Path) -> None:
+    """A legacy row keeps its scope and simply proves no candidate identity.
+
+    That is the fail-closed direction: nothing can be shown still-current, so
+    the run projects no merge-facing authority rather than binding the review
+    to whatever the heads have since become.
+    """
+    legacy = _bound_batch().to_dict()
+    del legacy["manifest_candidates"]
+
+    restored = TechLeadLaunchAuthority.from_dict(legacy)
+
+    assert restored.manifest_candidates == ()
+    assert restored.manifest_pr_numbers == (101, 102)
+    assert restored.candidate_for(101) is None
+
+
+def test_candidates_that_disagree_with_the_manifest_set_are_refused() -> None:
+    """One PR set, two spellings, is a bug the record must not be able to hold."""
+    with pytest.raises(ValueError, match="manifest_candidates"):
+        TechLeadLaunchAuthority(
+            flavor=TechLeadSessionFlavor.BATCH_REVIEW,
+            anchor_issue_number=7,
+            manifest_pr_numbers=(101, 102),
+            manifest_candidates=(TechLeadCandidate(101, "a" * 40),),
+        )
+
+
+def test_a_corrupt_candidate_row_fails_loudly() -> None:
+    corrupt = _bound_batch().to_dict()
+    corrupt["manifest_candidates"] = [{"pr_number": "101", "head_sha": "a" * 40}]
+
+    with pytest.raises(ValueError, match="pr_number"):
+        TechLeadLaunchAuthority.from_dict(corrupt)
 
 
 def test_discard_removes_only_the_named_run(tmp_path: Path) -> None:

@@ -30,6 +30,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
+from .tech_lead_candidate import TechLeadCandidateVerdict
 from .tech_lead_findings import VALID_FINDING_FIX_CLASSES
 
 
@@ -88,6 +89,10 @@ _MISSING: Any = object()
 # bound is a contract violation, not something to silently truncate.
 MAX_TECH_LEAD_FINDINGS = 50
 MAX_TECH_LEAD_ACTIONS = 20
+# One verdict per audited candidate, and a batch is threshold-sized. The bound
+# is generous against any realistic manifest and still refuses an artifact that
+# claims dispositions on hundreds of pull requests.
+MAX_TECH_LEAD_CANDIDATE_VERDICTS = 50
 MAX_ACTION_BODY_CHARS = 20_000
 MAX_TITLE_CHARS = 300
 MAX_SUMMARY_CHARS = 5_000
@@ -430,6 +435,12 @@ class TechLeadDecision:
     summary: str
     findings: tuple[TechLeadFinding, ...] = ()
     proposed_actions: tuple[ProposedTechLeadAction, ...] = ()
+    # The per-candidate merge-facing dispositions this review rendered (#345).
+    # Per CANDIDATE, not per session: a batch carrying two PRs may not transfer
+    # one candidate's answer to the other, so there is a verdict per pull
+    # request or there is no disposition for it at all. Empty is a legitimate
+    # decision — an audit that judged no candidate — and it projects nothing.
+    candidate_verdicts: tuple[TechLeadCandidateVerdict, ...] = ()
     schema_version: int = 1
     extra: dict[str, Any] = field(default_factory=dict)
 
@@ -469,16 +480,35 @@ class TechLeadDecision:
             ProposedTechLeadAction.from_mapping(item, index=index)
             for index, item in enumerate(raw_actions, start=1)
         )
+        raw_verdicts = data.get("candidate_verdicts", [])
+        if not isinstance(raw_verdicts, list):
+            raise ValueError("tech_lead decision candidate_verdicts must be a list")
+        if len(raw_verdicts) > MAX_TECH_LEAD_CANDIDATE_VERDICTS:
+            raise ValueError(
+                f"tech_lead decision has {len(raw_verdicts)} candidate verdicts"
+                f" (max {MAX_TECH_LEAD_CANDIDATE_VERDICTS})"
+            )
+        candidate_verdicts = tuple(
+            TechLeadCandidateVerdict.from_mapping(item, index=index)
+            for index, item in enumerate(raw_verdicts, start=1)
+        )
         decision = cls(
             summary=_bounded(summary, MAX_SUMMARY_CHARS, "tech_lead decision summary"),
             findings=findings,
             proposed_actions=actions,
+            candidate_verdicts=candidate_verdicts,
             schema_version=1,
             extra={
                 key: value
                 for key, value in data.items()
                 if key
-                not in {"schema_version", "summary", "findings", "proposed_actions"}
+                not in {
+                    "schema_version",
+                    "summary",
+                    "findings",
+                    "proposed_actions",
+                    "candidate_verdicts",
+                }
             },
         )
         decision.validate()
@@ -512,6 +542,7 @@ class TechLeadDecision:
                 f" duplicate ids: {', '.join(sorted(duplicates))}"
             )
         known = set(finding_ids)
+        self._validate_candidate_verdicts(known)
         act_level_action_by_target: dict[int, str] = {}
         for action in self.proposed_actions:
             action.validate()
@@ -532,12 +563,56 @@ class TechLeadDecision:
                     )
                 act_level_action_by_target[action.target_number] = action.id
 
+    def _validate_candidate_verdicts(self, known_finding_ids: set[str]) -> None:
+        """One verdict per candidate, each citing findings that exist (#345).
+
+        Two rejections, both structural. A decision naming one pull request
+        twice does not say what it decided about that candidate — and picking
+        either verdict would be the orchestrator choosing an answer the tech
+        lead did not give. A verdict citing an unknown finding id is the same
+        dangling reference the proposed actions already refuse.
+        """
+        seen: dict[int, TechLeadCandidateVerdict] = {}
+        for verdict in self.candidate_verdicts:
+            prior = seen.get(verdict.pr_number)
+            if prior is not None:
+                raise ValueError(
+                    "multiple candidate verdicts for PR"
+                    f" #{verdict.pr_number} ({prior.disposition.value},"
+                    f" {verdict.disposition.value}); exactly one disposition per"
+                    " candidate is allowed"
+                )
+            seen[verdict.pr_number] = verdict
+            unknown = [
+                ref for ref in verdict.finding_ids if ref not in known_finding_ids
+            ]
+            if unknown:
+                raise ValueError(
+                    f"candidate verdict for PR #{verdict.pr_number} references"
+                    f" unknown finding ids: {', '.join(unknown)}"
+                )
+
+    def verdict_for(self, pr_number: int) -> TechLeadCandidateVerdict | None:
+        """This decision's disposition for ``pr_number``, or ``None`` (#345).
+
+        ``None`` means the review rendered NO disposition for that candidate,
+        which is not a PASS and not a REWORK: the candidate simply receives no
+        merge-facing effect from this run.
+        """
+        for verdict in self.candidate_verdicts:
+            if verdict.pr_number == pr_number:
+                return verdict
+        return None
+
     def to_dict(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "schema_version": self.schema_version,
             "summary": self.summary,
             "findings": [finding.to_dict() for finding in self.findings],
             "proposed_actions": [action.to_dict() for action in self.proposed_actions],
+            "candidate_verdicts": [
+                verdict.to_dict() for verdict in self.candidate_verdicts
+            ],
         }
         payload.update(self.extra)
         return payload

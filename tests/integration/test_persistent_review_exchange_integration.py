@@ -52,6 +52,9 @@ from issue_orchestrator.events import EventName
 from issue_orchestrator.execution.attempt_execution_identity_store import (
     AttemptExecutionIdentityStore,
 )
+from issue_orchestrator.execution.attempt_review_verdict_store import (
+    AttemptReviewVerdictStore,
+)
 from issue_orchestrator.execution.manifest_accessor import ManifestAccessor, RunIdentity
 from issue_orchestrator.execution.persistent_exchange_pair_registry_inmemory import (
     InMemoryPersistentExchangePairRegistry,
@@ -192,6 +195,11 @@ def _identity_store(root: Path) -> AttemptExecutionIdentityStore:
     return AttemptExecutionIdentityStore(SidecarAttemptStore(root))
 
 
+def _review_verdict_store(root: Path) -> AttemptReviewVerdictStore:
+    """The verdict half of the same durable candidate record (#345)."""
+    return AttemptReviewVerdictStore(SidecarAttemptStore(root))
+
+
 def _make_review_exchange_runner(
     session_output: FileSystemSessionOutput,
     *,
@@ -216,6 +224,7 @@ def _make_review_exchange_runner(
         session_output,
         pair_registry or InMemoryPersistentExchangePairRegistry(),
         _identity_store(identity_root),
+        _review_verdict_store(identity_root),
     )
 
 
@@ -960,6 +969,7 @@ def test_real_interactive_codex_reviewer_round_trips_through_exchange(
                 session_output,
                 InMemoryPersistentExchangePairRegistry(),
                 _identity_store(tmp_path / "identity-root"),
+                _review_verdict_store(tmp_path / "identity-root"),
                 turn_mailbox=mailbox,
             ),
         )
@@ -1793,6 +1803,7 @@ def test_persistent_review_exchange_end_to_end_through_mailbox(
             session_output,
             InMemoryPersistentExchangePairRegistry(),
             _identity_store(tmp_path / "identity-root"),
+            _review_verdict_store(tmp_path / "identity-root"),
             turn_mailbox=mailbox,
         )
         cre = CompletionReviewExchange(

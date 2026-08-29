@@ -467,8 +467,11 @@ class TestCreateTechLeadReviewPrompt:
 
         assert "tech-lead-data" in content
         assert "manifest.json" in content
-        assert "pr-<number>-diff.txt" in content
-        assert "pr-<number>-meta.json" in content
+        # The per-candidate file names carry the audited commit (#345), so a
+        # file claims only the commit it can prove it is about.
+        assert "pr-<number>-<sha12>-diff.txt" in content
+        assert "pr-<number>-<sha12>-meta.json" in content
+        assert "candidate-evidence.json" in content
         assert "For Each PR" in content
 
     def test_includes_completion_instructions(self, tmp_path):

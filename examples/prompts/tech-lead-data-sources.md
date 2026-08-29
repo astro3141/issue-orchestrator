@@ -16,12 +16,15 @@ The primary input. The orchestrator writes it into your session directory:
 
 | Source | Access | What It Tells You |
 |--------|--------|-------------------|
-| Manifest | `cat "$ISSUE_ORCHESTRATOR_RUN_DIR/tech-lead-data/manifest.json"` | Which PRs to review, with local file names |
-| PR metadata | `cat .../tech-lead-data/pr-{N}-meta.json` | Title, body, branch, author |
-| PR diff | `cat .../tech-lead-data/pr-{N}-diff.txt` | Actual code changes |
+| Manifest | `cat "$ISSUE_ORCHESTRATOR_RUN_DIR/tech-lead-data/manifest.json"` | Which PRs to review, each bound to the exact `head_sha` it was selected at |
+| Candidate evidence | `cat .../tech-lead-data/candidate-evidence.json` | What the independent Reviewer decided about that exact commit, and whether it cleared the publication gate |
+| PR metadata | `cat .../tech-lead-data/pr-{N}-{sha12}-meta.json` | Title, body, branch, `candidate_sha` |
+| PR diff | `cat .../tech-lead-data/pr-{N}-{sha12}-diff.txt` | That candidate's code changes |
 
-The manifest is the definitive list of PRs in scope. Review exactly those PRs -
-no more, no less. On success the orchestrator labels exactly these PRs.
+The manifest is the definitive list of candidates in scope. Review exactly those
+PRs - no more, no less - and render your verdict against the commit named there.
+A candidate whose `candidate-evidence.json` entry carries a non-empty `gap` has
+no established independent approval of that commit and must never be passed.
 
 ### Board Snapshot (Authoritative)
 
@@ -78,10 +81,16 @@ Use for investigation; they may be incomplete, rotated, or stale.
 
 ## What Happens After You Complete
 
-- `coding-done completed`: the orchestrator adds the configured
-  `tech_lead_reviewed_label` (default `tech-lead-reviewed`) to every PR in the
-  manifest and publishes any commits on your branch.
+- `coding-done completed`: the orchestrator applies your `candidate_verdicts`
+  per candidate — the configured `tech_lead_reviewed_label` (default
+  `tech-lead-reviewed`) for a `pass` on a candidate still standing at the commit
+  you judged, the ordinary rework lane for a `rework`, human escalation for a
+  `human_a`, and nothing at all for a candidate whose head has moved — and
+  publishes any commits on your branch.
 - Session failure: manifest PRs get the `tech_lead_failed_label`
   (default `tech-lead-failed`).
-- No comments are posted, no other labels are flipped, and no issues are
-  created on your behalf.
+- Each candidate receives ONE receipt comment naming the exact commit your
+  verdict was about and this run's identity — including the refusals, so a
+  disposition that could not be applied is visible rather than silent. Nothing
+  else is commented, no other labels are flipped, and no issues are created on
+  your behalf.

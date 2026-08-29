@@ -18,6 +18,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TypedDict
 
+from .tech_lead_candidate import TechLeadCandidate
+
 logger = logging.getLogger(__name__)
 
 
@@ -35,6 +37,8 @@ class PRToReviewDict(TypedDict):
     title: str
     url: str
     branch: str
+    head_sha: str
+    review_established: bool
     files: PRFilesDict
 
 
@@ -58,6 +62,14 @@ class PRFiles:
 class PRToReview:
     """A PR that needs tech_lead review.
 
+    ``head_sha`` is the exact commit the orchestrator OBSERVED at this pull
+    request's head when it selected the PR for review (#345). It is the
+    candidate identity every merge-facing tech-lead fact is bound to; the
+    branch name, the labels and the PR body are not. Empty means the head could
+    not be read, which is carried rather than dropped so the audited set stays
+    exactly the set that tripped the threshold — a candidate that names no
+    commit simply cannot receive a merge-facing disposition.
+
     Note: Full PR metadata (additions, deletions, merged_at, etc.) is available
     in the metadata JSON file referenced by files.metadata.
     """
@@ -65,7 +77,19 @@ class PRToReview:
     title: str
     url: str
     branch: str
+    head_sha: str = ""
+    # Whether an independent Reviewer's approval of THIS exact commit was
+    # established when the session's inputs were staged (#345). Written by the
+    # downloader from the durable candidate record, never by the agent, and
+    # copied into the orchestrator-owned launch authority before the session
+    # spawns — so completion can refuse a PASS on an unreviewed candidate
+    # without re-reading anything the agent could have touched.
+    review_established: bool = False
     files: PRFiles = field(default_factory=PRFiles)
+
+    def candidate(self) -> TechLeadCandidate:
+        """This entry's exact-candidate identity (#345)."""
+        return TechLeadCandidate(pr_number=self.number, head_sha=self.head_sha)
 
 
 @dataclass
@@ -91,6 +115,8 @@ class TechLeadManifest:
                     "title": pr.title,
                     "url": pr.url,
                     "branch": pr.branch,
+                    "head_sha": pr.head_sha,
+                    "review_established": pr.review_established,
                     "files": {
                         "diff": pr.files.diff,
                         "metadata": pr.files.metadata,
@@ -111,6 +137,8 @@ class TechLeadManifest:
                 title=pr_data["title"],
                 url=pr_data["url"],
                 branch=pr_data["branch"],
+                head_sha=pr_data.get("head_sha", ""),
+                review_established=bool(pr_data.get("review_established", False)),
                 files=PRFiles(
                     diff=files_data.get("diff", ""),
                     metadata=files_data.get("metadata", ""),
@@ -138,3 +166,11 @@ class TechLeadManifest:
     def get_pr_numbers(self) -> list[int]:
         """Get list of PR numbers for completion handling."""
         return [pr.number for pr in self.prs]
+
+    def candidates(self) -> tuple[TechLeadCandidate, ...]:
+        """Every audited PR bound to the head commit that was observed (#345)."""
+        return tuple(pr.candidate() for pr in self.prs)
+
+    def reviewed_candidates(self) -> tuple[TechLeadCandidate, ...]:
+        """The candidates that arrived with an exact-commit reviewer approval."""
+        return tuple(pr.candidate() for pr in self.prs if pr.review_established)

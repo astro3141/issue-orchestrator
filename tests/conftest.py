@@ -955,6 +955,9 @@ def build_test_orchestrator_deps(
     from issue_orchestrator.execution.attempt_execution_identity_store import (
         AttemptExecutionIdentityStore,
     )
+    from issue_orchestrator.execution.attempt_review_verdict_store import (
+        AttemptReviewVerdictStore,
+    )
     from issue_orchestrator.entrypoints.bootstrap import create_attempt_store
     agent_callback_endpoint = ready_callback_endpoint()
     # One shared record of publication-gate refusals whose label write did not
@@ -989,6 +992,7 @@ def build_test_orchestrator_deps(
             session_output,
             InMemoryPersistentExchangePairRegistry(),
             AttemptExecutionIdentityStore(shared_attempt_store),
+            AttemptReviewVerdictStore(shared_attempt_store),
         ),
         label_config={
             "blocked": config.get_label_blocked(),

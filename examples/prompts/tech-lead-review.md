@@ -85,11 +85,25 @@ The orchestrator writes PR data into your session directory:
 
 ```
 .issue-orchestrator/sessions/{run}/tech-lead-data/
-  manifest.json          # List of PRs to review
-  pr-123-diff.txt        # Diff for PR #123
-  pr-123-meta.json       # Metadata for PR #123
+  manifest.json                  # PRs to review, each bound to an exact head_sha
+  candidate-evidence.json        # the independent Reviewer's verdict per candidate
+  pr-123-4f2a9c1b8e77-diff.txt   # Diff for PR #123 AT THAT EXACT COMMIT
+  pr-123-4f2a9c1b8e77-meta.json  # Metadata for PR #123
   ...
 ```
+
+Each manifest entry names a **candidate**: the pull request AND the exact
+`head_sha` the orchestrator observed when it selected it. Your verdict is
+authority for that commit and for no other, so read the files whose names carry
+that commit, and quote the same `head_sha` back in your verdict. A missing diff
+file means the pull request moved during preparation — say so in your rationale
+rather than reviewing something else.
+
+`candidate-evidence.json` carries, per candidate, what the independent Reviewer
+decided about that exact commit and whether the same commit cleared the
+publication gate. Read it; do NOT call `gh` to reconstruct it. An entry with a
+non-empty `gap` has NOT established an independent approval of this commit and
+must never receive `pass`.
 
 ```bash
 TECH_LEAD_DIR="$ISSUE_ORCHESTRATOR_RUN_DIR/tech-lead-data"
@@ -123,8 +137,9 @@ Then complete with
 ### 2. For Each PR, Analyze the Local Files
 
 ```bash
-cat "$TECH_LEAD_DIR/pr-123-meta.json"   # title, body, branch, ...
-cat "$TECH_LEAD_DIR/pr-123-diff.txt"    # the code changes
+cat "$TECH_LEAD_DIR/candidate-evidence.json"        # reviewer verdict per candidate
+cat "$TECH_LEAD_DIR/pr-123-4f2a9c1b8e77-meta.json"  # title, body, branch, candidate_sha
+cat "$TECH_LEAD_DIR/pr-123-4f2a9c1b8e77-diff.txt"   # that candidate's code changes
 ```
 
 Look for:
@@ -137,6 +152,31 @@ Look for:
 
 Advisory local sources (orchestrator log, session artifacts, worktree state) are
 described in `tech-lead-data-sources.md`.
+
+### Render one verdict per candidate
+
+For every manifest candidate, add an entry to `candidate_verdicts` in
+`tech-lead-decision.json`. The verdict is per candidate, never per session: a
+batch carrying two PRs reaches two independent answers.
+
+- `pass` — the candidate conforms to the governing contract and systemic
+  context, and the merge gate may consume that. Requires an exact-candidate
+  reviewer approval in `candidate-evidence.json` with an empty `gap`.
+  Informational findings may coexist with a `pass`; a blocking bounded defect
+  may not. The orchestrator re-checks this
+prerequisite itself: a `pass` on a candidate it never established an
+exact-commit reviewer approval for is refused and projects nothing.
+- `rework` — a bounded implementation or process defect inside already-settled
+  Spec/TD/policy. Your `rationale` IS the feedback the rework agent works from,
+  so make it specific and actionable. No human decision is implied.
+- `human_a` — a genuinely new Spec/TD/policy/authority decision is required.
+  Your `rationale` is the decision question. This stops the candidate; it is
+  not an implementation failure and it is not rework.
+
+Omit a candidate to render no disposition on it — that projects nothing. Every
+verdict carries `pr_number`, `candidate_sha` (the exact `head_sha` from the
+manifest), `disposition`, and a non-empty `rationale`; a verdict naming a pull
+request or a commit outside this session's manifest rejects the WHOLE decision.
 
 ### 3. Act Locally Where Patterns Warrant It
 
@@ -306,10 +346,27 @@ Compact `tech-lead-decision.json` example:
       "area": "ci-runtime",
       "finding_ids": ["T1"]
     }
+  ],
+  "candidate_verdicts": [
+    {
+      "pr_number": 123,
+      "candidate_sha": "4f2a9c1b8e7712d3a5c0b96e4d1f8a2c7b035e91",
+      "disposition": "pass",
+      "rationale": "Conforms to the governing contract; T1 is infrastructure, not this candidate's defect.",
+      "finding_ids": ["T1"]
+    }
   ]
 }
 ```
 
+- `candidate_verdicts` is the batch review's merge-facing output (one entry per
+  manifest candidate, at most 50). Each names `pr_number`, the exact
+  `candidate_sha` from the manifest, a `disposition` of `pass` / `rework` /
+  `human_a`, and a non-empty `rationale` (the pass reason, the actionable rework
+  feedback, or the human decision question). A verdict outside this session's
+  manifest — a pull request it did not audit, or a commit other than the one it
+  audited — rejects the whole decision. The other flavors have no candidates and
+  omit the field entirely.
 - Finding `classification` is one of: `infra`, `task`, `agent`, `systemic`.
 - Ids are canonical: findings are `T<n>` (`T1`, `T2`, ...) and actions are
   `A<n>` (`A1`, `A2`, ...), no leading zeros, unique across both lists. The
@@ -401,11 +458,22 @@ Compact `tech-lead-decision.json` example:
 ## Completion (Labels Are Automatic)
 
 When you complete successfully with a valid artifact pair, the orchestrator
-adds the configured `tech_lead_reviewed_label` (default: `tech-lead-reviewed`) to
-every PR in the manifest and executes your proposed actions per its
-configured authority. If the session fails - or the artifact pair is missing
-or invalid - manifest PRs get the `tech_lead_failed_label` (default:
-`tech-lead-failed`) instead.
+applies your `candidate_verdicts` PER CANDIDATE, after re-reading each pull
+request's live head:
+
+- `pass` on a candidate still standing at the commit you judged - the configured
+  `tech_lead_reviewed_label` (default: `tech-lead-reviewed`) plus a receipt
+  naming that commit;
+- `rework` - your rationale is posted as candidate-bound feedback FIRST, then the
+  pull request enters the ordinary rework lane and its existing budget;
+- `human_a` - the pull request is escalated to a human and blocked, with neither
+  merge nor rework authority;
+- a candidate whose head MOVED since the manifest was built, or whose head cannot
+  be read, receives NONE of these; the refusal is recorded on the pull request.
+
+It also executes your proposed actions per its configured authority. If the
+session fails - or the artifact pair is missing or invalid - manifest PRs get the
+`tech_lead_failed_label` (default: `tech-lead-failed`) instead.
 
 ```bash
 coding-done completed \

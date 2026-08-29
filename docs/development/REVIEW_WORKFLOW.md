@@ -422,12 +422,38 @@ comment.
 
 After the review loop approves code, additional stages can run.
 
+### The Tech Lead gate is bound to an exact candidate (#345)
+
+A batch review's merge-facing disposition is authority for **one commit**, not
+for a pull-request number:
+
+1. the manifest records each selected PR's observed `head_sha`, the downloader
+   materializes the diff for that commit (and refuses to file one under the
+   candidate's name when the head moved mid-fetch), and the orchestrator-owned
+   `TechLeadLaunchAuthority` carries those candidates beside the PR numbers;
+2. `candidate-evidence.json` is staged beside the manifest with the independent
+   Reviewer's exact-SHA verdict and the publication certification for the same
+   commit, so the session never has to fetch that context itself. An entry with
+   a non-empty `gap` has not established an approval of this commit;
+3. the decision returns one `candidate_verdicts` entry per candidate — `pass`,
+   `rework`, or `human_a` — validated against the launch authority, and
+   completion re-reads each pull request's live head before applying it.
+
+`tech-lead-reviewed` therefore means "this exact candidate passed Tech Lead
+contract review", never "a session produced a valid artifact over a manifest
+containing this number". A moved candidate inherits nothing; the refusal is
+recorded on the pull request.
+
 ```mermaid
 flowchart TD
   LOOP["Review loop approves code"] --> CR["Code-reviewed"]
   CR --> TECH_LEAD{"Tech Lead batch review configured?"}
-  TECH_LEAD -->|yes, threshold met| TR["Tech Lead agent reviews patterns across PRs"]
-  TR --> DONE["Tech-Lead-reviewed — ready for human merge"]
+  TECH_LEAD -->|yes, threshold met| TR["Tech Lead audits each exact candidate"]
+  TR --> PASS{"Per-candidate verdict"}
+  PASS -->|PASS, head unmoved| DONE["Tech-Lead-reviewed — ready for human merge"]
+  PASS -->|REWORK| NR["Feedback posted, then needs-rework"]
+  PASS -->|HUMAN_A| BNH["Escalated to a human, blocked"]
+  PASS -->|head moved / unreadable| REFUSED["Refusal recorded; no authority applied"]
   TECH_LEAD -->|no| DONE2["Ready for human merge"]
 
   FAIL["Session failed / blocked / timeout"] --> TFAIL{"tech_lead_review_on_failure?"}

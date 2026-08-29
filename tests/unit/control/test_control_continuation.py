@@ -690,7 +690,7 @@ def _reviewed(
 ) -> Attempt:
     return engine.attempts.update(
         _attempt_key(head_sha),
-        lambda attempt: attempt.with_continuation_review_verdict(
+        lambda attempt: attempt.with_review_verdict(
             BoundReviewVerdict(
                 verdict=outcome,
                 reviewed_sha=head_sha,
@@ -871,7 +871,7 @@ class TestExactSha:
         with pytest.raises(ValueError, match="own commit"):
             Attempt(
                 key=_attempt_key(SHA_A_PRIME),
-                continuation_review_verdict=BoundReviewVerdict(
+                review_verdict=BoundReviewVerdict(
                     verdict=ReviewVerdictOutcome.APPROVED,
                     reviewed_sha=SHA_A,
                     decided_at="2026-08-19T01:00:00Z",
@@ -1501,7 +1501,7 @@ class TestTheContinuationsRetryIsBounded:
         attempt = engine.attempts.for_key(_attempt_key())
         assert attempt is not None
         assert attempt.continuation_descriptor is not None
-        assert attempt.continuation_review_verdict is not None
+        assert attempt.review_verdict is not None
         assert len(attempt.publication_evaluations) == 2
 
     def test_one_run_left_still_holds_the_lane(self, engine: Engine) -> None:

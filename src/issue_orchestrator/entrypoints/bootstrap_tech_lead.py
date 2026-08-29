@@ -21,6 +21,11 @@ from ..infra.logging_config import get_repo_log_path, read_log_tail
 
 if TYPE_CHECKING:
     from ..control.board_snapshot_builder import BoardSnapshotBuilder
+    from ..control.publication_authority import PublicationVerdictReader
+    from ..ports.attempt_store import AttemptStore
+    from ..ports.tech_lead_candidate_evidence import (
+        TechLeadCandidateEvidenceSource,
+    )
     from ..control.fact_gatherer import FactGatherer
     from ..control.open_issue_corpus import OpenIssueCorpusManager
     from ..control.provider_resilience import ProviderResilienceManager
@@ -65,6 +70,34 @@ def create_tech_lead_authority_store(config: "Config") -> "TechLeadAuthorityStor
     from ..infra.tech_lead_authority_store import SqliteTechLeadAuthorityStore
 
     return SqliteTechLeadAuthorityStore.for_repo(config.repo_root)
+
+
+def candidate_review_evidence(
+    config: "Config",
+    attempt_store: "AttemptStore",
+    publication_verdict: "PublicationVerdictReader",
+) -> "TechLeadCandidateEvidenceSource":
+    """The exact-candidate review evidence a batch review is staged with (#345).
+
+    Assembled from the SAME durable records the review exchange writes and the
+    review-admission path reads: what the independent reviewer decided about the
+    candidate, who executed it, and whether that exact commit cleared the
+    publication contract. The verdict reader is INJECTED rather than rebuilt so
+    the evidence staged for a tech lead and the verdict a review admission reads
+    can never be two different answers.
+    """
+    from ..control.tech_lead_candidate_evidence import DurableCandidateEvidence
+    from ..execution.attempt_execution_identity_store import (
+        AttemptExecutionIdentityStore,
+    )
+    from ..execution.attempt_review_verdict_store import AttemptReviewVerdictStore
+
+    return DurableCandidateEvidence(
+        review_verdicts=AttemptReviewVerdictStore(attempt_store),
+        execution_identities=AttemptExecutionIdentityStore(attempt_store),
+        publication_verdict=publication_verdict,
+        profiles=config.validation_profiles(),
+    )
 
 
 def create_open_issue_corpus_store(config: "Config") -> "OpenIssueCorpusStore":
