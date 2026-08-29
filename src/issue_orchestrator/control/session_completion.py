@@ -39,6 +39,7 @@ from .session_completion_decision import completion_decider
 from .session_completion_diagnostics import run_session_analysis, surface_failure_context
 from .session_run_resolution import resolve_session_run_dir
 from .transition_log import log_transition
+from .tech_lead_evidence_capture import capture_tech_lead_session_evidence
 from .tech_lead_reaction import record_completed_session_problem
 
 if TYPE_CHECKING:
@@ -325,6 +326,17 @@ def handle_session_completion(  # noqa: C901, PLR0912 - handles validation, acti
         # Kill the terminal session but don't cleanup worktree (agent will continue there)
         kill_session_fn(session.terminal_id)
         return  # Skip normal completion processing
+
+    # Preserve a tech_lead run's staged evidence while its worktree still exists
+    # (#360). First, deliberately: the artifacts are the agent's finished work,
+    # they are complete by the time a session reaches terminal, and running
+    # before completion processing means a run whose processing raises — or one
+    # that FAILED or TIMED_OUT and never reaches the decision-artifact seams at
+    # all — still has its manifest, candidate evidence/contracts, diffs, report
+    # and decision copied out before the cleanup fact filed below turns into a
+    # worktree removal. Non-tech-lead sessions cost one identity check; a
+    # capture that fails reports itself and never fails the session.
+    capture_tech_lead_session_evidence(config=config, session=session, events=events)
 
     # Process completion (policy decisions). The terminal trace event, the cached
     # state-machine transition, and the completed_today gate ALL defer to the

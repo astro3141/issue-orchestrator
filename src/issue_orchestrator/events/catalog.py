@@ -279,6 +279,12 @@ class EventName(str, Enum):
     # coordination store, both of which are RETRIED rather than acted on.
     # Internal trace event.
     TECH_LEAD_RUN_OWNERSHIP_CHANGED = "tech_lead.run_ownership_changed"
+    # A tech-lead run's staged evidence was (or was not) preserved outside its
+    # worktree before teardown (#360). ``preserved`` is the whole signal: false
+    # means the run's manifest, candidate evidence/contracts, diffs, decision
+    # and report are about to be reaped with the worktree and nothing durable
+    # will hold them. Internal trace event.
+    TECH_LEAD_EVIDENCE_CAPTURED = "tech_lead.evidence_captured"
 
     # =========================================================================
     # Cleanup operations

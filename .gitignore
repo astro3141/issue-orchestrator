@@ -73,6 +73,9 @@ Thumbs.db
 .issue-orchestrator/*.db
 .issue-orchestrator/sessions/
 .issue-orchestrator/diagnostics/
+# Tech Lead run evidence copied out of a session's worktree before teardown
+# (#360). Orchestrator-written runtime output, never source.
+.issue-orchestrator/tech-lead-evidence/
 .issue-orchestrator/safety-state.json
 .issue-orchestrator/ai-gate-state.json
 .issue-orchestrator/backups/
