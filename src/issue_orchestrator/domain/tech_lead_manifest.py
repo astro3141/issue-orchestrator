@@ -46,6 +46,8 @@ class PRToReviewDict(TypedDict):
     review_gap: str
     contract_established: bool
     contract_gap: str
+    diff_established: bool
+    diff_gap: str
     files: PRFilesDict
 
 
@@ -60,7 +62,13 @@ class TechLeadManifestDict(TypedDict):
 
 @dataclass
 class PRFiles:
-    """Local file paths for a PR's data."""
+    """Local file paths for a PR's data.
+
+    ``diff`` is empty whenever the candidate's changes were not materialized
+    (#359). Empty is the ONLY representation of "no diff was staged": there is
+    never a file on disk that the manifest declines to name, and never a name
+    here for a file that holds anything but a successful, candidate-bound read.
+    """
     diff: str = ""  # Relative path to diff file
     metadata: str = ""  # Relative path to metadata JSON
 
@@ -111,6 +119,25 @@ class PRToReview:
     # The leaf-contract half of the same answer: the staged contract's own
     # ``gap`` when there is none, recorded for the reason ``review_gap`` is.
     contract_gap: str = ""
+    # Whether this candidate's OWN CODE CHANGES were materialized for this run
+    # (#359): read through the supported GitHub transport, and bound to this
+    # exact commit. Written by the staging owner, never by the agent, and
+    # carried into the launch authority for the reason the other two are — a
+    # `pass` on a candidate whose diff nobody could read is a claim about code
+    # no run ever saw.
+    #
+    # It is a separate fact from ``files.diff`` being non-empty rather than a
+    # derivation of it, because the filename is what the AGENT reads and this
+    # is what the ORCHESTRATOR refuses on. The two agree by construction here;
+    # keeping them distinct is what stops a manifest edit from becoming a merge
+    # prerequisite.
+    diff_established: bool = False
+    # The diff half of the same answer: the transport/binding failure that was
+    # actually observed — an HTTP status, a transport error, an empty success,
+    # a head that moved across the materialization boundary — recorded for the
+    # reason ``review_gap`` is. This string is the one thing the refusal
+    # receipt can say about a candidate nobody could read.
+    diff_gap: str = ""
     files: PRFiles = field(default_factory=PRFiles)
 
     def candidate(self) -> TechLeadCandidate:
@@ -120,7 +147,7 @@ class PRToReview:
     def prerequisite_gaps(self) -> tuple[CandidatePrerequisiteGap, ...]:
         """The recorded reason for each prerequisite this entry does not hold.
 
-        Derived from the two established/gap pairs together, so a reason can
+        Derived from the three established/gap pairs together, so a reason can
         never be carried for a prerequisite the entry holds — the drift that
         would put a false cause on a pull request. A missing prerequisite with
         no recorded reason yields nothing here rather than an empty record: the
@@ -140,6 +167,11 @@ class PRToReview:
                     CandidatePassPrerequisite.LEAF_CONTRACT,
                     self.contract_established,
                     self.contract_gap,
+                ),
+                (
+                    CandidatePassPrerequisite.CANDIDATE_DIFF,
+                    self.diff_established,
+                    self.diff_gap,
                 ),
             )
             if not established and gap.strip()
@@ -174,6 +206,8 @@ class TechLeadManifest:
                     "review_gap": pr.review_gap,
                     "contract_established": pr.contract_established,
                     "contract_gap": pr.contract_gap,
+                    "diff_established": pr.diff_established,
+                    "diff_gap": pr.diff_gap,
                     "files": {
                         "diff": pr.files.diff,
                         "metadata": pr.files.metadata,
@@ -201,6 +235,8 @@ class TechLeadManifest:
                     pr_data.get("contract_established", False)
                 ),
                 contract_gap=str(pr_data.get("contract_gap", "")),
+                diff_established=bool(pr_data.get("diff_established", False)),
+                diff_gap=str(pr_data.get("diff_gap", "")),
                 files=PRFiles(
                     diff=files_data.get("diff", ""),
                     metadata=files_data.get("metadata", ""),
@@ -240,6 +276,16 @@ class TechLeadManifest:
     def contracted_candidates(self) -> tuple[TechLeadCandidate, ...]:
         """The candidates whose executable-leaf contract was staged (#345)."""
         return tuple(pr.candidate() for pr in self.prs if pr.contract_established)
+
+    def diffed_candidates(self) -> tuple[TechLeadCandidate, ...]:
+        """The candidates whose own diff was materialized and bound (#359).
+
+        Per candidate, like its two siblings, because materialization fails per
+        candidate: one pull request whose diff read failed must leave the
+        others' staged evidence exactly as it was, and must not inherit their
+        eligibility.
+        """
+        return tuple(pr.candidate() for pr in self.prs if pr.diff_established)
 
     def prerequisite_gaps(self) -> tuple[CandidatePrerequisiteGap, ...]:
         """Every recorded reason a candidate misses a merge prerequisite (#345).

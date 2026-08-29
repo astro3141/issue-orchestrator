@@ -146,6 +146,70 @@ class TestTechLeadManifest:
         assert pr.title == "Big PR"
         assert pr.files.diff == "pr-99-diff.txt"
 
+    def test_the_staged_diff_fact_survives_the_round_trip(self):
+        """`diff_established`/`diff_gap` are part of the manifest contract (#359).
+
+        The agent reads this file to learn that a candidate it was asked to
+        audit has no reviewable code, and the launch authority is built from
+        the same entries — so a serializer that dropped them would restore a
+        candidate as diff-less-but-unexplained on one side and silently
+        passable on the other.
+        """
+        original = TechLeadManifest(
+            data_dir="d",
+            prs=[
+                PRToReview(
+                    number=1,
+                    title="staged",
+                    url="u1",
+                    branch="b1",
+                    head_sha="a" * 40,
+                    diff_established=True,
+                    files=PRFiles(diff="pr-1-diff.txt", metadata="pr-1-meta.json"),
+                ),
+                PRToReview(
+                    number=2,
+                    title="unreadable",
+                    url="u2",
+                    branch="b2",
+                    head_sha="b" * 40,
+                    diff_gap="the GitHub diff read for PR #2 failed: 502",
+                    files=PRFiles(metadata="pr-2-meta.json"),
+                ),
+            ],
+        )
+
+        restored = TechLeadManifest.from_dict(original.to_dict())
+
+        assert [pr.diff_established for pr in restored.prs] == [True, False]
+        assert restored.prs[1].diff_gap == (
+            "the GitHub diff read for PR #2 failed: 502"
+        )
+        assert restored.diffed_candidates() == (restored.candidates()[0],)
+
+    def test_a_manifest_written_before_staged_diffs_establishes_none(self):
+        """The fail-closed legacy direction (#359)."""
+        data = {
+            "prs": [
+                {
+                    "number": 1,
+                    "title": "legacy",
+                    "url": "u",
+                    "branch": "b",
+                    "head_sha": "a" * 40,
+                    "files": {"diff": "pr-1-diff.txt", "metadata": "m.json"},
+                }
+            ],
+        }
+
+        manifest = TechLeadManifest.from_dict(data)
+
+        # A named file is NOT the prerequisite: the fact the orchestrator
+        # recorded is, and this row recorded none.
+        assert manifest.prs[0].files.diff == "pr-1-diff.txt"
+        assert manifest.prs[0].diff_established is False
+        assert manifest.diffed_candidates() == ()
+
     def test_from_dict_handles_missing_optional_fields(self):
         """from_dict uses defaults for missing optional fields."""
         data = {

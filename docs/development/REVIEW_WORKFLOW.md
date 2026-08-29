@@ -428,9 +428,11 @@ A batch review's merge-facing disposition is authority for **one commit**, not
 for a pull-request number:
 
 1. the manifest records each selected PR's observed `head_sha`, the downloader
-   materializes the diff for that commit (and refuses to file one under the
-   candidate's name when the head moved mid-fetch), and the orchestrator-owned
-   `TechLeadLaunchAuthority` carries those candidates beside the PR numbers;
+   materializes the diff for that commit through the repository host's own
+   supported GitHub transport (and refuses to file anything under the
+   candidate's name when the read failed or the head moved mid-fetch), and the
+   orchestrator-owned `TechLeadLaunchAuthority` carries those candidates beside
+   the PR numbers;
 2. `candidate-evidence.json` is staged beside the manifest with the independent
    Reviewer's exact-SHA verdict and the publication certification for the same
    commit, so the session never has to fetch that context itself. An entry with
@@ -454,14 +456,15 @@ for a pull-request number:
    answers "unchanged" for the one transition after which no merge-facing
    authority may be applied at all.
 
-A merge-facing `pass` rests on **both** staged prerequisites, recorded on the
-launch authority before the session spawns and asked as one question by
+A merge-facing `pass` rests on **all three** staged prerequisites, recorded on
+the launch authority before the session spawns and asked as one question by
 `TechLeadLaunchAuthority.unmet_pass_prerequisites`:
 `CandidatePassPrerequisite.INDEPENDENT_REVIEW` — which covers the reviewer's
 approval of that exact commit *and* that same commit's publication-gate
-certification — and `CandidatePassPrerequisite.LEAF_CONTRACT`. Either one unmet
-refuses the `pass`. Neither gates `rework` or `human_a` — neither of those
-claims the candidate is mergeable.
+certification — `CandidatePassPrerequisite.LEAF_CONTRACT`, and
+`CandidatePassPrerequisite.CANDIDATE_DIFF` (#359). Any one unmet refuses the
+`pass`. None of them gates `rework` or `human_a` — neither of those claims the
+candidate is mergeable.
 
 The refusal receipt names which prerequisite was missing **and the reason the
 staging owner recorded for it**, carried on the launch authority as
@@ -486,6 +489,36 @@ contract review", never "a session produced a valid artifact over a manifest
 containing this number". A moved candidate inherits nothing; the refusal is
 recorded on the pull request.
 
+#### A candidate diff is a successful read, or it does not exist (#359)
+
+`CANDIDATE_DIFF` exists because a transport failure once became evidence. The
+downloader used to shell out to `gh pr diff`; the repository's direct-`gh`
+guard refused the invocation, the refusal text was written into
+`pr-<n>-<sha12>-diff.txt`, and `manifest.json` advertised that file as the
+candidate's diff. The live Tech Lead independently declined to `pass` on it —
+correctly — but nothing in the product would have stopped it.
+
+The seam is now typed end to end:
+
+- `PullRequestTracker.read_pr_diff` returns a `PullRequestDiffRead`: readable
+  bytes, or a reason there are none. A transport error, an HTTP error status, a
+  non-text body and an empty success all take the second branch. Success is
+  decided by the transport outcome, never by inspecting the body — an error
+  page containing `diff --git` is still an error page;
+- `GitHubAdapter` implements it over the authenticated REST client
+  (`Accept: application/vnd.github.v3.diff`). `TechLeadDownloader` holds no
+  command runner at all, so there is no subprocess seam left to refuse;
+- a diff file is written, and `PRFiles.diff` names it, only when the read
+  succeeded **and** the #345 bracket still binds the bytes to the manifest's
+  commit. Otherwise nothing is written, the manifest names no file, and the
+  entry carries `diff_established: false` with the observed `diff_gap`;
+- that gap travels onto the launch authority as a `CandidatePrerequisiteGap`,
+  so a `pass` on the candidate is refused with a receipt naming the transport
+  failure, long after the run directory is gone.
+
+Failure is per candidate: one unreadable pull request records its own gap and
+leaves its siblings' staged evidence and PASS eligibility untouched.
+
 #### Leaving the watch set
 
 The set that trips the batch threshold has to be the set a review settles, or
@@ -496,10 +529,10 @@ candidate's labels become.
 
 | The run concluded | Labels | Still a candidate? | How it gets back in |
 |---|---|---|---|
-| `pass`, head unmoved, both staged prerequisites established | `+tech-lead-reviewed` | no (terminal) | n/a — it passed |
+| `pass`, head unmoved, all three staged prerequisites established | `+tech-lead-reviewed` | no (terminal) | n/a — it passed |
 | `rework` | `-` watch label, `-` review-approval label, `+needs-rework` | no | automatically, on the next review that approves it |
 | `human_a` | `+tech-lead-failed`, `+needs-human` | no | operator removes `tech-lead-failed` |
-| `pass` refused — a staged prerequisite (exact-candidate reviewer approval and its publication certification, or a resolved leaf contract) is missing; the receipt names which and the reason recorded for it | `+tech-lead-failed` | no | operator removes `tech-lead-failed` |
+| `pass` refused — a staged prerequisite (exact-candidate reviewer approval and its publication certification, a resolved leaf contract, or the candidate's own materialized diff) is missing; the receipt names which and the reason recorded for it | `+tech-lead-failed` | no | operator removes `tech-lead-failed` |
 | head moved, unreadable, or never observed | none | **yes, deliberately** | it never left — re-audited at whatever it then proposes |
 | the pull request merged or closed after the manifest bound it — whatever its head | none | yes, but unreachable | it never re-enters: the batch observes open pull requests only |
 

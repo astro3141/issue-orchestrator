@@ -1068,22 +1068,26 @@ def test_batch_flow_teaches_that_a_leaf_only_constraint_governs(
 
 
 @pytest.mark.parametrize("variant", sorted(PROMPT_VARIANTS))
-def test_pass_requires_both_staged_prerequisites(variant: str) -> None:
+def test_pass_requires_every_staged_prerequisite(variant: str) -> None:
     """The mutation direction: the audit-only `pass` rule must be gone.
 
-    The superseded bullet made `pass` rest on the reviewer approval alone and
-    asked for patterns rather than conformance. If a variant reverts to it,
-    this fails — which is what makes the prompt part of the contract rather
-    than commentary.
+    The superseded bullets made `pass` rest on the reviewer approval alone, and
+    then on the reviewer approval plus the leaf contract while the candidate's
+    own diff was staged unchecked (#359). If a variant reverts to either, this
+    fails — which is what makes the prompt part of the contract rather than
+    commentary.
     """
     batch = _normalized(_flow_section(PROMPT_VARIANTS[variant], "Batch Review Flow"))
 
-    assert "Requires BOTH staged prerequisites for this candidate" in batch, (
-        f"{variant} does not require both staged prerequisites for a pass"
+    assert "Requires ALL THREE staged prerequisites for this candidate" in batch, (
+        f"{variant} does not require every staged prerequisite for a pass"
     )
     assert "a resolved leaf contract in `candidate-contracts.json` with an empty" in (
         batch
     ), f"{variant} does not require a resolved leaf contract for a pass"
+    assert "staged diff (`diff_established: true` in `manifest.json`)" in batch, (
+        f"{variant} does not require a staged candidate diff for a pass"
+    )
     assert "acceptance criteria" in batch and "STOP conditions" in batch, (
         f"{variant} does not ask for contract conformance, only patterns"
     )
@@ -1094,6 +1098,34 @@ def test_pass_requires_both_staged_prerequisites(variant: str) -> None:
     assert "a `pass` on a candidate it never established an exact-commit" not in (
         batch
     ), f"{variant} still states the reviewer-only pass prerequisite"
+    # Nor the two-prerequisite one the diff defect slipped past.
+    assert "Requires BOTH staged prerequisites" not in batch, (
+        f"{variant} still states the reviewer+contract-only pass prerequisites"
+    )
+
+
+@pytest.mark.parametrize("variant", sorted(PROMPT_VARIANTS))
+def test_batch_flow_teaches_the_staged_candidate_diff(variant: str) -> None:
+    """The staged diff is a FACT the orchestrator recorded, not a filename (#359).
+
+    The agent must learn three things the R29 live batch could not: the flag it
+    reads (`diff_established`), that a failed read is never written to disk as
+    a diff, and that reconstructing the diff itself is forbidden.
+    """
+    batch = _normalized(_flow_section(PROMPT_VARIANTS[variant], "Batch Review Flow"))
+
+    assert "diff_established" in batch, (
+        f"{variant} never names the staged-diff fact the orchestrator records"
+    )
+    assert "diff_gap" in batch, (
+        f"{variant} never names where the missing-diff reason is recorded"
+    )
+    assert "a transport failure is never written to disk as a diff" in batch, (
+        f"{variant} does not state that a failed read produces no diff file"
+    )
+    assert "Do NOT reconstruct the diff yourself" in batch, (
+        f"{variant} does not forbid reconstructing the candidate diff"
+    )
 
 
 def _completion_section(text: str) -> str:
@@ -1111,20 +1143,20 @@ def _completion_section(text: str) -> str:
 
 
 @pytest.mark.parametrize("variant", sorted(PROMPT_VARIANTS))
-def test_completion_effects_name_both_pass_prerequisites(variant: str) -> None:
+def test_completion_effects_name_every_pass_prerequisite(variant: str) -> None:
     """What the orchestrator does AFTER the verdict is stated the same way.
 
-    ``test_pass_requires_both_staged_prerequisites`` pins the agent-facing rule
+    ``test_pass_requires_every_staged_prerequisite`` pins the agent-facing rule
     in the batch flow; this pins the narrative of the orchestrator's own
     completion effects, which is a different sentence in a different section
     and drifted independently — one variant kept describing the refused `pass`
     as resting on the reviewer prerequisite alone while its `pass` bullet
-    already required both.
+    already required more.
     """
     section = _normalized(_completion_section(PROMPT_VARIANTS[variant]))
 
-    assert "EITHER staged prerequisite" in section, (
-        f"{variant} does not say a refused `pass` may want either prerequisite"
+    assert "ANY staged prerequisite" in section, (
+        f"{variant} does not say a refused `pass` may want any prerequisite"
     )
     assert "exact-candidate reviewer approval" in section, (
         f"{variant} does not name the reviewer prerequisite in its effects"
@@ -1132,9 +1164,15 @@ def test_completion_effects_name_both_pass_prerequisites(variant: str) -> None:
     assert "resolved leaf contract" in section, (
         f"{variant} does not name the leaf-contract prerequisite in its effects"
     )
-    # The superseded half-stated sentence, in the shape all three carried it.
+    assert "staged candidate diff" in section, (
+        f"{variant} does not name the candidate-diff prerequisite in its effects"
+    )
+    # The superseded half-stated sentences, in the shapes the variants carried.
     assert "want of an exact-candidate reviewer approval" not in section, (
         f"{variant} still describes the refusal as reviewer-only"
+    )
+    assert "EITHER staged prerequisite" not in section, (
+        f"{variant} still describes the refusal as a two-way choice"
     )
 
 

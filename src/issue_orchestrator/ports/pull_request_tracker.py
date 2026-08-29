@@ -172,6 +172,58 @@ class MergeQueueRead:
         return self.status == "PRESENT"
 
 
+@dataclass(frozen=True, slots=True)
+class PullRequestDiffRead:
+    """Typed outcome of reading a pull request's unified diff (#359).
+
+    Two states, and they may never collapse into a bare ``str``:
+
+    - **readable** — the supported transport returned a body, and those bytes
+      ARE the diff. Only this outcome may be materialized as evidence.
+    - **unavailable** — the read did not produce a diff, and ``reason`` says
+      what was observed instead. A transport error, an HTTP error body, an
+      empty success, or anything else that is not a diff lands here.
+
+    The distinction is carried by the OUTCOME, never by inspecting the bytes.
+    An error body that happens to contain ``diff --git`` is still an error
+    body, and content sniffing would be exactly the fail-open seam this type
+    exists to close: the R29 live batch staged
+    ``"# Error fetching diff: ..."`` under a ``*-diff.txt`` filename and the
+    manifest advertised it as the candidate's diff.
+
+    ``readable("")`` is refused rather than admitted as an empty diff. A
+    zero-byte body is an ambiguity — a genuinely empty changeset and a
+    truncated/blank response look identical — and a merge-facing PASS may not
+    rest on an ambiguity.
+    """
+
+    diff: str = ""
+    reason: str = ""
+
+    def __post_init__(self) -> None:
+        if bool(self.diff) == bool(self.reason):
+            raise ValueError(
+                "PullRequestDiffRead is either readable bytes or a reason they"
+                f" are unavailable, never both and never neither; got"
+                f" diff={len(self.diff)} bytes, reason={self.reason!r}"
+            )
+
+    @staticmethod
+    def readable(diff: str) -> "PullRequestDiffRead":
+        """The transport returned this candidate's diff bytes."""
+        return PullRequestDiffRead(diff=diff)
+
+    @staticmethod
+    def unavailable(reason: str) -> "PullRequestDiffRead":
+        """No diff was read, and this is what was observed instead."""
+        return PullRequestDiffRead(reason=reason)
+
+    @property
+    def is_readable(self) -> bool:
+        """Whether these bytes may be staged as the candidate's diff."""
+        return not self.reason
+
+
 # Outcome kind of reading the issues a PR is REGISTERED as closing. Two values,
 # and they must never collapse: ``KNOWN`` means the provider answered (possibly
 # with an empty set — "this PR closes nothing"), ``UNKNOWN`` means we could not
@@ -428,6 +480,30 @@ class PullRequestTracker(Protocol):
 
         Raises:
             RepositoryError: If there's an error accessing the data source.
+        """
+        ...
+
+    def read_pr_diff(self, pr_number: int) -> "PullRequestDiffRead":
+        """Read a pull request's unified diff through the supported transport.
+
+        The ONE supported way to materialize a pull request's code changes.
+        Implementations must never shell out to a CLI, and must never return an
+        error body, stderr, or an empty success as if it were a diff: every
+        such observation is a
+        :meth:`PullRequestDiffRead.unavailable` outcome carrying the reason.
+
+        The diff is read for the pull request's CURRENT head, because that is
+        what the transport names. Callers that need the bytes bound to an exact
+        candidate commit must bracket this read with their own head
+        observation — this port answers "what did the read produce", never
+        "which commit is it about".
+
+        Args:
+            pr_number: The pull request whose diff to read.
+
+        Returns:
+            A readable outcome carrying the diff bytes, or an unavailable
+            outcome carrying the observed failure reason.
         """
         ...
 

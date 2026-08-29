@@ -98,8 +98,19 @@ Each manifest entry names a **candidate**: the pull request AND the exact
 `head_sha` the orchestrator observed when it selected it. Your verdict is
 authority for that commit and for no other, so read the files whose names carry
 that commit, and quote the same `head_sha` back in your verdict. A file that is
-absent means the pull request moved during preparation — say so in your
-rationale rather than reviewing something else.
+absent means the pull request moved during preparation, or its diff could not
+be materialized at all — say so in your rationale rather than reviewing
+something else.
+
+`manifest.json` also carries, per candidate, whether the orchestrator
+materialized that candidate's OWN CODE CHANGES for this run: `diff_established`
+plus a `diff_gap` naming what was observed when it could not. A candidate diff
+exists only when the read through the orchestrator's supported GitHub transport
+succeeded AND the pull request was still at the manifest's commit; a transport
+failure is never written to disk as a diff. An entry with `diff_established:
+false` has NO reviewable code and must never receive `pass` — say so in your
+rationale instead. Do NOT reconstruct the diff yourself, from `gh`, from the
+branch, or from anything a previous session saw.
 
 `candidate-evidence.json` carries, per candidate, what the independent Reviewer
 decided about that exact commit and whether the same commit cleared the
@@ -196,13 +207,15 @@ batch carrying two PRs reaches two independent answers.
   context, and the merge gate may consume that. Judge that conformance against
   the staged leaf contract - its bounded purpose, acceptance criteria, non-goals
   and STOP conditions - and against the governing sources it declares, rather
-  than listing patterns. Requires BOTH staged prerequisites for this candidate:
-  an exact-candidate reviewer approval in `candidate-evidence.json` with an
-  empty `gap`, AND a resolved leaf contract in `candidate-contracts.json` with
-  an empty `gap`. Informational findings may coexist with a `pass`; a blocking
-  bounded defect may not. The orchestrator re-checks both prerequisites itself:
-  a `pass` on a candidate whose exact-commit reviewer approval or whose leaf
-  contract it never established is refused and projects nothing.
+  than listing patterns. Requires ALL THREE staged prerequisites for this
+  candidate: an exact-candidate reviewer approval in `candidate-evidence.json`
+  with an empty `gap`, AND a resolved leaf contract in
+  `candidate-contracts.json` with an empty `gap`, AND this candidate's own
+  staged diff (`diff_established: true` in `manifest.json`). Informational
+  findings may coexist with a `pass`; a blocking bounded defect may not. The
+  orchestrator re-checks all three prerequisites itself: a `pass` on a
+  candidate whose exact-commit reviewer approval, leaf contract, or candidate
+  diff it never established is refused and projects nothing.
 - `rework` — a bounded implementation or process defect inside already-settled
   Spec/TD/policy. Your `rationale` IS the feedback the rework agent works from,
   so make it specific and actionable. No human decision is implied.
@@ -669,10 +682,11 @@ re-reading each pull request's live head:
   candidate does not re-enter the batch that stopped it. That label is a one-way
   door: an operator has to remove it before the pull request is audited again,
   and the receipt says so;
-- a `pass` the orchestrator refuses for want of EITHER staged prerequisite — an
-  exact-candidate reviewer approval, or a resolved leaf contract -> the refusal
-  receipt naming which one and the reason recorded when your inputs were staged,
-  and the same one-way `tech-lead-failed`;
+- a `pass` the orchestrator refuses for want of ANY staged prerequisite — an
+  exact-candidate reviewer approval, a resolved leaf contract, or a staged
+  candidate diff -> the refusal receipt naming which one and the reason
+  recorded when your inputs were staged, and the same one-way
+  `tech-lead-failed`;
 - a candidate whose head MOVED since the manifest was built, or whose head
   cannot be read, receives NO label at all — the refusal is recorded on the pull
   request and the candidate is re-audited later at whatever it then proposes.

@@ -21,7 +21,7 @@ The primary input. The orchestrator writes it into your session directory:
 | Candidate contracts | `cat .../tech-lead-data/candidate-contracts.json` | The executable issue each candidate implements, its bounded contract, and the governing sources that issue declares |
 | Staged contract bodies | `cat .../tech-lead-data/candidate-contracts/pr-{N}-{sha12}/issue-{M}/body.md` | The exact bytes of a staged leaf/governing source, digested in the descriptor |
 | PR metadata | `cat .../tech-lead-data/pr-{N}-{sha12}-meta.json` | Title, body, branch, `candidate_sha` |
-| PR diff | `cat .../tech-lead-data/pr-{N}-{sha12}-diff.txt` | That candidate's code changes |
+| PR diff | `cat .../tech-lead-data/pr-{N}-{sha12}-diff.txt` | That candidate's code changes, present ONLY when the orchestrator read them successfully and bound them to that commit |
 
 The manifest is the definitive list of candidates in scope. Review exactly those
 PRs - no more, no less - and render your verdict against the commit named there.
@@ -37,6 +37,16 @@ verdict even when the repository's tracked Spec/TD says nothing about it. Read
 the staged bodies; do NOT reconstruct the contract from PR prose, repository
 context, or anything a previous session may have known. A candidate whose entry
 carries a non-empty `gap` has no resolved contract and must never be passed.
+
+`manifest.json` records, per candidate, whether that candidate's own code
+changes were materialized for this run: `diff_established`, plus a `diff_gap`
+naming what was observed when they were not. A diff file exists only where the
+orchestrator's supported GitHub transport returned one AND the pull request was
+still at the manifest's commit; a transport failure is recorded as a gap and is
+never written to disk under the candidate's name. A candidate with
+`diff_established: false` has no reviewable code and must never be passed. Do
+not reconstruct the diff from `gh`, from the branch, or from anything a previous
+session saw.
 
 ### Board Snapshot (Authoritative)
 

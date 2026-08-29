@@ -18,6 +18,7 @@ from ...ports.pull_request_tracker import (
     MergeQueueRead,
     PRInfo,
     PRRef,
+    PullRequestDiffRead,
     StatusCheckRollupRead,
     StatusCheckRollupState,
 )
@@ -1019,6 +1020,38 @@ class GitHubAdapter:
                 return None
             logger.error("Failed to get PR %s: %s", pr_number, e)
             raise
+
+    def read_pr_diff(self, pr_number: int) -> PullRequestDiffRead:
+        """Read a pull request's unified diff over the authenticated REST
+        transport (#359).
+
+        Every way this can fail to produce a diff — a transport error before a
+        response, an HTTP error status, a body that is not text, a success with
+        nothing in it — becomes an ``unavailable`` outcome carrying the reason
+        that was observed. None of them returns bytes, so no caller can file
+        the failure under the candidate's name and call it evidence.
+
+        The outcome is decided by the transport, never by looking at the body:
+        an error page that contains ``diff --git`` is still an error page.
+        """
+        try:
+            body = self._client.get_pr_diff(pr_number)
+        except (GitHubHttpError, GitHubTransportError) as exc:
+            logger.warning("Failed to read the diff of PR #%s: %s", pr_number, exc)
+            return PullRequestDiffRead.unavailable(
+                f"the GitHub diff read for PR #{pr_number} failed: {exc}"
+            )
+        if not body.strip():
+            # A success carrying nothing is an ambiguity, not an empty diff:
+            # "this pull request changes no files" and "the response body was
+            # lost" are indistinguishable here, and a merge-facing PASS may not
+            # rest on the difference being guessed.
+            return PullRequestDiffRead.unavailable(
+                f"the GitHub diff read for PR #{pr_number} succeeded with an"
+                " empty body, which cannot be shown to be the candidate's"
+                " changes"
+            )
+        return PullRequestDiffRead.readable(body)
 
     def read_pr_status_check_rollup(
         self, pr_number: int, *, skip_primary_source: bool = False

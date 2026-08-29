@@ -115,14 +115,15 @@ def _authority(
     *candidates: TechLeadCandidate,
     reviewed: tuple[TechLeadCandidate, ...] | None = None,
     contracted: tuple[TechLeadCandidate, ...] | None = None,
+    diffed: tuple[TechLeadCandidate, ...] | None = None,
     gaps: tuple[CandidatePrerequisiteGap, ...] = (),
 ) -> TechLeadLaunchAuthority:
     """A batch authority whose candidates hold every merge prerequisite.
 
-    ``reviewed``/``contracted`` default to ALL of them: these tests are about
-    what a verdict does to a candidate, and the prerequisites have their own
-    class below. ``gaps`` carries what the staging owners recorded about the
-    ones that were withheld, exactly as the launch path carries it.
+    ``reviewed``/``contracted``/``diffed`` default to ALL of them: these tests
+    are about what a verdict does to a candidate, and the prerequisites have
+    their own class below. ``gaps`` carries what the staging owners recorded
+    about the ones that were withheld, exactly as the launch path carries it.
     """
     return TechLeadLaunchAuthority(
         flavor=TechLeadSessionFlavor.BATCH_REVIEW,
@@ -131,6 +132,7 @@ def _authority(
         manifest_candidates=candidates,
         reviewed_candidates=candidates if reviewed is None else reviewed,
         contracted_candidates=candidates if contracted is None else contracted,
+        diffed_candidates=candidates if diffed is None else diffed,
         prerequisite_gaps=gaps,
     )
 
@@ -646,6 +648,7 @@ class TestPassPrerequisites:
         [
             ("reviewed", CandidatePassPrerequisite.INDEPENDENT_REVIEW),
             ("contracted", CandidatePassPrerequisite.LEAF_CONTRACT),
+            ("diffed", CandidatePassPrerequisite.CANDIDATE_DIFF),
         ],
     )
     def test_the_refusal_says_which_prerequisite_was_missing(
@@ -662,12 +665,9 @@ class TestPassPrerequisites:
         assert expected.value in receipt.comment
         assert expected.description in receipt.comment
         # Only the one that is actually missing is named.
-        other = next(
-            member
-            for member in CandidatePassPrerequisite
-            if member is not expected
-        )
-        assert other.value not in receipt.comment
+        for other in CandidatePassPrerequisite:
+            if other is not expected:
+                assert other.value not in receipt.comment
         assert CANDIDATE_A in receipt.comment
 
     def test_the_refusal_names_the_condition_that_was_actually_observed(
@@ -712,6 +712,73 @@ class TestPassPrerequisites:
             receipt.comment
         )
 
+    def test_a_pass_without_a_staged_candidate_diff_projects_nothing(
+        self, tmp_path: Path
+    ) -> None:
+        """#359 direction E: the agent cannot waive the diff prerequisite.
+
+        Complete reviewer evidence, a resolved leaf contract, an otherwise
+        valid `pass` naming the exact SHA — and no candidate diff. The
+        orchestrator refuses on its own record rather than on the agent's
+        prose, and the receipt names the transport failure the staging owner
+        actually observed, because nothing here removes the terminal label it
+        applies.
+        """
+        candidate = TechLeadCandidate(101, CANDIDATE_A)
+        recorded = (
+            "the GitHub diff read for PR #101 failed: 502 Bad Gateway"
+        )
+        actions = _plan(
+            tmp_path,
+            _authority(
+                candidate,
+                diffed=(),
+                gaps=(
+                    CandidatePrerequisiteGap(
+                        candidate=candidate,
+                        prerequisite=CandidatePassPrerequisite.CANDIDATE_DIFF,
+                        reason=recorded,
+                    ),
+                ),
+            ),
+            _decision(_verdict(101, "pass")),
+            {101: CANDIDATE_A},
+        )
+
+        assert _labels(actions, "tech-lead-reviewed") == []
+        assert [l.issue_number for l in _labels(actions, "tech-lead-failed")] == [101]
+        [receipt] = _comments(actions, 101)
+        assert CandidatePassPrerequisite.CANDIDATE_DIFF.value in receipt.comment
+        assert recorded in receipt.comment
+
+    def test_rework_and_human_a_survive_a_missing_candidate_diff(
+        self, tmp_path: Path
+    ) -> None:
+        """Neither claims the candidate is mergeable, so neither is gated (#359 E).
+
+        The direction that would otherwise turn a fail-closed merge gate into a
+        stalled lane: a candidate whose diff could not be read still routes to
+        rework or to a human on exactly its existing semantics.
+        """
+        candidate = TechLeadCandidate(101, CANDIDATE_A)
+        rework = _plan(
+            tmp_path,
+            _authority(candidate, diffed=()),
+            _decision(_verdict(101, "rework", rationale="Extract the owner.")),
+            {101: CANDIDATE_A},
+        )
+        human = _plan(
+            tmp_path,
+            _authority(candidate, diffed=()),
+            _decision(_verdict(101, "human_a", rationale="Whose call is this?")),
+            {101: CANDIDATE_A},
+        )
+
+        assert [l.label for l in _labels(rework, "needs-rework")] == ["needs-rework"]
+        assert [l.label for l in _labels(human, "tech-lead-failed")] == [
+            "tech-lead-failed"
+        ]
+
     def test_a_refusal_with_nothing_recorded_does_not_invent_a_cause(
         self, tmp_path: Path
     ) -> None:
@@ -727,14 +794,17 @@ class TestPassPrerequisites:
         assert CandidatePassPrerequisite.LEAF_CONTRACT.description in receipt.comment
         assert "Recorded when this review's inputs were staged" not in receipt.comment
 
-    def test_both_missing_prerequisites_are_named_in_one_receipt(
+    def test_every_missing_prerequisite_is_named_in_one_receipt(
         self, tmp_path: Path
     ) -> None:
         """A reader fixing one and re-running would otherwise be refused twice."""
         actions = _plan(
             tmp_path,
             _authority(
-                TechLeadCandidate(101, CANDIDATE_A), reviewed=(), contracted=()
+                TechLeadCandidate(101, CANDIDATE_A),
+                reviewed=(),
+                contracted=(),
+                diffed=(),
             ),
             _decision(_verdict(101, "pass")),
             {101: CANDIDATE_A},

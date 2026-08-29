@@ -5,12 +5,19 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-from issue_orchestrator.execution.tech_lead_downloader import TechLeadDownloader
+import pytest
+
+from issue_orchestrator.execution.tech_lead_downloader import (
+    CandidateMaterialization,
+    TechLeadDownloader,
+)
 from issue_orchestrator.domain.tech_lead_candidate import CandidatePassPrerequisite
 from issue_orchestrator.domain.tech_lead_manifest import (
     TechLeadManifest,
+    PRFiles,
     PRToReview,
 )
+from issue_orchestrator.ports.pull_request_tracker import PullRequestDiffRead
 
 
 @dataclass
@@ -27,42 +34,49 @@ class MockPR:
     head_sha: Optional[str] = None
 
 
-@dataclass
-class CommandResult:
-    """Mock command result."""
-
-    returncode: int
-    stdout: str
-    stderr: str
-
-
 class MockRepositoryHost:
-    """Mock RepositoryHost for testing."""
+    """Mock RepositoryHost for testing.
 
-    def __init__(self, prs: dict[int, MockPR] | None = None):
+    ``diffs`` maps a PR number to the typed outcome its diff read produces.
+    A PR with no entry reads as an ordinary, readable diff — the happy path
+    most of these tests are not about.
+    """
+
+    def __init__(
+        self,
+        prs: dict[int, MockPR] | None = None,
+        diffs: dict[int, PullRequestDiffRead] | None = None,
+    ):
         self._prs = prs or {}
+        self._diffs = diffs or {}
         self.get_pr_calls: list[int] = []
+        self.diff_calls: list[int] = []
 
     def get_pr(self, pr_number: int) -> Optional[MockPR]:
         self.get_pr_calls.append(pr_number)
         return self._prs.get(pr_number)
 
+    def read_pr_diff(self, pr_number: int) -> PullRequestDiffRead:
+        self.diff_calls.append(pr_number)
+        if pr_number in self._diffs:
+            return self._diffs[pr_number]
+        return PullRequestDiffRead.readable(
+            f"diff --git a/pr{pr_number}.py b/pr{pr_number}.py\n+line\n"
+        )
 
-class MockCommandRunner:
-    """Mock CommandRunner for testing."""
 
-    def __init__(self, results: dict[str, CommandResult] | None = None):
-        self._results = results or {}
-        self.run_calls: list[list[str]] = []
+def _diff_gaps(manifest: TechLeadManifest):
+    """Only the recorded CANDIDATE_DIFF reasons.
 
-    def run(self, args: list[str]) -> CommandResult:
-        self.run_calls.append(args)
-        # Match by PR number in args
-        for arg in args:
-            if arg in self._results:
-                return self._results[arg]
-        # Default success result
-        return CommandResult(returncode=0, stdout="", stderr="")
+    These fixtures wire no reviewer-evidence source, so every candidate also
+    carries the INDEPENDENT_REVIEW gap that omission records (#345). Filtering
+    keeps each assertion about the prerequisite it is actually testing.
+    """
+    return [
+        gap
+        for gap in manifest.prerequisite_gaps()
+        if gap.prerequisite is CandidatePassPrerequisite.CANDIDATE_DIFF
+    ]
 
 
 def _sha(pr_number: int) -> str:
@@ -76,21 +90,19 @@ class TestTechLeadDownloader:
     def test_download_empty_manifest(self, tmp_path: Path):
         """Handles empty manifest gracefully."""
         host = MockRepositoryHost()
-        runner = MockCommandRunner()
-        downloader = TechLeadDownloader(host, runner)
+        downloader = TechLeadDownloader(host)
 
         manifest = TechLeadManifest(data_dir="tech-lead-data", prs=[])
         result = downloader.download(manifest, tmp_path)
 
         assert result.prs == []
         assert len(host.get_pr_calls) == 0
-        assert len(runner.run_calls) == 0
+        assert host.diff_calls == []
 
     def test_download_requires_data_dir(self, tmp_path: Path):
         """Raises error if data_dir not set."""
         host = MockRepositoryHost()
-        runner = MockCommandRunner()
-        downloader = TechLeadDownloader(host, runner)
+        downloader = TechLeadDownloader(host)
 
         manifest = TechLeadManifest(data_dir="", prs=[
             PRToReview(number=1, title="PR", url="u", branch="b", head_sha=_sha(1)),
@@ -104,17 +116,17 @@ class TestTechLeadDownloader:
 
     def test_download_creates_diff_file(self, tmp_path: Path):
         """Downloads and writes diff for each PR."""
-        host = MockRepositoryHost(prs={
-            42: MockPR(number=42, title="Test PR", url="https://github.com/org/repo/pull/42", branch="test", labels=[], head_sha=_sha(42)),
-        })
-        runner = MockCommandRunner(results={
-            "42": CommandResult(
-                returncode=0,
-                stdout="diff --git a/file.py b/file.py\n+added line",
-                stderr="",
-            ),
-        })
-        downloader = TechLeadDownloader(host, runner)
+        host = MockRepositoryHost(
+            prs={
+                42: MockPR(number=42, title="Test PR", url="https://github.com/org/repo/pull/42", branch="test", labels=[], head_sha=_sha(42)),
+            },
+            diffs={
+                42: PullRequestDiffRead.readable(
+                    "diff --git a/file.py b/file.py\n+added line"
+                ),
+            },
+        )
+        downloader = TechLeadDownloader(host)
 
         manifest = TechLeadManifest(
             data_dir="tech-lead-data",
@@ -144,8 +156,7 @@ class TestTechLeadDownloader:
                 head_sha=_sha(42),
             ),
         })
-        runner = MockCommandRunner()
-        downloader = TechLeadDownloader(host, runner)
+        downloader = TechLeadDownloader(host)
 
         manifest = TechLeadManifest(
             data_dir="tech-lead-data",
@@ -168,37 +179,10 @@ class TestTechLeadDownloader:
         # Check manifest was updated
         assert result.prs[0].files.metadata == "pr-42-042aaaaaaaaa-meta.json"
 
-    def test_download_handles_diff_error(self, tmp_path: Path):
-        """Writes error message when diff fetch fails."""
-        host = MockRepositoryHost(prs={
-            99: MockPR(number=99, title="PR", url="u", branch="b", labels=[], head_sha=_sha(99)),
-        })
-        runner = MockCommandRunner(results={
-            "99": CommandResult(
-                returncode=1,
-                stdout="",
-                stderr="gh: PR not found",
-            ),
-        })
-        downloader = TechLeadDownloader(host, runner)
-
-        manifest = TechLeadManifest(
-            data_dir="data",
-            prs=[PRToReview(number=99, title="PR", url="u", branch="b", head_sha=_sha(99))],
-        )
-        downloader.download(manifest, tmp_path)
-
-        diff_path = tmp_path / "data" / "pr-99-099aaaaaaaaa-diff.txt"
-        assert diff_path.exists()
-        content = diff_path.read_text()
-        assert "Error fetching diff" in content
-        assert "PR not found" in content
-
     def test_download_handles_missing_pr(self, tmp_path: Path):
         """Writes error metadata when PR not found."""
         host = MockRepositoryHost(prs={})  # No PRs
-        runner = MockCommandRunner()
-        downloader = TechLeadDownloader(host, runner)
+        downloader = TechLeadDownloader(host)
 
         manifest = TechLeadManifest(
             data_dir="data",
@@ -214,17 +198,19 @@ class TestTechLeadDownloader:
 
     def test_download_multiple_prs(self, tmp_path: Path):
         """Downloads data for multiple PRs."""
-        host = MockRepositoryHost(prs={
-            1: MockPR(number=1, title="PR 1", url="u1", branch="b1", labels=[], head_sha=_sha(1)),
-            2: MockPR(number=2, title="PR 2", url="u2", branch="b2", labels=[], head_sha=_sha(2)),
-            3: MockPR(number=3, title="PR 3", url="u3", branch="b3", labels=[], head_sha=_sha(3)),
-        })
-        runner = MockCommandRunner(results={
-            "1": CommandResult(0, "diff1", ""),
-            "2": CommandResult(0, "diff2", ""),
-            "3": CommandResult(0, "diff3", ""),
-        })
-        downloader = TechLeadDownloader(host, runner)
+        host = MockRepositoryHost(
+            prs={
+                1: MockPR(number=1, title="PR 1", url="u1", branch="b1", labels=[], head_sha=_sha(1)),
+                2: MockPR(number=2, title="PR 2", url="u2", branch="b2", labels=[], head_sha=_sha(2)),
+                3: MockPR(number=3, title="PR 3", url="u3", branch="b3", labels=[], head_sha=_sha(3)),
+            },
+            diffs={
+                1: PullRequestDiffRead.readable("diff1"),
+                2: PullRequestDiffRead.readable("diff2"),
+                3: PullRequestDiffRead.readable("diff3"),
+            },
+        )
+        downloader = TechLeadDownloader(host)
 
         manifest = TechLeadManifest(
             data_dir="data",
@@ -249,43 +235,12 @@ class TestTechLeadDownloader:
         assert result.prs[1].files.diff == "pr-2-002aaaaaaaaa-diff.txt"
         assert result.prs[2].files.diff == "pr-3-003aaaaaaaaa-diff.txt"
 
-    def test_download_continues_on_pr_failure(self, tmp_path: Path):
-        """Continues downloading other PRs even if one fails."""
-        host = MockRepositoryHost(prs={
-            1: MockPR(number=1, title="PR 1", url="u1", branch="b1", labels=[], head_sha=_sha(1)),
-            # PR 2 missing
-            3: MockPR(number=3, title="PR 3", url="u3", branch="b3", labels=[], head_sha=_sha(3)),
-        })
-        runner = MockCommandRunner(results={
-            "1": CommandResult(0, "diff1", ""),
-            "2": CommandResult(1, "", "not found"),
-            "3": CommandResult(0, "diff3", ""),
-        })
-        downloader = TechLeadDownloader(host, runner)
-
-        manifest = TechLeadManifest(
-            data_dir="data",
-            prs=[
-                PRToReview(number=1, title="PR 1", url="u1", branch="b1", head_sha=_sha(1)),
-                PRToReview(number=2, title="PR 2", url="u2", branch="b2", head_sha=_sha(2)),
-                PRToReview(number=3, title="PR 3", url="u3", branch="b3", head_sha=_sha(3)),
-            ],
-        )
-        downloader.download(manifest, tmp_path)
-
-        # PR 1 and 3 should have proper files
-        assert (tmp_path / "data" / "pr-1-001aaaaaaaaa-diff.txt").exists()
-        assert (tmp_path / "data" / "pr-3-003aaaaaaaaa-diff.txt").exists()
-        assert "diff1" in (tmp_path / "data" / "pr-1-001aaaaaaaaa-diff.txt").read_text()
-        assert "diff3" in (tmp_path / "data" / "pr-3-003aaaaaaaaa-diff.txt").read_text()
-
     def test_download_creates_data_directory(self, tmp_path: Path):
         """Creates data directory if it doesn't exist."""
         host = MockRepositoryHost(prs={
             1: MockPR(number=1, title="PR", url="u", branch="b", labels=[], head_sha=_sha(1)),
         })
-        runner = MockCommandRunner()
-        downloader = TechLeadDownloader(host, runner)
+        downloader = TechLeadDownloader(host)
 
         manifest = TechLeadManifest(
             data_dir="deep/nested/tech-lead-data",
@@ -296,13 +251,20 @@ class TestTechLeadDownloader:
         assert (tmp_path / "deep" / "nested" / "tech-lead-data").exists()
         assert (tmp_path / "deep" / "nested" / "tech-lead-data" / "pr-1-001aaaaaaaaa-diff.txt").exists()
 
-    def test_download_calls_gh_pr_diff(self, tmp_path: Path):
-        """Calls gh pr diff with correct arguments."""
+    def test_download_reads_the_diff_through_the_repository_host(
+        self, tmp_path: Path
+    ):
+        """The candidate diff comes from the supported transport (#359).
+
+        The mutation direction of the R29 production defect: this downloader
+        used to run ``gh pr diff`` through a CommandRunner. It now has no
+        command runner at all, so restoring that call cannot even be wired —
+        and the read it does make is the repository host's own.
+        """
         host = MockRepositoryHost(prs={
             42: MockPR(number=42, title="PR", url="u", branch="b", labels=[], head_sha=_sha(42)),
         })
-        runner = MockCommandRunner()
-        downloader = TechLeadDownloader(host, runner)
+        downloader = TechLeadDownloader(host)
 
         manifest = TechLeadManifest(
             data_dir="data",
@@ -310,8 +272,267 @@ class TestTechLeadDownloader:
         )
         downloader.download(manifest, tmp_path)
 
-        assert len(runner.run_calls) == 1
-        assert runner.run_calls[0] == ["gh", "pr", "diff", "42"]
+        assert host.diff_calls == [42]
+        assert not hasattr(downloader, "_runner")
+
+
+class TestNoDirectGhSeamSurvives:
+    """The candidate-diff path holds no subprocess seam at all (#359 G).
+
+    A behavioural test cannot observe the absence of a call that is never
+    made, so this reads the module: restoring ``gh pr diff`` — or merely
+    re-accepting a ``CommandRunner`` to run it with — fails here.
+    """
+
+    @staticmethod
+    def _module_ast():
+        import ast
+        import inspect
+
+        from issue_orchestrator.execution import tech_lead_downloader
+
+        return ast.parse(inspect.getsource(tech_lead_downloader))
+
+    def test_the_module_names_no_gh_executable(self) -> None:
+        """Parsed, not grepped: the prose may DISCUSS the removed call."""
+        import ast
+
+        literals = {
+            node.value
+            for node in ast.walk(self._module_ast())
+            if isinstance(node, ast.Constant) and isinstance(node.value, str)
+        }
+
+        assert "gh" not in literals
+
+    def test_the_module_imports_no_command_runner(self) -> None:
+        import ast
+
+        imported = {
+            alias.name
+            for node in ast.walk(self._module_ast())
+            if isinstance(node, (ast.Import, ast.ImportFrom))
+            for alias in node.names
+        }
+
+        assert "CommandRunner" not in imported
+
+    def test_the_downloader_accepts_no_command_runner(self) -> None:
+        import inspect
+
+        parameters = inspect.signature(TechLeadDownloader.__init__).parameters
+
+        assert "command_runner" not in parameters
+
+
+class TestUnreadableDiffIsUnavailableNotContent:
+    """A failed diff read is an explicit gap, never bytes on disk (#359).
+
+    The R29 live batch proved the fail-open seam: the direct-``gh`` guard
+    refused the invocation, the refusal text was written into
+    ``pr-<n>-<sha12>-diff.txt``, and the manifest advertised that file as the
+    candidate's diff. Nothing here may write a transport failure under the
+    candidate's name.
+    """
+
+    def _download(
+        self, tmp_path: Path, diff: PullRequestDiffRead
+    ) -> TechLeadManifest:
+        host = MockRepositoryHost(
+            prs={
+                7: MockPR(
+                    number=7, title="PR", url="u", branch="b", labels=[],
+                    head_sha=_sha(7),
+                ),
+            },
+            diffs={7: diff},
+        )
+        manifest = TechLeadManifest(
+            data_dir="data",
+            prs=[PRToReview(number=7, title="PR", url="u", branch="b", head_sha=_sha(7))],
+        )
+        return TechLeadDownloader(host).download(manifest, tmp_path)
+
+    def test_a_transport_failure_writes_no_diff_file(self, tmp_path: Path) -> None:
+        self._download(
+            tmp_path,
+            PullRequestDiffRead.unavailable(
+                "the GitHub diff read for PR #7 failed: 502 Bad Gateway"
+            ),
+        )
+
+        assert not list((tmp_path / "data").glob("*-diff.txt"))
+
+    def test_the_manifest_advertises_no_diff_filename(self, tmp_path: Path) -> None:
+        manifest = self._download(
+            tmp_path,
+            PullRequestDiffRead.unavailable(
+                "the GitHub diff read for PR #7 failed: 502 Bad Gateway"
+            ),
+        )
+
+        assert manifest.prs[0].files.diff == ""
+        # The metadata is still staged: the candidate is audited, it simply has
+        # no code to audit.
+        assert manifest.prs[0].files.metadata == "pr-7-007aaaaaaaaa-meta.json"
+
+    def test_the_observed_reason_is_recorded_on_the_candidate(
+        self, tmp_path: Path
+    ) -> None:
+        manifest = self._download(
+            tmp_path,
+            PullRequestDiffRead.unavailable(
+                "the GitHub diff read for PR #7 failed: 502 Bad Gateway"
+            ),
+        )
+
+        assert manifest.prs[0].diff_established is False
+        assert "502 Bad Gateway" in manifest.prs[0].diff_gap
+        assert manifest.diffed_candidates() == ()
+        [gap] = _diff_gaps(manifest)
+        assert gap.candidate == manifest.candidates()[0]
+        assert "502 Bad Gateway" in gap.reason
+
+    def test_the_metadata_tells_the_agent_the_diff_is_missing(
+        self, tmp_path: Path
+    ) -> None:
+        """The agent reads metadata, not the manifest builder's intentions."""
+        self._download(
+            tmp_path,
+            PullRequestDiffRead.unavailable("GitHub refused: 403 Forbidden"),
+        )
+
+        metadata = json.loads(
+            (tmp_path / "data" / "pr-7-007aaaaaaaaa-meta.json").read_text()
+        )
+        assert metadata["diff_staged"] is False
+        assert "403 Forbidden" in metadata["diff_gap"]
+
+    def test_error_shaped_bytes_never_become_a_diff(self, tmp_path: Path) -> None:
+        """Success is a typed outcome, never a property of the bytes (#359 D).
+
+        An error body that itself contains ``diff --git`` must still follow the
+        failure path. Nothing in this pipeline sniffs content to decide whether
+        a read succeeded, so plausible-looking patch text in an error response
+        buys it nothing.
+        """
+        manifest = self._download(
+            tmp_path,
+            PullRequestDiffRead.unavailable(
+                "GitHub returned an error page containing"
+                " diff --git a/spoof.py b/spoof.py"
+            ),
+        )
+
+        assert manifest.prs[0].files.diff == ""
+        assert manifest.prs[0].diff_established is False
+        assert not list((tmp_path / "data").glob("*-diff.txt"))
+
+    def test_the_superseded_error_body_file_is_gone(self, tmp_path: Path) -> None:
+        """Falsification: the exact R29 artifact must be unwritable.
+
+        Restoring the old behaviour would put ``# Error fetching diff: ...``
+        into ``pr-7-007aaaaaaaaa-diff.txt`` and name it in the manifest. Both
+        halves are asserted, because either one alone is the defect.
+        """
+        manifest = self._download(
+            tmp_path,
+            PullRequestDiffRead.unavailable(
+                "Direct gh invocation is forbidden; use"
+                " GitHubHttpClient/GitHubAdapter"
+            ),
+        )
+
+        assert not (tmp_path / "data" / "pr-7-007aaaaaaaaa-diff.txt").exists()
+        assert manifest.prs[0].files.diff == ""
+        assert manifest.prs[0].diff_established is False
+
+    def test_an_unexpected_staging_failure_is_still_an_explicit_gap(
+        self, tmp_path: Path
+    ) -> None:
+        """A raising host is a refusal with a reason, not a silent skip."""
+
+        class _Exploding(MockRepositoryHost):
+            def read_pr_diff(self, pr_number: int) -> PullRequestDiffRead:
+                raise RuntimeError("socket exploded")
+
+        host = _Exploding(prs={
+            7: MockPR(
+                number=7, title="PR", url="u", branch="b", labels=[], head_sha=_sha(7)
+            ),
+        })
+        manifest = TechLeadManifest(
+            data_dir="data",
+            prs=[PRToReview(number=7, title="PR", url="u", branch="b", head_sha=_sha(7))],
+        )
+
+        result = TechLeadDownloader(host).download(manifest, tmp_path)
+
+        assert result.prs[0].files.diff == ""
+        assert result.prs[0].diff_established is False
+        assert "socket exploded" in result.prs[0].diff_gap
+
+
+class TestCandidateMaterializationRecord:
+    """The staging record cannot say "no diff" and "no reason" at once."""
+
+    def test_a_staged_diff_carries_no_gap(self) -> None:
+        staged = CandidateMaterialization(files=PRFiles(diff="d.txt", metadata="m"))
+
+        assert staged.establishes_candidate_diff is True
+
+    def test_a_gap_means_the_prerequisite_is_unmet(self) -> None:
+        staged = CandidateMaterialization(files=PRFiles(metadata="m"), gap="boom")
+
+        assert staged.establishes_candidate_diff is False
+
+    def test_an_unexplained_absence_is_unrepresentable(self) -> None:
+        with pytest.raises(ValueError, match="recorded why"):
+            CandidateMaterialization(files=PRFiles(metadata="m"))
+
+    def test_a_staged_diff_with_a_reason_is_unrepresentable(self) -> None:
+        with pytest.raises(ValueError, match="recorded why"):
+            CandidateMaterialization(files=PRFiles(diff="d.txt"), gap="boom")
+
+
+class TestMultiCandidateIsolation:
+    """One unreadable candidate must not touch its siblings (#359 F)."""
+
+    def test_a_failed_sibling_leaves_the_others_staged(self, tmp_path: Path) -> None:
+        host = MockRepositoryHost(
+            prs={
+                1: MockPR(number=1, title="PR 1", url="u1", branch="b1", labels=[], head_sha=_sha(1)),
+                2: MockPR(number=2, title="PR 2", url="u2", branch="b2", labels=[], head_sha=_sha(2)),
+                3: MockPR(number=3, title="PR 3", url="u3", branch="b3", labels=[], head_sha=_sha(3)),
+            },
+            diffs={
+                1: PullRequestDiffRead.readable("diff1"),
+                2: PullRequestDiffRead.unavailable("404 Not Found"),
+                3: PullRequestDiffRead.readable("diff3"),
+            },
+        )
+        manifest = TechLeadManifest(
+            data_dir="data",
+            prs=[
+                PRToReview(number=1, title="PR 1", url="u1", branch="b1", head_sha=_sha(1)),
+                PRToReview(number=2, title="PR 2", url="u2", branch="b2", head_sha=_sha(2)),
+                PRToReview(number=3, title="PR 3", url="u3", branch="b3", head_sha=_sha(3)),
+            ],
+        )
+
+        result = TechLeadDownloader(host).download(manifest, tmp_path)
+
+        assert "diff1" in (tmp_path / "data" / "pr-1-001aaaaaaaaa-diff.txt").read_text()
+        assert "diff3" in (tmp_path / "data" / "pr-3-003aaaaaaaaa-diff.txt").read_text()
+        assert not (tmp_path / "data" / "pr-2-002aaaaaaaaa-diff.txt").exists()
+
+        assert [pr.diff_established for pr in result.prs] == [True, False, True]
+        assert result.diffed_candidates() == (
+            result.candidates()[0],
+            result.candidates()[2],
+        )
+        [gap] = _diff_gaps(result)
+        assert gap.candidate.pr_number == 2
 
 
 class TestCandidateBinding:
@@ -337,8 +558,7 @@ class TestCandidateBinding:
                 head_sha=_sha(8),  # moved away from the manifest's candidate
             ),
         })
-        runner = MockCommandRunner(results={"7": CommandResult(0, "diff7", "")})
-        downloader = TechLeadDownloader(host, runner)
+        downloader = TechLeadDownloader(host)
 
         manifest = TechLeadManifest(
             data_dir="data",
@@ -349,6 +569,33 @@ class TestCandidateBinding:
         assert result.prs[0].files.diff == ""
         assert not list((tmp_path / "data").glob("*-diff.txt"))
 
+    def test_a_moved_candidate_holds_no_diff_prerequisite(
+        self, tmp_path: Path
+    ) -> None:
+        """#359 direction C: no diff is advertised, and the gap says why.
+
+        The bytes the transport returned WERE readable — they are simply about
+        the commit the pull request moved to. Nothing about them may reach A's
+        record, and A inherits nothing from B.
+        """
+        host = MockRepositoryHost(prs={
+            7: MockPR(
+                number=7, title="PR", url="u", branch="b", labels=[], head_sha=_sha(8)
+            ),
+        })
+        manifest = TechLeadManifest(
+            data_dir="data",
+            prs=[PRToReview(number=7, title="PR", url="u", branch="b", head_sha=_sha(7))],
+        )
+
+        result = TechLeadDownloader(host).download(manifest, tmp_path)
+
+        assert result.prs[0].diff_established is False
+        assert "moved" in result.prs[0].diff_gap
+        assert result.diffed_candidates() == ()
+        [gap] = _diff_gaps(result)
+        assert gap.candidate.head_sha == _sha(7)
+
     def test_the_metadata_records_why_the_content_could_not_be_bound(
         self, tmp_path: Path
     ) -> None:
@@ -357,7 +604,7 @@ class TestCandidateBinding:
                 number=7, title="PR", url="u", branch="b", labels=[], head_sha=_sha(8)
             ),
         })
-        downloader = TechLeadDownloader(host, MockCommandRunner())
+        downloader = TechLeadDownloader(host)
 
         manifest = TechLeadManifest(
             data_dir="data",
@@ -380,19 +627,26 @@ class TestCandidateBinding:
                 number=7, title="PR", url="u", branch="b", labels=[], head_sha=_sha(7)
             ),
         })
-        downloader = TechLeadDownloader(host, MockCommandRunner())
+        downloader = TechLeadDownloader(host)
 
         manifest = TechLeadManifest(
             data_dir="data",
             prs=[PRToReview(number=7, title="PR", url="u", branch="b", head_sha=_sha(7))],
         )
-        downloader.download(manifest, tmp_path)
+        result = downloader.download(manifest, tmp_path)
 
         metadata = json.loads(
             (tmp_path / "data" / f"pr-7-{_sha(7)[:12]}-meta.json").read_text()
         )
         assert metadata["candidate_bound"] is True
         assert "candidate_binding_gap" not in metadata
+        assert metadata["diff_staged"] is True
+        # #359 direction A: the exact returned bytes, written once, named by
+        # the manifest, and the prerequisite established for that candidate.
+        assert result.prs[0].files.diff == f"pr-7-{_sha(7)[:12]}-diff.txt"
+        assert result.prs[0].diff_established is True
+        assert result.prs[0].diff_gap == ""
+        assert result.diffed_candidates() == result.candidates()
 
     def test_a_pull_request_selected_without_a_head_stages_no_diff(
         self, tmp_path: Path
@@ -402,7 +656,7 @@ class TestCandidateBinding:
                 number=7, title="PR", url="u", branch="b", labels=[], head_sha=_sha(7)
             ),
         })
-        downloader = TechLeadDownloader(host, MockCommandRunner())
+        downloader = TechLeadDownloader(host)
 
         manifest = TechLeadManifest(
             data_dir="data",
@@ -411,8 +665,30 @@ class TestCandidateBinding:
         result = downloader.download(manifest, tmp_path)
 
         assert result.prs[0].files.diff == ""
+        assert result.prs[0].diff_established is False
         metadata = json.loads((tmp_path / "data" / "pr-7-unknown-meta.json").read_text())
         assert metadata["candidate_bound"] is False
+
+    def test_both_failures_are_reported_together(self, tmp_path: Path) -> None:
+        """An operator needs every condition observed, not just the first."""
+        host = MockRepositoryHost(
+            prs={
+                7: MockPR(
+                    number=7, title="PR", url="u", branch="b", labels=[],
+                    head_sha=_sha(8),
+                ),
+            },
+            diffs={7: PullRequestDiffRead.unavailable("503 Service Unavailable")},
+        )
+        manifest = TechLeadManifest(
+            data_dir="data",
+            prs=[PRToReview(number=7, title="PR", url="u", branch="b", head_sha=_sha(7))],
+        )
+
+        result = TechLeadDownloader(host).download(manifest, tmp_path)
+
+        assert "503 Service Unavailable" in result.prs[0].diff_gap
+        assert "moved" in result.prs[0].diff_gap
 
 
 class TestStagedReviewEvidence:
@@ -445,7 +721,7 @@ class TestStagedReviewEvidence:
                 number=7, title="PR", url="u", branch="b", labels=[], head_sha=_sha(7)
             ),
         })
-        downloader = TechLeadDownloader(host, MockCommandRunner(), source)
+        downloader = TechLeadDownloader(host, source)
         manifest = TechLeadManifest(
             data_dir="data",
             prs=[PRToReview(number=7, title="PR", url="u", branch="b", head_sha=_sha(7))],
@@ -510,7 +786,7 @@ class TestStagedReviewEvidence:
                 number=7, title="PR", url="u", branch="b", labels=[], head_sha=_sha(7)
             ),
         })
-        downloader = TechLeadDownloader(host, MockCommandRunner())
+        downloader = TechLeadDownloader(host)
         manifest = TechLeadManifest(
             data_dir="data",
             prs=[PRToReview(number=7, title="PR", url="u", branch="b", head_sha=_sha(7))],
