@@ -12,6 +12,9 @@ from __future__ import annotations
 
 import pytest
 
+from issue_orchestrator.control.tech_lead_candidate_policy import (
+    TechLeadCandidatePolicy,
+)
 from issue_orchestrator.domain.models import AgentConfig
 from issue_orchestrator.infra.config import Config
 from issue_orchestrator.infra.doctor.checks.tech_lead import (
@@ -96,6 +99,25 @@ class TestUnreachable:
         assert readiness.active is True
         assert readiness.reachable is False
         assert len(readiness.problems) == 2
+
+
+    def test_the_unreachable_label_is_the_one_the_projection_would_apply(self) -> None:
+        """The warning names a label a `pass` would actually add (review A1).
+
+        Doctor asks ``TechLeadCandidatePolicy`` for the merge-facing spelling
+        rather than reading the config field a second time. Under a custom
+        label, a locally-derived spelling would send the operator looking for a
+        label this deployment never applies.
+        """
+        config = _config(review_exchange_mode="via-draft-pr")
+        config.tech_lead_reviewed_label = "porchpin-tech-lead-ok"
+
+        [check] = check_tech_lead_merge_authority(config)
+
+        expected, _failed = TechLeadCandidatePolicy.terminal_labels_for(config)
+        assert expected == "porchpin-tech-lead-ok"
+        assert expected in check.detail
+        assert "tech-lead-reviewed" not in check.detail
 
 
 def test_the_readiness_owner_and_the_check_cannot_disagree() -> None:

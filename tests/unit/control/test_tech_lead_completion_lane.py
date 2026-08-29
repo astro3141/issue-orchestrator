@@ -23,9 +23,15 @@ from issue_orchestrator.control.completion_types import (
 from issue_orchestrator.control.subject_recovery_authority import (
     SubjectRecoveryAuthority,
 )
+from issue_orchestrator.control.reconciliation import ExpectedState
+from issue_orchestrator.control.tech_lead_candidate_policy import (
+    TechLeadCandidatePolicy,
+)
 from issue_orchestrator.control.tech_lead_completion import (
+    manifest_failure_label_actions,
     settle_tech_lead_completion,
 )
+from issue_orchestrator.domain.tech_lead_candidate import CandidateOutcome
 from issue_orchestrator.domain.models import (
     PUBLICATION_ACTIONS,
     SUBJECT_RECOVERY_ACTIONS,
@@ -380,3 +386,57 @@ class TestTheSettlementNamesWhatSurvivesDownstream:
 
         assert lane.zero_code is False
         assert lane.code_candidate.offers_code_candidate is True
+
+
+class TestTheFailureProjectionSpellsTheOwnersLabel:
+    """The whole-manifest failure label has one derivation (review A1).
+
+    ``TechLeadCandidatePolicy`` owns the terminal pair. The failure projection
+    and the per-candidate watch-set exit are the two paths whose disagreement
+    over a configured spelling would strand a pull request in the batch
+    forever, so the projection asks the owner rather than reading the config
+    field a second time.
+    """
+
+    def _authority(self) -> TechLeadLaunchAuthority:
+        return TechLeadLaunchAuthority(
+            flavor=TechLeadSessionFlavor.BATCH_REVIEW,
+            anchor_issue_number=7,
+            manifest_pr_numbers=(101, 102),
+        )
+
+    def test_a_custom_failed_label_is_what_the_manifest_receives(self) -> None:
+        config = Config(repo="acme/repo")
+        config.tech_lead_failed_label = "acme-tech-lead-stopped"
+
+        actions = manifest_failure_label_actions(
+            config, self._authority(), ExpectedState()
+        )
+
+        expected = TechLeadCandidatePolicy.terminal_labels_for(config)[1]
+        assert expected == "acme-tech-lead-stopped"
+        assert [action.label for action in actions] == [expected, expected]
+        assert [action.issue_number for action in actions] == [101, 102]
+
+    def test_the_projection_and_the_watch_set_exit_cannot_disagree(self) -> None:
+        """Same config, same spelling, whichever path settles the candidate."""
+        config = Config(repo="acme/repo")
+        config.tech_lead_failed_label = "acme-tech-lead-stopped"
+
+        [action, _] = manifest_failure_label_actions(
+            config, self._authority(), ExpectedState()
+        )
+        watch_exit = TechLeadCandidatePolicy.from_config(config).settle(
+            CandidateOutcome.UNSETTLED
+        )
+
+        assert watch_exit.add == (action.label,)
+
+    def test_an_empty_manifest_projects_nothing(self) -> None:
+        config = Config(repo="acme/repo")
+
+        authority = TechLeadLaunchAuthority(
+            flavor=TechLeadSessionFlavor.BATCH_REVIEW, anchor_issue_number=7
+        )
+
+        assert manifest_failure_label_actions(config, authority, ExpectedState()) == []

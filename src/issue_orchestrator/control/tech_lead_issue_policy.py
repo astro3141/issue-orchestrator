@@ -44,6 +44,7 @@ from ..domain.tech_lead_session import (
 )
 from .actions import CreateTechLeadIssueAction, TechLeadMilestoneIntent
 from .label_manager import LabelManager
+from .tech_lead_candidate_policy import TechLeadCandidatePolicy
 
 if TYPE_CHECKING:
     from ..domain.models import TechLeadFacts
@@ -233,6 +234,7 @@ def plan_batch_review_issue(
         return None
 
     pr_list = "\n".join(f"- PR #{number}: {title}" for number, title in facts.prs)
+    reviewed_label, failed_label = TechLeadCandidatePolicy.terminal_labels_for(config)
     body = f"""## Tech Lead Batch Review Triggered
 
 {facts.pr_count} PRs have passed code review and are ready for tech_lead review:
@@ -240,7 +242,15 @@ def plan_batch_review_issue(
 {pr_list}
 
 Review these PRs for patterns, architectural concerns, and process improvements.
-Flip labels from `{facts.watch_label}` to `{config.tech_lead_reviewed_label}` after review.
+
+Do not flip labels by hand. Render a verdict for each pull request listed above;
+the orchestrator projects the labels from that verdict, one candidate at a time,
+and leaves a receipt on the pull request saying what it decided and why.
+`{reviewed_label}` is added only for a `pass` whose verdict names the exact
+commit that was audited and whose staged prerequisites hold; a `rework` clears
+`{facts.watch_label}` instead; and a candidate the review stopped or the
+orchestrator refused gets `{failed_label}`, which only an operator removes.
+See `docs/development/REVIEW_WORKFLOW.md`, "Leaving the watch set".
 """
     title = apply_tech_lead_priority_prefix(
         config,

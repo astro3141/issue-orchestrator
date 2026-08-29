@@ -114,6 +114,7 @@ from .tech_lead_candidate_disposition import (
     CandidateHeadReader,
     plan_candidate_dispositions,
 )
+from .tech_lead_candidate_policy import TechLeadCandidatePolicy
 from .tech_lead_case_files import build_pattern_ledger
 from .tech_lead_decision_contract import validate_decision_for_authority
 from .tech_lead_proposals import build_op_ledger
@@ -596,10 +597,16 @@ def manifest_failure_label_actions(
     ``tech_lead_candidate_disposition``, from the verdict rendered for that
     exact commit, so there is no "label them all reviewed" branch here to
     reach for.
+
+    The failure spelling is asked of :class:`TechLeadCandidatePolicy`, the owner
+    of the terminal pair, rather than derived here (#345 review A1). This
+    projection and the per-candidate watch-set exit are precisely the two paths
+    whose disagreement over a configured label spelling would strand a pull
+    request in the batch forever.
     """
     if not authority.manifest_pr_numbers:
         return []
-    tech_lead_label = config.tech_lead_failed_label or "tech-lead-failed"
+    _reviewed, tech_lead_label = TechLeadCandidatePolicy.terminal_labels_for(config)
     logger.info(
         "[tech_lead] Adding '%s' label to %d PRs",
         tech_lead_label,

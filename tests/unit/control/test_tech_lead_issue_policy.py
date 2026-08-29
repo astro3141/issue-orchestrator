@@ -11,10 +11,14 @@ from issue_orchestrator.control.tech_lead_issue_policy import (
     decision_issue_labels,
     health_review_issue_labels,
     is_protected_tech_lead_label,
+    plan_batch_review_issue,
     protected_tech_lead_label_violations,
     resolve_tech_lead_milestone_number,
     tech_lead_follow_up_agent_label,
     tech_lead_issue_milestone_intent,
+)
+from issue_orchestrator.control.tech_lead_candidate_policy import (
+    TechLeadCandidatePolicy,
 )
 from issue_orchestrator.control.health_review_trigger import (
     HEALTH_REVIEW_ISSUE_TITLE,
@@ -156,6 +160,63 @@ class TestProtectedLabelSet:
             labels=LabelManager(config),
         )
         assert violations == ["in-progress", "agent:x"]
+
+
+class TestTheBatchAnchorBodyDescribesTheProjectionThatRuns:
+    """The anchor issue must not instruct the projection #345 made conditional.
+
+    Before #345 a landed batch labelled every manifest pull request, so "flip
+    labels after review" was true. It is now false in every direction, and it
+    is an instruction to perform by hand — on the very issue the tech-lead
+    session is launched against — exactly the merge-facing projection that now
+    requires an exact-candidate verdict plus two staged prerequisites. Nothing
+    pinned that sentence, which is why it survived the rest of the prose being
+    brought current (review F1).
+    """
+
+    def _facts(self, **overrides: object):
+        from issue_orchestrator.domain.models import TechLeadFacts
+
+        base = dict(
+            pr_count=2,
+            threshold=2,
+            watch_label="code-reviewed",
+            prs=((101, "Add the thing"), (102, "Fix the other thing")),
+        )
+        base.update(overrides)
+        return TechLeadFacts(**base)  # type: ignore[arg-type]
+
+    def test_no_manual_label_flip_is_instructed(self) -> None:
+        action = plan_batch_review_issue(make_config(), self._facts())
+
+        assert action is not None
+        assert "Flip labels" not in action.body
+        assert "Do not flip labels by hand." in action.body
+
+    def test_the_body_names_the_per_candidate_outcomes(self) -> None:
+        action = plan_batch_review_issue(make_config(), self._facts())
+
+        assert action is not None
+        assert "tech-lead-reviewed" in action.body
+        assert "tech-lead-failed" in action.body
+        assert "only an operator removes" in action.body
+        assert "receipt" in action.body
+        # The PRs under review are still listed; this is still their anchor.
+        assert "- PR #101: Add the thing" in action.body
+
+    def test_custom_terminal_labels_come_from_the_policy_owner(self) -> None:
+        """Same spellings the projection will actually apply (review A1)."""
+        config = make_config()
+        config.tech_lead_reviewed_label = "acme-tl-ok"
+        config.tech_lead_failed_label = "acme-tl-stopped"
+
+        action = plan_batch_review_issue(config, self._facts(watch_label="acme-cr"))
+
+        assert action is not None
+        reviewed, failed = TechLeadCandidatePolicy.terminal_labels_for(config)
+        assert reviewed in action.body and failed in action.body
+        assert "acme-cr" in action.body
+        assert "tech-lead-reviewed" not in action.body
 
 
 class TestSharedComposition:

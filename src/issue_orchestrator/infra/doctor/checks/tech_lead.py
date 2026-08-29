@@ -100,6 +100,13 @@ def check_tech_lead_merge_authority(config: "Config | None" = None) -> list[Chec
     if not readiness.active:
         return []
     if readiness.problems:
+        from ....control.tech_lead_candidate_policy import TechLeadCandidatePolicy
+
+        # The merge-facing spelling comes from the owner of the terminal pair,
+        # not from a second reading of the config field (#345 review A1) — a
+        # doctor naming a label the projection does not apply is the divergence
+        # this check exists to warn about.
+        reviewed_label, _failed = TechLeadCandidatePolicy.terminal_labels_for(config)
         return [
             Check(
                 name="Tech Lead Merge Authority",
@@ -110,8 +117,7 @@ def check_tech_lead_merge_authority(config: "Config | None" = None) -> list[Chec
                     + "; ".join(readiness.problems)
                     + ". Batch reviews will still run, but every `pass` is"
                     " refused for want of an exact-candidate reviewer approval"
-                    " and no PR receives"
-                    f" '{config.tech_lead_reviewed_label or 'tech-lead-reviewed'}'."
+                    f" and no PR receives '{reviewed_label}'."
                 ),
             )
         ]
