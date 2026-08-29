@@ -74,11 +74,11 @@ from typing import TYPE_CHECKING, Callable
 
 from ..domain.tech_lead_candidate import (
     CandidateOutcome,
-    CandidatePassPrerequisite,
     CandidateStanding,
     TechLeadCandidate,
     TechLeadCandidateDisposition,
     TechLeadCandidateVerdict,
+    UnmetPassPrerequisite,
 )
 from .actions import Action, AddCommentAction, AddLabelAction, RemoveLabelAction
 from .needs_human_block import NeedsHumanCause
@@ -248,7 +248,7 @@ def _effects_for(
     policy: TechLeadCandidatePolicy,
     labels: "LabelManager",
     run_identity: str,
-    unmet: tuple[CandidatePassPrerequisite, ...],
+    unmet: tuple[UnmetPassPrerequisite, ...],
 ) -> TechLeadCandidateEffects:
     """The effects for ONE candidate, in the order they must be applied.
 
@@ -300,7 +300,7 @@ def _log_outcome(
     verdict: TechLeadCandidateVerdict | None,
     standing: CandidateStanding,
     outcome: CandidateOutcome,
-    unmet: tuple[CandidatePassPrerequisite, ...],
+    unmet: tuple[UnmetPassPrerequisite, ...],
 ) -> None:
     """Say why a candidate reached a non-merge-facing conclusion."""
     if verdict is None:
@@ -330,7 +330,12 @@ def _log_outcome(
             " launch",
             candidate.pr_number,
             candidate.short_sha,
-            ", ".join(prerequisite.value for prerequisite in unmet),
+            ", ".join(
+                f"{prerequisite.value} ({prerequisite.recorded_reason})"
+                if prerequisite.recorded_reason
+                else prerequisite.value
+                for prerequisite in unmet
+            ),
         )
 
 
@@ -344,7 +349,7 @@ def _receipt_for(
     *,
     run_identity: str,
     readmission: str,
-    unmet: tuple[CandidatePassPrerequisite, ...],
+    unmet: tuple[UnmetPassPrerequisite, ...],
 ) -> tuple[Action, ...]:
     """The one comment this outcome publishes on the pull request, if any.
 
@@ -563,7 +568,7 @@ def _unproven_receipt(
     candidate: TechLeadCandidate,
     verdict: TechLeadCandidateVerdict,
     run_identity: str,
-    unmet: tuple[CandidatePassPrerequisite, ...],
+    unmet: tuple[UnmetPassPrerequisite, ...],
 ) -> str:
     """Which staged prerequisite the refused PASS was missing, in its own words.
 
@@ -571,9 +576,23 @@ def _unproven_receipt(
     is neither independently reviewed nor contract-resolved needs two things
     fixed, and a receipt naming one of them sends the reader back for a second
     round.
+
+    Each carries the reason RECORDED when this run's inputs were staged,
+    beneath the prerequisite's own fixed sentence. Nothing in this codebase
+    removes the terminal label this refusal applies, so this comment is the
+    operator's only instruction for undoing it — and one prerequisite covers
+    several conditions, so a fixed sentence alone would leave them to guess
+    which. Where nothing was recorded (a legacy authority row) the fixed
+    sentence stands alone rather than being filled in with a likely cause.
     """
     missing = "\n".join(
         f"- **{prerequisite.value}** — {prerequisite.description}."
+        + (
+            f"\n  - Recorded when this review's inputs were staged:"
+            f" {prerequisite.recorded_reason}"
+            if prerequisite.recorded_reason
+            else ""
+        )
         for prerequisite in unmet
     )
     return (

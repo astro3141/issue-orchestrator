@@ -453,10 +453,23 @@ for a pull-request number:
 A merge-facing `pass` rests on **both** staged prerequisites, recorded on the
 launch authority before the session spawns and asked as one question by
 `TechLeadLaunchAuthority.unmet_pass_prerequisites`:
-`CandidatePassPrerequisite.INDEPENDENT_REVIEW` and
-`CandidatePassPrerequisite.LEAF_CONTRACT`. Either one unmet refuses the `pass`
-and the refusal receipt names which. Neither gates `rework` or `human_a` —
-neither of those claims the candidate is mergeable.
+`CandidatePassPrerequisite.INDEPENDENT_REVIEW` — which covers the reviewer's
+approval of that exact commit *and* that same commit's publication-gate
+certification — and `CandidatePassPrerequisite.LEAF_CONTRACT`. Either one unmet
+refuses the `pass`. Neither gates `rework` or `human_a` — neither of those
+claims the candidate is mergeable.
+
+The refusal receipt names which prerequisite was missing **and the reason the
+staging owner recorded for it**, carried on the launch authority as
+`CandidatePrerequisiteGap`. One prerequisite covers several conditions — no
+verdict at all, a verdict about another commit, a rejection, an uncertified
+publication — and the receipt is the operator's only instruction for removing a
+label nothing here removes for them, so a fixed sentence that guessed would send
+them after a fact that is already on file. The long form lives in
+`candidate-evidence.json` / `candidate-contracts.json`, which cleanup disposes of
+with the tech-lead worktree; the reason travels out of it on the authority
+record. Where nothing was recorded (a legacy row) the prerequisite's own sentence
+stands alone rather than being filled in.
 
 The fetch/write/digest mechanics are shared with the planning lane's canonical
 context (#183) through `control/canonical_source_staging.py`; what differs is
@@ -479,10 +492,10 @@ candidate's labels become.
 
 | The run concluded | Labels | Still a candidate? | How it gets back in |
 |---|---|---|---|
-| `pass`, head unmoved, exact-candidate approval established | `+tech-lead-reviewed` | no (terminal) | n/a — it passed |
+| `pass`, head unmoved, both staged prerequisites established | `+tech-lead-reviewed` | no (terminal) | n/a — it passed |
 | `rework` | `-` watch label, `-` review-approval label, `+needs-rework` | no | automatically, on the next review that approves it |
 | `human_a` | `+tech-lead-failed`, `+needs-human` | no | operator removes `tech-lead-failed` |
-| `pass` refused — a staged prerequisite (exact-candidate reviewer approval, resolved leaf contract) is missing | `+tech-lead-failed` | no | operator removes `tech-lead-failed` |
+| `pass` refused — a staged prerequisite (exact-candidate reviewer approval and its publication certification, or a resolved leaf contract) is missing; the receipt names which and the reason recorded for it | `+tech-lead-failed` | no | operator removes `tech-lead-failed` |
 | head moved, unreadable, or never observed | none | **yes, deliberately** | it never left — re-audited at whatever it then proposes |
 
 Each row's last column is owned by `CandidateWatchExit.readmission` and is

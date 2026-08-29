@@ -1178,8 +1178,11 @@ class ReviewSettings(BaseModel):
             "doc_examples": ["tech-lead-reviewed"],
             "doc_notes": (
                 "Added per candidate, only for a `pass` on a pull request still"
-                " standing at the audited commit whose exact-commit reviewer"
-                " approval the orchestrator established. Requires a review"
+                " standing at the audited commit, and only when the"
+                " orchestrator established BOTH merge prerequisites for that"
+                " commit: an exact-commit reviewer approval, and the staged"
+                " bounded contract of the executable issue it implements."
+                " Requires a review"
                 " exchange (`review.exchange.mode` of auto/via-mcp/"
                 "via-local-loop with a reviewer configured); the classic review"
                 " lane records no candidate-bound verdict, so every `pass` is"
@@ -1199,8 +1202,10 @@ class ReviewSettings(BaseModel):
             "doc_notes": (
                 "Added to every PR in the tech lead manifest when the session"
                 " fails, and to a single candidate the run could not settle (a"
-                " `human_a`, or a `pass` refused for want of an exact-commit"
-                " reviewer approval). Either way it means the PR no longer"
+                " `human_a`, or a `pass` refused for want of either merge"
+                " prerequisite — an exact-commit reviewer approval, or the"
+                " staged bounded contract of the executable issue the candidate"
+                " implements). Either way it means the PR no longer"
                 " awaits a tech lead answer, so it stops counting toward the"
                 " batch threshold and releases deferred cleanup."
             ),

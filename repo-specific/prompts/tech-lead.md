@@ -669,8 +669,10 @@ re-reading each pull request's live head:
   candidate does not re-enter the batch that stopped it. That label is a one-way
   door: an operator has to remove it before the pull request is audited again,
   and the receipt says so;
-- a `pass` the orchestrator refuses for want of an exact-candidate reviewer
-  approval -> the refusal receipt, and the same one-way `tech-lead-failed`;
+- a `pass` the orchestrator refuses for want of EITHER staged prerequisite — an
+  exact-candidate reviewer approval, or a resolved leaf contract -> the refusal
+  receipt naming which one and the reason recorded when your inputs were staged,
+  and the same one-way `tech-lead-failed`;
 - a candidate whose head MOVED since the manifest was built, or whose head
   cannot be read, receives NO label at all — the refusal is recorded on the pull
   request and the candidate is re-audited later at whatever it then proposes.

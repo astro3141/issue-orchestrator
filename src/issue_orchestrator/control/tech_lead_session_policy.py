@@ -550,6 +550,15 @@ def prepare_tech_lead_session_data(
                 if tech_lead_manifest
                 else ()
             ),
+            # And WHY each candidate that holds neither missed it, as the two
+            # staging owners observed it (#345). Recorded here because the
+            # files that hold the long form live in the tech-lead worktree,
+            # which cleanup disposes of, while the refusal receipt built from
+            # this is the operator's only instruction for undoing a terminal
+            # label.
+            prerequisite_gaps=(
+                tech_lead_manifest.prerequisite_gaps() if tech_lead_manifest else ()
+            ),
             problem_issue_numbers=problem_issue_numbers,
             launch_base_sha=_launch_base_sha(working_copy, ctx.worktree_path),
         ),

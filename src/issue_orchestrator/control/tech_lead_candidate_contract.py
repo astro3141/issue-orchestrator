@@ -197,15 +197,22 @@ def stage_candidate_contracts(
     ``PRToReview.contract_established`` is the orchestrator's own answer copied
     onto the manifest entries, exactly as ``review_established`` is, so the
     launch authority can carry it out of the agent's reach and completion can
-    refuse a ``pass`` on a candidate whose contract was never resolved.
+    refuse a ``pass`` on a candidate whose contract was never resolved. The
+    contract's ``gap`` rides along with it for the same reason the reviewer
+    evidence's does: the descriptor written above is disposed of with this
+    session's worktree, and the refusal receipt that has to explain itself is
+    published after that.
     """
     contracts = build_candidate_contracts(
         entries, repository_host=repository_host, data_path=data_path
     )
     path = write_candidate_contracts(data_path, contracts)
     resolved = contracts.contracted_pr_numbers()
-    for entry in entries:
-        entry.contract_established = entry.number in resolved
+    # One-for-one and in order, like the evidence half: ``build_candidate_
+    # contracts`` stages exactly the entries it was handed.
+    for entry, contract in zip(entries, contracts.entries, strict=True):
+        entry.contract_established = contract.establishes_leaf_contract
+        entry.contract_gap = contract.gap
     logger.info(
         "[tech_lead] Staged leaf contracts for %d of %d candidate(s): %s",
         len(resolved),

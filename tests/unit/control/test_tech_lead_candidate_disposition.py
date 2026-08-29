@@ -49,6 +49,7 @@ from issue_orchestrator.control.tech_lead_candidate_policy import (
 from issue_orchestrator.domain.tech_lead_candidate import (
     CandidateOutcome,
     CandidatePassPrerequisite,
+    CandidatePrerequisiteGap,
     CandidateStanding,
     TechLeadCandidate,
 )
@@ -73,12 +74,14 @@ def _authority(
     *candidates: TechLeadCandidate,
     reviewed: tuple[TechLeadCandidate, ...] | None = None,
     contracted: tuple[TechLeadCandidate, ...] | None = None,
+    gaps: tuple[CandidatePrerequisiteGap, ...] = (),
 ) -> TechLeadLaunchAuthority:
     """A batch authority whose candidates hold every merge prerequisite.
 
     ``reviewed``/``contracted`` default to ALL of them: these tests are about
     what a verdict does to a candidate, and the prerequisites have their own
-    class below.
+    class below. ``gaps`` carries what the staging owners recorded about the
+    ones that were withheld, exactly as the launch path carries it.
     """
     return TechLeadLaunchAuthority(
         flavor=TechLeadSessionFlavor.BATCH_REVIEW,
@@ -87,6 +90,7 @@ def _authority(
         manifest_candidates=candidates,
         reviewed_candidates=candidates if reviewed is None else reviewed,
         contracted_candidates=candidates if contracted is None else contracted,
+        prerequisite_gaps=gaps,
     )
 
 
@@ -524,6 +528,63 @@ class TestPassPrerequisites:
         )
         assert other.value not in receipt.comment
         assert CANDIDATE_A in receipt.comment
+
+    def test_the_refusal_names_the_condition_that_was_actually_observed(
+        self, tmp_path: Path
+    ) -> None:
+        """The wrong-cause failure: a reviewed commit refused for another fact.
+
+        ``INDEPENDENT_REVIEW`` covers the publication half too, so a candidate
+        the reviewer DID approve can miss it because no publication-gate
+        certification exists for that commit. Nothing in this codebase removes
+        the terminal label this refusal applies, so the receipt is the
+        operator's only instruction — and sending them after a reviewer
+        approval that is already on file is sending them after nothing.
+        """
+        candidate = TechLeadCandidate(101, CANDIDATE_A)
+        recorded = (
+            f"{CANDIDATE_A[:12]} has no publication-gate certification"
+            " (publication_receipt_missing)"
+        )
+        actions = _plan(
+            tmp_path,
+            _authority(
+                candidate,
+                reviewed=(),
+                gaps=(
+                    CandidatePrerequisiteGap(
+                        candidate=candidate,
+                        prerequisite=CandidatePassPrerequisite.INDEPENDENT_REVIEW,
+                        reason=recorded,
+                    ),
+                ),
+            ),
+            _decision(_verdict(101, "pass")),
+            {101: CANDIDATE_A},
+        )
+
+        [receipt] = _comments(actions, 101)
+        assert recorded in receipt.comment
+        # And the fixed sentence beside it does not contradict the record: it
+        # says what was not SHOWN, never which half was missing.
+        assert "no independent Reviewer approval of that exact commit" not in (
+            receipt.comment
+        )
+
+    def test_a_refusal_with_nothing_recorded_does_not_invent_a_cause(
+        self, tmp_path: Path
+    ) -> None:
+        """A legacy authority row: the fixed sentence stands alone."""
+        actions = _plan(
+            tmp_path,
+            _authority(TechLeadCandidate(101, CANDIDATE_A), contracted=()),
+            _decision(_verdict(101, "pass")),
+            {101: CANDIDATE_A},
+        )
+
+        [receipt] = _comments(actions, 101)
+        assert CandidatePassPrerequisite.LEAF_CONTRACT.description in receipt.comment
+        assert "Recorded when this review's inputs were staged" not in receipt.comment
 
     def test_both_missing_prerequisites_are_named_in_one_receipt(
         self, tmp_path: Path

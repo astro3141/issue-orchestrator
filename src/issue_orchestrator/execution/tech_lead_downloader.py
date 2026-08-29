@@ -132,14 +132,17 @@ class TechLeadDownloader:
         )
         write_candidate_evidence(data_path, evidence)
         # The orchestrator's own answer, copied onto the manifest entries so the
-        # launch authority can carry it out of reach of the agent (#345).
-        established = {
-            entry.candidate.pr_number
-            for entry in evidence.entries
-            if entry.establishes_independent_review
-        }
-        for pr in manifest.prs:
-            pr.review_established = pr.number in established
+        # launch authority can carry it out of reach of the agent (#345) — and
+        # with it the reason, because the file written above dies with this
+        # session's worktree while the refusal receipt it explains is published
+        # from the completion lane afterwards.
+        # Zipped rather than looked up by number: ``build_candidate_evidence``
+        # answers the entries it was given, in order and one for one, so a
+        # mapping here would introduce a "not found" branch for a state that
+        # cannot occur.
+        for pr, answer in zip(manifest.prs, evidence.entries, strict=True):
+            pr.review_established = answer.establishes_independent_review
+            pr.review_gap = answer.gap
         return manifest
 
     def _download_pr_data(self, entry: PRToReview, data_path: Path) -> PRFiles:

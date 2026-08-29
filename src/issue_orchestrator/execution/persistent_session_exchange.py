@@ -2027,7 +2027,7 @@ def _drive_rounds(command: _DriveRoundsCommand) -> ReviewExchangeOutcome:
                 session_name=session_name,
                 validation_record_path=validation_record_path,
                 presented_head_sha=presented_head_sha,
-                execution_identities=execution_identities,
+                candidate_evidence=execution_identities,
             )
 
         last_reviewer_text = reviewer.response_text

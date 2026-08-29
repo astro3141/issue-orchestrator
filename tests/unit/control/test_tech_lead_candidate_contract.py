@@ -146,6 +146,9 @@ def _authority(
         manifest_candidates=manifest.candidates(),
         reviewed_candidates=manifest.candidates(),
         contracted_candidates=manifest.contracted_candidates() if contracted else (),
+        # Carried exactly as the launch path carries it, so the refusal these
+        # tests read is the one an operator would receive.
+        prerequisite_gaps=manifest.prerequisite_gaps() if contracted else (),
     )
 
 
@@ -382,9 +385,12 @@ class TestFailClosed:
         authority = _authority(contracted=True, entries=(entry,))
 
         candidate = entry.candidate()
-        assert authority.unmet_pass_prerequisites(candidate) == (
-            CandidatePassPrerequisite.LEAF_CONTRACT,
-        )
+        [unmet] = authority.unmet_pass_prerequisites(candidate)
+        assert unmet.prerequisite is CandidatePassPrerequisite.LEAF_CONTRACT
+        # And WHY, in the staging owner's own words rather than the
+        # prerequisite's fixed sentence: the descriptor that recorded it lives
+        # in a worktree cleanup deletes.
+        assert "boom" in unmet.recorded_reason
 
     def test_an_optional_source_that_cannot_be_read_is_not_a_gap(
         self, tmp_path: Path
@@ -613,9 +619,10 @@ class TestTheLaunchPathCarriesTheAnswer:
         assert payload["candidates"][0]["issue_number"] == LEAF
         # The reviewer prerequisite is a separate axis and is NOT established
         # here, so the run still cannot pass this candidate.
-        assert authority.unmet_pass_prerequisites(candidate) == (
-            CandidatePassPrerequisite.INDEPENDENT_REVIEW,
-        )
+        assert [
+            unmet.prerequisite
+            for unmet in authority.unmet_pass_prerequisites(candidate)
+        ] == [CandidatePassPrerequisite.INDEPENDENT_REVIEW]
 
     def test_an_unresolved_contract_reaches_it_as_a_refusal(
         self, tmp_path: Path
@@ -630,7 +637,7 @@ class TestTheLaunchPathCarriesTheAnswer:
 
         assert authority is not None
         candidate = authority.manifest_candidates[0]
-        assert (
-            CandidatePassPrerequisite.LEAF_CONTRACT
-            in authority.unmet_pass_prerequisites(candidate)
-        )
+        assert CandidatePassPrerequisite.LEAF_CONTRACT in [
+            unmet.prerequisite
+            for unmet in authority.unmet_pass_prerequisites(candidate)
+        ]

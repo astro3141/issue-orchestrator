@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Optional
 
 from issue_orchestrator.execution.tech_lead_downloader import TechLeadDownloader
+from issue_orchestrator.domain.tech_lead_candidate import CandidatePassPrerequisite
 from issue_orchestrator.domain.tech_lead_manifest import (
     TechLeadManifest,
     PRToReview,
@@ -475,6 +476,31 @@ class TestStagedReviewEvidence:
 
         assert manifest.prs[0].review_established is False
         assert manifest.reviewed_candidates() == ()
+
+    def test_the_reason_rides_along_with_the_refusal(self, tmp_path: Path) -> None:
+        """The staged file dies with this worktree; the refusal outlives it.
+
+        The receipt that has to explain the refusal is published from the
+        completion lane, after cleanup has disposed of
+        ``candidate-evidence.json`` — so the reason travels on the manifest
+        entry into the launch authority, not only into the file.
+        """
+        manifest = self._download(tmp_path, self._Source(established=False))
+
+        assert manifest.prs[0].review_gap == "no verdict for this commit"
+        [gap] = manifest.prerequisite_gaps()
+        assert gap.candidate == manifest.candidates()[0]
+        assert gap.prerequisite is CandidatePassPrerequisite.INDEPENDENT_REVIEW
+        assert gap.reason == "no verdict for this commit"
+
+    def test_an_established_candidate_carries_no_reason_to_explain(
+        self, tmp_path: Path
+    ) -> None:
+        """Nothing to explain, so nothing recorded: a met prerequisite has no gap."""
+        manifest = self._download(tmp_path, self._Source(established=True))
+
+        assert manifest.prs[0].review_gap == ""
+        assert manifest.prerequisite_gaps() == ()
 
     def test_a_composition_with_no_source_stages_the_omission(
         self, tmp_path: Path

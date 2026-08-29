@@ -24,9 +24,13 @@ Four value objects, each with exactly one job:
   found. A verdict is authority only while the candidate it names is still the
   candidate.
 * :class:`CandidatePassPrerequisite` — the staged facts a merge-facing PASS
-  rests on: an exact-commit reviewer approval, and the candidate's staged
-  executable-leaf contract. Both are established by the orchestrator before the
-  session spawns and recorded where the agent cannot reach them.
+  rests on: an exact-commit reviewer approval that cleared the publication
+  gate, and the candidate's staged executable-leaf contract. Both are
+  established by the orchestrator before the session spawns and recorded where
+  the agent cannot reach them. :class:`CandidatePrerequisiteGap` records WHY a
+  candidate missed one, and :class:`UnmetPassPrerequisite` is the pair a
+  refusal receipt is written from, so the receipt never asserts a cause the
+  orchestrator did not observe.
 * :class:`CandidateOutcome` — what the run actually concluded about the
   candidate once standing and those prerequisites are folded into the
   disposition. This is the value the watch-set owner keys its label effects on,
@@ -59,6 +63,11 @@ TECH_LEAD_CANDIDATE_SCHEMA_VERSION = 1
 #: decision file is untrusted input, so this is a contract violation rather
 #: than something to truncate — same stance as every other artifact bound.
 MAX_CANDIDATE_RATIONALE_CHARS = 20_000
+
+#: Bound on ONE recorded prerequisite reason once it reaches a pull-request
+#: receipt. Orchestrator-authored prose, so over-length is clipped rather than
+#: refused — see :class:`CandidatePrerequisiteGap`.
+MAX_PREREQUISITE_REASON_CHARS = 2_000
 
 
 def normalize_candidate_sha(value: object, *, field_name: str = "head_sha") -> str:
@@ -200,12 +209,19 @@ class CandidatePassPrerequisite(Enum):
     mergeable, so neither rests on the merge contract's prerequisites.
     """
 
-    #: An independent Reviewer approved this exact commit (#345 direction B).
+    #: An independent Reviewer approved this exact commit, and that same commit
+    #: cleared the publication gate (#345 direction B). One member rather than
+    #: two because one staged answer establishes both — see
+    #: :func:`~..control.tech_lead_candidate_evidence._evidence_gap`, whose four
+    #: refusal directions all land here. The sentence therefore states what was
+    #: NOT SHOWN rather than which half was missing: the recorded reason beside
+    #: it says which, and a fixed sentence that guessed would send the operator
+    #: after a reviewer approval that already exists.
     INDEPENDENT_REVIEW = (
         "independent_review",
-        "no independent Reviewer approval of that exact commit was established"
-        " when this review's inputs were staged; a review label on the pull"
-        " request is evidence about the pull request, not about this commit",
+        "this exact commit was not shown to hold an independent Reviewer's"
+        " approval that also cleared the publication gate; a review label on the"
+        " pull request is evidence about the pull request, not about this commit",
     )
     #: The executable issue's bounded contract, and the governing sources that
     #: issue declares, were staged for this run (#345 direction C).
@@ -221,10 +237,142 @@ class CandidatePassPrerequisite(Enum):
         self._value_ = value
         self._description = description
 
+    @classmethod
+    def _missing_(cls, value: object) -> "CandidatePassPrerequisite | None":
+        """Look a member up by its stable name.
+
+        Members are DEFINED as ``(name, sentence)`` tuples, so the enum machinery
+        registers each under the whole tuple and plain ``CandidatePassPrerequisite
+        ("leaf_contract")`` would miss — even though ``.value`` is the name. This
+        record is persisted on the launch authority and read back by name, so the
+        lookup callers reach for first is the one that has to work.
+        """
+        for member in cls:
+            if member.value == value:
+                return member
+        return None
+
     @property
     def description(self) -> str:
         """Why a PASS may not rest on this run, in one sentence."""
         return self._description
+
+
+@dataclass(frozen=True, slots=True)
+class CandidatePrerequisiteGap:
+    """The reason the ORCHESTRATOR observed for one unmet prerequisite (#345).
+
+    A :class:`CandidatePassPrerequisite` says what a merge-facing PASS rests
+    on, in words fixed at authorship time. This says what was actually found
+    when this run's inputs were staged — the evidence reader's own ``gap``
+    string, or the leaf contract's — for ONE candidate and ONE prerequisite.
+
+    The pair is load-bearing rather than decorative. A prerequisite covers
+    several ways of failing (no verdict at all, a verdict about another commit,
+    a rejection, an uncertified publication), and the refusal receipt is the
+    operator's only instruction for undoing a terminal label that nothing in
+    this codebase removes. A receipt that named the wrong one of those would
+    send them looking for a fact that already exists.
+    """
+
+    candidate: TechLeadCandidate
+    prerequisite: CandidatePassPrerequisite
+    reason: str
+
+    def __post_init__(self) -> None:
+        prerequisite = cast(object, self.prerequisite)
+        if not isinstance(prerequisite, CandidatePassPrerequisite):
+            raise ValueError(
+                "CandidatePrerequisiteGap prerequisite must be a"
+                f" CandidatePassPrerequisite, got {prerequisite!r}"
+            )
+        reason: Any = self.reason
+        if not isinstance(reason, str) or not reason.strip():
+            raise ValueError(
+                f"recorded prerequisite gap for PR #{self.candidate.pr_number}"
+                f" ({self.prerequisite.value}) requires the reason that was"
+                " observed; an unexplained gap is the silence this record exists"
+                " to remove"
+            )
+        reason = reason.strip()
+        # Clipped rather than refused, and the opposite call from
+        # ``TechLeadCandidateVerdict.rationale`` deliberately: that is untrusted
+        # agent input, where over-length is a contract violation, while this is
+        # the orchestrator's own prose — sometimes an OS error's text — and
+        # failing a launch over the length of our own message would trade a
+        # refused candidate for no review at all. The full text stays in the
+        # staged evidence/contract file; this copy exists to fit in a receipt.
+        if len(reason) > MAX_PREREQUISITE_REASON_CHARS:
+            reason = reason[:MAX_PREREQUISITE_REASON_CHARS] + " … (truncated)"
+        object.__setattr__(self, "reason", reason)
+
+    def to_payload(self) -> dict[str, Any]:
+        return {
+            "candidate": self.candidate.to_payload(),
+            "prerequisite": self.prerequisite.value,
+            "reason": self.reason,
+        }
+
+    @classmethod
+    def from_payload(
+        cls, payload: Mapping[str, object]
+    ) -> "CandidatePrerequisiteGap":
+        """Parse a stored gap; every malformed shape raises ValueError."""
+        raw_candidate = payload.get("candidate")
+        if not isinstance(raw_candidate, Mapping):
+            raise ValueError(
+                "tech_lead prerequisite gap candidate must be an object, got"
+                f" {raw_candidate!r}"
+            )
+        raw_prerequisite = payload.get("prerequisite")
+        try:
+            prerequisite = CandidatePassPrerequisite(raw_prerequisite)
+        except ValueError:
+            raise ValueError(
+                "tech_lead prerequisite gap names an unknown prerequisite"
+                f" {raw_prerequisite!r} (expected one of"
+                f" {[member.value for member in CandidatePassPrerequisite]})"
+            ) from None
+        raw_reason = payload.get("reason")
+        if not isinstance(raw_reason, str):
+            raise ValueError(
+                f"tech_lead prerequisite gap reason must be a string, got"
+                f" {raw_reason!r}"
+            )
+        return cls(
+            candidate=TechLeadCandidate.from_payload(raw_candidate),
+            prerequisite=prerequisite,
+            reason=raw_reason,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class UnmetPassPrerequisite:
+    """A prerequisite a candidate does not hold, and what was recorded about it.
+
+    The answer :meth:`~.tech_lead_session.TechLeadLaunchAuthority.
+    unmet_pass_prerequisites` gives, and the reason it is a pair rather than a
+    bare enum member: the fixed sentence says what the merge contract wanted,
+    ``recorded_reason`` says what this run found instead.
+
+    ``recorded_reason`` is empty only where nothing was recorded — a legacy
+    authority row written before gaps were carried. The receipt then prints the
+    prerequisite's own sentence alone, which is true but unspecific; it never
+    invents a cause to fill the space.
+    """
+
+    prerequisite: CandidatePassPrerequisite
+    recorded_reason: str = ""
+
+    @property
+    def value(self) -> str:
+        """The prerequisite's stable name, as receipts and logs spell it."""
+        return self.prerequisite.value
+
+    @property
+    def description(self) -> str:
+        """Why a PASS may not rest on this run, in one fixed sentence."""
+        return self.prerequisite.description
 
 
 class CandidateOutcome(Enum):
@@ -274,7 +422,7 @@ class CandidateOutcome(Enum):
         *,
         disposition: "TechLeadCandidateDisposition | None",
         standing: CandidateStanding,
-        unmet_prerequisites: "Sequence[CandidatePassPrerequisite]",
+        unmet_prerequisites: "Sequence[UnmetPassPrerequisite]",
     ) -> "CandidateOutcome":
         """Fold one candidate's three facts into the run's conclusion.
 
@@ -481,15 +629,18 @@ class TechLeadCandidateEvidenceSet:
 
 __all__ = [
     "MAX_CANDIDATE_RATIONALE_CHARS",
+    "MAX_PREREQUISITE_REASON_CHARS",
     "TECH_LEAD_CANDIDATE_EVIDENCE_FILENAME",
     "TECH_LEAD_CANDIDATE_SCHEMA_VERSION",
     "CandidateOutcome",
     "CandidatePassPrerequisite",
+    "CandidatePrerequisiteGap",
     "CandidateStanding",
     "TechLeadCandidate",
     "TechLeadCandidateDisposition",
     "TechLeadCandidateEvidence",
     "TechLeadCandidateEvidenceSet",
     "TechLeadCandidateVerdict",
+    "UnmetPassPrerequisite",
     "normalize_candidate_sha",
 ]
