@@ -1,9 +1,9 @@
-"""The completion gate routing owner (#293 / #319).
+"""The completion gate routing owner (#293 / #319 / #370).
 
 One question, one owner: given the owner-injected managed-run directory, does
 ``coding-done completed`` run the code-candidate quick gate? Everything the
-routing owner cannot read as a planning run must come back as the ordinary
-gate — the unsafe direction is skipping a real candidate's validation.
+routing owner cannot read as a tech-lead run must come back as the ordinary
+gate — the unsafe direction is skipping a real coder candidate's validation.
 """
 
 import json
@@ -79,6 +79,15 @@ class TestOrdinaryRouting:
     ):
         assert route_completion_gate(tmp_path).runs_candidate_quick_gate is True
 
+
+class TestTechLeadValidationOwnership:
+    """#370: no Tech Lead flavor runs repository validation in its sandbox.
+
+    #364 proved the coupling was fatal, not merely wasteful: the model session
+    could not complete at all, because the repository validation path needs
+    host/repository-owned effects outside the model's scratch write boundary.
+    """
+
     @pytest.mark.parametrize(
         "flavor,focus",
         [
@@ -87,7 +96,7 @@ class TestOrdinaryRouting:
             (TechLeadSessionFlavor.FAILURE_INVESTIGATION, 42),
         ],
     )
-    def test_every_non_planning_flavor_keeps_the_candidate_gate(
+    def test_every_non_planning_flavor_leaves_validation_to_the_orchestrator(
         self, tmp_path, flavor, focus
     ):
         run_dir = _stage(
@@ -97,8 +106,31 @@ class TestOrdinaryRouting:
 
         routing = route_completion_gate(run_dir)
 
-        assert routing.runs_candidate_quick_gate is True
+        assert (
+            routing.route
+            is CompletionGateRoute.TECH_LEAD_ORCHESTRATOR_OWNED_VALIDATION
+        )
+        assert routing.runs_candidate_quick_gate is False
         assert flavor.value in routing.reason
+        assert "orchestrator" in routing.reason
+
+    def test_every_tech_lead_flavor_is_routed_away_from_its_own_gate(self, tmp_path):
+        """No flavor may be left behind when a new one is added.
+
+        Enumerated from the enum rather than a literal list, so a future
+        flavor that nobody thought about here fails this test instead of
+        silently inheriting the in-sandbox gate the repair removed.
+        """
+        for flavor in TechLeadSessionFlavor:
+            run_dir = _stage(
+                tmp_path / flavor.value,
+                TechLeadAssignment(
+                    flavor=flavor,
+                    focus_issue_number=42 if flavor.is_issue_focused else None,
+                ),
+            )
+
+            assert route_completion_gate(run_dir).runs_candidate_quick_gate is False
 
 
 class TestFailSafe:

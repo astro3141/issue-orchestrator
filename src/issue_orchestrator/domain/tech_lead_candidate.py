@@ -25,11 +25,13 @@ Four value objects, each with exactly one job:
   the candidate it names is still the candidate — which a merged pull request
   is not, however unchanged its head (#352).
 * :class:`CandidatePassPrerequisite` — the staged facts a merge-facing PASS
-  rests on: an exact-commit reviewer approval that cleared the publication
-  gate, the candidate's staged executable-leaf contract, and the candidate's
-  own diff, materialized through the supported GitHub transport and bound to
-  that commit (#359). All three are established by the orchestrator before the
-  session spawns and recorded where the agent cannot reach them.
+  rests on: an exact-commit reviewer approval, the candidate's staged
+  executable-leaf contract, the candidate's own diff, materialized through the
+  supported GitHub transport and bound to that commit (#359), and the
+  repository's mandatory validation contract passing on that same commit under
+  the orchestrator's own gate (#370). All four are established by the
+  orchestrator before the session spawns and recorded where the agent cannot
+  reach them.
   :class:`CandidatePrerequisiteGap` records WHY a candidate missed one, and
   :class:`UnmetPassPrerequisite` is the pair a refusal receipt is written from,
   so the receipt never asserts a cause the orchestrator did not observe.
@@ -225,19 +227,18 @@ class CandidatePassPrerequisite(Enum):
     mergeable, so neither rests on the merge contract's prerequisites.
     """
 
-    #: An independent Reviewer approved this exact commit, and that same commit
-    #: cleared the publication gate (#345 direction B). One member rather than
-    #: two because one staged answer establishes both — see
-    #: :func:`~..control.tech_lead_candidate_evidence._evidence_gap`, whose four
-    #: refusal directions all land here. The sentence therefore states what was
-    #: NOT SHOWN rather than which half was missing: the recorded reason beside
-    #: it says which, and a fixed sentence that guessed would send the operator
-    #: after a reviewer approval that already exists.
+    #: An independent Reviewer approved this exact commit (#345 direction B).
+    #: The reviewer half ALONE since #370: the publication gate's certification
+    #: of the same commit used to be folded in here, and a merge-facing PASS
+    #: therefore rested on an orchestrator-owned mandatory validation that no
+    #: reader could name. It is :attr:`REPOSITORY_VALIDATION` now, so settlement
+    #: states the conjunction it actually enforces and each half can be
+    #: falsified on its own.
     INDEPENDENT_REVIEW = (
         "independent_review",
         "this exact commit was not shown to hold an independent Reviewer's"
-        " approval that also cleared the publication gate; a review label on the"
-        " pull request is evidence about the pull request, not about this commit",
+        " approval; a review label on the pull request is evidence about the"
+        " pull request, not about this commit",
     )
     #: The executable issue's bounded contract, and the governing sources that
     #: issue declares, were staged for this run (#345 direction C).
@@ -262,6 +263,31 @@ class CandidatePassPrerequisite(Enum):
         " supported GitHub transport and bound to this exact commit, so no run"
         " could show what was reviewed; a file under the candidate's name is"
         " not a diff unless the read that produced it succeeded",
+    )
+    #: The repository's MANDATORY validation contract passed on this exact
+    #: commit, executed by the orchestrator's own publication gate and filed as
+    #: a durable per-candidate receipt (#370). The fourth member rather than a
+    #: clause inside :attr:`INDEPENDENT_REVIEW` because it has a different
+    #: OWNER, and #364 proved the owner matters: the Tech Lead model session
+    #: could not run repository validation at all under a bounded provider
+    #: sandbox, because that path needs host/repository-owned effects — a write
+    #: to the shared git common dir among them — outside the model's scratch
+    #: write boundary. Mandatory validation is therefore executed outside the
+    #: model sandbox entirely, and a merge-facing PASS names the fact it rests
+    #: on instead of inheriting it from the reviewer's.
+    #:
+    #: Absence covers every way it failed — no receipt for this commit, a
+    #: receipt from a contract that is no longer the required one, a nonzero or
+    #: timed-out run, an unreadable record — because they all mean the same
+    #: thing here: nothing shows the repository's own gate passed on THIS
+    #: commit. A validation the orchestrator could not execute or could not
+    #: read is never converted into candidate evidence.
+    REPOSITORY_VALIDATION = (
+        "repository_validation",
+        "the repository's mandatory validation contract was not shown to have"
+        " passed on this exact commit under the orchestrator's own publication"
+        " gate; a validation that did not complete, could not be read, or ran"
+        " under a contract that is no longer required certifies nothing",
     )
 
     def __init__(self, value: str, description: str) -> None:
@@ -431,7 +457,9 @@ class CandidateOutcome(Enum):
     #: HUMAN_A: stop. A new Spec/TD/policy decision is required.
     HUMAN = ("human", True)
     #: A PASS the orchestrator refused for want of a staged prerequisite — an
-    #: exact-candidate reviewer approval, a resolved leaf contract, or both.
+    #: exact-candidate reviewer approval, a resolved leaf contract, the
+    #: candidate's own materialized diff, its mandatory repository validation,
+    #: or any combination.
     #: The run answered, and the answer is "not on this batch's authority".
     UNSETTLED = ("unsettled", True)
     #: The run could not audit this candidate (moved, unreadable or unbound
@@ -608,6 +636,15 @@ class TechLeadCandidateEvidence:
     verdict is about another commit" and "the reviewer requested changes" are
     three different facts, and a reader that saw only ``None`` would treat them
     alike.
+
+    ``validation_gap`` is the same thing for the OTHER owner (#370): non-empty
+    when nothing shows the repository's mandatory validation contract passed on
+    this exact commit under the orchestrator's own publication gate. Two gap
+    strings rather than one because the two facts have two owners and two
+    remedies — an operator sent after a missing reviewer approval when what is
+    actually missing is a validation receipt fixes neither — and because the
+    Tech Lead model session, which no longer executes repository validation at
+    all, must be able to read which of them its candidate is short of.
     """
 
     candidate: TechLeadCandidate
@@ -621,11 +658,17 @@ class TechLeadCandidateEvidence:
     publication_certified: bool = False
     publication_reason: str = ""
     gap: str = ""
+    validation_gap: str = ""
 
     @property
     def establishes_independent_review(self) -> bool:
         """Whether an exact-candidate reviewer approval is proven here."""
         return not self.gap
+
+    @property
+    def establishes_repository_validation(self) -> bool:
+        """Whether the orchestrator's own gate is proven to have passed here."""
+        return not self.validation_gap
 
     def to_payload(self) -> dict[str, Any]:
         return {
@@ -641,6 +684,7 @@ class TechLeadCandidateEvidence:
             "publication_certified": self.publication_certified,
             "publication_reason": self.publication_reason,
             "gap": self.gap,
+            "validation_gap": self.validation_gap,
         }
 
 

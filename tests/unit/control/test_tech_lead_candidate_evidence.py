@@ -261,13 +261,14 @@ class TestExactCandidateReviewEvidence:
     def test_an_approved_commit_that_never_cleared_publication_is_refused(
         self, tmp_path: Path
     ) -> None:
-        """The fourth gap direction, and the one that is not about the reviewer.
+        """The gap direction that is not about the reviewer at all.
 
-        The reviewer approved THIS commit; what is missing is the publication
-        gate's own certification of it. The prerequisite still refuses — a
-        merge-facing PASS rests on both — but the recorded reason has to say
-        which, because it is the only thing the refusal receipt can tell an
-        operator to go and fix.
+        The reviewer approved THIS commit; what is missing is the repository's
+        mandatory validation — the publication gate's own certification of that
+        commit, executed by the ORCHESTRATOR. Since #370 that is its own
+        prerequisite with its own gap string, so the reviewer's half reads
+        clean and the refusal an operator receives names the run that never
+        certified rather than a review that already exists.
         """
         reader, attempts = _reader(tmp_path, profiles=_publication_contract())
         _record_verdict(attempts, reviewed_sha=CANDIDATE_A)
@@ -278,12 +279,17 @@ class TestExactCandidateReviewEvidence:
         assert evidence.reviewer_verdict == "approved"
         assert evidence.reviewed_sha == CANDIDATE_A
         assert evidence.publication_certified is False
-        assert evidence.establishes_independent_review is False
-        assert "publication-gate certification" in evidence.gap
-        assert evidence.publication_reason in evidence.gap
+        # The reviewer half is established and says so.
+        assert evidence.establishes_independent_review is True
+        assert evidence.gap == ""
+        # The validation half is the one that refuses, in its own words.
+        assert evidence.establishes_repository_validation is False
+        assert "publication-gate certification" in evidence.validation_gap
+        assert evidence.publication_reason in evidence.validation_gap
+        assert "executed by the orchestrator" in evidence.validation_gap
         # And it does NOT claim the reviewer half is what went wrong.
-        assert "did not approve" not in evidence.gap
-        assert "no independent reviewer verdict" not in evidence.gap
+        assert "did not approve" not in evidence.validation_gap
+        assert "no independent reviewer verdict" not in evidence.validation_gap
 
     def test_a_certified_commit_with_an_approval_establishes_the_prerequisite(
         self, tmp_path: Path
@@ -344,4 +350,9 @@ class TestStaging:
 
         [entry] = evidence.entries
         assert entry.establishes_independent_review is False
-        assert "no exact-candidate review evidence source is wired" in entry.gap
+        assert "no exact-candidate evidence source is wired" in entry.gap
+        # Both owners, not just the reviewer's (#370): a composition that knows
+        # nothing must not read as one where the orchestrator's gate certified
+        # the commit.
+        assert entry.establishes_repository_validation is False
+        assert "mandatory validation" in entry.validation_gap

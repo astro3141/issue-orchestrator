@@ -18,6 +18,7 @@ import tomllib
 
 import pytest
 
+from issue_orchestrator.domain.sandbox_scope import SandboxScope
 from issue_orchestrator.domain.workspace_trust import WorkspaceTrustError
 from issue_orchestrator.execution.agent_runner_providers.codex import CodexProvider
 
@@ -313,3 +314,106 @@ class TestCodexBaseCommand:
 
         assert provider.requires_workspace_trust(execution_mode="exec") is False
         assert provider.build_command(prompt="hi", execution_mode="exec")
+
+
+class TestProviderDefaultsDoNotDefineRoleAuthority:
+    """#370 F5: the orchestrator's role scope outranks every provider default.
+
+    The Human's role/model topology puts Codex in the Reviewer and Tech Lead
+    seats. That is a model choice, and it must not become an authority choice:
+    a role whose bounds the orchestrator computed may not be widened — or
+    narrowed — by whichever approval/sandbox default the provider happens to
+    carry, or by a stray kwarg surviving in a config.
+
+    So when a ``SandboxScope`` is active the provider emits the scope's
+    enforcing argv and nothing else on those axes. These fix that, including
+    against the two kwargs that would otherwise grant the most.
+    """
+
+    @staticmethod
+    def _scope() -> SandboxScope:
+        assert _REPOSITORY is not None
+        return SandboxScope(
+            working_directory=_REPOSITORY,
+            read_roots=(_REPOSITORY,),
+            write_roots=(_REPOSITORY,),
+            egress="model-only",
+            deny_env=("GITHUB_TOKEN",),
+            deny_read_files=("~/.ssh",),
+        )
+
+    @pytest.fixture(autouse=True)
+    def _git_access(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The scope adapter reads the launch worktree's Git layout off disk.
+
+        Stubbed to a fixed linked-worktree layout: what these tests are about
+        is which approval/sandbox flags survive a scoped launch, not how a
+        real ``.git`` file resolves — that is covered in
+        ``test_sandbox_provider_adapter.py``.
+        """
+        from issue_orchestrator.execution.agent_runner_providers import (
+            sandbox as sandbox_module,
+        )
+        from issue_orchestrator.execution.agent_runner_providers.sandbox import (
+            GitWorktreeAccess,
+        )
+
+        common_dir = Path("/repo/.git")
+        monkeypatch.setattr(
+            sandbox_module,
+            "resolve_git_worktree_access",
+            lambda _worktree: GitWorktreeAccess(
+                git_dir=common_dir / "worktrees" / "issue-42",
+                common_dir=common_dir,
+                head_ref=common_dir / "refs" / "heads" / "42-fix",
+            ),
+        )
+
+    def _scoped_cmd(self, **kwargs: str) -> list[str]:
+        assert _REPOSITORY is not None
+        return CodexProvider().build_command(
+            prompt="task",
+            launch_workspace=approved_workspace(_REPOSITORY),
+            sandbox_scope=self._scope(),
+            **kwargs,
+        )
+
+    @pytest.mark.parametrize(
+        "kwargs",
+        [
+            {},
+            {"approval_mode": "yolo"},
+            {"approval_mode": "full-auto"},
+            {"approval_mode": "default"},
+            {"sandbox": "danger-full-access"},
+            {"approval_mode": "yolo", "sandbox": "danger-full-access"},
+            {"execution_mode": "exec", "approval_mode": "yolo"},
+        ],
+    )
+    def test_no_provider_default_reaches_a_scoped_launch(
+        self, kwargs: dict[str, str]
+    ) -> None:
+        cmd = self._scoped_cmd(**kwargs)
+
+        assert "--dangerously-bypass-approvals-and-sandbox" not in cmd
+        assert "--sandbox" not in cmd
+        assert "-s" not in cmd
+        assert "--ask-for-approval" not in cmd
+
+    def test_the_scope_still_pins_the_bounds_it_computed(self) -> None:
+        """Not narrowed either: the role's own approval and cwd survive."""
+        cmd = self._scoped_cmd(approval_mode="yolo")
+
+        assert cmd[cmd.index("-a") + 1] == "never"
+        assert cmd[cmd.index("-C") + 1] == str(_REPOSITORY)
+        assert "--strict-config" in cmd
+
+    def test_an_unscoped_launch_keeps_the_provider_default(self) -> None:
+        """The falsification: remove the scope and the default reappears.
+
+        Without this the parametrized test above would pass on a provider that
+        emitted no flags at all, which would prove nothing about precedence.
+        """
+        cmd = _cmd(approval_mode="yolo")
+
+        assert "--dangerously-bypass-approvals-and-sandbox" in cmd

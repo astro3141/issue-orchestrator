@@ -362,6 +362,7 @@ def _bound_authority(config: Config, host: FakeRepositoryHost):
         reviewed_candidates=candidates,
         contracted_candidates=candidates,
         diffed_candidates=candidates,
+        validated_candidates=candidates,
     )
 
 

@@ -205,6 +205,13 @@ class TechLeadDownloader:
         for pr, answer in zip(manifest.prs, evidence.entries, strict=True):
             pr.review_established = answer.establishes_independent_review
             pr.review_gap = answer.gap
+            # The orchestrator-owned mandatory-validation half of the same
+            # answer (#370), copied across for the same reason and out of the
+            # same file: the Tech Lead session does not run repository
+            # validation, so the only way a merge-facing PASS can rest on it is
+            # for the orchestrator's verdict to travel on the launch authority.
+            pr.validation_established = answer.establishes_repository_validation
+            pr.validation_gap = answer.validation_gap
         return manifest
 
     def _download_pr_data(

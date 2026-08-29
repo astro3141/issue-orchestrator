@@ -48,6 +48,8 @@ class PRToReviewDict(TypedDict):
     contract_gap: str
     diff_established: bool
     diff_gap: str
+    validation_established: bool
+    validation_gap: str
     files: PRFilesDict
 
 
@@ -138,6 +140,20 @@ class PRToReview:
     # reason ``review_gap`` is. This string is the one thing the refusal
     # receipt can say about a candidate nobody could read.
     diff_gap: str = ""
+    # Whether the repository's MANDATORY validation contract was shown to have
+    # passed on this exact commit, under the orchestrator's own publication
+    # gate (#370). Written by the staging owner from the durable per-candidate
+    # receipt, never by the agent, and never by the Tech Lead session running
+    # validation itself — that is the coupling #364 proved impossible under a
+    # bounded provider sandbox, because the validation path needs
+    # host/repository-owned effects outside the model's scratch write boundary.
+    validation_established: bool = False
+    # The validation half of the same answer: the certification reader's own
+    # reason — no receipt for this commit, a contract that is no longer the
+    # required one, a failed or unreadable run — recorded for the reason
+    # ``review_gap`` is. A validation the orchestrator could not execute or
+    # could not read lands here, never in the established flag above.
+    validation_gap: str = ""
     files: PRFiles = field(default_factory=PRFiles)
 
     def candidate(self) -> TechLeadCandidate:
@@ -147,7 +163,7 @@ class PRToReview:
     def prerequisite_gaps(self) -> tuple[CandidatePrerequisiteGap, ...]:
         """The recorded reason for each prerequisite this entry does not hold.
 
-        Derived from the three established/gap pairs together, so a reason can
+        Derived from the four established/gap pairs together, so a reason can
         never be carried for a prerequisite the entry holds — the drift that
         would put a false cause on a pull request. A missing prerequisite with
         no recorded reason yields nothing here rather than an empty record: the
@@ -172,6 +188,11 @@ class PRToReview:
                     CandidatePassPrerequisite.CANDIDATE_DIFF,
                     self.diff_established,
                     self.diff_gap,
+                ),
+                (
+                    CandidatePassPrerequisite.REPOSITORY_VALIDATION,
+                    self.validation_established,
+                    self.validation_gap,
                 ),
             )
             if not established and gap.strip()
@@ -208,6 +229,8 @@ class TechLeadManifest:
                     "contract_gap": pr.contract_gap,
                     "diff_established": pr.diff_established,
                     "diff_gap": pr.diff_gap,
+                    "validation_established": pr.validation_established,
+                    "validation_gap": pr.validation_gap,
                     "files": {
                         "diff": pr.files.diff,
                         "metadata": pr.files.metadata,
@@ -237,6 +260,10 @@ class TechLeadManifest:
                 contract_gap=str(pr_data.get("contract_gap", "")),
                 diff_established=bool(pr_data.get("diff_established", False)),
                 diff_gap=str(pr_data.get("diff_gap", "")),
+                validation_established=bool(
+                    pr_data.get("validation_established", False)
+                ),
+                validation_gap=str(pr_data.get("validation_gap", "")),
                 files=PRFiles(
                     diff=files_data.get("diff", ""),
                     metadata=files_data.get("metadata", ""),
@@ -286,6 +313,15 @@ class TechLeadManifest:
         eligibility.
         """
         return tuple(pr.candidate() for pr in self.prs if pr.diff_established)
+
+    def validated_candidates(self) -> tuple[TechLeadCandidate, ...]:
+        """The candidates the orchestrator's own gate certified (#370).
+
+        Per candidate, like its three siblings: mandatory repository validation
+        is a fact about ONE commit, and the run that establishes it is the
+        orchestrator's, never the Tech Lead model session's.
+        """
+        return tuple(pr.candidate() for pr in self.prs if pr.validation_established)
 
     def prerequisite_gaps(self) -> tuple[CandidatePrerequisiteGap, ...]:
         """Every recorded reason a candidate misses a merge prerequisite (#345).

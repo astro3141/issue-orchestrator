@@ -48,6 +48,14 @@ never written to disk under the candidate's name. A candidate with
 not reconstruct the diff from `gh`, from the branch, or from anything a previous
 session saw.
 
+`candidate-evidence.json` records, per candidate, the independent Reviewer's
+verdict on that exact commit (`gap`) and whether the repository's mandatory
+validation passed on it under the orchestrator's own gate (`validation_gap`);
+`manifest.json` mirrors the second as `validation_established`. You do not run
+that validation - it needs repository-owned effects your sandbox does not grant,
+so the orchestrator executes it outside your session. A candidate carrying
+either gap must never be passed.
+
 ### Board Snapshot (Authoritative)
 
 Written at launch for both tech lead flavors - a point-in-time snapshot of

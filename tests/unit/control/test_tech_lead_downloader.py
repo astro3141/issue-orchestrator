@@ -795,5 +795,10 @@ class TestStagedReviewEvidence:
         result = downloader.download(manifest, tmp_path)
 
         staged = json.loads((tmp_path / "data" / "candidate-evidence.json").read_text())
-        assert "no exact-candidate review evidence source" in staged["candidates"][0]["gap"]
+        entry = staged["candidates"][0]
+        assert "no exact-candidate evidence source" in entry["gap"]
         assert result.prs[0].review_established is False
+        # And the orchestrator-owned validation half is staged as unproven too
+        # (#370), rather than left empty where it would read as certified.
+        assert "mandatory validation" in entry["validation_gap"]
+        assert result.prs[0].validation_established is False

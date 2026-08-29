@@ -569,6 +569,21 @@ class TechLeadLaunchAuthority:
     # materialization boundary, a legacy row — because they all mean the same
     # thing here.
     diffed_candidates: tuple[TechLeadCandidate, ...] = ()
+    # The subset whose MANDATORY REPOSITORY VALIDATION the orchestrator's own
+    # publication gate certified for that exact commit (#370). Recorded beside
+    # the other three because the merge contract is a conjunction, and recorded
+    # SEPARATELY from ``reviewed_candidates`` — which used to carry it — because
+    # it has a different owner. #364 proved the owner is the whole point: a Tech
+    # Lead model session cannot execute repository validation under a bounded
+    # provider sandbox at all, since that path needs host/repository-owned
+    # effects (a write to the shared git common dir among them) outside the
+    # model's scratch write boundary. So validation is executed outside the
+    # model sandbox and its verdict is carried here, where the session cannot
+    # reach it. Absence covers every way it failed — no receipt for the commit,
+    # a receipt from a contract that is no longer required, a nonzero or
+    # timed-out run, an unreadable record, a legacy row — because they all mean
+    # the same thing here.
+    validated_candidates: tuple[TechLeadCandidate, ...] = ()
     # WHY each candidate missing one of the prerequisites above missed it,
     # as the staging owner observed it (#345). The subsets say a candidate does
     # not hold a prerequisite; a prerequisite covers several ways of failing,
@@ -683,6 +698,11 @@ class TechLeadLaunchAuthority:
                 "diffed_candidates",
                 CandidatePassPrerequisite.CANDIDATE_DIFF,
                 self.diffed_candidates,
+            ),
+            (
+                "validated_candidates",
+                CandidatePassPrerequisite.REPOSITORY_VALIDATION,
+                self.validated_candidates,
             ),
         )
 
@@ -901,6 +921,9 @@ class TechLeadLaunchAuthority:
             "diffed_candidates": [
                 candidate.to_payload() for candidate in self.diffed_candidates
             ],
+            "validated_candidates": [
+                candidate.to_payload() for candidate in self.validated_candidates
+            ],
             "prerequisite_gaps": [gap.to_payload() for gap in self.prerequisite_gaps],
             "problem_issue_numbers": list(self.problem_issue_numbers),
             "launch_base_sha": self.launch_base_sha,
@@ -948,6 +971,11 @@ class TechLeadLaunchAuthority:
         # nothing, which is the fail-closed direction: a run that never
         # recorded whether it staged a diff cannot show that it did.
         diffed = _manifest_candidates_from(data.get("diffed_candidates", []))
+        # Absent is the LEGACY row (written before #370), and it establishes
+        # nothing for the same fail-closed reason: a run that never recorded
+        # whether the orchestrator's gate certified the commit cannot show that
+        # it did.
+        validated = _manifest_candidates_from(data.get("validated_candidates", []))
         prerequisite_gaps = _prerequisite_gaps_from(data.get("prerequisite_gaps", []))
         raw_problems = data.get("problem_issue_numbers", [])
         if not isinstance(raw_problems, list) or any(
@@ -977,6 +1005,7 @@ class TechLeadLaunchAuthority:
             reviewed_candidates=reviewed,
             contracted_candidates=contracted,
             diffed_candidates=diffed,
+            validated_candidates=validated,
             prerequisite_gaps=prerequisite_gaps,
             problem_issue_numbers=tuple(raw_problems),
             launch_base_sha=raw_base_sha,

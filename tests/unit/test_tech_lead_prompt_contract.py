@@ -1071,15 +1071,16 @@ def test_batch_flow_teaches_that_a_leaf_only_constraint_governs(
 def test_pass_requires_every_staged_prerequisite(variant: str) -> None:
     """The mutation direction: the audit-only `pass` rule must be gone.
 
-    The superseded bullets made `pass` rest on the reviewer approval alone, and
+    The superseded bullets made `pass` rest on the reviewer approval alone;
     then on the reviewer approval plus the leaf contract while the candidate's
-    own diff was staged unchecked (#359). If a variant reverts to either, this
-    fails — which is what makes the prompt part of the contract rather than
-    commentary.
+    own diff was staged unchecked (#359); then on those three while the
+    repository's mandatory validation rode inside the reviewer's name (#370).
+    If a variant reverts to any of them, this fails — which is what makes the
+    prompt part of the contract rather than commentary.
     """
     batch = _normalized(_flow_section(PROMPT_VARIANTS[variant], "Batch Review Flow"))
 
-    assert "Requires ALL THREE staged prerequisites for this candidate" in batch, (
+    assert "Requires ALL FOUR staged prerequisites for this candidate" in batch, (
         f"{variant} does not require every staged prerequisite for a pass"
     )
     assert "a resolved leaf contract in `candidate-contracts.json` with an empty" in (
@@ -1087,6 +1088,13 @@ def test_pass_requires_every_staged_prerequisite(variant: str) -> None:
     ), f"{variant} does not require a resolved leaf contract for a pass"
     assert "staged diff (`diff_established: true` in `manifest.json`)" in batch, (
         f"{variant} does not require a staged candidate diff for a pass"
+    )
+    assert "validation_established: true" in batch, (
+        f"{variant} does not require the orchestrator's mandatory-validation"
+        " certification for a pass"
+    )
+    assert "You do NOT run that validation" in batch, (
+        f"{variant} does not tell the session that validation is not its job"
     )
     assert "acceptance criteria" in batch and "STOP conditions" in batch, (
         f"{variant} does not ask for contract conformance, only patterns"
@@ -1101,6 +1109,11 @@ def test_pass_requires_every_staged_prerequisite(variant: str) -> None:
     # Nor the two-prerequisite one the diff defect slipped past.
     assert "Requires BOTH staged prerequisites" not in batch, (
         f"{variant} still states the reviewer+contract-only pass prerequisites"
+    )
+    # Nor the three-prerequisite one that hid mandatory validation inside the
+    # reviewer's prerequisite (#370).
+    assert "Requires ALL THREE staged prerequisites" not in batch, (
+        f"{variant} still omits the orchestrator-owned validation prerequisite"
     )
 
 
@@ -1166,6 +1179,10 @@ def test_completion_effects_name_every_pass_prerequisite(variant: str) -> None:
     )
     assert "staged candidate diff" in section, (
         f"{variant} does not name the candidate-diff prerequisite in its effects"
+    )
+    assert "mandatory-validation" in section, (
+        f"{variant} does not name the orchestrator-owned validation"
+        " prerequisite in its effects"
     )
     # The superseded half-stated sentences, in the shapes the variants carried.
     assert "want of an exact-candidate reviewer approval" not in section, (
