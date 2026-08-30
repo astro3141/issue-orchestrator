@@ -1383,6 +1383,181 @@ The per-worktree command guards remain scoped as they are: only the
 because only there is running a gate a *procedural* error as well as an
 ownership one.
 
+### Nor does a Tech Lead run its own completion pre-push (#385)
+
+#370 moved the gate `coding-done` runs. It did not move the one the completion
+*protocol document* asks for: `resources/coding_done.md` makes `prepush-check
+--dirty-only -v` mandatory before `coding-done`, and a Tech Lead was handed
+that document because a tech-lead session takes the coding launch lane. R32
+proved the consequence on the exact same path #364 measured — a fresh bounded
+Codex Tech Lead reached the completion protocol, ran the command, and died with
+`PermissionError: Operation not permitted` writing
+`<git-common-dir>/issue-orchestrator/validate-timings.jsonl`.
+
+The repair moves the OWNER, not the gate:
+
+| Piece | Where |
+|-------|-------|
+| The Tech Lead completion protocol (no `prepush-check`) | `resources/tech_lead_done.md`, selected by `TaskKind.TECH_LEAD` in `resources.get_completion_instructions` |
+| The trusted owner that runs the check | `infra/tech_lead_completion_validation.py`, behind `ports/tech_lead_completion_validation.py` |
+| The publishable-tree rule both callers share | `infra/dirty_tree_guard.py` (also what `prepush-check` now asks) |
+| The evidence | `domain/tech_lead_completion_validation.py`, filed under `<repo>/.issue-orchestrator/state/tech-lead-completion-validation/` |
+| The fail-closed gate | `control/tech_lead_completion_validation.py`, called from `settle_tech_lead_completion` |
+
+The launcher declares the role — `TaskKind.TECH_LEAD` reaches
+`AgentConfig.get_command_for_prompt` for a tech-lead agent — while the session
+KEY stays `TaskKind.CODE`, because there is still one session slot per issue.
+That is the whole selection: task kind names the role whose completion protocol
+and sandbox role apply, and nothing else about the launch changes. All three
+coding-lane launch sites ask `control/tech_lead_session_policy.coding_lane_task_kind`
+for it — the first launch, the validation-retry relaunch, and the rework
+relaunch — since a tech-lead run that wrote code reaches the retry queue and the
+rework queue too. The rework queue is the one worth naming explicitly:
+`control/pr_scanner` builds a `PendingRework` from the issue's own `agent:*`
+label with no tech-lead exclusion, so a tech-lead run whose PR draws
+changes-requested is relaunched on that lane under the tech-lead agent. Each
+site passes its own `lane_task_kind` (`CODE`, `CODE`, `REWORK`) so routing
+through the owner does not restate a coder's role as something its lane is not;
+only the tech-lead override is decided in the owner.
+
+The rework lane is also where the sharper form of the defect showed:
+`completion_processor` selects the completion gate on the **agent label** while
+the protocol document is selected on the **task kind**, so a literal `REWORK`
+left the orchestrator validating a tech-lead completion on the model's behalf
+while the document in the model's hands still ordered it to validate itself.
+Same rule, two paths, two answers — the cross-path drift `AGENTS.md` classifies
+as a correctness risk.
+
+The trusted owner runs in the orchestrator's process, so it makes the shared
+git-common-dir timing write the model could not, under
+`kind: tech_lead_completion_validation`. Its verdict is filed create-once per
+exact `(run_id, session_name, candidate_head_sha)` and read back before it is
+returned, so an unwritable or unreadable record is an `UNAVAILABLE` verdict
+rather than an unnoticed no-op.
+
+A COMPLETED tech-lead completion is then refused whenever that verdict is
+missing, failed, timed out, unavailable, or bound to a different
+run/session/commit than the one the orchestrator observed. Refused means zero
+push, PR, or comment from the completion's own requested actions, and a FAILED
+session.
+
+Because the verdict is create-once, a refusal is durable for that exact
+`(run_id, session_name, candidate_head_sha)` — including the `UNAVAILABLE` a
+momentary shared-git-dir timing-write failure produces. Retrying the same run on
+the same commit re-reads the filed verdict rather than re-running the check, so
+**waiting is not the remedy**: either land a new candidate commit (a new key,
+and the ordinary route), or, when the `UNAVAILABLE` was environmental and that
+same commit must be re-judged, delete the verdict file under
+`<repo>/.issue-orchestrator/state/tech-lead-completion-validation/` and re-run
+completion, which re-files it. That deletion is a deliberate operator action, so
+it is not automated.
+
+A refusal does not mean zero labels: it carries
+`ERROR_PREFIX_TECH_LEAD_COMPLETION_VALIDATION`, which is a member of
+`control/tech_lead_completion_errors.TECH_LEAD_ERROR_PREFIXES`, so
+`critical_processing_errors` classifies it critical and the planner routes it to
+the tech-lead terminal-effects owner alongside the authority and decision
+refusals — `tech-lead-failed` on every manifest candidate, `blocked-failed` on
+the anchor, the rejection surfaced there, and history recording FAILED. That
+routing is why the prefix must be splatted from the owner tuple rather than
+re-listed at each consumer: a prefix the planner does not recognise falls
+through every branch and settles as an ordinary success.
+
+The three refusals share that routing but not their remedy, so the sentence the
+operator reads names which one it was: `TechLeadRefusalKind` (same owner module)
+maps each prefix to its noun — `decision`, `launch authority`,
+`completion validation` — and `plan_tech_lead_rejection_action` requires it, so
+no caller can surface its refusal as somebody else's. A caller that knows its
+kind statically calls the named constructor for it
+(`plan_tech_lead_decision_rejection_action`,
+`plan_tech_lead_authority_rejection_action`) rather than passing the argument;
+the general form is for the one caller that learns the kind at runtime by
+parsing the recorded error. The rendered artifact surface
+(`proposal_type="decision"`, a UI contract value) is unchanged; only the
+sentence is.
+
+Actor and Reviewer completion is untouched: `coding_done.md` still makes
+`prepush-check --dirty-only -v` mandatory, and the gate lives inside
+`settle_tech_lead_completion`, which no other principal reaches.
+
+One consequence is worth stating as a rule, because breaking it is how the
+repaired defect came back on a second path: **the completion protocol document
+is the only place that names a role's validation command.** An orchestrator
+prompt that needs to mention the step points back at the document instead —
+`session_controller._render_dirty_worktree_retry_prompt` says "Complete the
+validation step your completion protocol requires", not `prepush-check`. When
+it restated the command, a dirty tech-lead checkout took the dirty preflight
+(which runs *before* completion processing, so ahead of this gate), and the
+relaunch prompt ordered the one command that role may not run. Shipping the
+contradiction and resolving it by precedence inside the model is not the
+Agent-Intent/Orchestrator-Authority model; not emitting it is.
+
+`domain/review_exchange.build_coder_prompt` follows the same rule — its step 3
+defers, and `resources/review_exchange_coder.md`, the completion protocol
+document for that lane, is the one place naming the command.
+
+### Known gap: the review-exchange coder lane and the sandbox boundary
+
+The rule above is about *duplication*. It does not fix the case where the single
+remaining owner names a command the role cannot execute, and there is one open
+instance, deliberately not repaired by #385:
+
+A completion that requests `create_pr` and resolves a reviewer starts a review
+exchange with `coder_label = agent_label`
+(`control/completion_review_exchange.py`). Nothing on that path asks which role
+the agent is — `Config.get_reviewer_for_agent` falls back to
+`code_review_agent`, so a tech-lead agent resolves one like any other — and the
+lane launches with `task_kind="review_exchange_coder"`, which injects
+`review_exchange_coder.md` and its mandatory `prepush-check`. A sandboxed Tech
+Lead relaunched as an exchange coder therefore meets the #383 wall again, and
+`tech_lead_done.md`'s override is not present on that lane to counter it.
+
+The invariant is wider than one role: **the exchange coder protocol mandates a
+shared-git-dir write that no sandbox-opted-in agent may perform**, so a
+sandboxed Actor hits it identically (`AgentConfig.sandbox` defaults `False`, so
+an unsandboxed one is unaffected). It is also **pre-existing rather than
+introduced by #385**: before this change a sandboxed Tech Lead could not
+complete on the primary lane at all, so it never reached the exchange. #385 does
+not create the wall; it moves the road far enough to reach it.
+
+What gates it is the `sandbox: true` opt-in **alone**. The other half is on by
+default — `Config.review_exchange_mode` is `"via-local-loop"`
+(`infra/config.py`, `infra/config_sections.py`). This repository's own
+`selfhost.yaml` sets no `sandbox: true`, so the gap is latent *here*; it is not
+latent for the bounded-Codex Tech Lead configuration R33 turns that opt-in on
+for.
+
+Swapping the document is not on its own sufficient, and that is what makes the
+repair larger than it looks. The lane does not merely *instruct* the coder to
+validate; it *requires the artifact*. `_validate_coder_completion`
+(`execution/persistent_session_exchange.py`) rejects the turn unless a passing
+`validation-record.json` bound to current HEAD is present, and only
+`coding-done completed` writes one (`statuses_requiring_validation`). That
+requirement is on by default — `Config.review_exchange_require_validation` is
+`True` (`infra/config.py`). So a sandboxed coder handed a document that omits
+the command would still fail the turn for the missing record: the in-session
+validation obligation is in the lane's protocol contract, not just in its
+prose.
+
+Repairing it therefore means deciding what a sandboxed agent's exchange-coder
+protocol should be *and* who files the record it is judged on — either a
+role-aware document plus a trusted owner filing the turn's validation evidence
+the way #385 files the Tech Lead completion verdict, or excluding
+sandbox-opted-in agents from the exchange lane so their PRs take the ordinary
+review pipeline (smaller, but it removes internal review from those runs). That
+is a role×lane product decision and generic completion-platform redesign, which
+#385's STOP conditions exclude.
+
+**Status: open, not yet tracked by an issue.** #385 round 4 established that
+`coding-done --follow-up-file` does not file one — the proposal terminates in
+the session-diagnostics dialog (`view_models/dialogs.py`) and no
+`create_issue` producer reads it — and agents hold read-only GitHub access, so
+the follow-up `AGENTS.md`'s deferral rule requires (created, owned, scheduled,
+linked) has to be opened by a human. Until it is, this section is the record.
+`tests/unit/test_completion_processor.py::TestReviewExchangeModeResolution::test_a_tech_lead_agent_is_not_excluded_from_the_exchange`
+pins the reachability, so the gap rests on a measured fact and the repair has an
+anchor to invert.
+
 ### The other principal that must not run the gate
 
 A `planning_investigation` Tech Lead is refused the same commands, for an

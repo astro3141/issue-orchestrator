@@ -1784,7 +1784,21 @@ class SessionController:
         failure_kind: ValidationFailureKind,
         dirty_files: tuple[str, ...],
     ) -> str:
-        """Render a dirty-worktree-specific retry prompt."""
+        """Render a dirty-worktree-specific retry prompt.
+
+        The required-fix list DEFERS the validation step to the completion
+        protocol document this session was handed, and does not name a command
+        (#385 round 2 F3/A2). Naming one made this a second owner of "what
+        validation step does this role run", and the two owners disagreed: for a
+        bounded Tech Lead the answer is "none, the orchestrator runs it", while
+        this prompt ordered ``prepush-check --dirty-only -v`` — whose
+        shared-git-dir timing write its sandbox refuses. The dirty preflight is
+        the PRINCIPAL way a tech-lead run reaches this prompt, so the
+        contradiction was routine rather than exotic, and resolving it by
+        precedence inside the model is not this repository's model. The Actor
+        loses nothing: ``coding_done.md`` still names the command and still
+        makes it mandatory.
+        """
         display_count = retry_count + 1
         display_max = max_retries + 1
         dirty_lines = (
@@ -1811,7 +1825,7 @@ class SessionController:
 1. Run `git status --short`.
 2. Commit files that belong to the requested fix.
 3. Remove, revert, or stash unrelated/generated files that should not be part of this issue.
-4. Run `prepush-check --dirty-only -v`; it must pass before `coding-done`.
+4. Complete the validation step your completion protocol requires before `coding-done`.
 5. Run `coding-done completed --implementation "describe what you fixed" --problems "any remaining issues"`.
 
 Runtime note: orchestrator-managed metadata under `.issue-orchestrator/` and `.claude/` is ignored by the orchestrator dirty guard. Tracked project files, generated sources, lock files, schemas, and other repo changes must still be committed or removed.

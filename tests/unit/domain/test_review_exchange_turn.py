@@ -298,7 +298,14 @@ class TestBuildCoderPrompt:
         prompt = build_coder_prompt(packet)
 
         assert "clean working tree required" in prompt
-        assert "prepush-check --dirty-only -v" in prompt
+        # The validation step defers to the lane's completion protocol document
+        # and names no command; naming one made this prompt a second owner of
+        # that answer (#385 round 3 A3).
+        assert (
+            "Complete the validation step your completion protocol requires"
+            in prompt
+        )
+        assert "prepush-check" not in prompt
         assert "Tracked project files" in prompt
         assert ".issue-orchestrator/" in prompt
         assert "Reviewer report:" in prompt

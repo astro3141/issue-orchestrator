@@ -53,7 +53,10 @@ from .subject_recovery_authority import (
 from .tech_lead_completion import (
     manifest_failure_label_actions,
     resolve_launch_authority_for_session,
-    split_tech_lead_decision_error,
+)
+from .tech_lead_completion_errors import (
+    split_tech_lead_refusal,
+    tech_lead_refusal_kind,
 )
 from .tech_lead_decision_actions import plan_tech_lead_rejection_action
 from .tech_lead_session_policy import is_tech_lead_session
@@ -94,7 +97,12 @@ def generate_tech_lead_decision_failure_actions(
       not part of that. The rejection surface itself is untouched — only the
       label, and the sentence of the comment that describes it.
     """
-    failure, detail = split_tech_lead_decision_error(processing_errors)
+    failure, detail = split_tech_lead_refusal(processing_errors)
+    # WHAT was refused, not just why it failed: this path surfaces all three
+    # refusals, and each sends the operator somewhere different (#385 round 2
+    # N1). Read from the same owner and the same first-match scan, so the noun
+    # and the (failure, detail) below always describe one error.
+    refusal_kind = tech_lead_refusal_kind(processing_errors)
     actions: list[Action] = []
     authority, _tamper = resolve_launch_authority_for_session(
         tech_lead_authority, session
@@ -132,6 +140,7 @@ def generate_tech_lead_decision_failure_actions(
             anchor_issue_number=session.issue.number,
             failure=failure,
             detail=detail,
+            refusal_kind=refusal_kind,
         )
     )
     detail_text = detail or "no detail recorded"

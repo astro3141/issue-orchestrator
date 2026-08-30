@@ -40,6 +40,7 @@ from .zero_code_reads import ZeroCodeWorktreeReader
 if TYPE_CHECKING:
     from ..infra.config import Config
     from ..ports.tech_lead_authority import TechLeadAuthorityStore
+    from ..ports.tech_lead_completion_validation import TechLeadCompletionValidator
 
 logger = logging.getLogger(__name__)
 
@@ -78,6 +79,7 @@ def settle_tech_lead_pre_action(
     config: "Config | None",
     *,
     tech_lead_authority: "TechLeadAuthorityStore",
+    completion_validator: "TechLeadCompletionValidator",
     worktree: Path,
     record: CompletionRecord,
     agent_label: str | None,
@@ -106,7 +108,11 @@ def settle_tech_lead_pre_action(
 
     A completion no tech_lead owner governs — a coder's, a reviewer's, or any
     completion at all when no config is wired — is admitted offering the
-    ordinary code candidate, which is exactly today's behaviour.
+    ordinary code candidate, which is exactly today's behaviour. That is also
+    why ``completion_validator`` is threaded through here rather than consulted
+    from somewhere further in: the trusted Tech Lead completion validation
+    (#385) must reach the tech_lead owner and NOTHING else, so an Actor's or a
+    Reviewer's completion cannot acquire a gate it never had.
     """
     if config is None or not is_tech_lead_session(
         config.tech_lead_review_agent, agent_label
@@ -115,6 +121,7 @@ def settle_tech_lead_pre_action(
     lane = settle_tech_lead_completion(
         config,
         tech_lead_authority=tech_lead_authority,
+        completion_validator=completion_validator,
         run_dir=run_assets.run_dir,
         run_id=run_assets.run_id,
         session_name=run_assets.session_name,

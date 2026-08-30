@@ -97,6 +97,7 @@ from .tech_lead_gate_notes import (
     outcome_gate_note,
 )
 from .tech_lead_case_files import PatternCaseFilePlanner
+from .tech_lead_completion_errors import TechLeadRefusalKind
 from .tech_lead_issue_policy import (
     apply_tech_lead_priority_prefix,
     decision_issue_labels,
@@ -248,15 +249,63 @@ def _concrete_actions(
 
 
 def plan_tech_lead_rejection_action(
-    *, anchor_issue_number: int, failure: str, detail: str
+    *,
+    anchor_issue_number: int,
+    failure: str,
+    detail: str,
+    refusal_kind: TechLeadRefusalKind,
 ) -> SurfaceTechLeadProposalAction:
-    """Surface a rejected decision artifact pair (``mode="rejected"``)."""
+    """Surface a refused tech_lead completion (``mode="rejected"``).
+
+    ``refusal_kind`` names WHAT was refused in the operator-facing reason, and
+    is required so no caller can surface its refusal as somebody else's
+    (#385 round 2 N1). All three of these arrive here — a rejected/missing
+    decision pair, a missing or tampered launch authority, and a completion the
+    trusted validation owner did not clear — and they point at three different
+    remedies, so "tech_lead decision rejected (validation_failed)" sent the
+    operator to read an artifact that was never the problem.
+
+    ``proposal_type`` stays ``"decision"``: it is the ARTIFACT surface this
+    action renders (the decision-pair dialog and its published event), not the
+    sentence describing the refusal, and it is a UI-visible contract value.
+    """
     return SurfaceTechLeadProposalAction(
         issue_number=anchor_issue_number,
         proposal_type="decision",
         body_preview=detail[:_BODY_PREVIEW_CHARS],
         mode="rejected",
-        reason=f"tech_lead decision rejected ({failure})",
+        reason=f"tech_lead {refusal_kind.value} rejected ({failure})",
+    )
+
+
+def plan_tech_lead_decision_rejection_action(
+    *, anchor_issue_number: int, failure: str, detail: str
+) -> SurfaceTechLeadProposalAction:
+    """Surface a refused DECISION artifact — the pair itself is the remedy."""
+    return plan_tech_lead_rejection_action(
+        anchor_issue_number=anchor_issue_number,
+        failure=failure,
+        detail=detail,
+        refusal_kind=TechLeadRefusalKind.DECISION,
+    )
+
+
+def plan_tech_lead_authority_rejection_action(
+    *, anchor_issue_number: int, failure: str, detail: str
+) -> SurfaceTechLeadProposalAction:
+    """Surface a refused LAUNCH AUTHORITY — the record is the remedy.
+
+    A named constructor rather than a ``refusal_kind`` argument at the call
+    site: the two callers that know their kind statically cannot then pass the
+    wrong one, and the general form above stays for the ONE caller that learns
+    the kind at runtime by parsing the recorded error
+    (:func:`.tech_lead_terminal_effects.generate_tech_lead_decision_failure_actions`).
+    """
+    return plan_tech_lead_rejection_action(
+        anchor_issue_number=anchor_issue_number,
+        failure=failure,
+        detail=detail,
+        refusal_kind=TechLeadRefusalKind.LAUNCH_AUTHORITY,
     )
 
 
@@ -317,7 +366,9 @@ def plan_tech_lead_decision_actions(
         # refuses to pick a winner: the whole decision is rejected as a contract
         # violation and nothing partially planned is applied (#6957 review F3).
         return [
-            plan_tech_lead_rejection_action(
+            # A contract violation inside the decision artifact itself, so the
+            # decision IS what the operator must go fix.
+            plan_tech_lead_decision_rejection_action(
                 anchor_issue_number=anchor_issue.number,
                 failure="pattern_classification_conflict",
                 detail=str(exc),

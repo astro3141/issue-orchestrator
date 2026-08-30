@@ -36,8 +36,19 @@ from issue_orchestrator.control.pull_request_observation import (
 from issue_orchestrator.control.result_only_completion import (
     ResultOnlyCloseIssueAction,
 )
+from issue_orchestrator.control.completion_history_status import (
+    resolve_history_status,
+)
 from issue_orchestrator.control.tech_lead_completion import (
     admit_tech_lead_completion,
+)
+from issue_orchestrator.control.completion_types import (
+    ERROR_PREFIX_TECH_LEAD_AUTHORITY,
+    ERROR_PREFIX_TECH_LEAD_COMPLETION_VALIDATION,
+    ERROR_PREFIX_TECH_LEAD_DECISION,
+)
+from issue_orchestrator.control.tech_lead_completion_errors import (
+    TECH_LEAD_ERROR_PREFIXES,
 )
 from issue_orchestrator.control.label_manager import LabelManager
 from tests.conftest import make_provider_availability
@@ -3064,16 +3075,66 @@ class TestTechLeadDecisionFailureTransition:
 
     ERROR = "tech_lead_decision: contract_violation: finding T1 has no evidence"
 
-    def test_error_prefix_is_critical(self) -> None:
-        critical, downgraded = critical_processing_errors([self.ERROR])
-        assert critical == [self.ERROR]
-        assert downgraded == []
+    @pytest.mark.parametrize("prefix", TECH_LEAD_ERROR_PREFIXES)
+    def test_every_refusal_the_owner_issues_is_critical(self, prefix: str) -> None:
+        """Driven from the owner tuple, not from a list written out here.
 
-    def test_authority_error_prefix_is_critical(self) -> None:
-        error = "tech_lead_authority: scope_tampered: assignment flipped"
+        #385 round 1 F1: the owner gained a third refusal and this classifier
+        still named two of them inline, so a refused completion validation
+        matched no branch, was appended to neither list, and settled as an
+        ordinary success. Parametrizing over the owner is what makes the next
+        prefix impossible to add without reaching this path.
+        """
+        error = f"{prefix}: some_failure: some detail"
+
         critical, downgraded = critical_processing_errors([error])
+
         assert critical == [error]
         assert downgraded == []
+
+    @pytest.mark.parametrize(
+        ("prefix", "expected_noun"),
+        [
+            (ERROR_PREFIX_TECH_LEAD_DECISION, "decision"),
+            (ERROR_PREFIX_TECH_LEAD_AUTHORITY, "launch authority"),
+            (
+                ERROR_PREFIX_TECH_LEAD_COMPLETION_VALIDATION,
+                "completion validation",
+            ),
+        ],
+    )
+    def test_the_surfaced_reason_names_what_was_actually_refused(
+        self, tmp_path: Path, prefix: str, expected_noun: str
+    ) -> None:
+        """#385 round 2 N1: three refusals, three remedies, three nouns.
+
+        Every refusal the owner issues reaches this one surface, and it read
+        "tech_lead **decision** rejected" for all of them. An operator whose
+        completion validation failed was pointed at a decision artifact that
+        was never the problem — the same "which one do I go fix" argument
+        ``TechLeadCompletionValidationStatus`` makes for keeping FAILED /
+        TIMED_OUT / UNAVAILABLE distinct, one level up.
+
+        The nouns are written out here rather than read back from the owner's
+        map, so a change to that map has to be a deliberate change to what an
+        operator is told.
+        """
+        config = make_tech_lead_config(tmp_path)
+        session = make_tech_lead_session(tmp_path)
+        arm_investigation_session(config, session)
+
+        actions = make_planner(config).generate_completion_actions(
+            session,
+            SessionStatus.COMPLETED,
+            processing_errors=[f"{prefix}: some_failure: some detail"],
+        )
+
+        [rejection] = _rejections(actions)
+        assert rejection.reason == f"tech_lead {expected_noun} rejected (some_failure)"
+        # The artifact surface this action renders is unchanged — only the
+        # sentence describing the refusal moved.
+        assert rejection.proposal_type == "decision"
+        assert rejection.mode == "rejected"
 
     def test_batch_flavor_fails_manifest_and_blocks_own_issue(
         self, tmp_path: Path
@@ -3181,6 +3242,107 @@ class TestTechLeadDecisionFailureTransition:
         assert any(
             "no recovery authority" in comment for comment in comments(actions)
         )
+
+
+class TestARefusedCompletionValidationProjectsAFailedRun:
+    """The other half of #385's R3, on the side of the boundary the gate's own
+    tests stopped short of.
+
+    ``process_completion`` refusing is only half the promise: it buys zero
+    push/PR/comment. What an operator and every downstream consumer actually
+    read is the PLANNED disposition and the history row, and in round 1 both
+    said the run completed cleanly — the claim label was released, no
+    ``tech-lead-failed`` was applied, and nothing was surfaced on the anchor —
+    because the refusal's prefix was missing from the critical set.
+    """
+
+    ERROR = (
+        "tech_lead_completion_validation: validation_failed: "
+        "uncommitted content (dirty_check='tracked'): src/thing.py"
+    )
+
+    def test_the_refusal_routes_to_the_tech_lead_failure_owner(
+        self, tmp_path: Path
+    ) -> None:
+        config = make_tech_lead_config(tmp_path)
+        session = make_tech_lead_session(tmp_path)
+        arm_batch_session(config, session, tmp_path)
+
+        actions = make_planner(config).generate_completion_actions(
+            session,
+            SessionStatus.COMPLETED,
+            processing_errors=[self.ERROR],
+        )
+
+        failed = [
+            a for a in actions
+            if isinstance(a, AddLabelAction) and a.label == "tech-lead-failed"
+        ]
+        assert {a.issue_number for a in failed} == {101, 102}
+        assert "blocked-failed" in added_labels(actions)
+        # The tech_lead owner's route, not the generic publish-failure lane.
+        assert "publish-failed" not in added_labels(actions)
+        [rejection] = _rejections(actions)
+        assert rejection.issue_number == session.issue.number
+        assert "uncommitted content" in rejection.body_preview
+        assert any(
+            "Tech Lead completion rejected" in comment for comment in comments(actions)
+        )
+
+    def test_the_claim_is_released_as_a_refusal_not_as_a_success(
+        self, tmp_path: Path
+    ) -> None:
+        """The round-1 symptom, pinned where the two paths actually differ.
+
+        Both dispositions release ``in-progress``; what round 1 produced was
+        the *success* release with nothing else attached, which is
+        indistinguishable from a clean run. The release must be the refusal's.
+        """
+        config = make_tech_lead_config(tmp_path)
+        session = make_tech_lead_session(tmp_path)
+        arm_batch_session(config, session, tmp_path)
+
+        actions = make_planner(config).generate_completion_actions(
+            session,
+            SessionStatus.COMPLETED,
+            processing_errors=[self.ERROR],
+        )
+
+        releases = [
+            a for a in actions
+            if isinstance(a, RemoveLabelAction) and a.label == "in-progress"
+        ]
+        assert [a.reason for a in releases] == [
+            "Tech Lead completion rejected - releasing claim"
+        ]
+        assert not any(isinstance(a, CloseIssueAction) for a in actions)
+
+    def test_history_records_the_run_as_failed(self) -> None:
+        history = resolve_history_status(
+            status=SessionStatus.COMPLETED,
+            issue_number=1,
+            pr_url=None,
+            processing_errors=[self.ERROR],
+            review_exchange_halted=False,
+            completion_detail=None,
+        )
+
+        assert history.status is SessionStatus.FAILED
+        assert history.reason is not None
+
+    def test_a_pr_url_cannot_downgrade_the_refusal(self) -> None:
+        """No "but it landed anyway" evidence exists for an ungated completion.
+
+        A discoverable PR downgrades ``create_pr``; it says nothing about
+        whether the mandatory validation cleared this candidate, so it must not
+        soften this prefix.
+        """
+        critical, downgraded = critical_processing_errors(
+            [self.ERROR], pr_url="https://example.test/owner/repo/pull/7"
+        )
+
+        assert critical == [self.ERROR]
+        assert downgraded == []
 
 
 def test_interrupted_retry_adds_guard_and_keeps_retry_loop_bounded(tmp_path: Path) -> None:

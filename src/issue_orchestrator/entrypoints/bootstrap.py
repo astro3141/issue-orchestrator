@@ -122,6 +122,7 @@ from .bootstrap_tech_lead import (
     wire_tech_lead_act_executors,
 )
 from ..infra.repo_identity import state_dir
+from ..infra.tech_lead_completion_validation import TrustedTechLeadCompletionValidator
 from ..infra.secret_env import (
     configure_extra_forbidden_env_vars,
 )
@@ -1139,6 +1140,10 @@ def build_orchestrator_for_testing(
         review_artifact_reader=ManifestReviewArtifactReader(),
         runtime_identity=runtime_identity.resolve_runtime_identity(),
         tech_lead_authority=tech_lead_authority_for_testing,
+        # #385: gated on trusted, orchestrator-executed completion validation.
+        tech_lead_completion_validator=TrustedTechLeadCompletionValidator(
+            working_copy=working_copy, repo_root=config.repo_root
+        ),
         needs_human_block=pending_work.needs_human_block,
         unrecorded_refusals=publication_verdict.unrecorded,
     )

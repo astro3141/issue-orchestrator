@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING
 
 from ..domain.artifact_contracts import AgentProvider
 from ..domain.models import RequestedAction
+from ..domain.session_key import TaskKind
 from ..domain.tech_lead_manifest import TechLeadManifest
 from ..domain.board_snapshot import BOARD_SNAPSHOT_FILENAME, BoardSnapshot
 from ..domain.tech_lead_session import (
@@ -66,6 +67,44 @@ def is_tech_lead_session(
 ) -> bool:
     """True when ``agent_type`` is the configured tech_lead review agent."""
     return bool(tech_lead_review_agent and agent_type == tech_lead_review_agent)
+
+
+def coding_lane_task_kind(
+    tech_lead_review_agent: str | None,
+    agent_type: str | None,
+    *,
+    lane_task_kind: TaskKind = TaskKind.CODE,
+) -> str:
+    """The ROLE the coding launch lane runs this agent in (#385).
+
+    A tech_lead run takes the coding lane and keeps the lane's own session
+    identity — there is one session slot per issue — but it is not a coder, and
+    the task kind is what selects the completion protocol the session is handed
+    and the sandbox role it resolves to. Handing a bounded Tech Lead the coder
+    protocol is what made ``prepush-check --dirty-only -v`` mandatory for it,
+    and that command needs shared-git-dir writes its sandbox does not grant.
+
+    ``lane_task_kind`` is the kind the lane runs a NON-tech-lead agent in, so a
+    site keeps its own coder identity while the tech-lead override stays owned
+    here: the first launch and the validation-retry relaunch are ``CODE``, the
+    rework lane is ``REWORK``. Both collapse to the same coder protocol and the
+    same ``SandboxRole.CODER`` today, so this parameter changes nothing for an
+    Actor — it exists so routing a third site through this owner does not
+    silently restate its role as something the lane is not.
+
+    Lives beside :func:`is_tech_lead_session` because it is the same question
+    asked for a second consequence; a launcher-local conditional would be a
+    second place the role is decided. ALL THREE coding-lane launch sites must
+    ask it — the first launch, the validation-retry relaunch, and the rework
+    relaunch — since a tech_lead run that wrote code reaches the retry queue and
+    the rework queue too (``control/pr_scanner`` builds a ``PendingRework`` from
+    the issue's own ``agent:*`` label, with no tech-lead exclusion). A site
+    answering with a literal is precisely the drift this owner exists to prevent
+    (#385 round 1 F2, round 2 F1).
+    """
+    if is_tech_lead_session(tech_lead_review_agent, agent_type):
+        return TaskKind.TECH_LEAD.value
+    return lane_task_kind.value
 
 
 def recover_tech_lead_launch_scope(

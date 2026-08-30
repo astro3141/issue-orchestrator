@@ -10,9 +10,9 @@ The dead-or-rejected half lives in ``tech_lead_terminal_effects``: what a
 FAILED/TIMED_OUT session, or a COMPLETED session whose decision the contract
 refused, does to its anchor and to its subject. It shares this module's trusted
 reads (``resolve_launch_authority_for_session``,
-``manifest_failure_label_actions``,
-``split_tech_lead_decision_error``) so the two halves cannot disagree about
-what a run was.
+``manifest_failure_label_actions``) and the refusal-tag vocabulary in
+``tech_lead_completion_errors`` so the two halves cannot disagree about what a
+run was.
 
 Policy summary:
 
@@ -37,6 +37,11 @@ Policy summary:
   each pull request was audited at, and such a row has none; producing nothing
   instead would leave every one of its pull requests in the watch set,
   re-tripping the threshold for a batch that can never settle them.
+* Every COMPLETED tech_lead session must clear the completion protocol's
+  MANDATORY validation, which #385 moved off the model session onto a trusted
+  owner (:mod:`.tech_lead_completion_validation`) because running it needed
+  shared-git-dir writes a bounded Tech Lead may not make. Fail-closed in every
+  direction, so no Tech Lead settles terminally on unproven validation.
 * Every COMPLETED tech_lead session (any flavor) must produce a valid
   decision artifact pair — a missing/invalid pair is a contract violation.
   The authoritative classification runs in the completion processing path's
@@ -101,8 +106,9 @@ from .label_manager import LabelManager
 from .publish_recovery import is_publish_failure
 from .proposal_dedup_gate import DuplicateTargetGrant
 from .tech_lead_decision_actions import (
+    plan_tech_lead_authority_rejection_action,
     plan_tech_lead_decision_actions,
-    plan_tech_lead_rejection_action,
+    plan_tech_lead_decision_rejection_action,
 )
 from .tech_lead_decision_loader import (
     TechLeadArtifactLoadResult,
@@ -118,6 +124,7 @@ from .tech_lead_candidate_policy import TechLeadCandidatePolicy
 from .tech_lead_case_files import build_pattern_ledger
 from .tech_lead_decision_contract import validate_decision_for_authority
 from .tech_lead_proposals import build_op_ledger
+from .tech_lead_completion_validation import require_trusted_completion_validation
 from .tech_lead_session_policy import is_tech_lead_session
 from .tech_lead_zero_code import settle_zero_code_planning_completion
 from .zero_code_reads import ZeroCodeWorktreeReader
@@ -125,6 +132,7 @@ from .zero_code_reads import ZeroCodeWorktreeReader
 if TYPE_CHECKING:
     from ..infra.config import Config
     from ..ports.tech_lead_authority import TechLeadAuthorityStore
+    from ..ports.tech_lead_completion_validation import TechLeadCompletionValidator
     from .open_issue_corpus import OpenIssueCorpusManager
     from .reconciliation import ExpectedState
 
@@ -391,6 +399,7 @@ def settle_tech_lead_completion(
     requested_actions: tuple[RequestedAction, ...],
     worktree: Path,
     worktree_reader: ZeroCodeWorktreeReader,
+    completion_validator: TechLeadCompletionValidator,
 ) -> TechLeadCompletionLane:
     """The PRE-ACTION policy for a tech_lead completion of ANY outcome (#257).
 
@@ -450,6 +459,26 @@ def settle_tech_lead_completion(
                 zero_code=False,
                 detail=admission.error,
             )
+        # The completion protocol's own mandatory validation, executed by the
+        # trusted owner rather than by the model session (#385). Runs AFTER the
+        # admission contract for the same reason the zero-code lane does: a
+        # completion whose decision has not been judged has nothing to settle,
+        # and gating it first would answer a question about a run that is
+        # already rejected.
+        validation_error = require_trusted_completion_validation(
+            validator=completion_validator,
+            run_id=run_id,
+            session_name=session_name,
+            worktree=worktree,
+            worktree_reader=worktree_reader,
+        )
+        if validation_error is not None:
+            return TechLeadCompletionLane(
+                rejection=validation_error,
+                requested_actions=requested_actions,
+                zero_code=False,
+                detail=validation_error,
+            )
         authority = admission.authority
     else:
         authority, _tamper = resolve_tech_lead_launch_authority(
@@ -497,29 +526,6 @@ def _lane_detail(zero_code_detail: str, recovery_detail: str) -> str:
     if not recovery_detail:
         return zero_code_detail
     return f"{zero_code_detail}; {recovery_detail}"
-
-
-_TECH_LEAD_ERROR_PREFIXES = (ERROR_PREFIX_TECH_LEAD_DECISION, ERROR_PREFIX_TECH_LEAD_AUTHORITY)
-
-
-def has_tech_lead_decision_errors(processing_errors: list[str] | None) -> bool:
-    """True when processing errors include a rejected pair or tampered scope."""
-    return any(
-        error.startswith(_TECH_LEAD_ERROR_PREFIXES)
-        for error in processing_errors or ()
-    )
-
-
-def split_tech_lead_decision_error(processing_errors: list[str]) -> tuple[str, str]:
-    """Parse (failure, detail) back out of the recorded processing error."""
-    for error in processing_errors:
-        for prefix in _TECH_LEAD_ERROR_PREFIXES:
-            if not error.startswith(prefix):
-                continue
-            remainder = error[len(prefix):].lstrip(": ")
-            failure, sep, detail = remainder.partition(": ")
-            return (failure or "unknown", detail if sep else "")
-    return ("unknown", "")
 
 
 def resolve_launch_authority_for_session(
@@ -671,7 +677,7 @@ def generate_tech_lead_completion_actions(
             detail,
         )
         actions.append(
-            plan_tech_lead_rejection_action(
+            plan_tech_lead_authority_rejection_action(
                 anchor_issue_number=session.issue.number,
                 failure=failure,
                 detail=detail,
@@ -757,7 +763,7 @@ def generate_tech_lead_completion_actions(
             load_result.detail,
         )
         actions.append(
-            plan_tech_lead_rejection_action(
+            plan_tech_lead_decision_rejection_action(
                 anchor_issue_number=session.issue.number,
                 failure=failure,
                 detail=load_result.detail,

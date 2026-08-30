@@ -891,6 +891,12 @@ class TestClassificationConflictWithAnEarlierDecision:
         assert isinstance(rejection, SurfaceTechLeadProposalAction)
         assert rejection.mode == "rejected"
         assert "pattern_classification_conflict" in rejection.reason
+        # A contract violation inside the decision artifact, so this really is
+        # the "decision" refusal — the noun is right here rather than inherited
+        # from a surface that used to say it for every kind (#385 round 2 N1).
+        assert rejection.reason == (
+            "tech_lead decision rejected (pattern_classification_conflict)"
+        )
         # Nothing that would touch the case file was planned...
         assert not any(
             isinstance(a, AppendPatternObservationAction) for a in planned

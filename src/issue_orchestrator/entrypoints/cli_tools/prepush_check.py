@@ -24,7 +24,11 @@ from typing import Optional
 from ...control.validation import ValidationGate
 from ...domain.validation_profile import ValidationGateKind
 from ...execution import GitWorkingCopy, LocalCommandRunner
-from ...infra.runtime_artifacts import filter_runtime_managed_dirty_paths
+from ...infra.dirty_tree_guard import (
+    DEFAULT_DIRTY_CHECK_MODE,
+    DirtyTreeVerdict,
+    run_dirty_tree_guard,
+)
 from ...infra.validation_profiles import (
     DEFAULT_VALIDATION_PROFILE,
     ValidationGateContract,
@@ -43,7 +47,6 @@ def find_worktree_root() -> Path:
     return cwd
 
 
-DIRTY_CHECK_MODES = {"tracked", "unstaged", "all", "off"}
 DIRTY_FILE_LIST_LIMIT = 20
 
 
@@ -108,7 +111,7 @@ def load_validation_cmd(worktree: Path) -> PublishValidationSelection:
     publish_config = validation_config.get("publish", {}) or {}
     cmd = publish_config.get("cmd")
     timeout = publish_config.get("timeout_seconds", 1800)
-    dirty_check = publish_config.get("dirty_check", "tracked")
+    dirty_check = publish_config.get("dirty_check", DEFAULT_DIRTY_CHECK_MODE)
     profile = validation_config.get("profile") or DEFAULT_VALIDATION_PROFILE
     return PublishValidationSelection(
         cmd=cmd or None,
@@ -129,51 +132,44 @@ def _print_dirty_files(files: list[str]) -> None:
         print(f"  ... and {len(files) - DIRTY_FILE_LIST_LIMIT} more")
 
 
-def _filter_guard_excluded_files(files: list[str], worktree: Path) -> list[str]:
-    """Filter out orchestrator runtime metadata from dirty-tree guard checks."""
-    return filter_runtime_managed_dirty_paths(files, worktree)
-
-
 def _run_dirty_guard(worktree: Path, mode: str, verbose: bool) -> Optional[int]:
-    """Return exit code if dirty guard should block, else None."""
-    if mode not in DIRTY_CHECK_MODES:
-        if verbose:
+    """Return exit code if dirty guard should block, else None.
+
+    The verdict comes from the one owner of the publish dirty-tree rule
+    (:mod:`...infra.dirty_tree_guard`), shared with the trusted Tech Lead
+    completion validator (#385) so the two callers cannot disagree about
+    whether a checkout is publishable. What stays here is the CLI's own
+    business: how the refusal is worded on a terminal, and which exit code it
+    becomes.
+    """
+    result = run_dirty_tree_guard(worktree, mode=mode, working_copy=GitWorkingCopy())
+    if result.publishable:
+        return None
+    if verbose:
+        if result.verdict is DirtyTreeVerdict.INVALID_MODE:
             print(
                 "Invalid validation.publish.dirty_check value: "
                 f"{mode!r} (expected tracked|unstaged|all|off)"
             )
-        return 1
-    if mode == "off":
-        return None
-    working_copy = GitWorkingCopy()
-    raw_dirty_files = working_copy.list_dirty_files(worktree, mode)
-    if raw_dirty_files is None:
-        # Enumeration failed — fail closed instead of silently passing
-        # the gate (which would happen if we collapsed None to []).
-        if verbose:
+        elif result.verdict is DirtyTreeVerdict.UNENUMERABLE:
+            # Enumeration failed — fail closed instead of silently passing
+            # the gate (which would happen if we collapsed None to []).
             print(
                 "Could not enumerate dirty files; failing closed. "
                 f"(validation.publish.dirty_check={mode!r})"
             )
-        return 1
-    dirty_files = _filter_guard_excluded_files(raw_dirty_files, worktree)
-    if dirty_files:
-        if verbose:
-            if mode == "all":
-                print(
-                    "Working tree is dirty (tracked or untracked files); "
-                    "commit, add, or stash before pushing. "
-                    "Override with validation.publish.dirty_check."
-                )
-            else:
-                print(
-                    "Tracked files are dirty; commit or stash before pushing. "
-                    "Ignored files are allowed. "
-                    "Override with validation.publish.dirty_check."
-                )
-            _print_dirty_files(dirty_files)
-        return 1
-    return None
+        else:
+            print(
+                "Working tree is dirty (tracked or untracked files); "
+                "commit, add, or stash before pushing. "
+                "Override with validation.publish.dirty_check."
+                if mode == "all"
+                else "Tracked files are dirty; commit or stash before pushing. "
+                "Ignored files are allowed. "
+                "Override with validation.publish.dirty_check."
+            )
+            _print_dirty_files(list(result.dirty_files))
+    return 1
 
 
 def _run_validation_gate(
@@ -355,7 +351,7 @@ def run_prepush_check(verbose: bool = False, dirty_only: bool = False) -> int:
     monotonic_started_at = time.monotonic()
     cmd: str | None = None
     timeout = 0
-    dirty_check = "tracked"
+    dirty_check = DEFAULT_DIRTY_CHECK_MODE
     profile = DEFAULT_VALIDATION_PROFILE
     dirty_elapsed_seconds: float | None = None
     dirty_exit_code: int | None = None

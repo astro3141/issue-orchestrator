@@ -36,6 +36,7 @@ from .config_models import (
     ValidationConfig,
     ValidationProfileConfig,
 )
+from .dirty_tree_guard import DIRTY_CHECK_MODES
 
 __all__ = [
     "DEFAULT_VALIDATION_PROFILE",
@@ -395,13 +396,10 @@ def dirty_check_errors(profiles: Mapping[str, ValidationProfileConfig]) -> list[
     """Config-validation errors for per-profile ``publish.dirty_check`` values."""
     return [
         f"validation.profiles.{name}.publish.dirty_check must be "
-        "one of: tracked, unstaged, all, off"
+        f"one of: {', '.join(DIRTY_CHECK_MODES)}"
         for name, profile in sorted(profiles.items())
-        if profile.publish.dirty_check not in _DIRTY_CHECK_MODES
+        if profile.publish.dirty_check not in DIRTY_CHECK_MODES
     ]
-
-
-_DIRTY_CHECK_MODES = frozenset({"tracked", "unstaged", "all", "off"})
 
 
 def profiles_from_mapping(
