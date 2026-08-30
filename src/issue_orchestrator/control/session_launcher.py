@@ -1340,7 +1340,7 @@ class SessionLauncher:
                 issue_number=issue.number,
                 issue_title=issue.title,
                 worktree=worktree_path,
-                task_kind=TaskKind.CODE.value,
+                task_kind=coding_lane_task_kind(self.config.tech_lead_review_agent, agent_label),
                 extra_provider_args=extra_args,
             )
             base_command = self._wrap_provider_command(base_command, agent_config, run.run_dir, extra_provider_args=extra_args)

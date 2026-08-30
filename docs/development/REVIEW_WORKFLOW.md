@@ -597,10 +597,14 @@ The owner moved again, and the gate stayed:
   create-once per exact `(run, session, candidate commit)`.
 - **The completion is gated on that verdict.**
   `control/tech_lead_completion_validation.py` refuses a COMPLETED tech-lead
-  completion — zero push, PR, comment or label, FAILED session, refusal
-  surfaced on the anchor issue — when the verdict is missing, failed, timed
-  out, unavailable, or bound to a different run/session/commit than the one the
-  orchestrator observed on the finished checkout.
+  completion — none of its requested push/PR/comment actions execute, the
+  session is FAILED, `tech-lead-failed` lands on every manifest candidate,
+  `blocked-failed` on the anchor, and the refusal is surfaced there — when the
+  verdict is missing, failed, timed out, unavailable, or bound to a different
+  run/session/commit than the one the orchestrator observed on the finished
+  checkout. The labelling half only happens because the refusal's prefix is a
+  member of `TECH_LEAD_ERROR_PREFIXES`, which `critical_processing_errors`
+  splats rather than re-lists.
 
 Actor and Reviewer completion is untouched: `coding_done.md` still makes the
 step mandatory for them, and the gate lives inside the tech-lead completion

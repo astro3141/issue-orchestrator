@@ -116,6 +116,19 @@ def resolve_publish_dirty_check_mode(worktree: Path) -> str:
     reads, so the trusted owner and the CLI cannot be running two different
     policies against one repository. An unconfigured repository gets
     :data:`DEFAULT_DIRTY_CHECK_MODE`.
+
+    Know which process is asking. ``load_runtime_validation_config`` selects the
+    profile from ``ISSUE_ORCHESTRATOR_VALIDATION_PROFILE`` / ``CONFIG_PATH`` /
+    ``MODE`` in the CALLER's environment, so when the trusted completion-
+    validation owner (#385) calls this it resolves the ORCHESTRATOR's profile,
+    which a differently-configured orchestrator could set to a stricter or
+    looser ``dirty_check`` than the session's own profile names. That is
+    strictness, not a hole: every divergence still fails closed — an unknown
+    mode becomes :attr:`DirtyTreeVerdict.INVALID_MODE` and therefore a FAILED
+    completion validation, and a raised ``ValueError`` becomes ``UNAVAILABLE``,
+    which is also a refusal. Making the two profiles provably the same would
+    mean carrying the session's resolved profile name on the launch record and
+    reading it here instead of the ambient environment (#385 round 1 N3).
     """
     from .config import load_runtime_validation_config
 

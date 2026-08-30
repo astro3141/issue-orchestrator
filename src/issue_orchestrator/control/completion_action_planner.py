@@ -14,7 +14,7 @@ from .agent_blocked_completion import agent_blocked_actions
 from .agent_needs_human_completion import agent_needs_human_actions
 from .open_issue_corpus import OpenIssueCorpusManager
 from .tech_lead_completion import generate_tech_lead_completion_actions
-from .tech_lead_completion_errors import has_tech_lead_decision_errors
+from .tech_lead_completion_errors import TECH_LEAD_ERROR_PREFIXES, has_tech_lead_refusal
 from .subject_recovery_authority import SubjectRecoveryAuthority
 from .tech_lead_candidate_disposition import repository_candidate_observations
 from .tech_lead_terminal_effects import (
@@ -26,9 +26,7 @@ from .completion_types import (
     ERROR_PREFIX_CREATE_PR,
     ERROR_PREFIX_PUBLISH_BLOCKED,
     ERROR_PREFIX_PUSH,
-    ERROR_PREFIX_TECH_LEAD_AUTHORITY,
     ERROR_PREFIX_RESULT_UNDELIVERED,
-    ERROR_PREFIX_TECH_LEAD_DECISION,
     ResultOnlyDelivery,
     REVIEW_EXCHANGE_ERROR_PREFIX,
 )
@@ -48,6 +46,22 @@ from ..ports.provider_resilience import ProviderErrorType
 from .needs_human_block import NeedsHumanCause
 
 logger = logging.getLogger(__name__)
+
+
+#: Critical on sight, with no "but it landed anyway" evidence to weigh — unlike
+#: ``create_pr``, which is judged against a reconciled PR. The tech_lead members
+#: are SPLATTED FROM THEIR OWNER: re-listing them here is what produced #385
+#: round 1 F1, where the owner gained a third refusal and this path — the one
+#: deciding a tagged error routes to the tech_lead failure owner at all — never
+#: saw it, so a refused completion matched no branch, landed in neither returned
+#: list, and settled as an ordinary success. ``result_undelivered`` is here
+#: because on the zero-code lane the comment IS the publication (#337 round 2).
+_UNCONDITIONALLY_CRITICAL = (
+    ERROR_PREFIX_PUSH,
+    ERROR_PREFIX_PUBLISH_BLOCKED,
+    *TECH_LEAD_ERROR_PREFIXES,
+    ERROR_PREFIX_RESULT_UNDELIVERED,
+)
 
 
 def critical_processing_errors(
@@ -70,19 +84,7 @@ def critical_processing_errors(
     critical: list[str] = []
     downgraded: list[str] = []
     for error in processing_errors:
-        if error.startswith(
-            (
-                ERROR_PREFIX_PUSH,
-                ERROR_PREFIX_PUBLISH_BLOCKED,
-                ERROR_PREFIX_TECH_LEAD_DECISION,
-                ERROR_PREFIX_TECH_LEAD_AUTHORITY,
-                # Unconditionally critical, unlike create_pr: there is no
-                # "but it landed anyway" evidence to look for. On the zero-code
-                # lane the comment IS the publication, so its loss means the
-                # run published nothing at all (#337 round 2).
-                ERROR_PREFIX_RESULT_UNDELIVERED,
-            )
-        ):
+        if error.startswith(_UNCONDITIONALLY_CRITICAL):
             critical.append(error)
             continue
         if error.startswith(ERROR_PREFIX_CREATE_PR):
@@ -319,10 +321,12 @@ class CompletionActionPlanner:
     ) -> tuple[Action, ...]:
         """Route COMPLETED-with-critical-errors to the owning failure policy.
 
-        Rejected tech_lead decision pairs (#6761 finding 3) go to the tech_lead
-        owner (manifest tech-lead-failed labels, rejection surfacing,
-        blocked-failed on the session's own issue) — publish-failure copy
-        and publish-fail counters do not apply to them. That owner resolves the
+        Every refusal the tech_lead owner itself issued — a rejected decision
+        pair (#6761 finding 3), a missing/tampered launch authority, an
+        uncleared completion validation (#385) — goes to that owner (manifest
+        tech-lead-failed labels, rejection surfacing, blocked-failed on the
+        session's own issue); publish-failure copy and publish-fail counters do
+        not apply to them. That owner resolves the
         run's launch authority itself, so the subject-recovery answer is
         resolved only on the OTHER arm, where a generic path needs it threaded
         in (#182 review F1).
@@ -332,7 +336,7 @@ class CompletionActionPlanner:
             session.issue.number,
             critical_errors,
         )
-        if self._is_tech_lead_session(session) and has_tech_lead_decision_errors(
+        if self._is_tech_lead_session(session) and has_tech_lead_refusal(
             critical_errors
         ):
             return tuple(

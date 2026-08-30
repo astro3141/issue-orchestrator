@@ -25,8 +25,8 @@ from .completion_types import (
 
 __all__ = [
     "TECH_LEAD_ERROR_PREFIXES",
-    "has_tech_lead_decision_errors",
-    "split_tech_lead_decision_error",
+    "has_tech_lead_refusal",
+    "split_tech_lead_refusal",
 ]
 
 #: Every refusal the tech_lead owner itself issues. A rejected/missing decision
@@ -41,15 +41,21 @@ TECH_LEAD_ERROR_PREFIXES = (
 )
 
 
-def has_tech_lead_decision_errors(processing_errors: list[str] | None) -> bool:
-    """True when the errors include a refusal the tech_lead owner issued."""
+def has_tech_lead_refusal(processing_errors: list[str] | None) -> bool:
+    """True when the errors include a refusal the tech_lead owner issued.
+
+    Named for the whole set rather than for one member: only one of the three
+    prefixes is a *decision* refusal, and the older ``..._decision_errors``
+    name read as though a missing launch authority or an uncleared completion
+    validation were outside it (#385 round 1 N2).
+    """
     return any(
         error.startswith(TECH_LEAD_ERROR_PREFIXES)
         for error in processing_errors or ()
     )
 
 
-def split_tech_lead_decision_error(processing_errors: list[str]) -> tuple[str, str]:
+def split_tech_lead_refusal(processing_errors: list[str]) -> tuple[str, str]:
     """Parse (failure, detail) back out of the recorded processing error."""
     for error in processing_errors:
         for prefix in TECH_LEAD_ERROR_PREFIXES:

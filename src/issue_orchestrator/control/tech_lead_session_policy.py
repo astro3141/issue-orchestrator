@@ -83,7 +83,11 @@ def coding_lane_task_kind(
 
     Lives beside :func:`is_tech_lead_session` because it is the same question
     asked for a second consequence; a launcher-local conditional would be a
-    second place the role is decided.
+    second place the role is decided. BOTH coding-lane launch sites must ask it
+    — the first launch and the validation-retry relaunch — since a tech_lead run
+    that wrote code reaches the retry queue too, and the second site answering
+    with a literal is precisely the drift this owner exists to prevent
+    (#385 round 1 F2).
     """
     if is_tech_lead_session(tech_lead_review_agent, agent_type):
         return TaskKind.TECH_LEAD.value

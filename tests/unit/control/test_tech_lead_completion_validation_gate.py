@@ -29,7 +29,7 @@ from issue_orchestrator.control.tech_lead_completion import (
     settle_tech_lead_completion,
 )
 from issue_orchestrator.control.tech_lead_completion_errors import (
-    has_tech_lead_decision_errors,
+    has_tech_lead_refusal,
 )
 from issue_orchestrator.control.tech_lead_completion_validation import (
     UNWIRED_TECH_LEAD_COMPLETION_VALIDATOR,
@@ -262,7 +262,7 @@ class TestTheRefusalRoutesToTheTechLeadOwner:
         )
 
         assert lane.rejection is not None
-        assert has_tech_lead_decision_errors([lane.rejection])
+        assert has_tech_lead_refusal([lane.rejection])
 
 
 class TestNonTechLeadCompletionsAreUntouched:

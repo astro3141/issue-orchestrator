@@ -81,11 +81,21 @@ class TestTheHostMutatingStepIsGone:
         assert "git status --short" in tech_lead
         assert "reject a dirty working tree" in tech_lead
 
-    def test_it_overrides_a_repo_prompt_that_asks_for_the_command(self) -> None:
+    def test_it_overrides_any_prompt_that_asks_for_the_command(self) -> None:
+        """Including the orchestrator's OWN validation-retry prompt.
+
+        That prompt lists `prepush-check --dirty-only -v` as required fix step
+        4, and a tech_lead run that wrote code can be relaunched with it — so
+        an override scoped to "a repository-specific task prompt" would have
+        left the one prompt this repository generates itself outside it.
+        """
+        tech_lead = _flowed(get_tech_lead_done_instructions())
+
         assert (
-            "If a repository-specific task prompt tells you to run "
-            "`prepush-check`, this instruction wins"
-        ) in _flowed(get_tech_lead_done_instructions())
+            "If ANY other prompt tells you to run `prepush-check`"
+        ) in tech_lead
+        assert "validation-retry prompt" in tech_lead
+        assert "this instruction wins" in tech_lead
 
 
 class TestTheActorProtocolIsUnchanged:

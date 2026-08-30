@@ -1408,7 +1408,10 @@ The launcher declares the role — `TaskKind.TECH_LEAD` reaches
 `AgentConfig.get_command_for_prompt` for a tech-lead agent — while the session
 KEY stays `TaskKind.CODE`, because there is still one session slot per issue.
 That is the whole selection: task kind names the role whose completion protocol
-and sandbox role apply, and nothing else about the launch changes.
+and sandbox role apply, and nothing else about the launch changes. Both
+coding-lane launch sites ask `control/tech_lead_session_policy.coding_lane_task_kind`
+for it — the first launch and the validation-retry relaunch, since a tech-lead
+run that wrote code reaches the retry queue too.
 
 The trusted owner runs in the orchestrator's process, so it makes the shared
 git-common-dir timing write the model could not, under
@@ -1417,12 +1420,20 @@ exact `(run_id, session_name, candidate_head_sha)` and read back before it is
 returned, so an unwritable or unreadable record is an `UNAVAILABLE` verdict
 rather than an unnoticed no-op.
 
-A COMPLETED tech-lead completion is then refused — zero push, PR, comment or
-label, and a FAILED session — whenever that verdict is missing, failed, timed
-out, unavailable, or bound to a different run/session/commit than the one the
-orchestrator observed. The refusal carries
-`ERROR_PREFIX_TECH_LEAD_COMPLETION_VALIDATION`, which routes it to the tech-lead
-terminal-effects owner alongside the authority and decision refusals.
+A COMPLETED tech-lead completion is then refused whenever that verdict is
+missing, failed, timed out, unavailable, or bound to a different
+run/session/commit than the one the orchestrator observed. Refused means zero
+push, PR, or comment from the completion's own requested actions, and a FAILED
+session. It does not mean zero labels: the refusal carries
+`ERROR_PREFIX_TECH_LEAD_COMPLETION_VALIDATION`, which is a member of
+`control/tech_lead_completion_errors.TECH_LEAD_ERROR_PREFIXES`, so
+`critical_processing_errors` classifies it critical and the planner routes it to
+the tech-lead terminal-effects owner alongside the authority and decision
+refusals — `tech-lead-failed` on every manifest candidate, `blocked-failed` on
+the anchor, the rejection surfaced there, and history recording FAILED. That
+routing is why the prefix must be splatted from the owner tuple rather than
+re-listed at each consumer: a prefix the planner does not recognise falls
+through every branch and settles as an ordinary success.
 
 Actor and Reviewer completion is untouched: `coding_done.md` still makes
 `prepush-check --dirty-only -v` mandatory, and the gate lives inside
