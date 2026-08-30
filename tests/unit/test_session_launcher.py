@@ -21,6 +21,8 @@ from pathlib import Path
 from typing import Optional, cast
 from unittest.mock import MagicMock, patch
 
+from issue_orchestrator.adapters.sidecar_attempt_store import SidecarAttemptStore
+from issue_orchestrator.domain.attempt import AttemptKey
 from issue_orchestrator.domain.tech_lead_session import TechLeadCreationOrigin
 from issue_orchestrator.domain.claim import ClaimResult
 from issue_orchestrator.control.provider_resilience import ProviderResilienceManager
@@ -4637,6 +4639,96 @@ class TestOrchestratorLaunchTechLeadSession:
 
         assert result is None
         assert state.pending_tech_lead_reviews == []
+
+    def test_the_anchor_is_launched_under_the_repositorys_own_identity(
+        self, session_launcher, sample_config
+    ):
+        """#378 F3: the causal path that produced ``issue_scope=""``.
+
+        The anchor's work item is SYNTHESIZED at this boundary rather than
+        fetched, and it carried no repo — so ``launch_issue_session`` keyed the
+        session on ``GitHubIssueKey(repo="", external_id="376")`` and R31's
+        completion filed ``.issue-orchestrator/attempts/--376--<sha>.json``, a
+        record the product's own reader rejects.
+
+        Driven through the real launcher rather than a stub, because the claim
+        is about the identity the SESSION carries: every durable attempt record
+        this run files is keyed on ``session.key.issue``.
+        """
+        sample_config.tech_lead_review_agent = "agent:web"
+        state = OrchestratorState()
+        PendingSessionQueues(state).queue_batch_review(376, "Tech Lead batch")
+
+        session = orchestrator_launch_tech_lead_session(
+            state.pending_tech_lead_reviews[0],
+            state,
+            sample_config,
+            session_launcher,
+            MagicMock(),
+            _claims_store(),
+        )
+
+        assert session is not None
+        issue_key = session.key.issue
+        assert issue_key.scope() == sample_config.repo
+        assert str(issue_key.stable_id()) == "376"
+
+    def test_the_anchors_attempt_sidecar_is_named_by_a_scoped_candidate(
+        self, session_launcher, sample_config, tmp_path
+    ):
+        """#378 F3, second half: the file the anchor's evidence lands in.
+
+        The measured artefact was a FILENAME — ``--376--<sha>.json``, whose
+        empty leading component is the missing repository scope — so the proof
+        has to reach the persistence boundary rather than stop at the key.
+        """
+        sample_config.tech_lead_review_agent = "agent:web"
+        state = OrchestratorState()
+        PendingSessionQueues(state).queue_batch_review(376, "Tech Lead batch")
+
+        session = orchestrator_launch_tech_lead_session(
+            state.pending_tech_lead_reviews[0],
+            state,
+            sample_config,
+            session_launcher,
+            MagicMock(),
+            _claims_store(),
+        )
+
+        assert session is not None
+        head_sha = "c" * 40
+        store_root = tmp_path / "primary-checkout"
+        SidecarAttemptStore(store_root).update(
+            AttemptKey(session.key.issue, head_sha), lambda attempt: attempt
+        )
+
+        (sidecar,) = (store_root / ".issue-orchestrator" / "attempts").glob("*.json")
+        assert sidecar.name == f"test-repo--376--{head_sha}.json"
+        assert not sidecar.name.startswith("--")
+        assert json.loads(sidecar.read_text())["issue_scope"] == sample_config.repo
+
+    def test_an_engine_with_no_repository_refuses_to_launch_the_anchor(
+        self, sample_config
+    ):
+        """#378 R1: identity is resolved at the boundary, never invented later.
+
+        ``config.repo`` is the only source the synthesized work item has, so an
+        engine without one cannot name the anchor's candidate. Refusing here is
+        the fail-fast direction: filing evidence under an unfindable identity
+        and discovering it a tick later is what R31 did.
+        """
+        sample_config.tech_lead_review_agent = "agent:web"
+        sample_config.repo = "   "
+
+        with pytest.raises(ValueError, match="no canonical repository"):
+            orchestrator_launch_tech_lead_session(
+                _make_queued_tech_lead(),
+                OrchestratorState(),
+                sample_config,
+                _stub_tech_lead_launcher(LaunchResult(session=None, success=False)),
+                MagicMock(),
+                _claims_store(),
+            )
 
 
 class TestLaunchTechLeadIssueSessionFlavors:

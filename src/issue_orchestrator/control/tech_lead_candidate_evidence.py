@@ -112,8 +112,14 @@ class DurableCandidateEvidence:
             return TechLeadCandidateEvidence(
                 candidate=candidate, gap=unlocatable, validation_gap=unlocatable
             )
-        key = AttemptKey(repository_host.create_issue_key(issue_number), candidate.head_sha)
         try:
+            # Inside the fail-closed boundary, not before it (#378): an issue
+            # key that names no repository scope refuses at construction now,
+            # and a batch review must lose ONE candidate to that, not the whole
+            # audit it was staging.
+            key = AttemptKey(
+                repository_host.create_issue_key(issue_number), candidate.head_sha
+            )
             verdict = self.review_verdicts.read(key)
             identities = self.execution_identities.read(key)
         except (OSError, ValueError) as exc:

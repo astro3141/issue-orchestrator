@@ -45,6 +45,17 @@ class IssueBuilder:
     _body: Optional[str] = None
     _state: str = "open"
     _milestone: Optional[str] = None
+    # Real issues always arrive stamped with the repository the adapter
+    # resolved, and ``Issue.key`` is scoped by it. A repoless snapshot keys to
+    # ``("", "1")``, which names no work item — the exact identity #378 made
+    # unrepresentable — so the default here matches the other builders and
+    # ``sample_config.repo``.
+    _repo: str = "test/repo"
+
+    def with_repo(self, repo: str) -> "IssueBuilder":
+        """Set the repository this issue belongs to."""
+        self._repo = repo
+        return self
 
     def with_number(self, number: int) -> "IssueBuilder":
         """Set the issue number."""
@@ -91,6 +102,7 @@ class IssueBuilder:
             body=self._body,
             state=self._state,
             milestone=self._milestone,
+            repo=self._repo,
         )
 
 

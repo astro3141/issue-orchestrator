@@ -40,7 +40,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from ..domain.attempt import AttemptKey
+from ..domain.attempt import AttemptKey, CorruptAttemptEvidence
 from ..domain.session_run import (
     VALIDATION_RECORD_NAME,
     VALIDATION_STDERR_NAME,
@@ -578,6 +578,41 @@ class ValidationGate:
         )
 
     def check(self, session_output_dir: Optional[Path] = None) -> PublishGateResult:
+        """Decide this candidate, refusing rather than crashing on damage (#378).
+
+        The containment boundary for corrupt durable evidence, and it is here
+        rather than at either caller because BOTH gates consult and append to
+        the candidate's evaluation history: a rule enforced only by the
+        publication gate would leave the quick gate raising through the same
+        door on the next pass.
+
+        A damaged record refuses THIS candidate and nothing else. It is never
+        read as a cache miss (which would silently re-run and then re-file
+        against a record the store cannot rewrite), never as a pass, and never
+        as an identity to synthesize — the three readings #378 forbids. The
+        refusal carries the store's own attribution, so the operator reading a
+        gate failure learns which file, which attempt and why.
+        """
+        try:
+            return self._check(session_output_dir)
+        except CorruptAttemptEvidence as exc:
+            logger.error(
+                "%s: refusing %s — durable evidence is corrupt: %s",
+                self.suite,
+                exc.attempt_ref,
+                exc,
+            )
+            return PublishGateResult(
+                allowed=False,
+                reason=(
+                    f"{self.suite} cannot decide {exc.attempt_ref}: its durable "
+                    f"attempt evidence at {exc.path} is corrupt ({exc.reason}). "
+                    "Corrupt evidence is not an absent gate result, so this "
+                    "candidate cannot be published on it."
+                ),
+            )
+
+    def _check(self, session_output_dir: Optional[Path]) -> PublishGateResult:
         """Check if publishing is allowed.
 
         This method:

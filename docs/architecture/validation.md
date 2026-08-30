@@ -247,6 +247,56 @@ key nothing else uses is worse than no receipt at all. That is why resume asks
 the repository instead of reusing the display-title lookup, which answers with
 the placeholder `Issue #<n>` when nothing responds.
 
+### A sidecar the writer emits is one the reader accepts
+
+`AttemptKey` is the single owner of durable attempt identity validity, and that
+ownership is what keeps the two ends of a sidecar in agreement. Every sidecar
+*path* is derived from a key and every sidecar *payload* serializes one, so an
+identity the reader would reject cannot reach either — a write whose identity
+names no repository scope or no stable issue id refuses **before** a file is
+created or replaced, leaving no half-valid record behind.
+
+That rule exists because it was once absent. R31 ([#378]) persisted a
+current-schema sidecar as
+`.issue-orchestrator/attempts/--376--<sha>.json` carrying `issue_scope: ""`,
+and the product's own `Attempt.from_dict` refused it on the next read. The
+causal path was identity, not persistence: the Tech Lead anchor's work item is
+synthesized at the launch boundary rather than fetched, and it carried no
+repository — so the session, and every attempt record its completion filed,
+keyed on `("", "376")`. The anchor now carries the configured canonical
+repository, and an engine without one refuses to launch the anchor rather than
+filing evidence nothing can find again.
+
+The reader is not relaxed to meet the writer. `Attempt.from_dict` still rejects
+a blank `issue_scope`; both ends simply ask one predicate, so neither can drift
+into accepting what the other refuses.
+
+### Corrupt evidence refuses one candidate, not the pass it was found in
+
+A record already damaged is not made readable by any of the above, so
+encountering one has to be survivable. `SidecarAttemptStore` raises
+`CorruptAttemptEvidence`, which names the file, the attempt it was asked for,
+and the reason it could not be read. `ValidationGate.check` converts that into
+an ordinary gate refusal for **that** candidate — the containment lives on the
+gate rather than on either caller, because both the publication and quick
+contracts consult and append to the same history.
+
+Three readings are forbidden and stay forbidden:
+
+- **Not absence.** Damaged evidence is not "never gated". Reading it that way
+  is a claim about the world made from a broken instrument.
+- **Not a pass, and not a cache miss.** A miss would re-run the contract and
+  then be unable to file the result, so the candidate cannot obtain or reuse
+  validation authority at all.
+- **Not a synthesized identity.** Nothing infers or fills a missing scope from
+  the current checkout at read time.
+
+What it also is not is a crash. The R31 failure was that the `ValueError`
+escaped the candidate operation and aborted the whole planning iteration,
+repeatedly. Unrelated candidates in the same or the next control pass now
+proceed, and the damaged sidecar is left exactly as it was found: refusing must
+not repair, rewrite, rename or delete durable evidence.
+
 ### The receipt is also the cache
 
 The publication gate does not only *file* verdicts on `Attempt(issue, A)`; it

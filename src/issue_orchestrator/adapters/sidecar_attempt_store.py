@@ -6,7 +6,7 @@ import json
 from collections.abc import Callable
 from pathlib import Path
 
-from ..domain.attempt import Attempt, AttemptKey
+from ..domain.attempt import Attempt, AttemptKey, CorruptAttemptEvidence
 from ..domain.issue_key import IssueKey
 from ..domain.issue_key_codec import issue_key_path_part
 from ..infra.atomic_json import atomic_write_json
@@ -22,25 +22,51 @@ class SidecarAttemptStore:
         path = self._path_for(key)
         if not path.exists():
             return None
-        attempt = self._read(path)
+        attempt = self._read(path, attempt_ref=_attempt_ref(key))
         if not _names_same_attempt(attempt.key, key):
-            raise ValueError(f"Attempt sidecar key mismatch: {path}")
+            raise CorruptAttemptEvidence(
+                path=path,
+                attempt_ref=_attempt_ref(key),
+                reason=(
+                    "Attempt sidecar key mismatch: the record names "
+                    f"{_attempt_ref(attempt.key)}"
+                ),
+            )
         return attempt
 
-    def _read(self, path: Path) -> Attempt:
-        """The record one sidecar file states, or a loud failure.
+    def _read(self, path: Path, *, attempt_ref: str) -> Attempt:
+        """The record one sidecar file states, or a loud, attributed failure.
 
         Shared by both readers so an enumeration cannot parse by a laxer rule
         than a keyed read: a payload one accepted and the other rejected would
         make "what is recorded for this candidate" depend on how it was asked.
+
+        Every failure direction raises :class:`CorruptAttemptEvidence` rather
+        than a bare ``ValueError`` (#378), because the caller's obligation is
+        not "handle a value error" — it is to refuse THIS candidate while
+        naming the file, the attempt and the reason. An untyped failure is what
+        left the R31 planning loop with nothing to refuse and nothing to say.
         """
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
-            raise ValueError(f"Attempt sidecar is unreadable: {path}") from exc
+            raise CorruptAttemptEvidence(
+                path=path,
+                attempt_ref=attempt_ref,
+                reason=f"Attempt sidecar is unreadable: {exc}",
+            ) from exc
         if not isinstance(payload, dict):
-            raise ValueError(f"Attempt sidecar must contain an object: {path}")
-        return Attempt.from_dict(payload)
+            raise CorruptAttemptEvidence(
+                path=path,
+                attempt_ref=attempt_ref,
+                reason="Attempt sidecar must contain an object",
+            )
+        try:
+            return Attempt.from_dict(payload)
+        except ValueError as exc:
+            raise CorruptAttemptEvidence(
+                path=path, attempt_ref=attempt_ref, reason=str(exc)
+            ) from exc
 
     def update(self, key: AttemptKey, mutate: Callable[[Attempt], Attempt]) -> Attempt:
         existing = self.for_key(key)
@@ -60,7 +86,7 @@ class SidecarAttemptStore:
             return ()
         issue_prefix = f"{_issue_part(issue_key)}--"
         attempts = [
-            self._read(path)
+            self._read(path, attempt_ref=f"{issue_key.scope()}:{issue_key.stable_id()}")
             for path in sorted(self._base_dir.glob(f"{issue_prefix}*.json"))
             if path.is_file()
         ]
@@ -85,6 +111,11 @@ class SidecarAttemptStore:
         issue_part = _issue_part(key.issue_key)
         sha_part = key.head_sha
         return self._base_dir / f"{issue_part}--{sha_part}.json"
+
+
+def _attempt_ref(key: AttemptKey) -> str:
+    """How a refusal names the attempt it could not read (#378)."""
+    return f"{key.issue_scope}:{key.issue_stable_id}@{key.head_sha}"
 
 
 def _names_same_attempt(left: AttemptKey, right: AttemptKey) -> bool:

@@ -64,8 +64,10 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 
+from ..domain.attempt import AttemptIdentityError
 from ..domain.issue_key import IssueKey
 from ..domain.validation_profile import ValidationGateKind
+from ..domain.validation_verdict_receipt import ValidationVerdictReceipt
 from ..infra.validation_profiles import (
     UnknownValidationProfileError,
     ValidationProfileRegistry,
@@ -149,6 +151,12 @@ class CandidatePublicationEvidence:
                 issue_key=issue_key,
                 head_sha=head_sha or "",
             )
+        except AttemptIdentityError:
+            # The other half of the same identity (#378): a key naming no
+            # repository scope or no stable id identifies no work item, which
+            # is the same refusal a caller with no key at all gets — and not
+            # the SHA refusal below, whose remedy is a different one.
+            return _refuse("publication_candidate_unidentified")
         except (TypeError, ValueError):
             # No usable candidate SHA: the PR read did not carry a head, or
             # carried one this codebase will not compare (abbreviated, non-hex).
@@ -187,23 +195,37 @@ class CandidatePublicationEvidence:
             # attempt already decides all four against its own key.
             return _refuse("publication_verdict_not_passed")
 
-        try:
-            contract = profiles.resolve(receipt.profile).contract(
-                ValidationGateKind.PUBLISH
-            )
-        except UnknownValidationProfileError:
-            # The contract this candidate was validated under no longer exists,
-            # so nothing can say whether the pass still means anything.
-            return _refuse("publication_profile_retired")
+        return _still_the_required_contract(receipt, profiles)
 
-        mismatch = contract.result_mismatch(
-            suite=receipt.suite,
-            command=receipt.command,
-            profile=receipt.profile,
+
+def _still_the_required_contract(
+    receipt: ValidationVerdictReceipt, profiles: ValidationProfileRegistry
+) -> PublicationCertification:
+    """Whether the contract this PASS was earned under is the required one.
+
+    The last phase of certification and a question of its own: everything
+    before it asks what the candidate's own record says, and this asks whether
+    the repository still requires what that record proves. Both ways of
+    answering "no" name themselves, because a retired profile and a drifted
+    command have different remedies.
+    """
+    try:
+        contract = profiles.resolve(receipt.profile).contract(
+            ValidationGateKind.PUBLISH
         )
-        if mismatch is not None:
-            return _refuse(f"publication_contract_changed:{mismatch}")
-        return _ADMITTED
+    except UnknownValidationProfileError:
+        # The contract this candidate was validated under no longer exists,
+        # so nothing can say whether the pass still means anything.
+        return _refuse("publication_profile_retired")
+
+    mismatch = contract.result_mismatch(
+        suite=receipt.suite,
+        command=receipt.command,
+        profile=receipt.profile,
+    )
+    if mismatch is not None:
+        return _refuse(f"publication_contract_changed:{mismatch}")
+    return _ADMITTED
 
 
 __all__ = ["CandidatePublicationEvidence", "PublicationCertification"]

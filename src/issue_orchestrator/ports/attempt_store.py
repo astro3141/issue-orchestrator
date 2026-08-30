@@ -11,10 +11,26 @@ from ..domain.issue_key import IssueKey
 
 @runtime_checkable
 class AttemptStore(Protocol):
-    """Persistence boundary for #6130 attempt state."""
+    """Persistence boundary for #6130 attempt state.
+
+    Damage is part of this contract, not an implementation detail (#378). A
+    record that exists but cannot be read raises
+    :class:`~..domain.attempt.CorruptAttemptEvidence`, which names the file,
+    the attempt asked for, and why — never ``None``, never a default record.
+    "Nothing is recorded" and "the record of what was decided is damaged" have
+    different remedies, and a caller that cannot tell them apart will grant
+    authority to a candidate on the strength of a broken instrument.
+
+    ``AttemptKey`` refuses an identity that names no repository scope or no
+    stable issue id, so no implementation is ever asked to derive a path or a
+    payload from one.
+    """
 
     def for_key(self, key: AttemptKey) -> Attempt | None:
-        """Return an attempt record for ``key`` if one exists."""
+        """Return an attempt record for ``key`` if one exists.
+
+        ``None`` means no record — never a record that could not be read.
+        """
         ...
 
     def update(self, key: AttemptKey, mutate: Callable[[Attempt], Attempt]) -> Attempt:

@@ -344,7 +344,14 @@ class TestPRScannerSessionFiltering:
         configure_publication_contract(test_config)
         head_sha = "a" * 40
         issue = Issue(
-            number=123, title="Test issue", labels=["agent:backend"], body=""
+            number=123,
+            title="Test issue",
+            labels=["agent:backend"],
+            body="",
+            # The repository the adapter stamps on every real snapshot. Without
+            # it ``issue.key`` scopes to nothing, and the receipt would be filed
+            # under an identity the durable store refuses (#378).
+            repo=test_config.repo,
         )
         mock_repository_scanner.get_issue = Mock(return_value=issue)
         mock_repository_scanner.get_prs_with_label = Mock(
