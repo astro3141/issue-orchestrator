@@ -72,6 +72,9 @@ from issue_orchestrator.ports.working_copy import (
 )
 from tests.callback_endpoint_helpers import ready_callback_endpoint
 from tests.unit.session_run_helpers import make_session_run_assets
+from tests.unit.tech_lead_completion_validation_helpers import (
+    passing_completion_validator,
+)
 
 TECH_LEAD_AGENT = "agent:tech-lead"
 CODER_AGENT = "agent:coder"
@@ -298,6 +301,9 @@ def _processor(
         label_config={},
         config=config,
         tech_lead_authority=authority_store,
+        # The trusted completion-validation owner (#385): a COMPLETED tech_lead
+        # run is refused without one, and this suite is about the quick gate.
+        tech_lead_completion_validator=passing_completion_validator(),
     )
 
 

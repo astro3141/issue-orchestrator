@@ -17,6 +17,9 @@ from ..execution.session_output_adapter import FileSystemSessionOutput
 from ..infra import runtime_identity
 from ..control.completion_ports import LabelAdapter, PRAdapter
 from ..infra.config import Config
+from ..infra.tech_lead_completion_validation import (
+    TrustedTechLeadCompletionValidator,
+)
 from ..ports import EventSink
 from ..ports.coder_prompt import (
     CoderPromptAddendumProvider,
@@ -238,6 +241,15 @@ def create_completion_components(
         review_artifact_reader=ManifestReviewArtifactReader(),
         runtime_identity=runtime_identity.resolve_runtime_identity(),
         tech_lead_authority=tech_lead_authority,
+        # The completion protocol's mandatory validation, executed here in the
+        # orchestrator's process instead of inside the Tech Lead model session
+        # (#385). The primary checkout — not the disposable scratch worktree —
+        # holds the durable verdicts, so the evidence outlives the run and no
+        # session can write it.
+        tech_lead_completion_validator=TrustedTechLeadCompletionValidator(
+            working_copy=working_copy,
+            repo_root=config.repo_root,
+        ),
         needs_human_block=needs_human_block,
         unrecorded_refusals=unrecorded_refusals,
         # The gate's verdict is the last moment the agent's completion record

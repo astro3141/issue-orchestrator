@@ -53,8 +53,8 @@ from .subject_recovery_authority import (
 from .tech_lead_completion import (
     manifest_failure_label_actions,
     resolve_launch_authority_for_session,
-    split_tech_lead_decision_error,
 )
+from .tech_lead_completion_errors import split_tech_lead_decision_error
 from .tech_lead_decision_actions import plan_tech_lead_rejection_action
 from .tech_lead_session_policy import is_tech_lead_session
 

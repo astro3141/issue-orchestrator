@@ -13,10 +13,8 @@ from .actions import Action, AddCommentAction, AddLabelAction, RemoveLabelAction
 from .agent_blocked_completion import agent_blocked_actions
 from .agent_needs_human_completion import agent_needs_human_actions
 from .open_issue_corpus import OpenIssueCorpusManager
-from .tech_lead_completion import (
-    generate_tech_lead_completion_actions,
-    has_tech_lead_decision_errors,
-)
+from .tech_lead_completion import generate_tech_lead_completion_actions
+from .tech_lead_completion_errors import has_tech_lead_decision_errors
 from .subject_recovery_authority import SubjectRecoveryAuthority
 from .tech_lead_candidate_disposition import repository_candidate_observations
 from .tech_lead_terminal_effects import (

@@ -48,6 +48,10 @@ from issue_orchestrator.infra.config import Config
 from issue_orchestrator.infra.tech_lead_authority_store import (
     SqliteTechLeadAuthorityStore,
 )
+from tests.unit.tech_lead_completion_validation_helpers import (
+    StubTechLeadCompletionValidator,
+    passing_completion_validator,
+)
 
 LAUNCH_SHA = "e" * 40
 RUN_ID = "20260824T153405000000Z"
@@ -115,10 +119,12 @@ class ArmedRun:
         outcome: CompletionOutcome = CompletionOutcome.BLOCKED,
         requested_actions: tuple[RequestedAction, ...] = BLOCKED_INTENTS,
         reader: FakeWorktreeReader | None = None,
+        validator: StubTechLeadCompletionValidator | None = None,
     ):
         return settle_tech_lead_completion(
             self.config,
             tech_lead_authority=self.store,
+            completion_validator=validator or passing_completion_validator(),
             run_dir=self.run_dir,
             run_id=RUN_ID,
             session_name=SESSION_NAME,

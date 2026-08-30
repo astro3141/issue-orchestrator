@@ -70,6 +70,10 @@ from issue_orchestrator.ports.working_copy import (
 from issue_orchestrator.domain.events import EventBus, SessionEvent
 from issue_orchestrator.infra.issue_diagnostics import DiagnosticReference
 from tests.unit.publication_evidence_helpers import verdict_with_no_evidence
+from tests.unit.tech_lead_completion_validation_helpers import (
+    StubTechLeadCompletionValidator,
+    passing_completion_validator,
+)
 from tests.unit.session_run_helpers import make_session_run_assets
 
 
@@ -3288,6 +3292,9 @@ class TestCompletionProcessorPRActions:
         )
 
 
+TECH_LEAD_HEAD_SHA = "d" * 40
+
+
 class TestTechLeadCompletionEffects:
     """Tech Lead completion effects (#6768 B1 / ADR-0031).
 
@@ -3312,6 +3319,7 @@ class TestTechLeadCompletionEffects:
         tech_lead_authority=None,
         pre_publish_gate=None,
         review_exchange_max_rounds=None,
+        tech_lead_completion_validator=None,
     ) -> CompletionProcessor:
         prompt = tmp_path / "tech-lead.md"
         prompt.write_text("Tech Lead prompt")
@@ -3335,6 +3343,9 @@ class TestTechLeadCompletionEffects:
         if review_exchange_max_rounds is not None:
             config.review_exchange_max_rounds = review_exchange_max_rounds
         mock_git_adapter.default_branch.return_value = "main"
+        # The orchestrator's own read of the finished checkout: the commit the
+        # trusted completion validation is bound to (#385).
+        mock_git_adapter.get_head_sha.return_value = TECH_LEAD_HEAD_SHA
         from issue_orchestrator.infra.tech_lead_authority_store import (
             SqliteTechLeadAuthorityStore,
         )
@@ -3353,6 +3364,9 @@ class TestTechLeadCompletionEffects:
             label_config={},
             config=config,
             tech_lead_authority=tech_lead_authority,
+            tech_lead_completion_validator=(
+                tech_lead_completion_validator or passing_completion_validator()
+            ),
         )
 
     @staticmethod
@@ -4015,6 +4029,65 @@ class TestTechLeadCompletionEffects:
 
         assert not result.errors
 
+    def test_a_refused_completion_validation_produces_zero_effects(
+        self,
+        tmp_path,
+        mock_label_adapter,
+        mock_pr_adapter,
+        mock_git_adapter,
+        event_bus,
+        tech_lead_authority_store,
+        worktree_with_completion,
+    ):
+        """#385 R3/F5, end to end: no push, no PR, no comment, no label.
+
+        The lane-level fail-closed directions live in
+        ``tests/unit/control/test_tech_lead_completion_validation_gate.py``;
+        this is the other half of the boundary — that the refusal reaches the
+        generic action executor as "execute nothing".
+        """
+        from issue_orchestrator.control.completion_types import (
+            ERROR_PREFIX_TECH_LEAD_COMPLETION_VALIDATION,
+        )
+        from issue_orchestrator.domain.tech_lead_completion_validation import (
+            TechLeadCompletionValidationStatus,
+        )
+
+        validator = StubTechLeadCompletionValidator(
+            status=TechLeadCompletionValidationStatus.FAILED,
+            detail="uncommitted content (dirty_check='tracked'): src/a.py",
+        )
+        processor = self._make_processor(
+            tmp_path,
+            mock_label_adapter,
+            mock_pr_adapter,
+            mock_git_adapter,
+            event_bus,
+            tech_lead_authority=tech_lead_authority_store,
+            tech_lead_completion_validator=validator,
+        )
+        worktree = worktree_with_completion(self._completed_record())
+        run_assets = self._armed_run_assets(tech_lead_authority_store, worktree)
+
+        result = self._process(
+            processor,
+            worktree,
+            agent_label="agent:tech-lead",
+            run_assets=run_assets,
+        )
+
+        assert result.success is False
+        assert any(
+            error.startswith(ERROR_PREFIX_TECH_LEAD_COMPLETION_VALIDATION)
+            for error in result.errors
+        )
+        mock_git_adapter.push.assert_not_called()
+        mock_pr_adapter.create_pr.assert_not_called()
+        mock_pr_adapter.add_comment.assert_not_called()
+        mock_label_adapter.add_label.assert_not_called()
+        # The trusted owner was asked about the commit the orchestrator read.
+        assert validator.calls[0]["candidate_head_sha"] == TECH_LEAD_HEAD_SHA
+
 
 class _PlanningLaneHarness:
     """Arming shared by the tech_lead planning-completion lane suites.
@@ -4070,6 +4143,10 @@ class _PlanningLaneHarness:
             label_config={},
             config=config,
             tech_lead_authority=tech_lead_authority_store,
+            # The trusted completion-validation owner (#385). These suites vary
+            # the checkout's zero-code proof, not its publishability, so the
+            # owner passes and the lane under test is the one that moves.
+            tech_lead_completion_validator=passing_completion_validator(),
         )
 
     @staticmethod
@@ -4291,7 +4368,6 @@ class TestZeroCodePlanningLane(_PlanningLaneHarness):
         [
             ("d" * 40, [], "HEAD moved after launch"),
             ("c" * 40, ["src/thing.py"], "blocking tracked dirt is present"),
-            (None, [], "HEAD is unreadable"),
             ("c" * 40, None, "tracked dirt is unenumerable"),
         ],
     )
@@ -4328,6 +4404,56 @@ class TestZeroCodePlanningLane(_PlanningLaneHarness):
 
         assert mock_git_adapter.push.called, why
         assert mock_pr_adapter.create_pr.called, why
+
+    def test_an_unreadable_head_now_refuses_the_completion_outright(
+        self,
+        tmp_path,
+        mock_label_adapter,
+        mock_pr_adapter,
+        mock_git_adapter,
+        event_bus,
+        tech_lead_authority_store,
+        worktree_with_completion,
+    ):
+        """Unreadable HEAD was "unproven zero code"; since #385 it is also
+        "unvalidatable".
+
+        The zero-code lane's answer has not changed — an unreadable checkout is
+        not a checkout proven unchanged, so no publication intent is dropped.
+        What changed is that the completion no longer settles at all: the
+        trusted completion validation must be bound to the exact commit the
+        orchestrator observed, and there is no commit to bind it to. That is
+        strictly more conservative than the publication path this case used to
+        take.
+        """
+        from issue_orchestrator.control.completion_types import (
+            ERROR_PREFIX_TECH_LEAD_COMPLETION_VALIDATION,
+        )
+
+        processor = self._make_processor(
+            tmp_path,
+            mock_label_adapter,
+            mock_pr_adapter,
+            mock_git_adapter,
+            event_bus,
+            tech_lead_authority_store,
+        )
+        mock_git_adapter.get_head_sha.return_value = None
+        mock_git_adapter.list_dirty_files.return_value = []
+        worktree = worktree_with_completion(self._completed_record())
+        run_assets = self._arm_planning_run(
+            tech_lead_authority_store, worktree, launch_base_sha=self.LAUNCH_SHA
+        )
+
+        result = self._process(processor, worktree, run_assets)
+
+        assert result.success is False
+        assert any(
+            error.startswith(ERROR_PREFIX_TECH_LEAD_COMPLETION_VALIDATION)
+            for error in result.errors
+        )
+        assert not mock_git_adapter.push.called
+        assert not mock_pr_adapter.create_pr.called
 
     def test_a_legacy_authority_row_keeps_the_publication_path(
         self,

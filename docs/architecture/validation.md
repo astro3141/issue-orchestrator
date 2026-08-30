@@ -1383,6 +1383,51 @@ The per-worktree command guards remain scoped as they are: only the
 because only there is running a gate a *procedural* error as well as an
 ownership one.
 
+### Nor does a Tech Lead run its own completion pre-push (#385)
+
+#370 moved the gate `coding-done` runs. It did not move the one the completion
+*protocol document* asks for: `resources/coding_done.md` makes `prepush-check
+--dirty-only -v` mandatory before `coding-done`, and a Tech Lead was handed
+that document because a tech-lead session takes the coding launch lane. R32
+proved the consequence on the exact same path #364 measured — a fresh bounded
+Codex Tech Lead reached the completion protocol, ran the command, and died with
+`PermissionError: Operation not permitted` writing
+`<git-common-dir>/issue-orchestrator/validate-timings.jsonl`.
+
+The repair moves the OWNER, not the gate:
+
+| Piece | Where |
+|-------|-------|
+| The Tech Lead completion protocol (no `prepush-check`) | `resources/tech_lead_done.md`, selected by `TaskKind.TECH_LEAD` in `resources.get_completion_instructions` |
+| The trusted owner that runs the check | `infra/tech_lead_completion_validation.py`, behind `ports/tech_lead_completion_validation.py` |
+| The publishable-tree rule both callers share | `infra/dirty_tree_guard.py` (also what `prepush-check` now asks) |
+| The evidence | `domain/tech_lead_completion_validation.py`, filed under `<repo>/.issue-orchestrator/state/tech-lead-completion-validation/` |
+| The fail-closed gate | `control/tech_lead_completion_validation.py`, called from `settle_tech_lead_completion` |
+
+The launcher declares the role — `TaskKind.TECH_LEAD` reaches
+`AgentConfig.get_command_for_prompt` for a tech-lead agent — while the session
+KEY stays `TaskKind.CODE`, because there is still one session slot per issue.
+That is the whole selection: task kind names the role whose completion protocol
+and sandbox role apply, and nothing else about the launch changes.
+
+The trusted owner runs in the orchestrator's process, so it makes the shared
+git-common-dir timing write the model could not, under
+`kind: tech_lead_completion_validation`. Its verdict is filed create-once per
+exact `(run_id, session_name, candidate_head_sha)` and read back before it is
+returned, so an unwritable or unreadable record is an `UNAVAILABLE` verdict
+rather than an unnoticed no-op.
+
+A COMPLETED tech-lead completion is then refused — zero push, PR, comment or
+label, and a FAILED session — whenever that verdict is missing, failed, timed
+out, unavailable, or bound to a different run/session/commit than the one the
+orchestrator observed. The refusal carries
+`ERROR_PREFIX_TECH_LEAD_COMPLETION_VALIDATION`, which routes it to the tech-lead
+terminal-effects owner alongside the authority and decision refusals.
+
+Actor and Reviewer completion is untouched: `coding_done.md` still makes
+`prepush-check --dirty-only -v` mandatory, and the gate lives inside
+`settle_tech_lead_completion`, which no other principal reaches.
+
 ### The other principal that must not run the gate
 
 A `planning_investigation` Tech Lead is refused the same commands, for an

@@ -44,7 +44,11 @@ from issue_orchestrator.entrypoints.setup_wizard_prompts import (
     build_tech_lead_review_prompt_text,
 )
 from issue_orchestrator.control.label_manager import LabelManager
-from issue_orchestrator.resources import get_coding_done_instructions, get_reviewer_done_instructions
+from issue_orchestrator.resources import (
+    get_coding_done_instructions,
+    get_reviewer_done_instructions,
+    get_tech_lead_done_instructions,
+)
 from tests.git_push_authorization import authorized_local_fixture_git_env
 from tests.conftest import make_provider_availability
 from tests.unit.session_run_helpers import make_session_run_assets
@@ -278,7 +282,16 @@ def test_control_api_prompt_templates_have_valid_completion_commands(
 
 
 def test_canonical_completion_instructions_have_valid_commands(tmp_path: Path) -> None:
-    combined = get_coding_done_instructions() + "\n" + get_reviewer_done_instructions()
+    combined = "\n".join(
+        (
+            get_coding_done_instructions(),
+            get_reviewer_done_instructions(),
+            # The Tech Lead protocol is a third canonical document since #385:
+            # same `coding-done` command surface, without the host-mutating
+            # pre-push step a bounded Tech Lead may not run.
+            get_tech_lead_done_instructions(),
+        )
+    )
     commands = _extract_completion_commands(combined)
     _assert_commands_are_valid(commands, cwd=tmp_path)
 

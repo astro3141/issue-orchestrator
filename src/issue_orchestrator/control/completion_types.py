@@ -17,6 +17,14 @@ ERROR_PREFIX_TECH_LEAD_DECISION = "tech_lead_decision"
 # no longer match it — tamper evidence. Critical like the decision prefix
 # (#6761 re-review finding 1).
 ERROR_PREFIX_TECH_LEAD_AUTHORITY = "tech_lead_authority"
+# A COMPLETED tech_lead session whose MANDATORY completion validation — the one
+# #385 moved off the model session onto a trusted owner, because running it
+# needed shared-repository writes a bounded Tech Lead sandbox does not grant —
+# is missing, failed, timed out, unavailable, or bound to another
+# candidate/run. Critical like the two prefixes above: the completion protocol
+# is still gated, so an ungated completion must be a FAILED session rather than
+# a quiet success that could project a merge-facing PASS.
+ERROR_PREFIX_TECH_LEAD_COMPLETION_VALIDATION = "tech_lead_completion_validation"
 # A label that only NeedsHumanBlock may write reached an ordinary label writer
 # (#6999 F2 round 5). Its own prefix, and NOT one of the publish prefixes,
 # because the two consequences differ: a publish error is retried by the

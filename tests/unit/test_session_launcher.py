@@ -1082,6 +1082,58 @@ class TestLaunchIssueSession:
             agent_label="agent:tech-lead",
         )
 
+    def test_tech_lead_command_is_never_told_to_run_prepush_check(
+        self,
+        internal_review_launcher_bundle,
+        tmp_path,
+    ):
+        """#385 F1/F2: the bounded Tech Lead is not handed the host-mutating step.
+
+        ``prepush-check`` records its timing under the repository's shared git
+        common dir, which is outside a bounded Tech Lead's write roots — the
+        measured cause of a run that could not complete at all. The command is
+        not skipped, it is owned elsewhere, so what the session is handed must
+        not name it.
+        """
+        bundle, provider = internal_review_launcher_bundle
+        prompt_path = tmp_path / "tech-lead-prompt.md"
+        bundle.launcher.config.agents["agent:tech-lead"] = AgentConfig(
+            prompt_path=prompt_path,
+            model="sonnet",
+            timeout_minutes=45,
+        )
+        bundle.launcher.config.tech_lead_review_agent = "agent:tech-lead"
+        provider.prepare.return_value = PreparedCoderPromptAddendum(None)
+        issue = Issue(
+            number=126,
+            title="Batch Review",
+            labels=["agent:tech-lead"],
+            repo="test/repo",
+        )
+
+        result = bundle.launcher.launch_issue_session(issue, active_sessions=[])
+
+        assert result.success is True
+        command = bundle.create_session_calls[0]["cmd"]
+        # The coder protocol's imperative — the exact command #383 died on.
+        assert "prepush-check --dirty-only -v" not in command
+        assert "Validation is NOT yours to run" in command
+        assert "Do not run `prepush-check`" in command
+        assert "coding-done completed" in command
+
+    def test_a_coder_command_still_carries_the_prepush_step(
+        self,
+        internal_review_launcher_bundle,
+        sample_issue,
+    ):
+        """R4 control: the Actor's completion protocol is unchanged."""
+        bundle, _provider = internal_review_launcher_bundle
+
+        result = bundle.launcher.launch_issue_session(sample_issue, active_sessions=[])
+
+        assert result.success is True
+        assert "prepush-check --dirty-only -v" in bundle.create_session_calls[0]["cmd"]
+
     def test_tech_lead_launch_preserves_branch_but_coding_does_not(
         self, session_launcher, mock_worktree_manager, sample_config, sample_issue, tmp_path
     ):

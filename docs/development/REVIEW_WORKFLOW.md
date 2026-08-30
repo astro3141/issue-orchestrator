@@ -567,6 +567,45 @@ owner now outside the model sandbox, a refusal that could only say "something
 about this commit was not shown" could not tell an operator whether to go and
 find a review or a validation run, and those have different remedies.
 
+#### So is the completion protocol's own pre-push (#385)
+
+#370 moved the gate `coding-done` runs. It did not move the one the completion
+protocol *document* asks for. A tech-lead session takes the coding launch lane,
+so it was handed `resources/coding_done.md`, which makes `prepush-check
+--dirty-only -v` mandatory before `coding-done` — the same shared-git-dir write
+#364 measured, reached by a different route. The R32 proof (#383) died there:
+`PermissionError: Operation not permitted` on
+`<git-common-dir>/issue-orchestrator/validate-timings.jsonl`, with no
+completion at all.
+
+The owner moved again, and the gate stayed:
+
+- **The Tech Lead gets its own completion protocol.**
+  `resources/tech_lead_done.md`, selected because the coding lane now declares
+  the launched agent's ROLE (`TaskKind.TECH_LEAD`) even though the session KEY
+  stays `TaskKind.CODE` — one session slot per issue, two different questions.
+  It still requires a committed, clean checkout, still completes with
+  `coding-done`, and explicitly forbids running `prepush-check` even if a
+  repository's own task prompt asks for it.
+- **A trusted owner runs the validation instead.**
+  `infra/tech_lead_completion_validation.py`, behind
+  `ports/tech_lead_completion_validation.py`, runs in the orchestrator's
+  process. It asks the same publishable-tree question `prepush-check
+  --dirty-only` asks (one owner, `infra/dirty_tree_guard.py`), makes the shared
+  git-common-dir timing write the model could not, and files a durable verdict
+  under `<repo>/.issue-orchestrator/state/tech-lead-completion-validation/`,
+  create-once per exact `(run, session, candidate commit)`.
+- **The completion is gated on that verdict.**
+  `control/tech_lead_completion_validation.py` refuses a COMPLETED tech-lead
+  completion — zero push, PR, comment or label, FAILED session, refusal
+  surfaced on the anchor issue — when the verdict is missing, failed, timed
+  out, unavailable, or bound to a different run/session/commit than the one the
+  orchestrator observed on the finished checkout.
+
+Actor and Reviewer completion is untouched: `coding_done.md` still makes the
+step mandatory for them, and the gate lives inside the tech-lead completion
+owner, which no other principal reaches.
+
 #### Leaving the watch set
 
 The set that trips the batch threshold has to be the set a review settles, or

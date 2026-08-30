@@ -112,6 +112,7 @@ from .completion_ports import (
     PRAdapter,
 )
 from .completion_pre_action import PreActionOutcome, settle_tech_lead_pre_action
+from .tech_lead_completion_validation import UNWIRED_TECH_LEAD_COMPLETION_VALIDATOR
 from .completion_pr_labels import apply_pr_labels, reserved_pr_label_error
 from .completion_types import (
     ActionExecutionOutcome,
@@ -152,6 +153,7 @@ if TYPE_CHECKING:
     from ..ports.agent_callback_endpoint import AgentCallbackEndpoint
     from ..ports.review_exchange_approval_gate import ReviewExchangeApprovalGate
     from ..ports.tech_lead_authority import TechLeadAuthorityStore
+    from ..ports.tech_lead_completion_validation import TechLeadCompletionValidator
     from .stack_base import StackBaseDecision
     from .stack_publish_gate import StackBaseGate
 
@@ -205,6 +207,7 @@ class CompletionProcessor:
         review_artifact_reader: ReviewArtifactReader | None = None,
         runtime_identity: RuntimeIdentity | None = None,
         tech_lead_authority: "TechLeadAuthorityStore | None" = None,
+        tech_lead_completion_validator: "TechLeadCompletionValidator | None" = None,
         # The one owner of the shared needs-human block (#6999 F2 round 3).
         # An explicit null object rather than an optional: it governs no label,
         # so a composition path without one behaves as it always did.
@@ -246,6 +249,10 @@ class CompletionProcessor:
             tech_lead_authority: Orchestrator-owned tech_lead launch-authority port
                 (ADR-0031). Required whenever tech_lead completions are
                 processed; the fail-fast default raises on first use.
+            tech_lead_completion_validator: Runs a tech_lead run's mandatory
+                completion validation outside the model sandbox and files
+                durable, candidate-bound evidence (#385). Without it every
+                COMPLETED tech_lead run is refused.
         """
         self.label_adapter = label_adapter
         self.needs_human_block = needs_human_block
@@ -310,6 +317,11 @@ class CompletionProcessor:
         self._review_artifact_reader = review_artifact_reader or MissingReviewArtifactReader()
         self._tech_lead_authority: "TechLeadAuthorityStore" = (
             tech_lead_authority or MissingTechLeadAuthorityStore()
+        )
+        # #385: a null object that REFUSES rather than raises, so an unwired
+        # composition looks like an owner that could not answer.
+        self._tech_lead_completion_validator: "TechLeadCompletionValidator" = (
+            tech_lead_completion_validator or UNWIRED_TECH_LEAD_COMPLETION_VALIDATOR
         )
         self._runtime_identity = runtime_identity
         # Optional stack publish-gate owner (ADR-0029 / #6596). When attached, a
@@ -929,6 +941,7 @@ class CompletionProcessor:
         settled = settle_tech_lead_pre_action(
             self._config,
             tech_lead_authority=self._tech_lead_authority,
+            completion_validator=self._tech_lead_completion_validator,
             worktree=worktree,
             record=record,
             agent_label=agent_label,
