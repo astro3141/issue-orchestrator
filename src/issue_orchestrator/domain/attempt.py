@@ -57,6 +57,7 @@ unchanged after a run that already discharged it.
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from pathlib import Path
 
 from .commit_sha import normalize_commit_sha
 from .continuation_descriptor import ContinuationDescriptor
@@ -131,9 +132,67 @@ class StoredIssueKey:
         return f"{self.key_scope}:{self.stable}"
 
 
+class AttemptIdentityError(ValueError):
+    """A durable attempt identity cannot name one candidate (#378).
+
+    Raised by :class:`AttemptKey` — the one owner of the rule — and by
+    :meth:`Attempt.from_dict`, which asks the same question of a payload. Two
+    enforcement points, one predicate: see :func:`require_identity_component`.
+    """
+
+
+class CorruptAttemptEvidence(ValueError):
+    """A durable attempt record exists but does not state a readable attempt.
+
+    Distinct from absence, and it must stay distinct (#378). Absence means "no
+    gate, no exchange and no continuation has recorded anything about this
+    candidate"; this means the record of what they decided is damaged. Reading
+    the second as the first is a claim about the world made from a broken
+    instrument, and reading it as a crash aborts every unrelated candidate the
+    same control pass was going to handle.
+
+    Carries the three things a reader has to be able to say out loud when it
+    refuses: WHERE the damaged record is, WHICH attempt was asked for, and WHY
+    it could not be read.
+    """
+
+    def __init__(self, *, path: Path, attempt_ref: str, reason: str) -> None:
+        self.path = path
+        self.attempt_ref = attempt_ref
+        self.reason = reason
+        super().__init__(
+            f"Attempt evidence for {attempt_ref} at {path} is unreadable: {reason}"
+        )
+
+
+def require_identity_component(value: object, *, refusal: str) -> str:
+    """The one predicate for "this half of an attempt identity is nameable".
+
+    Both halves of a durable attempt identity — the repository scope and the
+    stable issue id — have to survive a round trip through a sidecar, and the
+    R31 defect (#378) was that they did not: the writer serialized a blank
+    ``issue_scope`` that its own reader rejected. Stating the rule once and
+    calling it from both ends is what makes that asymmetry unrepresentable;
+    a second spelling on either side is how the two ends drift apart again.
+
+    ``refusal`` is the caller's own attribution, because the two ends refuse
+    about different things — one about an identity it was handed, the other
+    about a payload it just read — and an operator has to be able to tell which.
+    """
+    if not isinstance(value, str) or not value.strip():
+        raise AttemptIdentityError(refusal)
+    return value
+
+
 @dataclass(frozen=True)
 class AttemptKey:
-    """Stable identity for an issue attempt at a specific commit."""
+    """Stable identity for an issue attempt at a specific commit.
+
+    The one owner of durable attempt identity validity (#378). Every sidecar
+    path is derived from this key and every sidecar payload serializes it, so
+    an identity this refuses cannot reach either — the refusal lands before a
+    file could be created or replaced, rather than after.
+    """
 
     issue_key: IssueKey
     head_sha: str
@@ -146,6 +205,24 @@ class AttemptKey:
             self,
             "head_sha",
             normalize_commit_sha(self.head_sha, field_name="AttemptKey.head_sha"),
+        )
+        # ...and the same reasoning for the other half of the identity. A key
+        # whose scope or stable id is blank names no work item, so evidence
+        # filed under it is unfindable by everything that holds a real issue —
+        # which is what the R31 ``--376--<sha>.json`` sidecar demonstrated.
+        require_identity_component(
+            self.issue_key.scope(),
+            refusal=(
+                "AttemptKey.issue_key names no repository scope, so nothing may "
+                f"be filed under it: {self.issue_key!r}"
+            ),
+        )
+        require_identity_component(
+            str(self.issue_key.stable_id()),
+            refusal=(
+                "AttemptKey.issue_key names no stable issue id, so nothing may "
+                f"be filed under it: {self.issue_key!r}"
+            ),
         )
 
     @property
@@ -494,10 +571,16 @@ class Attempt:
         head_sha = data.get("head_sha")
         if not isinstance(issue_key_type_raw, str) or not issue_key_type_raw.strip():
             raise ValueError("Attempt sidecar missing issue_key_type")
-        if not isinstance(issue_key_raw, str) or not issue_key_raw.strip():
-            raise ValueError("Attempt sidecar missing issue_key")
-        if not isinstance(issue_scope_raw, str) or not issue_scope_raw.strip():
-            raise ValueError("Attempt sidecar missing issue_scope")
+        # The identity halves are asked of the SAME predicate the writer's key
+        # is asked of (#378), so a payload this reader rejects is a payload the
+        # writer could never have emitted. The messages stay reader-flavoured
+        # because they are what an operator holding a damaged file reads.
+        issue_key_raw = require_identity_component(
+            issue_key_raw, refusal="Attempt sidecar missing issue_key"
+        )
+        issue_scope_raw = require_identity_component(
+            issue_scope_raw, refusal="Attempt sidecar missing issue_scope"
+        )
         if not isinstance(head_sha, str) or not head_sha.strip():
             raise ValueError("Attempt sidecar missing head_sha")
         return cls(

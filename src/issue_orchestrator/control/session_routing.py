@@ -258,7 +258,7 @@ def orchestrator_launch_tech_lead_session(
         claim=PendingWorkClaim(PendingWorkKind.TECH_LEAD, tech_lead), claims=claims
     )
     result = session_launcher.launch_issue_session(
-        Issue(tech_lead.issue_number, tech_lead.title, [agent]),
+        _tech_lead_anchor_work_item(tech_lead, config, agent),
         state.active_sessions,
         tech_lead_scope=tech_lead.launch_scope(),
         work_claim=work,
@@ -298,6 +298,39 @@ def orchestrator_launch_tech_lead_session(
         ),
         plan_retry=_plan_retry,
     ).settle(result, state)
+
+
+def _tech_lead_anchor_work_item(
+    tech_lead: PendingTechLeadReview, config: Config, agent: str
+) -> Issue:
+    """The anchor's work item, carrying the repository it belongs to (#378).
+
+    ``SessionLauncher.launch_issue_session`` keys the session — and therefore
+    every durable attempt record the session's completion files — on
+    ``issue.key``, which is ``github_issue_key(repo, number, title)``. The
+    anchor's work item is synthesized here rather than fetched, so this is the
+    one place the repository half of that key can come from, and it was
+    omitted: R31 filed ``Attempt(":376", A)`` as
+    ``.issue-orchestrator/attempts/--376--<sha>.json``, a record the product's
+    own reader rejects.
+
+    ``config.repo`` is the sanctioned source, and the same one
+    ``completion_review_exchange`` uses — ``bootstrap._resolve_repo`` writes
+    the auto-detected value back into it before any adapter exists, and builds
+    no repository host at all when none resolves. So an engine reaching here
+    without one is misconfigured in a way no launch could survive, and saying
+    so at the launch boundary is better than filing unfindable evidence and
+    discovering it a tick later.
+    """
+    repo = (config.repo or "").strip()
+    if not repo:
+        raise ValueError(
+            "Cannot launch tech lead anchor #"
+            f"{tech_lead.issue_number}: no canonical repository is configured, "
+            "so the anchor's durable attempt evidence would be filed under an "
+            "identity nothing can find again."
+        )
+    return Issue(tech_lead.issue_number, tech_lead.title, [agent], repo=repo)
 
 
 def _commit_dropped_tech_lead(
