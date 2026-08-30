@@ -1439,6 +1439,18 @@ Actor and Reviewer completion is untouched: `coding_done.md` still makes
 `prepush-check --dirty-only -v` mandatory, and the gate lives inside
 `settle_tech_lead_completion`, which no other principal reaches.
 
+One consequence is worth stating as a rule, because breaking it is how the
+repaired defect came back on a second path: **the completion protocol document
+is the only place that names a role's validation command.** An orchestrator
+prompt that needs to mention the step points back at the document instead —
+`session_controller._render_dirty_worktree_retry_prompt` says "Complete the
+validation step your completion protocol requires", not `prepush-check`. When
+it restated the command, a dirty tech-lead checkout took the dirty preflight
+(which runs *before* completion processing, so ahead of this gate), and the
+relaunch prompt ordered the one command that role may not run. Shipping the
+contradiction and resolving it by precedence inside the model is not the
+Agent-Intent/Orchestrator-Authority model; not emitting it is.
+
 ### The other principal that must not run the gate
 
 A `planning_investigation` Tech Lead is refused the same commands, for an

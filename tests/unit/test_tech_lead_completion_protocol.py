@@ -82,20 +82,24 @@ class TestTheHostMutatingStepIsGone:
         assert "reject a dirty working tree" in tech_lead
 
     def test_it_overrides_any_prompt_that_asks_for_the_command(self) -> None:
-        """Including the orchestrator's OWN validation-retry prompt.
+        """Insurance for repository-supplied text, not for our own prompts.
 
-        That prompt lists `prepush-check --dirty-only -v` as required fix step
-        4, and a tech_lead run that wrote code can be relaunched with it — so
-        an override scoped to "a repository-specific task prompt" would have
-        left the one prompt this repository generates itself outside it.
+        A target repository can supply a task prompt or a
+        ``retry_prompt_template`` that names the command; those the orchestrator
+        does not control, so the document has to win against them. What it must
+        NOT be is the resolution for a contradiction the orchestrator itself
+        ships — #385 round 2 F3/A2 removed that contradiction at its source, and
+        the document says so, so this sentence stays insurance rather than
+        becoming load-bearing.
         """
         tech_lead = _flowed(get_tech_lead_done_instructions())
 
         assert (
             "If ANY other prompt tells you to run `prepush-check`"
         ) in tech_lead
-        assert "validation-retry prompt" in tech_lead
+        assert "repository-supplied retry template" in tech_lead
         assert "this instruction wins" in tech_lead
+        assert "The orchestrator's own prompts will not ask you to" in tech_lead
 
 
 class TestTheActorProtocolIsUnchanged:

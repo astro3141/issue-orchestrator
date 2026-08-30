@@ -1662,7 +1662,14 @@ class TestSessionControllerValidationCaching:
         retry_prompt_content = retry_prompt.read_text()
         assert "No validation command ran" in retry_prompt_content
         assert "Your changes broke validation" not in retry_prompt_content
-        assert "prepush-check --dirty-only -v" in retry_prompt_content
+        # The validation step DEFERS to the role's completion protocol; naming
+        # a command here made this a second owner of that answer, and the two
+        # disagreed for a bounded Tech Lead (#385 round 2 F3/A2).
+        assert (
+            "Complete the validation step your completion protocol requires"
+            in retry_prompt_content
+        )
+        assert "prepush-check" not in retry_prompt_content
         assert "scripts/dev.sh" in retry_prompt_content
         retry_events = [
             event
