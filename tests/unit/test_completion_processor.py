@@ -1357,11 +1357,19 @@ class TestReviewExchangeModeResolution:
         makes that a measured fact rather than a reading. The real invariant is
         wider than one role — the exchange coder protocol mandates a
         shared-git-dir write that NO sandbox-opted-in agent may perform — which
-        is why the repair is a follow-up rather than #385's seam, whose STOP
-        conditions exclude generic completion-platform redesign.
+        is why the repair is a role×lane decision rather than #385's seam, whose
+        STOP conditions exclude generic completion-platform redesign.
 
-        When the follow-up lands, this test should be inverted, not deleted.
+        The exchange mode is NOT a second gate, which round 3 got wrong and
+        round 4 corrected: ``Config.review_exchange_mode`` already defaults to
+        ``via-local-loop``, asserted below so the claim cannot rot. The single
+        real gate is the ``sandbox: true`` opt-in — the configuration R33 turns
+        on — so "latent" describes this repository, not R33's target.
+
+        When the repair lands, this test should be inverted, not deleted.
         """
+        assert Config().review_exchange_mode == "via-local-loop"
+
         config = self._make_config(tmp_path)
         config.review_exchange_mode = "via-local-loop"
         config.tech_lead_review_agent = "agent:tech-lead"

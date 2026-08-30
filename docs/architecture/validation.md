@@ -1473,13 +1473,35 @@ Lead relaunched as an exchange coder therefore meets the #383 wall again, and
 
 The invariant is wider than one role: **the exchange coder protocol mandates a
 shared-git-dir write that no sandbox-opted-in agent may perform**, so a
-sandboxed Actor hits it identically. Repairing it means deciding what a
-sandboxed agent's exchange-coder protocol should be — a role×lane question, and
-generic completion-platform redesign, which #385's STOP conditions exclude. It
-is tracked as a follow-up, and
+sandboxed Actor hits it identically (`AgentConfig.sandbox` defaults `False`, so
+an unsandboxed one is unaffected). It is also **pre-existing rather than
+introduced by #385**: before this change a sandboxed Tech Lead could not
+complete on the primary lane at all, so it never reached the exchange. #385 does
+not create the wall; it moves the road far enough to reach it.
+
+What gates it is the `sandbox: true` opt-in **alone**. The other half is on by
+default — `Config.review_exchange_mode` is `"via-local-loop"`
+(`infra/config.py`, `infra/config_sections.py`). This repository's own
+`selfhost.yaml` sets no `sandbox: true`, so the gap is latent *here*; it is not
+latent for the bounded-Codex Tech Lead configuration R33 turns that opt-in on
+for.
+
+Repairing it means deciding what a sandboxed agent's exchange-coder protocol
+should be — either a role-aware document routing the obligation to the trusted
+owner above, or excluding sandbox-opted-in agents from the exchange lane so
+their PRs take the ordinary review pipeline (smaller, but it removes internal
+review from those runs). That is a role×lane product decision and generic
+completion-platform redesign, which #385's STOP conditions exclude.
+
+**Status: open, not yet tracked by an issue.** #385 round 4 established that
+`coding-done --follow-up-file` does not file one — the proposal terminates in
+the session-diagnostics dialog (`view_models/dialogs.py`) and no
+`create_issue` producer reads it — and agents hold read-only GitHub access, so
+the follow-up `AGENTS.md`'s deferral rule requires (created, owned, scheduled,
+linked) has to be opened by a human. Until it is, this section is the record.
 `tests/unit/test_completion_processor.py::TestReviewExchangeModeResolution::test_a_tech_lead_agent_is_not_excluded_from_the_exchange`
-pins the reachability so the deferral rests on a measured fact and the repair
-has an anchor to invert.
+pins the reachability, so the gap rests on a measured fact and the repair has an
+anchor to invert.
 
 ### The other principal that must not run the gate
 
