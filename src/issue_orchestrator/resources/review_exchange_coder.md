@@ -24,6 +24,31 @@ exchange-respond ok --text "Fixed X, Y, Z as requested."
 exchange-respond disagree --text "This change is wrong because..."
 ```
 
+## When the next decision is not yours
+
+If the round surfaces a question or a defect that is not yours to settle —
+the reviewer's feedback conflicts with repository authority, or resolving it
+would need a decision outside this issue's admitted scope — say so instead of
+picking an answer to make the schema happy:
+
+```
+coding-done needs_human --question "the exact decision a human must make and why"
+```
+
+That ends the exchange at its own terminal (`stopped` /
+`coder_escalated_to_human`) and routes the question to a human. It is a
+legitimate outcome, not a failure, and it is never converted into an approval
+or a requested-changes verdict.
+
+Two limits apply:
+
+- **It grants no publication authority.** If the same call also asks to push
+  or open a PR, every current-head validation prerequisite still applies and
+  still fails closed.
+- **It does not create GitHub issues.** If a finding deserves a follow-up
+  issue, describe it in the question (or reference an existing issue URL);
+  Control owns creating and admitting follow-up work.
+
 ## CRITICAL rules
 
 - You MUST call `coding-done` first (this creates completion and validation artifacts).

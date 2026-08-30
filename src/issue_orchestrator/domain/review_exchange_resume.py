@@ -216,6 +216,21 @@ won't fix itself by retrying on the same head — escalates immediately."""
 REASON_REVIEWER_DECISION_INVALID = ReviewExchangeReason.REVIEWER_DECISION_INVALID
 """Status=error terminal: reviewer produced malformed decision artifacts."""
 
+REASON_CODER_ESCALATED_TO_HUMAN = ReviewExchangeReason.CODER_ESCALATED_TO_HUMAN
+"""Status=stopped terminal: the coder answered its turn with ``needs_human``
+(#386). Deterministic on the same head — the question was raised about that
+exact commit and no amount of respawning will answer it — so it halts, and
+the caller surfaces the escalation.
+
+It is also the one terminal exempt from :func:`_is_stale`'s validation-evidence
+checks. Those checks ask "can this cache prove the commit it covers was
+validated?", which is the right question for a cached verdict about a change
+being offered for publication. An escalation offers no change: it requested no
+publication, so it never produced publish evidence, and requiring some would
+send the escalation back through a fresh exchange to be swallowed again — the
+D1/D2 pair #386 exists to close. Its head binding still applies in full: a
+new commit means a new subject, and the question is spawned fresh over it."""
+
 
 _NO_COMPLETION_REASONS: frozenset[ReviewExchangeReason] = frozenset(
     {
@@ -231,8 +246,18 @@ _TERMINAL_HALT_REASONS: frozenset[ReviewExchangeReason] = frozenset(
         REASON_MAX_ROUNDS_EXCEEDED,
         REASON_CODER_PROTOCOL_ERROR,
         REASON_REVIEWER_DECISION_INVALID,
+        REASON_CODER_ESCALATED_TO_HUMAN,
     }
 )
+
+_PUBLICATION_EVIDENCE_EXEMPT_REASONS: frozenset[ReviewExchangeReason] = frozenset(
+    {REASON_CODER_ESCALATED_TO_HUMAN}
+)
+"""Terminals whose cache never claimed publication evidence, so cannot lack it.
+
+One membership test rather than a condition spelled twice inside
+:func:`_is_stale`, because the two validation-evidence checks there ask the
+same question of the same fact and must stay answered the same way."""
 
 
 def is_no_completion_reason(reason: ReviewExchangeReason | str | None) -> bool:
@@ -323,6 +348,7 @@ _KNOWN_STATUS_REASON_PAIRS: frozenset[
         (STATUS_REVIEWER_STOPPED, REASON_REVIEWER_REQUESTED_CHANGES),
         (STATUS_REVIEWER_STOPPED, REASON_REVIEWER_REPORTS_NO_PROGRESS),
         (STATUS_REVIEWER_STOPPED, REASON_MAX_ROUNDS_EXCEEDED),
+        (STATUS_REVIEWER_STOPPED, REASON_CODER_ESCALATED_TO_HUMAN),
         (STATUS_REVIEWER_ERROR, REASON_REVIEWER_NO_COMPLETION),
         (STATUS_REVIEWER_ERROR, REASON_CODER_NO_COMPLETION),
         (STATUS_REVIEWER_ERROR, REASON_CODER_PROTOCOL_ERROR),
@@ -356,8 +382,18 @@ def _is_stale(facts: ResumeFacts) -> bool:
     - Current validation explicitly failed (validation flipped on
       the same SHA, e.g. flake fixed itself or env regression —
       cached approval no longer holds).
+
+    Every one of those except the head comparison asks about publication
+    evidence, so none of them applies to a terminal in
+    :data:`_PUBLICATION_EVIDENCE_EXEMPT_REASONS` — see
+    :data:`REASON_CODER_ESCALATED_TO_HUMAN` for why. The head comparison
+    still applies to every terminal alike.
     """
-    if facts.require_validation and facts.current_head_sha is None:
+    # Read once and conjoined into each evidence branch rather than returned
+    # from the first one: an exempt terminal must still fall through to the
+    # head comparison below, not skip it by leaving early.
+    needs_evidence = facts.reason not in _PUBLICATION_EVIDENCE_EXEMPT_REASONS
+    if facts.require_validation and facts.current_head_sha is None and needs_evidence:
         return True
     # When the current head is known, the cached head_sha must match
     # — including when the cache can't prove a head_sha at all. A
@@ -371,12 +407,16 @@ def _is_stale(facts: ResumeFacts) -> bool:
         and facts.cached_head_sha != facts.current_head_sha
     ):
         return True
-    if facts.require_validation and not facts.cached_validation_passed:
+    if (
+        facts.require_validation
+        and not facts.cached_validation_passed
+        and needs_evidence
+    ):
         # Cache could not prove its commit was validated. Includes
         # the False case (record present, passed: false) and the
         # None case (no record, no embedded head_sha). Both mean
         # "we can't trust this cache under require_validation".
         return True
-    if facts.current_validation_failed:
+    if facts.current_validation_failed and needs_evidence:
         return True
     return False

@@ -167,6 +167,31 @@ Three downstream consumers route through the same module:
   (`_legacy_response_from_typed_result`) so downstream call sites in
   the runner can be migrated incrementally.
 
+## Amendments
+
+### The coder's escalation is exempt from the validation-evidence checks (#386)
+
+`stopped` / `coder_escalated_to_human` was added as a matrix row through
+exactly the change this ADR describes — reason constant, `decide()` row,
+state-table row, production-layout row — with one addition the ladder did not
+previously admit: the row is listed in
+`_PUBLICATION_EVIDENCE_EXEMPT_REASONS`, and `_is_stale` skips its
+validation-evidence branches for it.
+
+The exemption is not a loosening of the ladder; it is the ladder asking a
+question this cell cannot answer. Every staleness branch except the head
+comparison asks "can this cache prove the commit it covers was validated?",
+which is the right question for a cached verdict about a change being offered
+for publication. An escalation offers no change: it requested no publication,
+so it produced no publish evidence, and under `require_validation` the absence
+read as an unprovable cache and spawned a fresh exchange — over the same
+commit, reaching the same escalation, forever. The head comparison still
+applies in full, so a new commit is still a new subject.
+
+The exemption set is named rather than spelled twice inline because the two
+validation-evidence branches ask one question of one fact and must stay
+answered the same way.
+
 ## Deferred
 
 - **Agent-side packet consumption.** Agents (Codex, Claude Code)

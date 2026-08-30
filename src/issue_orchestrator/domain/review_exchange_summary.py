@@ -25,6 +25,18 @@ class ReviewExchangeReason(StrEnum):
     REVIEWER_NO_COMPLETION = "reviewer_no_completion"
     CODER_NO_COMPLETION = "coder_no_completion"
     CODER_PROTOCOL_ERROR = "coder_protocol_error"
+    CODER_ESCALATED_TO_HUMAN = "coder_escalated_to_human"
+    """The coder answered its turn with ``needs_human`` (#386).
+
+    Its own terminal because the three it would otherwise collapse into say
+    something false. ``reviewer_reports_no_progress`` claims successive coder
+    turns stopped converging; ``reviewer_requested_changes`` claims the
+    reviewer rejected the commit; ``coder_protocol_error`` claims the coder
+    broke the exchange's contract. An escalation is none of those: the coder
+    kept the protocol and answered honestly that the next decision is not
+    its to make. A reader that cannot tell the two apart cannot tell a
+    question from a failure.
+    """
     REVIEWER_DECISION_INVALID = "reviewer_decision_invalid"
 
 
@@ -42,6 +54,10 @@ VALID_REVIEW_EXCHANGE_TERMINALS: frozenset[
             ReviewExchangeReason.REVIEWER_REPORTS_NO_PROGRESS,
         ),
         (ReviewExchangeStatus.STOPPED, ReviewExchangeReason.MAX_ROUNDS_EXCEEDED),
+        (
+            ReviewExchangeStatus.STOPPED,
+            ReviewExchangeReason.CODER_ESCALATED_TO_HUMAN,
+        ),
         (ReviewExchangeStatus.ERROR, ReviewExchangeReason.REVIEWER_NO_COMPLETION),
         (ReviewExchangeStatus.ERROR, ReviewExchangeReason.CODER_NO_COMPLETION),
         (ReviewExchangeStatus.ERROR, ReviewExchangeReason.CODER_PROTOCOL_ERROR),
