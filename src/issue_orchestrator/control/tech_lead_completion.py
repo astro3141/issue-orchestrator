@@ -106,8 +106,9 @@ from .label_manager import LabelManager
 from .publish_recovery import is_publish_failure
 from .proposal_dedup_gate import DuplicateTargetGrant
 from .tech_lead_decision_actions import (
+    plan_tech_lead_authority_rejection_action,
     plan_tech_lead_decision_actions,
-    plan_tech_lead_rejection_action,
+    plan_tech_lead_decision_rejection_action,
 )
 from .tech_lead_decision_loader import (
     TechLeadArtifactLoadResult,
@@ -676,7 +677,7 @@ def generate_tech_lead_completion_actions(
             detail,
         )
         actions.append(
-            plan_tech_lead_rejection_action(
+            plan_tech_lead_authority_rejection_action(
                 anchor_issue_number=session.issue.number,
                 failure=failure,
                 detail=detail,
@@ -762,7 +763,7 @@ def generate_tech_lead_completion_actions(
             load_result.detail,
         )
         actions.append(
-            plan_tech_lead_rejection_action(
+            plan_tech_lead_decision_rejection_action(
                 anchor_issue_number=session.issue.number,
                 failure=failure,
                 detail=load_result.detail,

@@ -3143,6 +3143,70 @@ class TestLaunchReworkSession:
             agent_label="agent:web",
         )
 
+    def test_a_tech_lead_rework_is_never_told_to_run_prepush_check(
+        self,
+        internal_review_launcher_bundle,
+        tmp_path,
+    ):
+        """#385 round 2 F1: the THIRD coding-lane launch site, same rule.
+
+        ``control/pr_scanner`` builds a ``PendingRework`` from the issue's own
+        ``agent:*`` label and excludes no agent, so a tech-lead run whose PR
+        draws changes-requested is relaunched here under the tech-lead agent. A
+        hardcoded ``TaskKind.REWORK`` handed that bounded Tech Lead the coder
+        protocol and its mandatory ``prepush-check --dirty-only -v`` — the #383
+        sandbox write — on a lane neither the first-launch nor the retry fix
+        touched, while the completion gate (which selects on the agent label)
+        was already validating that same completion on its behalf.
+        """
+        bundle, provider = internal_review_launcher_bundle
+        prompt_path = tmp_path / "tech-lead-prompt.md"
+        bundle.launcher.config.agents["agent:tech-lead"] = AgentConfig(
+            prompt_path=prompt_path,
+            model="sonnet",
+            timeout_minutes=45,
+        )
+        bundle.launcher.config.tech_lead_review_agent = "agent:tech-lead"
+        provider.prepare.return_value = PreparedCoderPromptAddendum(None)
+        rework = PendingRework(
+            issue_key=GitHubIssueKey(repo="test/repo", external_id="123"),
+            agent_type="agent:tech-lead",
+            rework_cycle=1,
+        )
+
+        result = bundle.launcher.launch_rework_session(rework, active_sessions=[])
+
+        assert result.success is True
+        command = bundle.create_session_calls[0]["cmd"]
+        assert "prepush-check --dirty-only -v" not in command
+        assert "Validation is NOT yours to run" in command
+        assert "Do not run `prepush-check`" in command
+        assert "coding-done completed" in command
+
+    def test_a_coder_rework_still_carries_the_prepush_step(
+        self,
+        internal_review_launcher_bundle,
+    ):
+        """R4 control on the rework lane: the Actor's protocol is unchanged.
+
+        Routing this site through ``coding_lane_task_kind`` must not restate an
+        ordinary rework as some other role — it stays a coder and still owns its
+        own pre-push step.
+        """
+        bundle, _provider = internal_review_launcher_bundle
+        rework = PendingRework(
+            issue_key=GitHubIssueKey(repo="test/repo", external_id="123"),
+            agent_type="agent:web",
+            rework_cycle=1,
+        )
+
+        result = bundle.launcher.launch_rework_session(rework, active_sessions=[])
+
+        assert result.success is True
+        assert (
+            "prepush-check --dirty-only -v" in bundle.create_session_calls[0]["cmd"]
+        )
+
     def test_missing_internal_review_instructions_fail_before_rework_mutation(
         self,
         unavailable_provider_internal_review_bundle,

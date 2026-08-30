@@ -8,8 +8,11 @@ common dir, outside the session's sandbox write roots, so a live bounded run
 
 These tests pin the two halves of the repair at the source: the Tech Lead
 document never issues the command, and the Actor/rework document still does.
-The end-to-end direction — that what the launcher hands a tech-lead session is
-this document — lives in ``tests/unit/test_session_launcher.py``.
+They also pin the owner that decides which of the two a coding-lane launch is
+handed — ``control/tech_lead_session_policy.coding_lane_task_kind`` — since the
+three launch sites are only as correct as the answer they ask it for. The
+end-to-end direction, that each launcher actually hands a tech-lead session this
+document, lives in ``tests/unit/test_session_launcher.py``.
 """
 
 from __future__ import annotations
@@ -18,6 +21,9 @@ from pathlib import Path
 
 import pytest
 
+from issue_orchestrator.control.tech_lead_session_policy import (
+    coding_lane_task_kind,
+)
 from issue_orchestrator.domain.session_key import TaskKind
 from issue_orchestrator.resources import (
     get_coding_done_instructions,
@@ -124,6 +130,87 @@ class TestTheActorProtocolIsUnchanged:
     ) -> None:
         assert get_completion_instructions(task_kind) == (
             get_reviewer_done_instructions()
+        )
+
+
+class TestTheCodingLaneRoleOwner:
+    """`coding_lane_task_kind` is the ONE place the lane's role is decided.
+
+    Three sites launch on the coding lane — the first launch, the
+    validation-retry relaunch, and the rework relaunch — and each must ask this
+    owner rather than answer with a literal (#385 round 1 F2, round 2 F1). Its
+    contract has two halves: a tech-lead agent always resolves to the Tech Lead
+    role, and every other agent keeps the lane's OWN coder kind, so routing a
+    site through the owner cannot restate an Actor as something its lane is not.
+    """
+
+    @pytest.mark.parametrize(
+        "lane_task_kind", [TaskKind.CODE, TaskKind.REWORK]
+    )
+    def test_a_tech_lead_agent_resolves_to_the_tech_lead_role_on_every_lane(
+        self, lane_task_kind: TaskKind
+    ) -> None:
+        assert (
+            coding_lane_task_kind(
+                "agent:tech-lead",
+                "agent:tech-lead",
+                lane_task_kind=lane_task_kind,
+            )
+            == TaskKind.TECH_LEAD.value
+        )
+
+    @pytest.mark.parametrize(
+        "lane_task_kind", [TaskKind.CODE, TaskKind.REWORK]
+    )
+    def test_every_other_agent_keeps_its_own_lane_kind(
+        self, lane_task_kind: TaskKind
+    ) -> None:
+        assert (
+            coding_lane_task_kind(
+                "agent:tech-lead", "agent:web", lane_task_kind=lane_task_kind
+            )
+            == lane_task_kind.value
+        )
+
+    def test_the_default_lane_is_code(self) -> None:
+        """The two pre-existing sites call it without naming a lane."""
+        assert coding_lane_task_kind("agent:tech-lead", "agent:web") == (
+            TaskKind.CODE.value
+        )
+
+    def test_an_unconfigured_tech_lead_agent_never_claims_the_role(self) -> None:
+        """No tech lead configured means no agent can resolve to it."""
+        assert (
+            coding_lane_task_kind(
+                None, "agent:tech-lead", lane_task_kind=TaskKind.REWORK
+            )
+            == TaskKind.REWORK.value
+        )
+
+    @pytest.mark.parametrize(
+        "lane_task_kind", [TaskKind.CODE, TaskKind.REWORK]
+    )
+    def test_the_role_it_returns_selects_the_document_the_session_is_handed(
+        self, lane_task_kind: TaskKind
+    ) -> None:
+        """The owner's answer and the protocol document are one decision.
+
+        This is the join the three launch sites rely on: whatever role the owner
+        names is the document ``get_completion_instructions`` hands the session,
+        so a lane that asks the owner cannot hand a Tech Lead the coder protocol.
+        """
+        tech_lead_kind = coding_lane_task_kind(
+            "agent:tech-lead", "agent:tech-lead", lane_task_kind=lane_task_kind
+        )
+        coder_kind = coding_lane_task_kind(
+            "agent:tech-lead", "agent:web", lane_task_kind=lane_task_kind
+        )
+
+        assert get_completion_instructions(tech_lead_kind) == (
+            get_tech_lead_done_instructions()
+        )
+        assert get_completion_instructions(coder_kind) == (
+            get_coding_done_instructions()
         )
 
 

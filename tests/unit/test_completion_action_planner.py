@@ -42,6 +42,11 @@ from issue_orchestrator.control.completion_history_status import (
 from issue_orchestrator.control.tech_lead_completion import (
     admit_tech_lead_completion,
 )
+from issue_orchestrator.control.completion_types import (
+    ERROR_PREFIX_TECH_LEAD_AUTHORITY,
+    ERROR_PREFIX_TECH_LEAD_COMPLETION_VALIDATION,
+    ERROR_PREFIX_TECH_LEAD_DECISION,
+)
 from issue_orchestrator.control.tech_lead_completion_errors import (
     TECH_LEAD_ERROR_PREFIXES,
 )
@@ -3086,6 +3091,50 @@ class TestTechLeadDecisionFailureTransition:
 
         assert critical == [error]
         assert downgraded == []
+
+    @pytest.mark.parametrize(
+        ("prefix", "expected_noun"),
+        [
+            (ERROR_PREFIX_TECH_LEAD_DECISION, "decision"),
+            (ERROR_PREFIX_TECH_LEAD_AUTHORITY, "launch authority"),
+            (
+                ERROR_PREFIX_TECH_LEAD_COMPLETION_VALIDATION,
+                "completion validation",
+            ),
+        ],
+    )
+    def test_the_surfaced_reason_names_what_was_actually_refused(
+        self, tmp_path: Path, prefix: str, expected_noun: str
+    ) -> None:
+        """#385 round 2 N1: three refusals, three remedies, three nouns.
+
+        Every refusal the owner issues reaches this one surface, and it read
+        "tech_lead **decision** rejected" for all of them. An operator whose
+        completion validation failed was pointed at a decision artifact that
+        was never the problem — the same "which one do I go fix" argument
+        ``TechLeadCompletionValidationStatus`` makes for keeping FAILED /
+        TIMED_OUT / UNAVAILABLE distinct, one level up.
+
+        The nouns are written out here rather than read back from the owner's
+        map, so a change to that map has to be a deliberate change to what an
+        operator is told.
+        """
+        config = make_tech_lead_config(tmp_path)
+        session = make_tech_lead_session(tmp_path)
+        arm_investigation_session(config, session)
+
+        actions = make_planner(config).generate_completion_actions(
+            session,
+            SessionStatus.COMPLETED,
+            processing_errors=[f"{prefix}: some_failure: some detail"],
+        )
+
+        [rejection] = _rejections(actions)
+        assert rejection.reason == f"tech_lead {expected_noun} rejected (some_failure)"
+        # The artifact surface this action renders is unchanged — only the
+        # sentence describing the refusal moved.
+        assert rejection.proposal_type == "decision"
+        assert rejection.mode == "rejected"
 
     def test_batch_flavor_fails_manifest_and_blocks_own_issue(
         self, tmp_path: Path

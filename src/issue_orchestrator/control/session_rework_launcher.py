@@ -44,6 +44,7 @@ from .session_worktree_diagnostics import (
     build_worktree_error_comment,
     write_worktree_diagnostic,
 )
+from .tech_lead_session_policy import coding_lane_task_kind
 from .transition_log import log_transition
 from .worktree_context import WorktreeContext
 from .worktree_provisioning import WorktreeProvisioner, provision_launch_worktree
@@ -520,7 +521,18 @@ def launch_rework_session(
             issue_title=issue_title,
             worktree=worktree_path,
             pr_number=pr_number,
-            task_kind=TaskKind.REWORK.value,
+            # The THIRD coding-lane launch site (#385 round 2 F1). The rework
+            # queue is built from the issue's own ``agent:*`` label with no
+            # tech-lead exclusion, so a tech-lead run whose PR draws
+            # changes-requested is relaunched here — and a literal REWORK handed
+            # it the coder protocol and its mandatory ``prepush-check
+            # --dirty-only -v`` while the completion gate, which selects on the
+            # agent label, was already validating on its behalf.
+            task_kind=coding_lane_task_kind(
+                deps.config.tech_lead_review_agent,
+                rework.agent_type,
+                lane_task_kind=TaskKind.REWORK,
+            ),
         )
         base_command = deps.wrap_provider_command(base_command, agent_config, run.run_dir)
         completion_path = get_completion_path(rework.agent_type, run_dir=run.run_dir.name)

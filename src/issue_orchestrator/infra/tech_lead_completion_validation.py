@@ -35,6 +35,23 @@ could not land, a durable record that could not be written or read back — each
 one produces evidence whose status refuses the completion. Nothing in this
 module can return ``PASSED`` without having actually checked and actually
 filed.
+
+**Operator note: a refusal is durable, so "wait and retry" is not the remedy.**
+Create-once applies to every status, including the ``UNAVAILABLE`` a momentary
+shared-git-dir timing-write failure produces. A retry on the same run and the
+same commit re-reads that filed verdict rather than re-running the check, so the
+refusal stands until the KEY changes. This is deliberate — a second, kinder
+verdict for one candidate is exactly what create-once exists to prevent — but it
+means there are only two ways forward, and neither is waiting:
+
+1. land a new candidate commit (a new ``candidate_head_sha`` is a new key, and
+   the ordinary way a rejected run proceeds); or
+2. if the ``UNAVAILABLE`` was environmental and the same commit must be
+   re-judged, delete that verdict file — a file per
+   ``(run_id, session_name, candidate_head_sha)`` under
+   ``<repo>/.issue-orchestrator/state/tech-lead-completion-validation/`` — and
+   re-run completion, which re-files it from scratch. Deleting evidence is an
+   operator action taken deliberately, which is why it is not automated here.
 """
 
 from __future__ import annotations

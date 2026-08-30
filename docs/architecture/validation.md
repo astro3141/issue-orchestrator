@@ -1408,10 +1408,25 @@ The launcher declares the role — `TaskKind.TECH_LEAD` reaches
 `AgentConfig.get_command_for_prompt` for a tech-lead agent — while the session
 KEY stays `TaskKind.CODE`, because there is still one session slot per issue.
 That is the whole selection: task kind names the role whose completion protocol
-and sandbox role apply, and nothing else about the launch changes. Both
+and sandbox role apply, and nothing else about the launch changes. All three
 coding-lane launch sites ask `control/tech_lead_session_policy.coding_lane_task_kind`
-for it — the first launch and the validation-retry relaunch, since a tech-lead
-run that wrote code reaches the retry queue too.
+for it — the first launch, the validation-retry relaunch, and the rework
+relaunch — since a tech-lead run that wrote code reaches the retry queue and the
+rework queue too. The rework queue is the one worth naming explicitly:
+`control/pr_scanner` builds a `PendingRework` from the issue's own `agent:*`
+label with no tech-lead exclusion, so a tech-lead run whose PR draws
+changes-requested is relaunched on that lane under the tech-lead agent. Each
+site passes its own `lane_task_kind` (`CODE`, `CODE`, `REWORK`) so routing
+through the owner does not restate a coder's role as something its lane is not;
+only the tech-lead override is decided in the owner.
+
+The rework lane is also where the sharper form of the defect showed:
+`completion_processor` selects the completion gate on the **agent label** while
+the protocol document is selected on the **task kind**, so a literal `REWORK`
+left the orchestrator validating a tech-lead completion on the model's behalf
+while the document in the model's hands still ordered it to validate itself.
+Same rule, two paths, two answers — the cross-path drift `AGENTS.md` classifies
+as a correctness risk.
 
 The trusted owner runs in the orchestrator's process, so it makes the shared
 git-common-dir timing write the model could not, under
@@ -1424,7 +1439,20 @@ A COMPLETED tech-lead completion is then refused whenever that verdict is
 missing, failed, timed out, unavailable, or bound to a different
 run/session/commit than the one the orchestrator observed. Refused means zero
 push, PR, or comment from the completion's own requested actions, and a FAILED
-session. It does not mean zero labels: the refusal carries
+session.
+
+Because the verdict is create-once, a refusal is durable for that exact
+`(run_id, session_name, candidate_head_sha)` — including the `UNAVAILABLE` a
+momentary shared-git-dir timing-write failure produces. Retrying the same run on
+the same commit re-reads the filed verdict rather than re-running the check, so
+**waiting is not the remedy**: either land a new candidate commit (a new key,
+and the ordinary route), or, when the `UNAVAILABLE` was environmental and that
+same commit must be re-judged, delete the verdict file under
+`<repo>/.issue-orchestrator/state/tech-lead-completion-validation/` and re-run
+completion, which re-files it. That deletion is a deliberate operator action, so
+it is not automated.
+
+A refusal does not mean zero labels: it carries
 `ERROR_PREFIX_TECH_LEAD_COMPLETION_VALIDATION`, which is a member of
 `control/tech_lead_completion_errors.TECH_LEAD_ERROR_PREFIXES`, so
 `critical_processing_errors` classifies it critical and the planner routes it to
@@ -1434,6 +1462,19 @@ the anchor, the rejection surfaced there, and history recording FAILED. That
 routing is why the prefix must be splatted from the owner tuple rather than
 re-listed at each consumer: a prefix the planner does not recognise falls
 through every branch and settles as an ordinary success.
+
+The three refusals share that routing but not their remedy, so the sentence the
+operator reads names which one it was: `TechLeadRefusalKind` (same owner module)
+maps each prefix to its noun — `decision`, `launch authority`,
+`completion validation` — and `plan_tech_lead_rejection_action` requires it, so
+no caller can surface its refusal as somebody else's. A caller that knows its
+kind statically calls the named constructor for it
+(`plan_tech_lead_decision_rejection_action`,
+`plan_tech_lead_authority_rejection_action`) rather than passing the argument;
+the general form is for the one caller that learns the kind at runtime by
+parsing the recorded error. The rendered artifact surface
+(`proposal_type="decision"`, a UI contract value) is unchanged; only the
+sentence is.
 
 Actor and Reviewer completion is untouched: `coding_done.md` still makes
 `prepush-check --dirty-only -v` mandatory, and the gate lives inside
