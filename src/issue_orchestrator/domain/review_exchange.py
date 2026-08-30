@@ -206,6 +206,13 @@ def build_coder_prompt(packet: "ReviewExchangeTurnPacket") -> str:
     ``role == Role.CODER`` and ``reviewer_feedback`` set. Runner is
     expected to copy the most-recent persisted reviewer report into the
     packet's ``reviewer_feedback`` slot.
+
+    The validation step DEFERS to the completion protocol document this lane
+    injects (``resources/review_exchange_coder.md``) and names no command
+    (#385 round 3 A3). ``validation.md``'s rule: the completion protocol
+    document is the only place that names a role's validation command, so a
+    prompt that restates it becomes a second owner of the same answer — the
+    duplication F3 removed from the dirty-worktree retry prompt.
     """
     from .review_exchange_turn import Role
 
@@ -225,7 +232,8 @@ def build_coder_prompt(packet: "ReviewExchangeTurnPacket") -> str:
         "Steps:\n"
         "1. Make the requested changes (or prepare a disagreement).\n"
         "2. Commit all changes (clean working tree required).\n"
-        "3. Run `prepush-check --dirty-only -v` and fix any dirty-worktree failure.\n"
+        "3. Complete the validation step your completion protocol requires, "
+        "and fix any dirty-worktree failure.\n"
         "4. Run `coding-done completed --implementation '...' --problems '...'`\n"
         "5. Submit your verdict by running `exchange-respond`\n"
         "Runtime-managed metadata under `.issue-orchestrator/` and `.claude/` "

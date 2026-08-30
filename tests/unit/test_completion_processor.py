@@ -1340,6 +1340,42 @@ class TestReviewExchangeModeResolution:
 
         assert processor._resolve_review_exchange_mode("agent:coder") == "via-local-loop"  # noqa: SLF001
 
+    def test_a_tech_lead_agent_is_not_excluded_from_the_exchange(self, tmp_path):
+        """Characterization, and the receipt behind a deferral (#385 round 3 F4).
+
+        This pins TODAY'S behaviour, which is a defect and is deliberately not
+        fixed here: nothing on this path asks whether the completing agent is
+        the tech lead. The agent inherits ``code_review_agent`` through
+        ``Config.get_reviewer_for_agent``, so it resolves a reviewer and the
+        mode survives; downstream ``coder_label = agent_label`` makes it the
+        exchange's coder and the lane injects
+        ``resources/review_exchange_coder.md``, whose step 3 mandates
+        ``prepush-check`` — the command a bounded Tech Lead's sandbox refuses.
+
+        Round 2 justified leaving that alone by claiming the lane was
+        unreachable for a tech-lead agent. It is not, and this test is what
+        makes that a measured fact rather than a reading. The real invariant is
+        wider than one role — the exchange coder protocol mandates a
+        shared-git-dir write that NO sandbox-opted-in agent may perform — which
+        is why the repair is a follow-up rather than #385's seam, whose STOP
+        conditions exclude generic completion-platform redesign.
+
+        When the follow-up lands, this test should be inverted, not deleted.
+        """
+        config = self._make_config(tmp_path)
+        config.review_exchange_mode = "via-local-loop"
+        config.tech_lead_review_agent = "agent:tech-lead"
+        config.agents["agent:tech-lead"] = AgentConfig(
+            prompt_path=tmp_path / "coder.md", ai_system="claude-code"
+        )
+        processor = self._make_processor(config)
+
+        assert config.get_reviewer_for_agent("agent:tech-lead") == "agent:reviewer"
+        assert (
+            processor._resolve_review_exchange_mode("agent:tech-lead")  # noqa: SLF001
+            == "via-local-loop"
+        )
+
 
 class TestReviewExchangeExecution:
     """Tests for review exchange execution paths."""

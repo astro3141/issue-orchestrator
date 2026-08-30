@@ -1451,6 +1451,36 @@ relaunch prompt ordered the one command that role may not run. Shipping the
 contradiction and resolving it by precedence inside the model is not the
 Agent-Intent/Orchestrator-Authority model; not emitting it is.
 
+`domain/review_exchange.build_coder_prompt` follows the same rule — its step 3
+defers, and `resources/review_exchange_coder.md`, the completion protocol
+document for that lane, is the one place naming the command.
+
+### Known gap: the review-exchange coder lane and the sandbox boundary
+
+The rule above is about *duplication*. It does not fix the case where the single
+remaining owner names a command the role cannot execute, and there is one open
+instance, deliberately not repaired by #385:
+
+A completion that requests `create_pr` and resolves a reviewer starts a review
+exchange with `coder_label = agent_label`
+(`control/completion_review_exchange.py`). Nothing on that path asks which role
+the agent is — `Config.get_reviewer_for_agent` falls back to
+`code_review_agent`, so a tech-lead agent resolves one like any other — and the
+lane launches with `task_kind="review_exchange_coder"`, which injects
+`review_exchange_coder.md` and its mandatory `prepush-check`. A sandboxed Tech
+Lead relaunched as an exchange coder therefore meets the #383 wall again, and
+`tech_lead_done.md`'s override is not present on that lane to counter it.
+
+The invariant is wider than one role: **the exchange coder protocol mandates a
+shared-git-dir write that no sandbox-opted-in agent may perform**, so a
+sandboxed Actor hits it identically. Repairing it means deciding what a
+sandboxed agent's exchange-coder protocol should be — a role×lane question, and
+generic completion-platform redesign, which #385's STOP conditions exclude. It
+is tracked as a follow-up, and
+`tests/unit/test_completion_processor.py::TestReviewExchangeModeResolution::test_a_tech_lead_agent_is_not_excluded_from_the_exchange`
+pins the reachability so the deferral rests on a measured fact and the repair
+has an anchor to invert.
+
 ### The other principal that must not run the gate
 
 A `planning_investigation` Tech Lead is refused the same commands, for an
