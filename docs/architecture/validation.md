@@ -1486,12 +1486,26 @@ default — `Config.review_exchange_mode` is `"via-local-loop"`
 latent for the bounded-Codex Tech Lead configuration R33 turns that opt-in on
 for.
 
-Repairing it means deciding what a sandboxed agent's exchange-coder protocol
-should be — either a role-aware document routing the obligation to the trusted
-owner above, or excluding sandbox-opted-in agents from the exchange lane so
-their PRs take the ordinary review pipeline (smaller, but it removes internal
-review from those runs). That is a role×lane product decision and generic
-completion-platform redesign, which #385's STOP conditions exclude.
+Swapping the document is not on its own sufficient, and that is what makes the
+repair larger than it looks. The lane does not merely *instruct* the coder to
+validate; it *requires the artifact*. `_validate_coder_completion`
+(`execution/persistent_session_exchange.py`) rejects the turn unless a passing
+`validation-record.json` bound to current HEAD is present, and only
+`coding-done completed` writes one (`statuses_requiring_validation`). That
+requirement is on by default — `Config.review_exchange_require_validation` is
+`True` (`infra/config.py`). So a sandboxed coder handed a document that omits
+the command would still fail the turn for the missing record: the in-session
+validation obligation is in the lane's protocol contract, not just in its
+prose.
+
+Repairing it therefore means deciding what a sandboxed agent's exchange-coder
+protocol should be *and* who files the record it is judged on — either a
+role-aware document plus a trusted owner filing the turn's validation evidence
+the way #385 files the Tech Lead completion verdict, or excluding
+sandbox-opted-in agents from the exchange lane so their PRs take the ordinary
+review pipeline (smaller, but it removes internal review from those runs). That
+is a role×lane product decision and generic completion-platform redesign, which
+#385's STOP conditions exclude.
 
 **Status: open, not yet tracked by an issue.** #385 round 4 established that
 `coding-done --follow-up-file` does not file one — the proposal terminates in
