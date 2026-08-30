@@ -155,8 +155,10 @@ def _authority(
         reviewed_candidates=manifest.candidates(),
         contracted_candidates=manifest.contracted_candidates() if contracted else (),
         # Held, so these tests stay about the leaf-contract prerequisite rather
-        # than tripping over the diff one (#359).
+        # than tripping over the diff one (#359) or the orchestrator-owned
+        # mandatory-validation one (#370).
         diffed_candidates=manifest.candidates(),
+        validated_candidates=manifest.candidates(),
         # Carried exactly as the launch path carries it, so the refusal these
         # tests read is the one an operator would receive.
         prerequisite_gaps=manifest.prerequisite_gaps() if contracted else (),
@@ -717,16 +719,18 @@ class TestTheLaunchPathCarriesTheAnswer:
         assert len(staged) == 1
         payload = json.loads(staged[0].read_text())
         assert payload["candidates"][0]["issue_number"] == LEAF
-        # The reviewer and diff prerequisites are separate axes and neither is
-        # established here — the stub downloader stages no candidate diff — so
-        # the run still cannot pass this candidate. The leaf contract, which
-        # this test IS about, is absent from the refusal.
+        # The reviewer, diff and orchestrator-owned validation prerequisites
+        # are separate axes and none is established here — the stub downloader
+        # stages no candidate diff — so the run still cannot pass this
+        # candidate. The leaf contract, which this test IS about, is absent
+        # from the refusal.
         assert [
             unmet.prerequisite
             for unmet in authority.unmet_pass_prerequisites(candidate)
         ] == [
             CandidatePassPrerequisite.INDEPENDENT_REVIEW,
             CandidatePassPrerequisite.CANDIDATE_DIFF,
+            CandidatePassPrerequisite.REPOSITORY_VALIDATION,
         ]
 
     def test_an_unresolved_contract_reaches_it_as_a_refusal(

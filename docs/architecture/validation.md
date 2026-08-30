@@ -1301,6 +1301,38 @@ where it is not (see the gap above) the note is all there is. A change that
 lets the reviewer run gates must remove the guard *and* route this worktree
 through `WorktreeProvisioner`.
 
+### No Tech Lead runs the gate at completion (#370)
+
+Independently of the command guards below, `coding-done` no longer runs the
+code-candidate quick gate for **any** tech-lead flavor.
+`control/completion_gate_routing.py` owns that discrimination and gives two
+different reasons for it: a `planning_investigation` has no candidate to
+validate (#319), and every other flavor's mandatory repository validation
+belongs to the orchestrator (#370).
+
+#364 measured why the second one is not optional. A Codex Tech Lead under a
+bounded `SandboxScope` could adjudicate its candidates and then not complete at
+all: the validation path writes to the shared Git common dir
+(`.git/issue-orchestrator/validate-timings.jsonl`) via
+`infra/validation_timings.py`, which is outside the scratch worktree the model
+may write. That is a property of the validation path, not of the scope, so
+opting the role into a narrower posture cannot fix it and widening the posture
+to admit it is a real authority grant.
+
+Nothing is skipped. Anything a tech-lead completion offers to publish still
+meets the repository's contract through the orchestrator's own publication gate
+(`CompletionProcessor._check_publish_gate_if_required`), which runs in the
+orchestrator's process. What a merge-facing Tech Lead PASS rests on is a
+separate, exact-candidate fact —
+`CandidatePassPrerequisite.REPOSITORY_VALIDATION`, read from the durable
+per-candidate publication receipt at staging time and carried on the launch
+authority (see `docs/development/REVIEW_WORKFLOW.md`).
+
+The per-worktree command guards remain scoped as they are: only the
+`planning_investigation` scratch worktree carries the Codex gate-refusal policy,
+because only there is running a gate a *procedural* error as well as an
+ownership one.
+
 ### The other principal that must not run the gate
 
 A `planning_investigation` Tech Lead is refused the same commands, for an

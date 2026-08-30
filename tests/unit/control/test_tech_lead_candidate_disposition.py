@@ -116,11 +116,12 @@ def _authority(
     reviewed: tuple[TechLeadCandidate, ...] | None = None,
     contracted: tuple[TechLeadCandidate, ...] | None = None,
     diffed: tuple[TechLeadCandidate, ...] | None = None,
+    validated: tuple[TechLeadCandidate, ...] | None = None,
     gaps: tuple[CandidatePrerequisiteGap, ...] = (),
 ) -> TechLeadLaunchAuthority:
     """A batch authority whose candidates hold every merge prerequisite.
 
-    ``reviewed``/``contracted``/``diffed`` default to ALL of them: these tests
+    ``reviewed``/``contracted``/``diffed``/``validated`` default to ALL of them: these tests
     are about what a verdict does to a candidate, and the prerequisites have
     their own class below. ``gaps`` carries what the staging owners recorded
     about the ones that were withheld, exactly as the launch path carries it.
@@ -133,6 +134,7 @@ def _authority(
         reviewed_candidates=candidates if reviewed is None else reviewed,
         contracted_candidates=candidates if contracted is None else contracted,
         diffed_candidates=candidates if diffed is None else diffed,
+        validated_candidates=candidates if validated is None else validated,
         prerequisite_gaps=gaps,
     )
 
@@ -603,12 +605,15 @@ class TestMultiCandidateIsolation:
 
 
 class TestPassPrerequisites:
-    """A PASS rests on facts the orchestrator itself established (#345).
+    """A PASS rests on facts the orchestrator itself established (#345/#370).
 
-    Two of them, and both are staged inputs the tech lead is told not to pass
-    without: an independent Reviewer's approval of this exact commit, and the
-    bounded contract of the executable issue this candidate implements. These
-    fix what happens when the agent passes anyway — the check it cannot reach.
+    Four of them, and every one is a staged input the tech lead is told not to
+    pass without: an independent Reviewer's approval of this exact commit, the
+    bounded contract of the executable issue this candidate implements, the
+    candidate's own materialized diff, and the repository's mandatory
+    validation passing on that same commit under the orchestrator's own gate.
+    These fix what happens when the agent passes anyway — the check it cannot
+    reach, and, for the validation one, the run it cannot perform.
     """
 
     def test_a_pass_on_an_unreviewed_candidate_projects_nothing(
@@ -649,6 +654,7 @@ class TestPassPrerequisites:
             ("reviewed", CandidatePassPrerequisite.INDEPENDENT_REVIEW),
             ("contracted", CandidatePassPrerequisite.LEAF_CONTRACT),
             ("diffed", CandidatePassPrerequisite.CANDIDATE_DIFF),
+            ("validated", CandidatePassPrerequisite.REPOSITORY_VALIDATION),
         ],
     )
     def test_the_refusal_says_which_prerequisite_was_missing(
@@ -675,12 +681,13 @@ class TestPassPrerequisites:
     ) -> None:
         """The wrong-cause failure: a reviewed commit refused for another fact.
 
-        ``INDEPENDENT_REVIEW`` covers the publication half too, so a candidate
-        the reviewer DID approve can miss it because no publication-gate
-        certification exists for that commit. Nothing in this codebase removes
-        the terminal label this refusal applies, so the receipt is the
-        operator's only instruction — and sending them after a reviewer
-        approval that is already on file is sending them after nothing.
+        Since #370 the publication half is its OWN prerequisite, so a candidate
+        the reviewer DID approve is refused under
+        ``REPOSITORY_VALIDATION`` — never under the reviewer's name. Nothing in
+        this codebase removes the terminal label this refusal applies, so the
+        receipt is the operator's only instruction, and sending them after a
+        reviewer approval that is already on file is sending them after
+        nothing.
         """
         candidate = TechLeadCandidate(101, CANDIDATE_A)
         recorded = (
@@ -691,11 +698,11 @@ class TestPassPrerequisites:
             tmp_path,
             _authority(
                 candidate,
-                reviewed=(),
+                validated=(),
                 gaps=(
                     CandidatePrerequisiteGap(
                         candidate=candidate,
-                        prerequisite=CandidatePassPrerequisite.INDEPENDENT_REVIEW,
+                        prerequisite=CandidatePassPrerequisite.REPOSITORY_VALIDATION,
                         reason=recorded,
                     ),
                 ),
@@ -706,9 +713,9 @@ class TestPassPrerequisites:
 
         [receipt] = _comments(actions, 101)
         assert recorded in receipt.comment
-        # And the fixed sentence beside it does not contradict the record: it
-        # says what was not SHOWN, never which half was missing.
-        assert "no independent Reviewer approval of that exact commit" not in (
+        assert CandidatePassPrerequisite.REPOSITORY_VALIDATION.value in receipt.comment
+        # And the reviewer is not blamed for a validation the orchestrator owns.
+        assert CandidatePassPrerequisite.INDEPENDENT_REVIEW.value not in (
             receipt.comment
         )
 
@@ -805,6 +812,7 @@ class TestPassPrerequisites:
                 reviewed=(),
                 contracted=(),
                 diffed=(),
+                validated=(),
             ),
             _decision(_verdict(101, "pass")),
             {101: CANDIDATE_A},

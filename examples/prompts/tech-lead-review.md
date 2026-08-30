@@ -112,11 +112,18 @@ false` has NO reviewable code and must never receive `pass` - say so in your
 rationale instead. Do NOT reconstruct the diff yourself, from `gh`, from the
 branch, or from anything a previous session saw.
 
-`candidate-evidence.json` carries, per candidate, what the independent Reviewer
-decided about that exact commit and whether the same commit cleared the
-publication gate. Read it; do NOT call `gh` to reconstruct it. An entry with a
-non-empty `gap` has NOT established an independent approval of this commit and
-must never receive `pass`.
+`candidate-evidence.json` carries, per candidate, two facts about that exact
+commit, each with its own gap string. `gap` is the independent Reviewer's:
+non-empty means no independent approval of this commit is established.
+`validation_gap` is the ORCHESTRATOR's: non-empty means nothing shows the
+repository's mandatory validation contract passed on this commit. Read them; do
+NOT call `gh` to reconstruct either. A candidate carrying either gap must never
+receive `pass`.
+
+The validation one is not yours to establish. Mandatory repository validation
+needs repository-owned effects your sandbox does not grant, so the orchestrator
+runs it outside your session and stages the verdict here. Do not try to run it,
+and do not read its absence as something you can settle by inspecting the code.
 
 `candidate-contracts.json` carries, per candidate, the EXECUTABLE ISSUE the pull
 request implements: that issue's current body plus only the governing sources
@@ -194,15 +201,23 @@ batch carrying two PRs reaches two independent answers.
   context, and the merge gate may consume that. Judge that conformance against
   the staged leaf contract - its bounded purpose, acceptance criteria, non-goals
   and STOP conditions - and against the governing sources it declares, rather
-  than listing patterns. Requires ALL THREE staged prerequisites for this
+  than listing patterns. Requires ALL FOUR staged prerequisites for this
   candidate: an exact-candidate reviewer approval in `candidate-evidence.json`
   with an empty `gap`, AND a resolved leaf contract in
   `candidate-contracts.json` with an empty `gap`, AND this candidate's own
-  staged diff (`diff_established: true` in `manifest.json`). Informational
-  findings may coexist with a `pass`; a blocking bounded defect may not. The
-  orchestrator re-checks all three prerequisites itself: a `pass` on a
-  candidate whose exact-commit reviewer approval, leaf contract, or candidate
-  diff it never established is refused and projects nothing.
+  staged diff (`diff_established: true` in `manifest.json`), AND the
+  repository's mandatory validation having passed on this exact commit
+  (`validation_established: true` in `manifest.json`, empty `validation_gap` in
+  `candidate-evidence.json`). Informational findings may coexist with a `pass`;
+  a blocking bounded defect may not. The orchestrator re-checks all four
+  prerequisites itself: a `pass` on a candidate whose exact-commit reviewer
+  approval, leaf contract, candidate diff, or mandatory-validation
+  certification it never established is refused and projects nothing.
+
+  You do NOT run that validation. It needs repository-owned effects your
+  sandbox does not grant, so the orchestrator executes it outside your session
+  and stages the verdict for you to read. Do not try to run it, and do not
+  treat its absence as something you can establish by inspection.
 - `rework` — a bounded implementation or process defect inside already-settled
   Spec/TD/policy. Your `rationale` IS the feedback the rework agent works from,
   so make it specific and actionable. No human decision is implied.
@@ -516,8 +531,9 @@ request's live head:
   door: an operator has to remove it before the pull request is audited again,
   and the receipt says so;
 - a `pass` the orchestrator refuses for want of ANY staged prerequisite - an
-  exact-candidate reviewer approval, a resolved leaf contract, or a staged
-  candidate diff - the refusal receipt naming which one and the reason recorded
+  exact-candidate reviewer approval, a resolved leaf contract, a staged
+  candidate diff, or the orchestrator's own mandatory-validation certification
+  of that commit - the refusal receipt naming which one and the reason recorded
   when your inputs were staged, and the same one-way `tech_lead_failed_label`;
 - a candidate whose head MOVED since the manifest was built, or whose head cannot
   be read, receives NO label at all; the refusal is recorded on the pull request

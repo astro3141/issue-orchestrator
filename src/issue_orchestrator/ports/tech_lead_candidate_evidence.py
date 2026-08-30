@@ -29,12 +29,15 @@ class TechLeadCandidateEvidenceSource(Protocol):
     def evidence_for(
         self, entry: "PRToReview", *, repository_host: "RepositoryHost"
     ) -> TechLeadCandidateEvidence:
-        """The reviewer/publication evidence for ``entry``'s exact commit.
+        """The reviewer/validation evidence for ``entry``'s exact commit.
 
         Never raises for missing or damaged evidence: an implementation reports
         it as a :attr:`~..domain.tech_lead_candidate.TechLeadCandidateEvidence.gap`
-        so the batch review still runs and that candidate simply cannot be
-        passed. Incomplete evidence is not permissive evidence.
+        — or, for the repository's mandatory validation, as its
+        ``validation_gap`` (#370) — so the batch review still runs and that
+        candidate simply cannot be passed. Incomplete evidence is not
+        permissive evidence, and an execution error is never candidate
+        evidence.
         """
         ...
 
@@ -53,13 +56,18 @@ class NoTechLeadCandidateEvidence:
     def evidence_for(
         self, entry: "PRToReview", *, repository_host: "RepositoryHost"
     ) -> TechLeadCandidateEvidence:
+        unwired = (
+            "no exact-candidate evidence source is wired into this"
+            " orchestrator, so nothing can prove an independent reviewer"
+            " approved this commit or that the repository's mandatory"
+            " validation passed on it"
+        )
+        # Both halves refuse (#370). A composition with no evidence source
+        # knows nothing about EITHER owner, and leaving the validation gap
+        # empty would read as "the orchestrator's gate certified this commit"
+        # — the one direction a null object must never claim.
         return TechLeadCandidateEvidence(
-            candidate=entry.candidate(),
-            gap=(
-                "no exact-candidate review evidence source is wired into this"
-                " orchestrator, so nothing can prove an independent reviewer"
-                " approved this commit"
-            ),
+            candidate=entry.candidate(), gap=unwired, validation_gap=unwired
         )
 
 

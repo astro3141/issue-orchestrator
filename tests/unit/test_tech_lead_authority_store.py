@@ -328,7 +328,7 @@ def test_candidates_that_disagree_with_the_manifest_set_are_refused() -> None:
 
 
 def test_the_pass_prerequisites_survive_the_store(tmp_path: Path) -> None:
-    """Every fact a PASS rests on outlives the launch (#345, #359).
+    """Every fact a PASS rests on outlives the launch (#345, #359, #370).
 
     The record is the one thing a completing session cannot have touched, so
     the answer to "may this candidate be passed" must come back off disk
@@ -344,6 +344,7 @@ def test_the_pass_prerequisites_survive_the_store(tmp_path: Path) -> None:
         reviewed_candidates=(reviewed_only, both),
         contracted_candidates=(both,),
         diffed_candidates=(reviewed_only, both),
+        validated_candidates=(reviewed_only, both),
         prerequisite_gaps=(
             CandidatePrerequisiteGap(
                 candidate=reviewed_only,
@@ -378,16 +379,19 @@ def test_a_row_written_before_leaf_contracts_existed_holds_none() -> None:
     legacy = _bound_batch().to_dict()
     del legacy["contracted_candidates"]
     del legacy["diffed_candidates"]
+    del legacy["validated_candidates"]
 
     restored = TechLeadLaunchAuthority.from_dict(legacy)
 
     assert restored.contracted_candidates == ()
     assert restored.diffed_candidates == ()
+    assert restored.validated_candidates == ()
     # Every refusal, and none of them invents a reason it was never told.
     assert restored.unmet_pass_prerequisites(TechLeadCandidate(101, "a" * 40)) == (
         UnmetPassPrerequisite(CandidatePassPrerequisite.INDEPENDENT_REVIEW),
         UnmetPassPrerequisite(CandidatePassPrerequisite.LEAF_CONTRACT),
         UnmetPassPrerequisite(CandidatePassPrerequisite.CANDIDATE_DIFF),
+        UnmetPassPrerequisite(CandidatePassPrerequisite.REPOSITORY_VALIDATION),
     )
 
 

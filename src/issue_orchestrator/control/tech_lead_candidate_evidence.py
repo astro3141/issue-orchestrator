@@ -27,11 +27,19 @@ Three properties are the contract:
   orchestrator's own durable candidate record, and the publication half from
   the same :class:`~.publication_authority.PublicationVerdictReader` every
   other reader of that verdict uses.
-* **Absence is loud.** Each entry states, in one string, exactly why it does
-  not establish an approval. The completion gate refuses a PASS whose evidence
-  carries a gap, so an unstaged, unreadable, misbound or changes-requested
-  candidate cannot be waved through — and an operator reading the staged file
-  can see which of those it was.
+* **Absence is loud.** Each entry states, in one string per owner, exactly why
+  it does not establish the fact. The completion gate refuses a PASS whose
+  evidence carries a gap, so an unstaged, unreadable, misbound or
+  changes-requested candidate cannot be waved through — and an operator reading
+  the staged file can see which of those it was.
+* **One string per owner, not one per entry (#370).** The reviewer's approval
+  and the repository's mandatory validation are two facts established by two
+  owners, so they carry two gaps — ``gap`` and ``validation_gap``. They were
+  one string until the Tech Lead model session stopped executing repository
+  validation itself: with the validation owner now outside the model sandbox
+  entirely, a settlement that could only say "something about this commit was
+  not shown" could not say whether the missing thing was a review or a
+  validation run, and those have different remedies.
 
 Which ISSUE a pull request belongs to is read from the branch, the way every
 other PR-to-issue association in this orchestrator is read. That is an
@@ -88,21 +96,21 @@ class DurableCandidateEvidence:
     ) -> TechLeadCandidateEvidence:
         candidate = entry.candidate()
         if not candidate.is_bound:
+            unbound = (
+                f"PR #{candidate.pr_number} was selected without an"
+                " observable head commit, so no evidence can be bound to it"
+            )
             return TechLeadCandidateEvidence(
-                candidate=candidate,
-                gap=(
-                    f"PR #{candidate.pr_number} was selected without an"
-                    " observable head commit, so no evidence can be bound to it"
-                ),
+                candidate=candidate, gap=unbound, validation_gap=unbound
             )
         issue_number = extract_issue_number_from_branch(entry.branch)
         if issue_number is None:
+            unlocatable = (
+                f"branch {entry.branch!r} names no issue, so the durable"
+                " candidate record for this commit cannot be located"
+            )
             return TechLeadCandidateEvidence(
-                candidate=candidate,
-                gap=(
-                    f"branch {entry.branch!r} names no issue, so the durable"
-                    " candidate record for this commit cannot be located"
-                ),
+                candidate=candidate, gap=unlocatable, validation_gap=unlocatable
             )
         key = AttemptKey(repository_host.create_issue_key(issue_number), candidate.head_sha)
         try:
@@ -118,10 +126,12 @@ class DurableCandidateEvidence:
                 candidate.short_sha,
                 exc,
             )
+            unreadable = f"the durable candidate record could not be read: {exc}"
             return TechLeadCandidateEvidence(
                 candidate=candidate,
                 issue_number=issue_number,
-                gap=f"the durable candidate record could not be read: {exc}",
+                gap=unreadable,
+                validation_gap=unreadable,
             )
         certification = self.publication_verdict.certifies_candidate(
             issue_key=key.issue_key,
@@ -145,22 +155,27 @@ class DurableCandidateEvidence:
             ),
             publication_certified=certification.admitted,
             publication_reason=certification.reason,
-            gap=_evidence_gap(
-                candidate, verdict=verdict, certification=certification
-            ),
+            gap=_reviewer_gap(candidate, verdict=verdict),
+            validation_gap=_validation_gap(candidate, certification=certification),
         )
 
 
-def _evidence_gap(
+def _reviewer_gap(
     candidate: TechLeadCandidate,
     *,
     verdict: "BoundReviewVerdict | None",
-    certification: "PublicationCertification",
 ) -> str:
-    """Why this candidate is not proven reviewed-and-publishable, or ``""``.
+    """Why this candidate is not proven independently reviewed, or ``""``.
 
     Ordered most-specific first, and every branch refuses: a PASS may only rest
     on a positive, exact answer about this commit.
+
+    The publication half used to end this same chain. It is
+    :func:`_validation_gap` now (#370), and the split is not cosmetic: the two
+    facts are established by two owners, and the one the Tech Lead model
+    session no longer executes at all — the repository's mandatory validation —
+    must be nameable on its own or settlement cannot say which of the two it
+    refused a PASS for.
     """
     if verdict is None:
         return (
@@ -186,12 +201,31 @@ def _evidence_gap(
             f"the independent reviewer did not approve {candidate.short_sha}"
             f" (verdict={verdict.verdict.value})"
         )
-    if not certification.admitted:
-        return (
-            f"{candidate.short_sha} has no publication-gate certification"
-            f" ({certification.reason})"
-        )
     return ""
+
+
+def _validation_gap(
+    candidate: TechLeadCandidate,
+    *,
+    certification: "PublicationCertification",
+) -> str:
+    """Why the orchestrator's own gate is not proven passed here, or ``""``.
+
+    The certification reader already refuses in every direction that matters —
+    no receipt for this commit, a receipt from a contract that is no longer the
+    required one, a failed or unreadable run — and carries its own reason for
+    which one it was. This adds the candidate's identity to that reason and
+    nothing else: the answer is the validation owner's, not this module's, and
+    re-deriving it here is how two readers of one gate start disagreeing.
+    """
+    if certification.admitted:
+        return ""
+    return (
+        f"{candidate.short_sha} has no publication-gate certification"
+        f" ({certification.reason}); the repository's mandatory validation is"
+        " executed by the orchestrator, so a candidate without its receipt was"
+        " never shown to pass it"
+    )
 
 
 def build_candidate_evidence(

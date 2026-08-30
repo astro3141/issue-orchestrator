@@ -305,8 +305,10 @@ def resolve_completion_gate_routing(
     """Which gate this completion takes, decided from owner-injected context.
 
     Asked BEFORE the candidate quick contract is read, because reading that
-    contract is the first half of running it: a planning run that got as far
-    as ``load_validation_cmd`` has already been handed the command it must not
+    contract is the first half of running it: a run whose validation is not its
+    own to execute — a planning run, or any Tech Lead run whose mandatory
+    repository validation the orchestrator owns (#370) — that got as far as
+    ``load_validation_cmd`` has already been handed the command it must not
     execute, and a config error in a gate it will never run would fail it.
 
     The only run directory the routing owner is shown is one this session's

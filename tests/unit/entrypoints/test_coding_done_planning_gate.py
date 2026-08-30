@@ -1,10 +1,14 @@
-"""``coding-done completed`` in an orchestrator-managed planning run (#319).
+"""``coding-done completed`` in an orchestrator-managed tech-lead run (#319/#370).
 
 A ``planning_investigation`` Tech Lead prepares one bounded issue. It produces
 no code candidate, and #289 refuses it the very gate commands the quick
 contract names — so a planning completion must not read the candidate quick
-configuration and must not run the gate. Every other principal keeps the gate
-exactly as it was.
+configuration and must not run the gate.
+
+Since #370 no Tech Lead flavor runs it, for a second and independent reason:
+the repository's mandatory validation needs host/repository-owned effects the
+model-provider sandbox does not grant, so the orchestrator owns it. Every
+non-tech-lead principal keeps the gate exactly as it was.
 
 The proofs here are on the CALL and EFFECT boundaries rather than on a log
 line: the loader and the runner are replaced with detonators, and the run's
@@ -21,7 +25,7 @@ from unittest.mock import patch
 
 import pytest
 
-from issue_orchestrator.domain.models import COMPLETION_RECORD_PATH
+from issue_orchestrator.domain.models import COMPLETION_RECORD_PATH, CompletionRecord
 from issue_orchestrator.domain.tech_lead_session import (
     TechLeadAssignment,
     TechLeadSessionFlavor,
@@ -250,6 +254,123 @@ class TestPlanningRunKeepsThePreCompletionRefusals:
 
 
 @patch(f"{_MODULE}.check_dirty_files", return_value=[])
+class TestTechLeadValidationIsTheOrchestratorsToRun:
+    """#370 F1: a Tech Lead completes without running repository validation.
+
+    #364 proved the coupling was fatal under a bounded provider sandbox: the
+    repository validation path needs host/repository-owned effects outside the
+    model's scratch write boundary, so a Tech Lead that had to run it could not
+    complete at all. These fix that the session no longer runs it — on the CALL
+    and EFFECT boundaries, not on a log line.
+    """
+
+    @pytest.mark.parametrize(
+        "flavor,focus",
+        [
+            (TechLeadSessionFlavor.BATCH_REVIEW, None),
+            (TechLeadSessionFlavor.HEALTH_REVIEW, None),
+            (TechLeadSessionFlavor.FAILURE_INVESTIGATION, 42),
+        ],
+    )
+    def test_no_tech_lead_flavor_runs_the_gate_in_its_own_session(
+        self, _dirty, managed_worktree, flavor, focus
+    ):
+        worktree, run_dir = managed_worktree
+        _stage_assignment(run_dir, flavor, focus_issue_number=focus)
+
+        with patch.dict(os.environ, _managed_env(run_dir)):
+            _complete()
+
+        assert not (run_dir / "validation-record.json").exists()
+        assert not (run_dir / "validation-stdout.log").exists()
+        assert not (run_dir / "validation-stderr.log").exists()
+        record = _completion_record(worktree)
+        assert record.get("validation_record_path") is None
+        assert record["outcome"] == "completed"
+
+    def test_the_batch_review_never_reads_the_quick_contract_either(
+        self, _dirty, managed_worktree
+    ):
+        """Reading the command is the first half of running it.
+
+        A contract that was loaded has already been handed to a session whose
+        sandbox cannot execute it, and a config error in a gate it will never
+        run would fail the completion — the exact shape of the R30 failure.
+        """
+        worktree, run_dir = managed_worktree
+        _stage_assignment(run_dir, TechLeadSessionFlavor.BATCH_REVIEW)
+
+        with patch.dict(os.environ, _managed_env(run_dir)):
+            with patch(
+                f"{_MODULE}.load_validation_cmd",
+                side_effect=AssertionError("the quick contract must not be read"),
+            ):
+                _complete()
+
+        assert _completion_record(worktree)["outcome"] == "completed"
+
+    def test_a_failing_gate_command_cannot_fail_a_batch_review_completion(
+        self, _dirty, tmp_path, monkeypatch
+    ):
+        """F1 in its falsifiable form: the gate that failed R30 cannot fail it.
+
+        A quick contract that always fails stands in for every host effect the
+        model sandbox refuses. Before this repair the Tech Lead could not
+        complete; now the completion record is written and the repository's
+        mandatory validation is somebody else's job.
+        """
+        _git_repo(tmp_path)
+        config_dir = tmp_path / ".issue-orchestrator" / "config"
+        config_dir.mkdir(parents=True)
+        (config_dir / "default.yaml").write_text(
+            "validation:\n  quick:\n    cmd: 'exit 1'\n    timeout_seconds: 10\n"
+        )
+        run_dir = _managed_run(tmp_path)
+        monkeypatch.chdir(tmp_path)
+        _stage_assignment(run_dir, TechLeadSessionFlavor.BATCH_REVIEW)
+
+        with patch.dict(os.environ, _managed_env(run_dir)):
+            _complete()
+
+        assert (tmp_path / COMPLETION_RECORD_PATH).exists()
+
+    def test_the_orchestrators_publish_contract_still_applies(
+        self, _dirty, managed_worktree
+    ):
+        """F6: nothing is skipped, only reassigned.
+
+        The record still asks to publish, so it still satisfies
+        ``offers_a_change_for_review`` — which is what selects the
+        orchestrator's own publish gate. Drop the publication intent here and
+        this completion would slip past the repository contract entirely,
+        which is the one thing the reassignment must not buy.
+        """
+        worktree, run_dir = managed_worktree
+        _stage_assignment(run_dir, TechLeadSessionFlavor.BATCH_REVIEW)
+
+        with patch.dict(os.environ, _managed_env(run_dir)):
+            _complete()
+
+        record = CompletionRecord.from_dict(_completion_record(worktree))
+        assert record.offers_a_change_for_review is True
+
+    def test_it_says_who_owns_the_validation_rather_than_claiming_a_pass(
+        self, _dirty, managed_worktree, capsys
+    ):
+        worktree, run_dir = managed_worktree
+        _stage_assignment(run_dir, TechLeadSessionFlavor.BATCH_REVIEW)
+
+        with patch.dict(os.environ, _managed_env(run_dir)):
+            _complete()
+
+        out = capsys.readouterr().out
+        assert "Skipping code-candidate quick validation" in out
+        assert "orchestrator" in out
+        assert "Validation: passed" not in out
+        assert "Validation: failed" not in out
+
+
+@patch(f"{_MODULE}.check_dirty_files", return_value=[])
 class TestEveryOtherPrincipalKeepsTheCandidateQuickGate:
     def test_ordinary_actor_runs_the_gate(self, _dirty, managed_worktree):
         worktree, run_dir = managed_worktree
@@ -287,28 +408,6 @@ class TestEveryOtherPrincipalKeepsTheCandidateQuickGate:
             call.args for call in injected_context_read.call_args_list
         ] == [("RUN_DIR",)]
         assert (run_dir / "validation-record.json").exists()
-
-    @pytest.mark.parametrize(
-        "flavor,focus",
-        [
-            (TechLeadSessionFlavor.BATCH_REVIEW, None),
-            (TechLeadSessionFlavor.HEALTH_REVIEW, None),
-            (TechLeadSessionFlavor.FAILURE_INVESTIGATION, 42),
-        ],
-    )
-    def test_every_non_planning_tech_lead_flavor_runs_the_gate(
-        self, _dirty, managed_worktree, flavor, focus
-    ):
-        worktree, run_dir = managed_worktree
-        _stage_assignment(run_dir, flavor, focus_issue_number=focus)
-
-        with patch.dict(os.environ, _managed_env(run_dir)):
-            _complete()
-
-        assert (run_dir / "validation-record.json").exists()
-        assert _completion_record(worktree)["validation_record_path"] == str(
-            run_dir / "validation-record.json"
-        )
 
     def test_a_failing_gate_still_refuses_an_ordinary_completion(
         self, _dirty, tmp_path, monkeypatch, capsys

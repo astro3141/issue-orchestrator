@@ -456,21 +456,23 @@ for a pull-request number:
    answers "unchanged" for the one transition after which no merge-facing
    authority may be applied at all.
 
-A merge-facing `pass` rests on **all three** staged prerequisites, recorded on
+A merge-facing `pass` rests on **all four** staged prerequisites, recorded on
 the launch authority before the session spawns and asked as one question by
 `TechLeadLaunchAuthority.unmet_pass_prerequisites`:
-`CandidatePassPrerequisite.INDEPENDENT_REVIEW` — which covers the reviewer's
-approval of that exact commit *and* that same commit's publication-gate
-certification — `CandidatePassPrerequisite.LEAF_CONTRACT`, and
-`CandidatePassPrerequisite.CANDIDATE_DIFF` (#359). Any one unmet refuses the
-`pass`. None of them gates `rework` or `human_a` — neither of those claims the
-candidate is mergeable.
+`CandidatePassPrerequisite.INDEPENDENT_REVIEW` — the reviewer's approval of
+that exact commit — `CandidatePassPrerequisite.LEAF_CONTRACT`,
+`CandidatePassPrerequisite.CANDIDATE_DIFF` (#359), and
+`CandidatePassPrerequisite.REPOSITORY_VALIDATION` (#370) — the repository's
+mandatory validation contract passing on that same commit under the
+orchestrator's own publication gate. Any one unmet refuses the `pass`. None of
+them gates `rework` or `human_a` — neither of those claims the candidate is
+mergeable.
 
 The refusal receipt names which prerequisite was missing **and the reason the
 staging owner recorded for it**, carried on the launch authority as
 `CandidatePrerequisiteGap`. One prerequisite covers several conditions — no
-verdict at all, a verdict about another commit, a rejection, an uncertified
-publication — and the receipt is the operator's only instruction for removing a
+verdict at all, a verdict about another commit, a rejection, an unreadable
+record — and the receipt is the operator's only instruction for removing a
 label nothing here removes for them, so a fixed sentence that guessed would send
 them after a fact that is already on file. The long form lives in
 `candidate-evidence.json` / `candidate-contracts.json`, which cleanup disposes of
@@ -519,6 +521,52 @@ The seam is now typed end to end:
 Failure is per candidate: one unreadable pull request records its own gap and
 leaves its siblings' staged evidence and PASS eligibility untouched.
 
+#### Mandatory repository validation is the orchestrator's to run (#370)
+
+The R30 proof (#364) established that a Tech Lead could consume the exact
+candidate contract and render a candidate-bound `pass` — and then could not
+complete. `coding-done` ran the code-candidate quick gate inside the model
+session, and that gate needs host/repository-owned effects the model-provider
+sandbox does not grant: the concrete one observed was a write to the shared Git
+common dir (`.git/issue-orchestrator/validate-timings.jsonl`), outside the Tech
+Lead's scratch worktree. Opting the role into `SandboxScope`'s
+read-broad/write-scratch-only posture does not fix that, because the validation
+path itself is what reaches outside the boundary; widening the sandbox to admit
+it is the authority grant the repair exists to avoid.
+
+Ownership moved instead, in two places, and neither is the model session:
+
+- **No Tech Lead flavor runs the code-candidate quick gate.**
+  `control/completion_gate_routing.py` is the one owner of that
+  discrimination. A `planning_investigation` is refused it because there is no
+  candidate (#319); every other flavor is refused it because the validation
+  owner is the orchestrator. The routing hint lives in the agent-writable
+  worktree and buys nothing but skipping that gate — no publication, no label,
+  no effect.
+- **Anything the run offers to publish still meets the repository's contract**,
+  through the orchestrator's own publication gate
+  (`CompletionProcessor._check_publish_gate_if_required`), which runs in the
+  orchestrator's process on the completed worktree. Nothing is skipped; it is
+  executed somewhere the sandbox does not reach.
+
+What a merge-facing `pass` rests on is bound to the exact audited candidate
+rather than to the Tech Lead's own checkout, and travels the same way the other
+three prerequisites do: the durable per-candidate publication receipt is read
+at staging time by `DurableCandidateEvidence`, recorded on the manifest entry as
+`validation_established` / `validation_gap`, and carried onto
+`TechLeadLaunchAuthority.validated_candidates` where the session cannot reach
+it. Every absent direction refuses — no receipt for the commit, a receipt bound
+to another commit, a failed or timed-out run, a receipt from a contract that is
+no longer the required one, an unreadable record, a legacy row. A validation the
+orchestrator could not execute or could not read is never converted into
+candidate evidence.
+
+The reviewer's approval and the repository's validation are therefore two named
+prerequisites rather than one. They were one until #370; with the validation
+owner now outside the model sandbox, a refusal that could only say "something
+about this commit was not shown" could not tell an operator whether to go and
+find a review or a validation run, and those have different remedies.
+
 #### Leaving the watch set
 
 The set that trips the batch threshold has to be the set a review settles, or
@@ -529,10 +577,10 @@ candidate's labels become.
 
 | The run concluded | Labels | Still a candidate? | How it gets back in |
 |---|---|---|---|
-| `pass`, head unmoved, all three staged prerequisites established | `+tech-lead-reviewed` | no (terminal) | n/a — it passed |
+| `pass`, head unmoved, all four staged prerequisites established | `+tech-lead-reviewed` | no (terminal) | n/a — it passed |
 | `rework` | `-` watch label, `-` review-approval label, `+needs-rework` | no | automatically, on the next review that approves it |
 | `human_a` | `+tech-lead-failed`, `+needs-human` | no | operator removes `tech-lead-failed` |
-| `pass` refused — a staged prerequisite (exact-candidate reviewer approval and its publication certification, a resolved leaf contract, or the candidate's own materialized diff) is missing; the receipt names which and the reason recorded for it | `+tech-lead-failed` | no | operator removes `tech-lead-failed` |
+| `pass` refused — a staged prerequisite (exact-candidate reviewer approval, a resolved leaf contract, the candidate's own materialized diff, or the orchestrator's mandatory-validation certification of that commit) is missing; the receipt names which and the reason recorded for it | `+tech-lead-failed` | no | operator removes `tech-lead-failed` |
 | head moved, unreadable, or never observed | none | **yes, deliberately** | it never left — re-audited at whatever it then proposes |
 | the pull request merged or closed after the manifest bound it — whatever its head | none | yes, but unreachable | it never re-enters: the batch observes open pull requests only |
 

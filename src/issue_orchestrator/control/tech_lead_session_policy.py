@@ -558,6 +558,17 @@ def prepare_tech_lead_session_data(
             diffed_candidates=(
                 tech_lead_manifest.diffed_candidates() if tech_lead_manifest else ()
             ),
+            # And which of them the orchestrator's OWN publication gate
+            # certified for that exact commit (#370). The session does not run
+            # repository validation — it cannot, under a bounded provider
+            # sandbox — so the verdict has to arrive here, from the owner that
+            # executed it outside the sandbox, or a merge-facing `pass` would
+            # rest on a validation nobody performed.
+            validated_candidates=(
+                tech_lead_manifest.validated_candidates()
+                if tech_lead_manifest
+                else ()
+            ),
             # And WHY each candidate that holds one of them missed it, as the
             # staging owners observed it (#345, #359). Recorded here because the
             # files that hold the long form live in the tech-lead worktree,

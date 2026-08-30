@@ -352,6 +352,14 @@ def arm_batch_session(
                 if with_manifest
                 else ()
             ),
+            validated_candidates=(
+                (
+                    TechLeadCandidate(101, pr_candidate_sha(101)),
+                    TechLeadCandidate(102, pr_candidate_sha(102)),
+                )
+                if with_manifest
+                else ()
+            ),
         ),
     )
 
