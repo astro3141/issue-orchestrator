@@ -37,6 +37,10 @@ from issue_orchestrator.domain.runtime_config import RuntimeConfigReference
 from issue_orchestrator.domain.repository_launch_selection import (
     RepositoryLaunchSelection,
 )
+from issue_orchestrator.entrypoints.cli_tools.agent_done import (
+    STATUS_TO_ACTIONS,
+    AgentStatus,
+)
 from issue_orchestrator.events import EventContext, EventName
 from issue_orchestrator.execution import persistent_session_exchange as pse
 from issue_orchestrator.execution.persistent_role_prompt_policy import (
@@ -60,7 +64,21 @@ from issue_orchestrator.execution.attempt_review_verdict_store import (
 from issue_orchestrator.execution.candidate_execution_identity import (
     CandidateExecutionIdentityRecorder,
 )
-from issue_orchestrator.execution.review_exchange_records import load_review_verdict
+from issue_orchestrator.execution.review_exchange_records import (
+    load_coder_escalation,
+    load_review_verdict,
+)
+from issue_orchestrator.execution import (
+    review_exchange_validation_mirror as validation_mirror,
+)
+from issue_orchestrator.execution.review_exchange_coder_turn import (
+    CoderTurnDisposition,
+    CoderTurnRead,
+    read_coder_turn,
+)
+from issue_orchestrator.execution.review_exchange_validation_mirror import (
+    PairValidationMirror,
+)
 from issue_orchestrator.execution.session_output_adapter import FileSystemSessionOutput
 from issue_orchestrator.ports import TraceEvent
 from issue_orchestrator.execution.agent_runner_providers.codex_trust import (
@@ -378,6 +396,7 @@ def _patch_persistent_runner(
     write_coder_completion: bool = True,
     coder_completion_script: list[bool] | None = None,
     coder_validation_payload_script: list[dict[str, Any]] | None = None,
+    coder_completion_payload_script: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Patch the runner functions in pse to consume a per-role response script.
 
@@ -396,6 +415,12 @@ def _patch_persistent_runner(
 
     ``coder_validation_payload_script`` lets a test vary the validation
     record payload written with each successful coder completion.
+
+    ``coder_completion_payload_script`` lets a test vary the completion
+    payload itself per coder attempt — the ``outcome`` and
+    ``requested_actions`` fields the exchange reads to tell an ordinary turn
+    from a ``needs_human`` escalation (#386). Each entry is merged over the
+    default completed payload.
     """
     registry = _FakePairRegistry()
     state: dict[str, Any] = {
@@ -413,6 +438,11 @@ def _patch_persistent_runner(
     validation_payload_script = (
         list(coder_validation_payload_script)
         if coder_validation_payload_script is not None
+        else None
+    )
+    completion_payload_script = (
+        list(coder_completion_payload_script)
+        if coder_completion_payload_script is not None
         else None
     )
 
@@ -508,7 +538,7 @@ def _patch_persistent_runner(
             report_path.parent.mkdir(parents=True, exist_ok=True)
             report_path.write_text(str(authored_report_text), encoding="utf-8")
         # Stub the coder's completion artifact write so the protocol
-        # guardrail in pse._validate_coder_completion has the file it expects.
+        # guardrail in pse._read_coder_turn has the file it expects.
         should_write_completion = write_coder_completion
         if role == "coder" and completion_script is not None:
             if not completion_script:
@@ -542,14 +572,19 @@ def _patch_persistent_runner(
                 json.dumps(validation_payload),
                 encoding="utf-8",
             )
+            completion_payload: dict[str, Any] = {
+                "outcome": "completed",
+                "implementation": "stub",
+                "validation_record_path": str(validation_record),
+            }
+            if completion_payload_script is not None:
+                if not completion_payload_script:
+                    raise AssertionError(
+                        "test fixture: coder_completion_payload_script exhausted"
+                    )
+                completion_payload.update(completion_payload_script.pop(0))
             completion.write_text(
-                json.dumps(
-                    {
-                        "outcome": "completed",
-                        "implementation": "stub",
-                        "validation_record_path": str(validation_record),
-                    }
-                ),
+                json.dumps(completion_payload),
                 encoding="utf-8",
             )
         if raise_after is not None:
@@ -1304,6 +1339,30 @@ class TestPersistentSessionExchangeHappyPath:
         assert "Tighten wording" in rework_response.response_text
 
 
+def coder_turn_disposition(
+    *,
+    completion_path: Path,
+    pair_validation: PairValidationMirror,
+    run_validation_record_path: Path,
+    require_validation: bool,
+    issue_number: int = 42,
+    session_name: str = "issue-42-coder",
+    round_index: int = 1,
+) -> CoderTurnDisposition:
+    """Read one coder turn's disposition through its typed command."""
+    return read_coder_turn(
+        CoderTurnRead(
+            completion_path=completion_path,
+            pair_validation=pair_validation,
+            run_validation_record_path=run_validation_record_path,
+            require_validation=require_validation,
+            issue_number=issue_number,
+            session_name=session_name,
+            round_index=round_index,
+        )
+    )
+
+
 class TestPairValidationMirror:
     def test_current_validation_seed_replaces_existing_pair_record(
         self,
@@ -1323,7 +1382,7 @@ class TestPairValidationMirror:
             encoding="utf-8",
         )
 
-        mirror = pse._PairValidationMirror(  # noqa: SLF001
+        mirror = PairValidationMirror(
             pair_dir=pair_dir,
             record_path=pair_record,
             coder_worktree_path=coder_wt,
@@ -1353,7 +1412,7 @@ class TestPairValidationMirror:
         current_record = tmp_path / "current-validation-record.json"
         current_record.write_text(json.dumps(payload), encoding="utf-8")
 
-        mirror = pse._PairValidationMirror(  # noqa: SLF001
+        mirror = PairValidationMirror(
             pair_dir=pair_dir,
             record_path=pair_record,
             coder_worktree_path=coder_wt,
@@ -1388,7 +1447,7 @@ class TestPairValidationMirror:
             json.dumps({"passed": True, "head_sha": "old-sha"}),
             encoding="utf-8",
         )
-        mirror = pse._PairValidationMirror(  # noqa: SLF001
+        mirror = PairValidationMirror(
             pair_dir=pair_dir,
             record_path=pair_record,
             coder_worktree_path=coder_wt,
@@ -1430,19 +1489,19 @@ class TestPairValidationMirror:
             ),
             encoding="utf-8",
         )
-        monkeypatch.setattr(pse, "get_repo_head_sha", lambda _: "head-b")
-        mirror = pse._PairValidationMirror(  # noqa: SLF001
+        monkeypatch.setattr(validation_mirror, "get_repo_head_sha", lambda _: "head-b")
+        mirror = PairValidationMirror(
             pair_dir=pair_dir,
             record_path=pair_record,
             coder_worktree_path=coder_wt,
         )
 
-        error = pse._validate_coder_completion(  # noqa: SLF001
+        error = coder_turn_disposition(
             completion_path=completion,
             pair_validation=mirror,
             run_validation_record_path=tmp_path / "run" / "validation-record.json",
             require_validation=True,
-        )
+        ).protocol_error
 
         assert error is None
         assert json.loads(pair_record.read_text(encoding="utf-8")) == {
@@ -1475,19 +1534,19 @@ class TestPairValidationMirror:
             ),
             encoding="utf-8",
         )
-        monkeypatch.setattr(pse, "get_repo_head_sha", lambda _: "head-b")
-        mirror = pse._PairValidationMirror(  # noqa: SLF001
+        monkeypatch.setattr(validation_mirror, "get_repo_head_sha", lambda _: "head-b")
+        mirror = PairValidationMirror(
             pair_dir=pair_dir,
             record_path=pair_record,
             coder_worktree_path=coder_wt,
         )
 
-        error = pse._validate_coder_completion(  # noqa: SLF001
+        error = coder_turn_disposition(
             completion_path=completion,
             pair_validation=mirror,
             run_validation_record_path=tmp_path / "run" / "validation-record.json",
             require_validation=True,
-        )
+        ).protocol_error
 
         assert error is not None
         assert "does not match current HEAD" in error
@@ -1511,19 +1570,19 @@ class TestPairValidationMirror:
             encoding="utf-8",
         )
         completion.write_text(json.dumps({"outcome": "completed"}), encoding="utf-8")
-        monkeypatch.setattr(pse, "get_repo_head_sha", lambda _: "head-b")
-        mirror = pse._PairValidationMirror(  # noqa: SLF001
+        monkeypatch.setattr(validation_mirror, "get_repo_head_sha", lambda _: "head-b")
+        mirror = PairValidationMirror(
             pair_dir=pair_dir,
             record_path=pair_record,
             coder_worktree_path=coder_wt,
         )
 
-        error = pse._validate_coder_completion(  # noqa: SLF001
+        error = coder_turn_disposition(
             completion_path=completion,
             pair_validation=mirror,
             run_validation_record_path=tmp_path / "run" / "validation-record.json",
             require_validation=True,
-        )
+        ).protocol_error
 
         assert error == "validation-record.json missing"
         assert not pair_record.exists()
@@ -1551,19 +1610,19 @@ class TestPairValidationMirror:
             json.dumps({"passed": True, "head_sha": "head-b"}),
             encoding="utf-8",
         )
-        monkeypatch.setattr(pse, "get_repo_head_sha", lambda _: "head-b")
-        mirror = pse._PairValidationMirror(  # noqa: SLF001
+        monkeypatch.setattr(validation_mirror, "get_repo_head_sha", lambda _: "head-b")
+        mirror = PairValidationMirror(
             pair_dir=pair_dir,
             record_path=pair_record,
             coder_worktree_path=coder_wt,
         )
 
-        error = pse._validate_coder_completion(  # noqa: SLF001
+        error = coder_turn_disposition(
             completion_path=completion,
             pair_validation=mirror,
             run_validation_record_path=run_record,
             require_validation=True,
-        )
+        ).protocol_error
 
         assert error is None
         assert json.loads(pair_record.read_text(encoding="utf-8")) == {
@@ -3286,7 +3345,7 @@ class TestCallerHooks:
             json.dumps(validation_payload),
             encoding="utf-8",
         )
-        monkeypatch.setattr(pse, "get_repo_head_sha", lambda _: "head-a")
+        monkeypatch.setattr(validation_mirror, "get_repo_head_sha", lambda _: "head-a")
 
         state = _patch_persistent_runner(
             monkeypatch,
@@ -3367,7 +3426,7 @@ class TestCallerHooks:
             json.dumps(initial_payload),
             encoding="utf-8",
         )
-        monkeypatch.setattr(pse, "get_repo_head_sha", lambda _: "head-b")
+        monkeypatch.setattr(validation_mirror, "get_repo_head_sha", lambda _: "head-b")
 
         state = _patch_persistent_runner(
             monkeypatch,
@@ -7167,6 +7226,69 @@ class TestProductionLayoutCacheResolution:
         )
         assert resolution.decision is ResumeDecision.REUSE_HALT
 
+    def test_coder_escalation_halts_without_publish_evidence(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """#386: the escalation survives the tick that reads it back.
+
+        Production shape for F2: the coder committed and then escalated, so
+        the newest validation record on disk names the previous head and the
+        summary names the commit the question was raised about. Without the
+        exemption this reads as an unprovable cache and spawns a fresh
+        exchange — straight back into the swallow.
+        """
+        from issue_orchestrator.domain.review_exchange_resume import ResumeDecision
+
+        worktree, coder_run = self._stage_run(
+            tmp_path,
+            coder_head_sha="HEAD_OLD",
+            review_status="stopped",
+            review_reason="coder_escalated_to_human",
+            review_head_sha="HEAD_NEW",
+            validation_passed=None,
+        )
+        review = self._build_completion_review_exchange(
+            tmp_path,
+            FileSystemSessionOutput(),
+        )
+        resolution = review.decide_review_exchange_resumption(
+            worktree=worktree,
+            session_name="coding-1",
+            require_validation=True,
+            current_validation_record_path=coder_run / "validation-record.json",
+            current_head_sha="HEAD_NEW",
+        )
+        assert resolution.decision is ResumeDecision.REUSE_HALT
+
+    def test_coder_escalation_at_a_superseded_head_is_ignored_stale(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """#386: the head binding still applies — a new commit re-reviews."""
+        from issue_orchestrator.domain.review_exchange_resume import ResumeDecision
+
+        worktree, coder_run = self._stage_run(
+            tmp_path,
+            coder_head_sha="HEAD_NEWER",
+            review_status="stopped",
+            review_reason="coder_escalated_to_human",
+            review_head_sha="HEAD_OLD",
+            validation_passed=None,
+        )
+        review = self._build_completion_review_exchange(
+            tmp_path,
+            FileSystemSessionOutput(),
+        )
+        resolution = review.decide_review_exchange_resumption(
+            worktree=worktree,
+            session_name="coding-1",
+            require_validation=True,
+            current_validation_record_path=coder_run / "validation-record.json",
+            current_head_sha="HEAD_NEWER",
+        )
+        assert resolution.decision is ResumeDecision.IGNORE_STALE
+
     def test_max_rounds_exceeded_at_current_head_reuses_halt(
         self,
         tmp_path: Path,
@@ -8583,3 +8705,452 @@ class TestCandidateExecutionIdentityBinding:
 
         assert (outcome.status, outcome.reason) == ("ok", "reviewer_ok")
         assert not (tmp_path / "identity-root" / ".issue-orchestrator").exists()
+
+
+# ---------------------------------------------------------------------------
+# Coder escalation (#386) — a needs_human turn is routed, never swallowed
+# ---------------------------------------------------------------------------
+
+_STALE_HEAD_SHA = "0" * 40
+_CODER_ATTEMPTS_PER_ROUND = 3
+"""One initial coder attempt plus the exchange's two protocol retries."""
+
+
+def _run_escalation_exchange(
+    *,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    completion_payload: dict[str, Any],
+    validation_payload_for: Any,
+    require_validation: bool = True,
+    max_rounds: int = 3,
+    coder_attempts: int = 1,
+    sink: Any = None,
+) -> tuple[Any, "_BindingRepo"]:
+    """Drive one reviewer-rejects -> coder-answers round over a real repo.
+
+    A real ``_BindingRepo`` rather than the bare-directory fixture: the
+    escalation binds to the commit the coder worktree actually holds, so a
+    worktree whose HEAD cannot be observed would prove nothing about the
+    binding. ``validation_payload_for`` receives the repo and returns the
+    validation-record payload the coder's turn writes, which is how a test
+    says "current" or "stale" without hard-coding a SHA.
+
+    The reviewer always requests changes so control reaches the coder turn,
+    which is where the completion artifact is read. ``completion_payload`` is
+    merged over the fixture's default completed payload, so a test states only
+    the fields whose meaning it is pinning.
+    """
+    prompt_path = tmp_path / "p.md"
+    prompt_path.write_text("Prompt", encoding="utf-8")
+    repo = _BindingRepo(tmp_path)
+    session_output = FileSystemSessionOutput()
+    validation_payload = validation_payload_for(repo)
+
+    state = _patch_persistent_runner(
+        monkeypatch,
+        response_script={
+            "reviewer": [
+                {
+                    "response_type": "changes_requested",
+                    "response_text": "Please fix X",
+                    "getting_closer": True,
+                }
+            ],
+            "coder": [
+                {
+                    "response_type": "ok",
+                    "response_text": "Answered",
+                    "getting_closer": None,
+                }
+                for _ in range(coder_attempts)
+            ],
+        },
+        coder_validation_payload_script=[validation_payload] * coder_attempts,
+        coder_completion_payload_script=[completion_payload] * coder_attempts,
+    )
+
+    outcome = pse.run_persistent_session_exchange(
+        exchange_run=_start_exchange_run(
+            session_output=session_output,
+            coder_worktree_path=repo.coder_wt,
+            issue_number=42,
+            coder_label="agent:backend",
+        ),
+        session_output=session_output,
+        pair_registry=state["registry"],
+        persistent_pair_root=tmp_path / "persistent-pairs",
+        coder_worktree_path=repo.coder_wt,
+        reviewer_worktree_factory=lambda: repo.reviewer_wt,
+        coder_branch=repo.branch,
+        issue_number=42,
+        issue_title="Test",
+        coder_label="agent:backend",
+        reviewer_label="agent:reviewer",
+        coder_agent=_make_agent(prompt_path),
+        reviewer_agent=_make_agent(prompt_path),
+        runtime_config=_runtime_config(tmp_path),
+        max_rounds=max_rounds,
+        max_no_progress=5,
+        require_validation=require_validation,
+        execution_identities=_identity_recorder(tmp_path),
+        events=sink,
+        event_context=EventContext() if sink is not None else None,
+    )
+    return outcome, repo
+
+
+class TestCoderEscalationRouting:
+    """#386: a ``needs_human`` coder turn reaches its own terminal."""
+
+    @staticmethod
+    def _current(repo: "_BindingRepo") -> dict[str, Any]:
+        return {"passed": True, "head_sha": repo.coder_head()}
+
+    @staticmethod
+    def _stale(_repo: "_BindingRepo") -> dict[str, Any]:
+        return {"passed": True, "head_sha": _STALE_HEAD_SHA}
+
+    def test_escalation_is_not_swallowed_by_a_matching_validation_record(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """F1: HEAD unchanged, validation still current - still an escalation.
+
+        This is the silent-swallow case. Everything the envelope check looks
+        at is in order, so before #386 the round simply advanced and the
+        question the coder asked went nowhere.
+        """
+        outcome, repo = _run_escalation_exchange(
+            tmp_path=tmp_path,
+            monkeypatch=monkeypatch,
+            completion_payload={
+                "outcome": "needs_human",
+                "question": "Does the contract in AGENTS.md permit this?",
+                "context": "Reviewer asked for a change the doc forbids.",
+            },
+            validation_payload_for=self._current,
+        )
+
+        assert (outcome.status, outcome.reason) == (
+            "stopped",
+            "coder_escalated_to_human",
+        )
+        assert outcome.reason != "reviewer_reports_no_progress"
+        escalation = load_coder_escalation(outcome.run_assets.exchange_dir)
+        assert escalation is not None
+        assert escalation.issue_number == 42
+        assert escalation.round_index == 1
+        assert escalation.head_sha == repo.coder_head()
+        assert escalation.question == "Does the contract in AGENTS.md permit this?"
+        assert escalation.offered_a_change_for_review is False
+
+    def test_committed_escalation_survives_a_stale_validation_record(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """F2: only the prior head's evidence exists, and that is fine.
+
+        The coder legitimately committed before escalating, so the record on
+        disk names the old commit. Nothing is being published, so there is
+        nothing that evidence would authorize - rejecting the escalation for
+        its staleness replaces a question with a validation failure.
+        """
+        outcome, repo = _run_escalation_exchange(
+            tmp_path=tmp_path,
+            monkeypatch=monkeypatch,
+            completion_payload={
+                "outcome": "needs_human",
+                "question": "Whose call is the schema change?",
+            },
+            validation_payload_for=self._stale,
+        )
+
+        assert (outcome.status, outcome.reason) == (
+            "stopped",
+            "coder_escalated_to_human",
+        )
+        escalation = load_coder_escalation(outcome.run_assets.exchange_dir)
+        assert escalation is not None
+        # Bound to the commit the worktree actually holds, not to the record.
+        assert escalation.head_sha == repo.coder_head()
+        assert escalation.head_sha != _STALE_HEAD_SHA
+
+    def test_the_real_coding_done_payload_survives_a_stale_record(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """F2, over the payload ``coding-done needs_human`` actually writes.
+
+        The other cases here pass hand-written action lists; this one asks the
+        producer's own table what the artifact contains, because that set
+        carries ``push_branch`` and an exemption keyed on reaching the remote
+        would leave every one of them green while production never reached the
+        terminal at all.
+        """
+        outcome, repo = _run_escalation_exchange(
+            tmp_path=tmp_path,
+            monkeypatch=monkeypatch,
+            completion_payload={
+                "outcome": "needs_human",
+                "question": "Whose call is the schema change?",
+                "requested_actions": [
+                    action.value
+                    for action in STATUS_TO_ACTIONS[AgentStatus.NEEDS_HUMAN]
+                ],
+            },
+            validation_payload_for=self._stale,
+        )
+
+        assert (outcome.status, outcome.reason) == (
+            "stopped",
+            "coder_escalated_to_human",
+        )
+        escalation = load_coder_escalation(outcome.run_assets.exchange_dir)
+        assert escalation is not None
+        assert escalation.head_sha == repo.coder_head()
+        assert escalation.head_sha != _STALE_HEAD_SHA
+        assert escalation.offered_a_change_for_review is False
+
+    def test_escalation_that_also_asks_to_publish_still_fails_closed(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """F3: publication prerequisites survive the escalation path.
+
+        Same stale record as F2, but this turn asks for a PR. Escalating
+        grants no publication authority, so the current-head validation
+        requirement applies in full and the exchange refuses.
+        """
+        outcome, _ = _run_escalation_exchange(
+            tmp_path=tmp_path,
+            monkeypatch=monkeypatch,
+            completion_payload={
+                "outcome": "needs_human",
+                "question": "Ship it anyway?",
+                "requested_actions": ["create_pr"],
+            },
+            validation_payload_for=self._stale,
+            coder_attempts=_CODER_ATTEMPTS_PER_ROUND,
+        )
+
+        assert (outcome.status, outcome.reason) == ("error", "coder_protocol_error")
+        assert load_coder_escalation(outcome.run_assets.exchange_dir) is None
+
+    def test_a_pr_asking_escalation_that_does_present_evidence_is_recorded(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The one way the record's offer flag is written true.
+
+        Same PR-asking turn as above, but its validation record does name
+        current HEAD, so the prerequisite it kept is satisfied and the
+        escalation reaches its terminal — carrying the fact that it asked to
+        publish while escalating, which is what the flag is for.
+        """
+        outcome, _ = _run_escalation_exchange(
+            tmp_path=tmp_path,
+            monkeypatch=monkeypatch,
+            completion_payload={
+                "outcome": "needs_human",
+                "question": "Ship it anyway?",
+                "requested_actions": ["create_pr"],
+            },
+            validation_payload_for=self._current,
+        )
+
+        assert (outcome.status, outcome.reason) == (
+            "stopped",
+            "coder_escalated_to_human",
+        )
+        escalation = load_coder_escalation(outcome.run_assets.exchange_dir)
+        assert escalation is not None
+        assert escalation.offered_a_change_for_review is True
+
+    def test_push_only_escalation_is_still_a_question(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """F3 stops at ``create_pr``: ``push_branch`` preserves, it does not offer.
+
+        A branch-preserving push is what every ``needs_human`` completion asks
+        for and what the orchestrator performs under its own authority; it puts
+        no change up to be judged, so there is no publish contract for a
+        current-head record to satisfy here.
+        """
+        outcome, repo = _run_escalation_exchange(
+            tmp_path=tmp_path,
+            monkeypatch=monkeypatch,
+            completion_payload={
+                "outcome": "needs_human",
+                "question": "Preserve this branch?",
+                "requested_actions": ["push_branch"],
+            },
+            validation_payload_for=self._stale,
+        )
+
+        assert (outcome.status, outcome.reason) == (
+            "stopped",
+            "coder_escalated_to_human",
+        )
+        escalation = load_coder_escalation(outcome.run_assets.exchange_dir)
+        assert escalation is not None
+        assert escalation.head_sha == repo.coder_head()
+
+    def test_ordinary_completed_turn_records_no_escalation(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """F4: the ordinary rework round is untouched.
+
+        The reviewer's changes-requested round runs a coder turn, the coder
+        completes normally, and the exchange keeps going to the round budget
+        - no escalation terminal, no escalation record.
+        """
+        outcome, _ = _run_escalation_exchange(
+            tmp_path=tmp_path,
+            monkeypatch=monkeypatch,
+            completion_payload={"outcome": "completed"},
+            validation_payload_for=self._current,
+            max_rounds=1,
+        )
+
+        assert (outcome.status, outcome.reason) == ("stopped", "max_rounds_exceeded")
+        assert load_coder_escalation(outcome.run_assets.exchange_dir) is None
+
+    def test_ordinary_completed_turn_still_fails_on_stale_validation(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """F4: the validation gate an ordinary turn faces is unchanged."""
+        outcome, _ = _run_escalation_exchange(
+            tmp_path=tmp_path,
+            monkeypatch=monkeypatch,
+            completion_payload={"outcome": "completed"},
+            validation_payload_for=self._stale,
+            coder_attempts=_CODER_ATTEMPTS_PER_ROUND,
+        )
+
+        assert (outcome.status, outcome.reason) == ("error", "coder_protocol_error")
+
+    def test_summary_names_the_escalation_and_the_commit_it_covers(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """F6: the durable terminal reason is machine-readable and specific."""
+        outcome, repo = _run_escalation_exchange(
+            tmp_path=tmp_path,
+            monkeypatch=monkeypatch,
+            completion_payload={
+                "outcome": "needs_human",
+                "question": "Which owner should hold this policy?",
+            },
+            validation_payload_for=self._stale,
+        )
+
+        summary_file = outcome.run_assets.exchange_dir / "summary.json"
+        payload = json.loads(summary_file.read_text(encoding="utf-8"))
+        assert payload["status"] == "stopped"
+        assert payload["reason"] == "coder_escalated_to_human"
+        # The summary names the commit the question was raised about, not the
+        # commit the leftover validation record happens to name.
+        assert payload["head_sha"] == repo.coder_head()
+        assert "Which owner should hold this policy?" in payload["detail"]
+
+    def test_escalation_reaches_the_event_surface_without_new_authority(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """F7: the escalation is reported, and it approves nothing.
+
+        ``stopped`` is what the outcome carries, so nothing downstream reads
+        this exchange as an approval - the escalation buys the coder no
+        publication and no verdict binding.
+        """
+        sink = _Sink()
+
+        outcome, _ = _run_escalation_exchange(
+            tmp_path=tmp_path,
+            monkeypatch=monkeypatch,
+            completion_payload={"outcome": "needs_human", "question": "Who owns X?"},
+            validation_payload_for=self._stale,
+            sink=sink,
+        )
+
+        assert outcome.status != "ok"
+        assert load_review_verdict(outcome.run_assets.exchange_dir) is None
+        completed = [
+            event
+            for event in sink.events
+            if event.event_type is EventName.REVIEW_EXCHANGE_COMPLETED
+        ]
+        assert [event.data["reason"] for event in completed] == [
+            "coder_escalated_to_human"
+        ]
+        assert "Who owns X?" in completed[0].data["detail"]
+        rounds = [
+            event
+            for event in sink.events
+            if event.event_type is EventName.REVIEW_EXCHANGE_ROUND_COMPLETED
+        ]
+        assert rounds[-1].data["coder_response_type"] == "escalated_to_human"
+
+    def test_deferred_follow_up_needs_only_a_pre_existing_issue_url(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """F5: a material out-of-scope finding needs no new issue to be filed.
+
+        The reviewer defers the finding to an issue that already exists and
+        approves. That reaches a schema-valid terminal without the reviewer
+        ever creating anything on GitHub — issue creation stays Control's, and
+        no agent needs it to make its own verdict representable.
+        """
+        outcome = _run_binding_exchange(
+            tmp_path=tmp_path,
+            monkeypatch=monkeypatch,
+            response_script={
+                "reviewer": [
+                    {
+                        "response_type": "ok",
+                        "response_text": "Approved; abstraction deferred.",
+                        "getting_closer": True,
+                        "decision": {
+                            "verdict": "approved",
+                            "risk": "low",
+                            "abstraction_review": {
+                                "status": "deferred",
+                                "rationale": "Owner extraction is its own change.",
+                                "follow_up_issue_url": (
+                                    "https://github.com/org/repo/issues/388"
+                                ),
+                            },
+                        },
+                    }
+                ],
+                "coder": [],
+            },
+        )
+
+        assert (outcome.status, outcome.reason) == ("ok", "reviewer_ok")
+        decision_file = (
+            outcome.run_assets.exchange_dir
+            / "turns"
+            / "round-1-reviewer-attempt-1.review-decision.json"
+        )
+        decision = json.loads(decision_file.read_text(encoding="utf-8"))
+        assert decision["abstraction_review"]["status"] == "deferred"
+        assert decision["abstraction_review"]["follow_up_issue_url"] == (
+            "https://github.com/org/repo/issues/388"
+        )

@@ -112,6 +112,52 @@ exchange — and reports so, via `review_exchange_completed`, rather than merely
 naming no run — is unchanged: it never held review evidence, so it settles from
 what it produced.
 
+### When the coder's answer is a question (#386)
+
+A coder turn can discover that the next decision is not its own — the
+reviewer's feedback conflicts with repository authority, or settling it needs a
+call outside the issue's admitted scope. `coding-done needs_human` is how it
+says so, and the exchange ends at a terminal of its own:
+
+| | |
+|---|---|
+| Terminal | `stopped` / `coder_escalated_to_human` |
+| Durable record | `coder-escalation.json`, beside `summary.json` in the exchange run |
+| Bound to | the issue, the session, the round, and the coder worktree's **current** HEAD |
+| Resume decision | `REUSE_HALT` at the same head; `IGNORE_STALE` once the branch moves |
+
+Three properties of that terminal are load-bearing, and each closes a way the
+escalation used to disappear:
+
+- **It is read, not inferred.** The exchange reads the completion's `outcome`
+  in the same pass that validates its envelope
+  (`execution/review_exchange_coder_turn.py`). Before #386 only the envelope
+  was checked, so a `needs_human` turn whose HEAD had not moved satisfied every
+  check there was and advanced the round as if it had said nothing.
+- **It presents no publication evidence, and is asked for none.** An escalation
+  offers no change for review, so there is no publication for a validation
+  record to authorize. Demanding a current-head record anyway is what rejected
+  a coder that legitimately committed before escalating — a validation failure
+  standing in for a question. The exemption is keyed on `create_pr` — the
+  domain's `offers_a_change_for_review`, the same predicate the publish
+  contract uses — and not on reaching the remote at all: `coding-done
+  needs_human` always requests `push_branch` to preserve the coder's work, so
+  an exemption keyed that way would never fire for any escalation a coder can
+  produce. The exemption is still exactly as narrow as it sounds: **if the same
+  turn also requests `create_pr`, every current-head publication prerequisite
+  applies in full and the turn fails closed.**
+- **Its reason is its own.** `reviewer_reports_no_progress` claims successive
+  coder turns stopped converging, `reviewer_requested_changes` claims the
+  reviewer rejected the commit, and `coder_protocol_error` claims the coder
+  broke the contract. An escalation is none of those, and a reader that cannot
+  tell them apart cannot tell a question from a failure.
+
+The escalation grants no authority whatsoever: no approval, no verdict binding,
+no publication — and no issue creation. A finding that deserves a follow-up
+issue is described in the question, or points at an issue that already exists;
+Control owns creating and admitting follow-up work, and no agent needs that
+authority to make its own verdict representable.
+
 ## Review Artifacts
 
 Before PR creation, each review exchange produces a paired artifact set:
@@ -173,8 +219,10 @@ approving terminal at all. Every other way an exchange can end
 `review-verdict.json`, because no reviewer verdict describes the commit the
 exchange left behind: max rounds is reached after a coder turn that was asked to
 move HEAD past the last reviewed commit, and the other terminals end before a
-verdict is rendered at all. Absence is therefore not a gap to fill in later; it
-means this exchange produced no verdict any gate may admit.
+verdict is rendered at all. The coder's escalation (#386) is in that same set,
+and for the same reason — the round ended on the coder's answer, not on a
+reviewer's verdict about what it left behind. Absence is therefore not a gap to
+fill in later; it means this exchange produced no verdict any gate may admit.
 
 The binding is written next to `summary.json` and reloaded from there, so it
 survives an orchestrator restart. If the orchestrator cannot observe the

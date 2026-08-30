@@ -16,6 +16,12 @@ the caller may inject a ``before_reviewer_round`` callback that runs after it.
 
 This module owns the round-loop semantics — validation gating,
 no-progress termination, and event emission.
+
+Two things the loop consults but does not decide live beside it:
+``review_exchange_validation_mirror`` owns whether the pair's validation
+evidence is current, and ``review_exchange_coder_turn`` owns what one coder
+turn's completion artifact means — including the escalation terminal a
+``needs_human`` turn reaches (#386).
 """
 
 from __future__ import annotations
@@ -78,6 +84,7 @@ from ..domain.review_artifacts import (
     persist_review_artifact_pair,
     review_requires_nit_rework,
 )
+from ..domain.review_exchange_escalation import CoderEscalation
 from ..domain.review_exchange_resume import is_no_completion_reason
 from ..domain.review_exchange_turn import (
     ReviewExchangePromptFiles,
@@ -92,19 +99,25 @@ from ..domain.review_exchange_rework import ReviewExchangeRework
 from ..domain.review_exchange_summary import ReviewExchangeReason, ReviewExchangeStatus
 from ..domain.review_verdict_binding import ReviewVerdictOutcome
 from .candidate_execution_identity import CandidateExecutionIdentityRecorder
+from .review_exchange_coder_turn import (
+    CoderEscalationTerminal,
+    CoderTurnRead,
+    build_outcome_for_coder_escalation,
+    read_coder_turn,
+)
 from .review_exchange_records import write_exchange_summary
 from .review_exchange_terminals import (
     ReviewerRoundTerminals,
     complete_with_reviewer_decision,
     emit_built_event,
 )
+from .review_exchange_validation_mirror import PairValidationMirror
 from .reviewer_worktree import ReviewerCandidatePresentation
 from ..domain.runtime_config import RuntimeConfigReference
 from ..domain import review_exchange_turn_artifacts as turn_artifacts
 from ..events import EventContext, EventName
 from ..infra.env import ENV_PREFIX
 from ..infra.logging_config import log_context
-from ..infra.repo_identity import get_repo_head_sha
 from ..infra.terminal_recording import TERMINAL_RECORDING_FILENAME
 from ..ports import (
     EventSink,
@@ -545,7 +558,7 @@ def run_persistent_session_exchange(  # noqa: PLR0913
     )
 
     run_validation_record_path = exchange_run.assets.validation_record_path
-    pair_validation = _PairValidationMirror(
+    pair_validation = PairValidationMirror(
         pair_dir=pair_dir,
         record_path=pair_validation_record,
         coder_worktree_path=coder_worktree_path,
@@ -833,121 +846,6 @@ def run_persistent_session_exchange(  # noqa: PLR0913
         outcome=outcome,
     )
     return outcome
-
-
-@dataclass(frozen=True)
-class _PairValidationMirror:
-    """Own the pair-scoped validation record's freshness contract.
-
-    The persistent pair owns pair-scoped validation evidence, but validation is
-    only valid for the coder worktree's current HEAD. This mirror is the
-    single owner for invalidating stale pair records, copying the
-    current validation owner's record into pair scope, and asserting
-    that a required validation record both passed and matches HEAD.
-    """
-
-    pair_dir: Path
-    record_path: Path
-    coder_worktree_path: Path
-    run_record_path: Path | None = None
-
-    def replace_from_initial(self, source: Path | None) -> None:
-        """Mirror the caller's current validation source at exchange start.
-
-        A missing source clears any prior pair record. That is
-        intentional: an exchange without current validation evidence
-        must not inherit the last exchange's passing record.
-        """
-        self._replace_from(source)
-
-    def refresh_from_completion(
-        self,
-        payload: dict[str, Any],
-        *,
-        run_validation_record_path: Path,
-    ) -> str | None:
-        """Mirror validation evidence produced by this coder turn."""
-        source, error = self._completion_validation_source(
-            payload,
-            run_validation_record_path=run_validation_record_path,
-        )
-        if error is not None:
-            self._clear()
-            return error
-        self._replace_from(source)
-        return None
-
-    def observe_candidate_head(self) -> str | None:
-        """The commit the *coder worktree* currently holds, or None.
-
-        This is the commit validation evidence must name to still be current,
-        and nothing else. Deliberately not the source of the verdict binding's
-        ``reviewed_sha``, which names what the reviewer's worktree was checked
-        out at — the coder's branch can move in between.
-        ``docs/foundation/VALIDATED_WORK_DISPOSITION.md`` §4 requires the two
-        to agree; agreement is *checked* (stale validation routes the round to
-        rework; a bound verdict re-derives ``approves`` against current HEAD),
-        never assumed by reading one worktree and calling it both.
-        """
-        return get_repo_head_sha(self.coder_worktree_path)
-
-    def current_validation_error(self) -> str | None:
-        return _validation_record_error(
-            self.record_path,
-            current_head_sha=self.observe_candidate_head(),
-        )
-
-    def _completion_validation_source(
-        self,
-        payload: dict[str, Any],
-        *,
-        run_validation_record_path: Path,
-    ) -> tuple[Path | None, str | None]:
-        raw_path = payload.get("validation_record_path")
-        if raw_path is not None:
-            if not isinstance(raw_path, str) or not raw_path.strip():
-                return (
-                    None,
-                    "completion validation_record_path must be a non-empty string",
-                )
-            return self._validated_worktree_path(raw_path)
-        if run_validation_record_path.exists():
-            return run_validation_record_path, None
-        return None, None
-
-    def _validated_worktree_path(self, raw_path: str) -> tuple[Path | None, str | None]:
-        candidate = Path(raw_path)
-        if not candidate.is_absolute():
-            candidate = self.coder_worktree_path / candidate
-        try:
-            resolved = candidate.resolve()
-            worktree = self.coder_worktree_path.resolve()
-            if resolved != self.record_path.resolve():
-                resolved.relative_to(worktree)
-        except (OSError, ValueError):
-            return None, (
-                "completion validation_record_path must stay under the coder worktree"
-            )
-        if not resolved.exists():
-            return None, f"completion validation_record_path does not exist: {resolved}"
-        if not resolved.is_file():
-            return None, f"completion validation_record_path is not a file: {resolved}"
-        return resolved, None
-
-    def _replace_from(self, source: Path | None) -> None:
-        if source is None or not source.exists():
-            self._clear()
-            return
-        self.pair_dir.mkdir(parents=True, exist_ok=True)
-        payload = source.read_bytes()
-        _atomic_write_bytes(self.record_path, payload)
-        if self.run_record_path is not None:
-            _atomic_write_bytes(self.run_record_path, payload)
-
-    def _clear(self) -> None:
-        self.record_path.unlink(missing_ok=True)
-        if self.run_record_path is not None:
-            self.run_record_path.unlink(missing_ok=True)
 
 
 @dataclass(frozen=True)
@@ -1575,7 +1473,7 @@ def _finalize_reviewer_decision(
     reviewer_report_path: Path,
     nit_policy: NitPolicy,
     require_validation: bool,
-    pair_validation: _PairValidationMirror,
+    pair_validation: PairValidationMirror,
     approval_gate: ReviewExchangeApprovalGate | None,
 ) -> _ReviewerDecisionResult:
     validation_error = (
@@ -1762,7 +1660,7 @@ class _DriveRoundsCommand:
     coder_completion_path: Path
     validation_record_path: Path
     prompt_files: ReviewExchangePromptFiles
-    pair_validation: _PairValidationMirror
+    pair_validation: PairValidationMirror
     coder_timeout_seconds: float
     reviewer_timeout_seconds: float
     max_rounds: int
@@ -2231,7 +2129,7 @@ class _CoderProtocolCommand:
     coder_recording: Path
     coder_completion_path: Path
     validation_record_path: Path
-    pair_validation: _PairValidationMirror
+    pair_validation: PairValidationMirror
     run_assets: ReviewExchangeRunAssets
     coder_timeout_seconds: float
     require_validation: bool
@@ -2245,6 +2143,31 @@ class _CoderProtocolCommand:
     response_channel: ResponseChannel = "mailbox"
 
 
+def _coder_escalation_terminal(
+    command: _CoderProtocolCommand,
+    coder: ReviewExchangeResponse,
+    escalation: CoderEscalation,
+) -> CoderEscalationTerminal:
+    """Bind ``escalation`` to the round it was raised in.
+
+    Both call sites below reach the same terminal from the same round, and
+    the initial attempt and the protocol retry differ only in which coder
+    response is the last one. Derived once so the two cannot come to describe
+    the same escalation differently.
+    """
+    return CoderEscalationTerminal(
+        run_assets=command.run_assets,
+        exchange_dir=command.exchange_dir,
+        round_index=command.cycle_index,
+        escalation=escalation,
+        issue_number=command.issue_number,
+        session_name=command.session_name,
+        emit=command.emit,
+        last_reviewer=command.reviewer,
+        last_coder=coder,
+    )
+
+
 def _enforce_coder_protocol(
     command: _CoderProtocolCommand,
 ) -> tuple[ReviewExchangeResponse, ReviewExchangeOutcome | None]:
@@ -2255,6 +2178,12 @@ def _enforce_coder_protocol(
     Mirrors the active runner's _run_coder_round_with_protocol_retries.
     Without this guardrail a coder could advance the exchange by writing
     only the review-response file while skipping coding-done.
+
+    ``read_coder_turn`` decides what the artifact means, so an escalation
+    short-circuits here rather than being retried: a ``needs_human`` turn kept
+    the protocol, and re-prompting a coder that has just said the decision is
+    not its own asks it to make one anyway (#386). Both the initial attempt
+    and every retry check for it, because a retry can produce one too.
     """
     session_output = command.session_output
     coder_session_owner = command.coder_session_owner
@@ -2279,12 +2208,21 @@ def _enforce_coder_protocol(
     coder_mirror = command.coder_mirror
     turn_mailbox = command.turn_mailbox
 
-    protocol_error = _validate_coder_completion(
+    read_command = CoderTurnRead(
         completion_path=coder_completion_path,
         pair_validation=pair_validation,
         run_validation_record_path=run_dir / "validation-record.json",
         require_validation=require_validation,
+        issue_number=issue_number,
+        session_name=session_name,
+        round_index=cycle_index,
     )
+    disposition = read_coder_turn(read_command)
+    if disposition.escalation is not None:
+        return coder, build_outcome_for_coder_escalation(
+            _coder_escalation_terminal(command, coder, disposition.escalation)
+        )
+    protocol_error = disposition.protocol_error
     next_attempt_index = 2
     while (
         protocol_error is not None
@@ -2296,8 +2234,9 @@ def _enforce_coder_protocol(
             f"{protocol_error}\n"
             "Run `coding-done completed --implementation '...' --problems '...'` "
             "(or `coding-done blocked --reason '...' --attempted '...'` if you "
-            "cannot continue), then submit your verdict again by running "
-            "`exchange-respond <ok|disagree> --text '...'`."
+            "cannot continue, or `coding-done needs_human --question '...'` if "
+            "the next decision is not yours to make), then submit your verdict "
+            "again by running `exchange-respond <ok|disagree> --text '...'`."
         )
         retry_prompt = prompt_for_response_channel(
             retry_prompt,
@@ -2398,12 +2337,12 @@ def _enforce_coder_protocol(
                 validation_record_path=validation_record_path,
             )
         coder = retry_response
-        protocol_error = _validate_coder_completion(
-            completion_path=coder_completion_path,
-            pair_validation=pair_validation,
-            run_validation_record_path=run_dir / "validation-record.json",
-            require_validation=require_validation,
-        )
+        disposition = read_coder_turn(read_command)
+        if disposition.escalation is not None:
+            return coder, build_outcome_for_coder_escalation(
+                _coder_escalation_terminal(command, coder, disposition.escalation)
+            )
+        protocol_error = disposition.protocol_error
     if protocol_error is not None:
         return coder, _build_outcome_for_protocol_error(
             run_assets=run_assets,
@@ -3064,71 +3003,6 @@ def _record_chapter(command: _ChapterRecordCommand) -> int:
         },
     )
     return pair_event_index
-
-
-def _validation_record_error(
-    record_path: Path,
-    *,
-    current_head_sha: str | None,
-) -> str | None:
-    if not record_path.exists():
-        return "validation-record.json missing"
-    try:
-        data = json.loads(record_path.read_text())
-    except json.JSONDecodeError:
-        return "validation-record.json is not valid JSON"
-    if not isinstance(data, dict):
-        return "validation-record.json must be a JSON object"
-    if data.get("passed") is not True:
-        return "validation-record.json did not pass"
-    if current_head_sha is None:
-        return "cannot determine current HEAD for validation-record.json"
-    record_head_sha = data.get("head_sha")
-    if not isinstance(record_head_sha, str) or not record_head_sha:
-        return "validation-record.json missing head_sha"
-    if record_head_sha != current_head_sha:
-        return (
-            "validation-record.json head "
-            f"{record_head_sha[:12]} does not match current HEAD "
-            f"{current_head_sha[:12]}"
-        )
-    return None
-
-
-def _validate_coder_completion(
-    *,
-    completion_path: Path,
-    pair_validation: _PairValidationMirror,
-    run_validation_record_path: Path,
-    require_validation: bool,
-) -> str | None:
-    """Mirror of control/review_exchange_loop._validate_coder_protocol.
-
-    The coder must produce a completion-coder.json artifact (the
-    ``coding-done`` CLI's output) and, when ``require_validation`` is on,
-    a passing validation-record.json. A coder that only writes the
-    review-response file but skips coding-done would otherwise advance
-    the exchange by accident.
-    """
-    if not completion_path.exists():
-        return f"missing completion artifact: {completion_path}"
-    if completion_path.stat().st_size <= 0:
-        return f"completion artifact is empty: {completion_path}"
-    try:
-        payload = json.loads(completion_path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-        return f"completion artifact is not valid JSON: {completion_path}"
-    if not isinstance(payload, dict):
-        return f"completion artifact must be a JSON object: {completion_path}"
-    validation_source_error = pair_validation.refresh_from_completion(
-        payload,
-        run_validation_record_path=run_validation_record_path,
-    )
-    if require_validation:
-        if validation_source_error is not None:
-            return validation_source_error
-        return pair_validation.current_validation_error()
-    return None
 
 
 # ``_atomic_write_bytes`` is the shared helper from ``infra.atomic_io``,

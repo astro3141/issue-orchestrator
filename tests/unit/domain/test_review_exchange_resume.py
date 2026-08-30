@@ -17,6 +17,7 @@ from __future__ import annotations
 import pytest
 
 from issue_orchestrator.domain.review_exchange_resume import (
+    REASON_CODER_ESCALATED_TO_HUMAN,
     REASON_CODER_NO_COMPLETION,
     REASON_CODER_PROTOCOL_ERROR,
     REASON_MAX_ROUNDS_EXCEEDED,
@@ -361,6 +362,7 @@ class TestNoCompletionClassifier:
             REASON_MAX_ROUNDS_EXCEEDED,
             REASON_CODER_PROTOCOL_ERROR,
             REASON_REVIEWER_DECISION_INVALID,
+            REASON_CODER_ESCALATED_TO_HUMAN,
             "made_up_reason",
             "",
         ],
@@ -387,6 +389,7 @@ _MATRIX_AT_CURRENT_HEAD: list[tuple[str, str, ResumeDecision]] = [
     ("stopped", REASON_REVIEWER_REQUESTED_CHANGES, ResumeDecision.REUSE_HALT),
     ("stopped", REASON_REVIEWER_REPORTS_NO_PROGRESS, ResumeDecision.REUSE_HALT),
     ("stopped", REASON_MAX_ROUNDS_EXCEEDED, ResumeDecision.REUSE_HALT),
+    ("stopped", REASON_CODER_ESCALATED_TO_HUMAN, ResumeDecision.REUSE_HALT),
     (
         "error",
         REASON_REVIEWER_NO_COMPLETION,
@@ -436,3 +439,80 @@ def test_matrix_covers_every_known_pair_in_decide() -> None:
     assert not extra, (
         f"test matrix references pair(s) decide() doesn't recognize: {sorted(extra)}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Escalation durability (#386)
+# ---------------------------------------------------------------------------
+
+
+class TestCoderEscalationDurability:
+    """A ``needs_human`` terminal must survive the tick that reads it back.
+
+    An escalation requests no publication, so it produces no publish evidence.
+    Under ``require_validation`` the ordinary staleness checks read that
+    absence as "this cache cannot be trusted" and spawn a fresh exchange —
+    which walks straight back into the swallow #386 closes. The head binding
+    still applies: a new commit is a new subject.
+    """
+
+    @staticmethod
+    def _escalated(**overrides: object) -> ResumeFacts:
+        fields: dict[str, object] = {
+            "status": "stopped",
+            "reason": REASON_CODER_ESCALATED_TO_HUMAN,
+        }
+        fields.update(overrides)
+        return _facts(**fields)  # type: ignore[arg-type]
+
+    def test_halts_without_any_validation_evidence(self) -> None:
+        assert (
+            decide(self._escalated(cached_validation_passed=None))
+            is ResumeDecision.REUSE_HALT
+        )
+
+    def test_halts_when_no_current_validation_record_exists(self) -> None:
+        assert (
+            decide(
+                self._escalated(
+                    cached_head_sha=None,
+                    cached_validation_passed=None,
+                    current_head_sha=None,
+                )
+            )
+            is ResumeDecision.REUSE_HALT
+        )
+
+    def test_halts_even_when_current_validation_failed(self) -> None:
+        """A failing gate is not an answer to the question that was asked."""
+        assert (
+            decide(
+                self._escalated(
+                    cached_validation_passed=False,
+                    current_validation_failed=True,
+                )
+            )
+            is ResumeDecision.REUSE_HALT
+        )
+
+    def test_a_new_commit_is_a_new_subject(self) -> None:
+        assert (
+            decide(self._escalated(current_head_sha="HEAD_Y"))
+            is ResumeDecision.IGNORE_STALE
+        )
+
+    def test_the_exemption_does_not_leak_to_other_terminals(self) -> None:
+        """Only the escalation is exempt; every other cache still proves itself."""
+        assert (
+            decide(
+                _facts(
+                    status="stopped",
+                    reason=REASON_REVIEWER_REPORTS_NO_PROGRESS,
+                    cached_validation_passed=None,
+                )
+            )
+            is ResumeDecision.IGNORE_STALE
+        )
+
+    def test_escalation_never_counts_toward_the_no_completion_budget(self) -> None:
+        assert is_no_completion_reason(REASON_CODER_ESCALATED_TO_HUMAN) is False

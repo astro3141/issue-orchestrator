@@ -13,9 +13,15 @@ agent:
     the verdict the orchestrator concluded, paired with the commit it checked
     out into the reviewer's worktree for that round.
 
+``coder-escalation.json``
+    The coder's ``needs_human`` turn (:class:`~..domain.review_exchange_escalation.CoderEscalation`),
+    paired with the commit its worktree held when it was raised (#386).
+
 They are deliberately separate files. The summary records what happened; the
 binding is an authority artifact that a later admission gate checks, and it
 must not be reachable through a record whose other fields are policy inputs.
+The escalation is a third thing again — a question, carrying no authority at
+all — and reading it must never be a way to reach the other two.
 """
 
 from __future__ import annotations
@@ -34,6 +40,10 @@ from ..domain.review_exchange_summary import (
     ReviewExchangeTerminalState,
 )
 from ..domain.review_exchange import ReviewExchangeResponse
+from ..domain.review_exchange_escalation import (
+    ESCALATION_RECORD_FILENAME,
+    CoderEscalation,
+)
 from ..domain.review_verdict_binding import (
     REVIEW_VERDICT_BINDING_FILENAME,
     BoundReviewVerdict,
@@ -55,6 +65,63 @@ def summary_path(exchange_dir: Path) -> Path:
 def review_verdict_path(exchange_dir: Path) -> Path:
     """Path of the exchange's exact-SHA verdict binding."""
     return exchange_dir / REVIEW_VERDICT_BINDING_FILENAME
+
+
+def coder_escalation_path(exchange_dir: Path) -> Path:
+    """Path of the exchange's coder escalation record."""
+    return exchange_dir / ESCALATION_RECORD_FILENAME
+
+
+def record_coder_escalation(
+    *,
+    exchange_dir: Path,
+    escalation: CoderEscalation,
+) -> Path:
+    """Persist the coder's ``needs_human`` turn and return where it landed.
+
+    Unlike :func:`bind_review_verdict`, this never declines to write. The
+    verdict binding may be skipped because an unbound verdict is one no gate
+    can admit, and refusing to write it is the safe direction. There is no
+    equivalent safe direction here: the escalation carries no authority to
+    withhold, and the only thing not writing it accomplishes is losing the
+    question — which is the failure #386 is about.
+    """
+    path = coder_escalation_path(exchange_dir)
+    atomic_write_json(path, escalation.to_payload())
+    logger.warning(
+        "[REVIEW_EXCHANGE] coder escalated to human: issue=%d session=%s "
+        "round=%d head_sha=%s record=%s",
+        escalation.issue_number,
+        escalation.session_name,
+        escalation.round_index,
+        escalation.head_sha[:12],
+        path,
+    )
+    return path
+
+
+def load_coder_escalation(exchange_dir: Path) -> CoderEscalation | None:
+    """Reload a recorded escalation, or ``None`` when none was raised.
+
+    A record that exists but does not parse raises rather than reading as
+    "no escalation" — a corrupt question is not an absent one.
+
+    No production caller today, and that is the intended shape rather than a
+    missing surface: what routes the question to a human is the terminal
+    itself — ``stopped`` / ``coder_escalated_to_human`` with the question in
+    ``summary.detail`` and in both exchange events. The record is durable
+    evidence bound to the commit it was raised against, and this is the read
+    half of that artifact contract, which is what keeps the written half
+    honest. A surface that wants to render the question reads it here rather
+    than re-deriving the file's schema.
+    """
+    path = coder_escalation_path(exchange_dir)
+    if not path.exists():
+        return None
+    payload = json.loads(path.read_text())
+    if not isinstance(payload, Mapping):
+        raise ValueError(f"coder escalation record must be a JSON object: {path}")
+    return CoderEscalation.from_payload(payload)
 
 
 def read_validation_facts(path: Path | None) -> tuple[str | None, bool | None]:
@@ -93,6 +160,7 @@ def write_exchange_summary(
     validation_record_path: Path | None,
     review_artifacts: list[dict[str, str]] | None = None,
     detail: str | None = None,
+    bound_head_sha: str | None = None,
 ) -> ReviewExchangeSummaryV1:
     """Persist summary.json atomically.
 
@@ -121,9 +189,20 @@ def write_exchange_summary(
 
     This ``head_sha`` is validation's, not review's. It is not the verdict
     binding and must not be read as one — see :func:`bind_review_verdict`.
+
+    ``bound_head_sha`` names the commit for the one terminal that has one
+    without having a validation record to read it from: the coder's
+    escalation (#386), which is raised against current HEAD precisely because
+    it requested no publication. It replaces the validation-derived value
+    rather than filling in for a missing one — an escalation that arrives
+    beside a *stale* record must still record the commit it was actually
+    raised about, or the resume path compares the question against the wrong
+    subject and respawns the exchange that swallows it.
     """
     terminal = ReviewExchangeTerminalState(status=status, reason=reason)
     head_sha, passed = read_validation_facts(validation_record_path)
+    if bound_head_sha is not None:
+        head_sha = bound_head_sha
     artifacts = tuple(
         ReviewExchangeSummaryArtifactRef.from_payload(artifact)
         for artifact in (review_artifacts or [])
