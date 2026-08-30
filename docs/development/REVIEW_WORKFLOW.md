@@ -135,12 +135,17 @@ escalation used to disappear:
   was checked, so a `needs_human` turn whose HEAD had not moved satisfied every
   check there was and advanced the round as if it had said nothing.
 - **It presents no publication evidence, and is asked for none.** An escalation
-  requests no push and no PR, so there is no publication for a validation
+  offers no change for review, so there is no publication for a validation
   record to authorize. Demanding a current-head record anyway is what rejected
   a coder that legitimately committed before escalating — a validation failure
-  standing in for a question. The exemption is exactly that narrow: **if the
-  same turn also requests `push_branch` or `create_pr`, every current-head
-  publication prerequisite applies in full and the turn fails closed.**
+  standing in for a question. The exemption is keyed on `create_pr` — the
+  domain's `offers_a_change_for_review`, the same predicate the publish
+  contract uses — and not on reaching the remote at all: `coding-done
+  needs_human` always requests `push_branch` to preserve the coder's work, so
+  an exemption keyed that way would never fire for any escalation a coder can
+  produce. The exemption is still exactly as narrow as it sounds: **if the same
+  turn also requests `create_pr`, every current-head publication prerequisite
+  applies in full and the turn fails closed.**
 - **Its reason is its own.** `reviewer_reports_no_progress` claims successive
   coder turns stopped converging, `reviewer_requested_changes` claims the
   reviewer rejected the commit, and `coder_protocol_error` claims the coder

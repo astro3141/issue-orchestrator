@@ -105,6 +105,15 @@ def load_coder_escalation(exchange_dir: Path) -> CoderEscalation | None:
 
     A record that exists but does not parse raises rather than reading as
     "no escalation" — a corrupt question is not an absent one.
+
+    No production caller today, and that is the intended shape rather than a
+    missing surface: what routes the question to a human is the terminal
+    itself — ``stopped`` / ``coder_escalated_to_human`` with the question in
+    ``summary.detail`` and in both exchange events. The record is durable
+    evidence bound to the commit it was raised against, and this is the read
+    half of that artifact contract, which is what keeps the written half
+    honest. A surface that wants to render the question reads it here rather
+    than re-deriving the file's schema.
     """
     path = coder_escalation_path(exchange_dir)
     if not path.exists():

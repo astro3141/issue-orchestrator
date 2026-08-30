@@ -37,6 +37,10 @@ from issue_orchestrator.domain.runtime_config import RuntimeConfigReference
 from issue_orchestrator.domain.repository_launch_selection import (
     RepositoryLaunchSelection,
 )
+from issue_orchestrator.entrypoints.cli_tools.agent_done import (
+    STATUS_TO_ACTIONS,
+    AgentStatus,
+)
 from issue_orchestrator.events import EventContext, EventName
 from issue_orchestrator.execution import persistent_session_exchange as pse
 from issue_orchestrator.execution.persistent_role_prompt_policy import (
@@ -8840,7 +8844,7 @@ class TestCoderEscalationRouting:
         assert escalation.round_index == 1
         assert escalation.head_sha == repo.coder_head()
         assert escalation.question == "Does the contract in AGENTS.md permit this?"
-        assert escalation.requested_publication is False
+        assert escalation.offered_a_change_for_review is False
 
     def test_committed_escalation_survives_a_stale_validation_record(
         self,
@@ -8874,6 +8878,43 @@ class TestCoderEscalationRouting:
         assert escalation.head_sha == repo.coder_head()
         assert escalation.head_sha != _STALE_HEAD_SHA
 
+    def test_the_real_coding_done_payload_survives_a_stale_record(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """F2, over the payload ``coding-done needs_human`` actually writes.
+
+        The other cases here pass hand-written action lists; this one asks the
+        producer's own table what the artifact contains, because that set
+        carries ``push_branch`` and an exemption keyed on reaching the remote
+        would leave every one of them green while production never reached the
+        terminal at all.
+        """
+        outcome, repo = _run_escalation_exchange(
+            tmp_path=tmp_path,
+            monkeypatch=monkeypatch,
+            completion_payload={
+                "outcome": "needs_human",
+                "question": "Whose call is the schema change?",
+                "requested_actions": [
+                    action.value
+                    for action in STATUS_TO_ACTIONS[AgentStatus.NEEDS_HUMAN]
+                ],
+            },
+            validation_payload_for=self._stale,
+        )
+
+        assert (outcome.status, outcome.reason) == (
+            "stopped",
+            "coder_escalated_to_human",
+        )
+        escalation = load_coder_escalation(outcome.run_assets.exchange_dir)
+        assert escalation is not None
+        assert escalation.head_sha == repo.coder_head()
+        assert escalation.head_sha != _STALE_HEAD_SHA
+        assert escalation.offered_a_change_for_review is False
+
     def test_escalation_that_also_asks_to_publish_still_fails_closed(
         self,
         tmp_path: Path,
@@ -8900,13 +8941,50 @@ class TestCoderEscalationRouting:
         assert (outcome.status, outcome.reason) == ("error", "coder_protocol_error")
         assert load_coder_escalation(outcome.run_assets.exchange_dir) is None
 
-    def test_push_only_escalation_also_keeps_the_validation_requirement(
+    def test_a_pr_asking_escalation_that_does_present_evidence_is_recorded(
         self,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """F3: ``push_branch`` is publication too, not just ``create_pr``."""
+        """The one way the record's offer flag is written true.
+
+        Same PR-asking turn as above, but its validation record does name
+        current HEAD, so the prerequisite it kept is satisfied and the
+        escalation reaches its terminal — carrying the fact that it asked to
+        publish while escalating, which is what the flag is for.
+        """
         outcome, _ = _run_escalation_exchange(
+            tmp_path=tmp_path,
+            monkeypatch=monkeypatch,
+            completion_payload={
+                "outcome": "needs_human",
+                "question": "Ship it anyway?",
+                "requested_actions": ["create_pr"],
+            },
+            validation_payload_for=self._current,
+        )
+
+        assert (outcome.status, outcome.reason) == (
+            "stopped",
+            "coder_escalated_to_human",
+        )
+        escalation = load_coder_escalation(outcome.run_assets.exchange_dir)
+        assert escalation is not None
+        assert escalation.offered_a_change_for_review is True
+
+    def test_push_only_escalation_is_still_a_question(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """F3 stops at ``create_pr``: ``push_branch`` preserves, it does not offer.
+
+        A branch-preserving push is what every ``needs_human`` completion asks
+        for and what the orchestrator performs under its own authority; it puts
+        no change up to be judged, so there is no publish contract for a
+        current-head record to satisfy here.
+        """
+        outcome, repo = _run_escalation_exchange(
             tmp_path=tmp_path,
             monkeypatch=monkeypatch,
             completion_payload={
@@ -8915,10 +8993,15 @@ class TestCoderEscalationRouting:
                 "requested_actions": ["push_branch"],
             },
             validation_payload_for=self._stale,
-            coder_attempts=_CODER_ATTEMPTS_PER_ROUND,
         )
 
-        assert (outcome.status, outcome.reason) == ("error", "coder_protocol_error")
+        assert (outcome.status, outcome.reason) == (
+            "stopped",
+            "coder_escalated_to_human",
+        )
+        escalation = load_coder_escalation(outcome.run_assets.exchange_dir)
+        assert escalation is not None
+        assert escalation.head_sha == repo.coder_head()
 
     def test_ordinary_completed_turn_records_no_escalation(
         self,

@@ -91,14 +91,17 @@ def read_coder_turn(command: CoderTurnRead) -> CoderTurnDisposition:
     is why the outcome is read before the validation gate is applied rather
     than after:
 
-    * an ordinary turn, and an escalation that asks to publish in the same
-      breath, must present a passing validation record naming current HEAD
-      when ``require_validation`` is on. Escalating grants no publication
+    * an ordinary turn, and an escalation that offers a change for review in
+      the same breath, must present a passing validation record naming current
+      HEAD when ``require_validation`` is on. Escalating grants no publication
       authority, so asking for both keeps every publication prerequisite;
-    * an escalation that asks for no publication is bound to the coder
+    * an escalation that offers no change for review is bound to the coder
       worktree's current HEAD and returned. It is not held to publish
       evidence it never claimed, and a stale record that happens to match
-      cannot turn it back into an ordinary completed round.
+      cannot turn it back into an ordinary completed round. The
+      ``push_branch`` every ``coding-done needs_human`` record carries is not
+      such an offer — it is work being preserved, and the exchange stops at
+      the escalation terminal without reaching any publish path.
     """
     pair_validation = command.pair_validation
     payload, envelope_error = _read_completion_payload(command.completion_path)
@@ -134,7 +137,7 @@ def read_coder_turn(command: CoderTurnRead) -> CoderTurnDisposition:
             raised_at=datetime.now(timezone.utc).isoformat(),
             question=intent.question,
             context=intent.context,
-            requested_publication=intent.requests_publication,
+            offered_a_change_for_review=intent.offers_a_change_for_review,
         )
     )
 
@@ -170,9 +173,9 @@ def build_outcome_for_coder_escalation(
     reverse ordering leaves the harmless one, an unreferenced record that the
     next exchange overwrites.
 
-    No validation record is read. An escalation that requested no publication
-    produced no publish evidence, so there is nothing to summarize, and the
-    commit the summary must name is the one the escalation was raised
+    No validation record is read. An escalation that offered no change for
+    review produced no publish evidence, so there is nothing to summarize, and
+    the commit the summary must name is the one the escalation was raised
     against.
     """
     escalation = terminal.escalation
@@ -222,7 +225,6 @@ def build_outcome_for_coder_escalation(
         reviewer_response=last_reviewer,
         summary=summary,
     )
-
 
 
 def _read_completion_payload(path: Path) -> tuple[dict[str, Any], str | None]:

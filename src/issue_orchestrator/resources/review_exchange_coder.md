@@ -42,9 +42,11 @@ or a requested-changes verdict.
 
 Two limits apply:
 
-- **It grants no publication authority.** If the same call also asks to push
-  or open a PR, every current-head validation prerequisite still applies and
-  still fails closed.
+- **It grants no publication authority.** `coding-done needs_human` skips the
+  validation gate and asks only to preserve your branch, which is why a commit
+  made just before escalating does not turn the question into a validation
+  failure. If a call ever escalates while also asking to open a PR, every
+  current-head validation prerequisite still applies and still fails closed.
 - **It does not create GitHub issues.** If a finding deserves a follow-up
   issue, describe it in the question (or reference an existing issue URL);
   Control owns creating and admitting follow-up work.

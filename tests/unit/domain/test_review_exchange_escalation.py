@@ -2,20 +2,40 @@
 
 Pure-domain tests: every input is a payload literal, every assertion is on the
 value object built from it. The question these pin is narrow and load-bearing
-— *does this turn escalate, and does it ask to publish?* — because the two
-answers together decide whether the exchange demands current-head validation
-evidence or routes a question to a human.
+— *does this turn escalate, and does it offer a change for review?* — because
+the two answers together decide whether the exchange demands current-head
+validation evidence or routes a question to a human.
+
+One test here reaches for the producer's own action table
+(``STATUS_TO_ACTIONS``) rather than a literal. The predicate is only correct
+relative to what ``coding-done`` actually writes, and reading a literal instead
+is how the exemption shipped unreachable: every payload under test carried
+actions no producer emits.
 """
 
 from __future__ import annotations
 
 import pytest
 
-from issue_orchestrator.domain.models import CompletionOutcome, RequestedAction
+from issue_orchestrator.domain.models import (
+    CompletionOutcome,
+    CompletionRecord,
+    RequestedAction,
+    offers_a_change_for_review,
+)
 from issue_orchestrator.domain.review_exchange_escalation import (
     CoderCompletionIntent,
     CoderEscalation,
 )
+from issue_orchestrator.entrypoints.cli_tools.agent_done import (
+    STATUS_TO_ACTIONS,
+    AgentStatus,
+)
+
+
+def _needs_human_actions() -> list[str]:
+    """What ``coding-done needs_human`` writes into ``requested_actions``."""
+    return [action.value for action in STATUS_TO_ACTIONS[AgentStatus.NEEDS_HUMAN]]
 
 
 _HEAD = "a" * 40
@@ -61,26 +81,63 @@ class TestCoderCompletionIntent:
         assert intent.outcome is None
         assert intent.requires_publication_evidence is True
 
-    def test_escalation_without_publication_needs_no_publish_evidence(self) -> None:
+    def test_escalation_offering_no_change_needs_no_publish_evidence(self) -> None:
         intent = CoderCompletionIntent.from_payload(
             {"outcome": "needs_human", "requested_actions": ["post_comment"]}
         )
 
-        assert intent.requests_publication is False
+        assert intent.offers_a_change_for_review is False
         assert intent.requires_publication_evidence is False
 
-    @pytest.mark.parametrize("action", ["create_pr", "push_branch"])
-    def test_escalation_that_publishes_keeps_the_evidence_requirement(
-        self, action: str
-    ) -> None:
+    def test_the_real_needs_human_action_set_needs_no_publish_evidence(self) -> None:
+        """The payload ``coding-done needs_human`` actually writes is exempt.
+
+        ``push_branch`` is in that set — the orchestrator's standing intent to
+        preserve the coder's work — so a predicate keyed on reaching the remote
+        would make the exemption unreachable in production while every literal
+        payload in this file still passed. If ``STATUS_TO_ACTIONS`` ever grows
+        ``create_pr`` for this status, this fails here rather than silently
+        re-disabling the exemption.
+        """
+        actions = _needs_human_actions()
+
         intent = CoderCompletionIntent.from_payload(
-            {"outcome": "needs_human", "requested_actions": [action]}
+            {"outcome": "needs_human", "requested_actions": actions}
         )
 
-        assert intent.requests_publication is True
+        assert RequestedAction.PUSH_BRANCH in intent.requested_actions
+        assert intent.offers_a_change_for_review is False
+        assert intent.requires_publication_evidence is False
+
+    def test_push_branch_alone_is_not_an_offer_of_a_change(self) -> None:
+        """Preserving work is not putting a change up to be judged."""
+        intent = CoderCompletionIntent.from_payload(
+            {"outcome": "needs_human", "requested_actions": ["push_branch"]}
+        )
+
+        assert intent.offers_a_change_for_review is False
+        assert intent.requires_publication_evidence is False
+
+    def test_escalation_that_opens_a_pr_keeps_the_evidence_requirement(self) -> None:
+        intent = CoderCompletionIntent.from_payload(
+            {"outcome": "needs_human", "requested_actions": ["create_pr"]}
+        )
+
+        assert intent.offers_a_change_for_review is True
         assert intent.requires_publication_evidence is True
 
-    def test_unknown_actions_are_dropped_rather_than_read_as_publication(
+    def test_a_pr_beside_the_real_needs_human_set_still_fails_closed(self) -> None:
+        intent = CoderCompletionIntent.from_payload(
+            {
+                "outcome": "needs_human",
+                "requested_actions": [*_needs_human_actions(), "create_pr"],
+            }
+        )
+
+        assert intent.offers_a_change_for_review is True
+        assert intent.requires_publication_evidence is True
+
+    def test_unknown_actions_are_dropped_rather_than_read_as_an_offer(
         self,
     ) -> None:
         intent = CoderCompletionIntent.from_payload(
@@ -88,7 +145,7 @@ class TestCoderCompletionIntent:
         )
 
         assert intent.requested_actions == ()
-        assert intent.requests_publication is False
+        assert intent.offers_a_change_for_review is False
 
     def test_actions_that_are_not_a_list_are_no_actions(self) -> None:
         intent = CoderCompletionIntent.from_payload(
@@ -96,7 +153,7 @@ class TestCoderCompletionIntent:
         )
 
         assert intent.requested_actions == ()
-        assert intent.requests_publication is False
+        assert intent.offers_a_change_for_review is False
 
     def test_known_actions_survive_beside_unknown_ones(self) -> None:
         intent = CoderCompletionIntent.from_payload(
@@ -113,6 +170,61 @@ class TestCoderCompletionIntent:
 
         assert intent.question is None
         assert intent.context is None
+
+
+class TestOneOwnerForTheOfferQuestion:
+    """The record reader and the payload reader must answer alike (#386, A1).
+
+    They read different shapes — ``CompletionRecord`` is the strict reader the
+    orchestrator acts on, ``CoderCompletionIntent`` is the exchange reading a
+    raw artifact — but "does this offer a change for review?" is one question
+    with one answer, and answering it twice is what let the exchange's answer
+    diverge from the publish contract's.
+    """
+
+    @staticmethod
+    def _record(actions: list[str]) -> CompletionRecord:
+        return CompletionRecord(
+            session_id="issue-386",
+            timestamp="2026-08-31T00:00:00Z",
+            outcome=CompletionOutcome.NEEDS_HUMAN,
+            summary="Needs human: whose call is this?",
+            requested_actions=[RequestedAction(action) for action in actions],
+        )
+
+    @pytest.mark.parametrize(
+        "actions",
+        [
+            pytest.param(_needs_human_actions(), id="real-needs-human-set"),
+            pytest.param(["push_branch"], id="push-only"),
+            pytest.param(["create_pr"], id="pr-only"),
+            pytest.param(["push_branch", "create_pr"], id="both"),
+            pytest.param(["post_comment"], id="neither"),
+        ],
+    )
+    def test_both_readers_agree_over_the_same_actions(
+        self, actions: list[str]
+    ) -> None:
+        intent = CoderCompletionIntent.from_payload(
+            {"outcome": "needs_human", "requested_actions": actions}
+        )
+
+        assert (
+            intent.offers_a_change_for_review
+            is self._record(actions).offers_a_change_for_review
+        )
+
+    def test_the_shared_predicate_reads_the_action_vocabulary(self) -> None:
+        """Asked of every action there is, so the answer is not a literal."""
+        assert offers_a_change_for_review(tuple(RequestedAction)) is True
+        assert (
+            offers_a_change_for_review(
+                action
+                for action in RequestedAction
+                if action is not RequestedAction.CREATE_PR
+            )
+            is False
+        )
 
 
 class TestCoderEscalation:
@@ -185,9 +297,9 @@ class TestCoderEscalation:
         with pytest.raises(ValueError, match="issue_number"):
             CoderEscalation.from_payload(payload)
 
-    def test_publication_flag_must_be_a_bool(self) -> None:
+    def test_offer_flag_must_be_a_bool(self) -> None:
         payload = self._escalation().to_payload()
-        payload["requested_publication"] = "yes"
+        payload["offered_a_change_for_review"] = "yes"
 
-        with pytest.raises(ValueError, match="requested_publication"):
+        with pytest.raises(ValueError, match="offered_a_change_for_review"):
             CoderEscalation.from_payload(payload)

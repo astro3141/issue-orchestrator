@@ -189,6 +189,24 @@ def without_publication_intent(
     )
 
 
+def offers_a_change_for_review(actions: Iterable[RequestedAction]) -> bool:
+    """Whether ``actions`` offer their work as a change for review.
+
+    Deliberately narrower than :data:`PUBLICATION_ACTIONS`, and the distinction
+    is the whole point: ``PUSH_BRANCH`` on its own is work being preserved —
+    what a ``blocked`` or ``needs_human`` completion does while it asks a human
+    a question — whereas ``CREATE_PR`` is the completion putting a change up to
+    be judged. Only the second is what the publish contract, and the review
+    exchange's escalation exemption, apply to.
+
+    Free of :class:`CompletionRecord` on purpose: the review exchange reads a
+    raw ``completion-coder.json`` payload and cannot build a record, so without
+    a predicate over the vocabulary itself it would have to re-spell the
+    question — which is exactly how the two answers drifted apart in #386.
+    """
+    return any(action is RequestedAction.CREATE_PR for action in actions)
+
+
 SUBJECT_RECOVERY_ACTIONS: frozenset[RequestedAction] = frozenset({
     RequestedAction.ADD_BLOCKED_LABEL,
     RequestedAction.ADD_NEEDS_HUMAN_LABEL,
@@ -586,8 +604,12 @@ class CompletionRecord:
         asking a human a question, not offering a change — so holding it to
         the publish contract would replace the question with a validation
         failure. Its push still happens under the orchestrator's authority.
+
+        The record-shaped view of the module-level predicate of the same name,
+        which is where the answer lives so that a reader holding only a raw
+        completion payload gets the same one (#386).
         """
-        return RequestedAction.CREATE_PR in self.requested_actions
+        return offers_a_change_for_review(self.requested_actions)
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary for JSON serialization."""

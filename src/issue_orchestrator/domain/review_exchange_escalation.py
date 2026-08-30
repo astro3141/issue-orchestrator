@@ -16,10 +16,16 @@ two ways to end, and neither was the escalation:
 
 :class:`CoderCompletionIntent` is the missing reader. It answers the two
 questions the exchange has to ask of a completion — *does this escalate?* and
-*does this ask to reach the remote?* — from the vocabulary the completion
+*does this offer a change for review?* — from the vocabulary the completion
 record already speaks (:class:`~.models.CompletionOutcome`,
-:data:`~.models.PUBLICATION_ACTIONS`), so escalation and publication authority
-cannot drift apart from how the rest of the system spells them.
+:func:`~.models.offers_a_change_for_review`), so escalation and publication
+authority cannot drift apart from how the rest of the system spells them.
+
+The second question is asked of ``create_pr``, not of "does this touch the
+remote at all", and that is load-bearing rather than incidental. ``coding-done
+needs_human`` always requests ``push_branch`` — the orchestrator's standing
+intent to preserve the coder's work — so an exemption keyed on reaching the
+remote would never fire for any escalation a coder can actually produce.
 
 It reads leniently on purpose, and that is not the same as reading loosely.
 :meth:`CompletionRecord.from_dict` is the strict reader for a record the
@@ -32,9 +38,9 @@ way to reach the escalation terminal.
 :class:`CoderEscalation` is what the exchange records once the answer is
 "escalate": the question, bound to the exact issue, session, round, and the
 commit the coder's worktree holds *now*. Binding to current HEAD rather than
-to a validation record is the whole point — an escalation requests no
-publication, so there is no publication evidence for it to name, and demanding
-some is what turned a question into a rejection.
+to a validation record is the whole point — an escalation offers no change for
+review, so there is no publication evidence for it to name, and demanding some
+is what turned a question into a rejection.
 
 An escalation grants no authority. It does not approve a commit, it does not
 push, and it does not create anything on GitHub: it names a decision that
@@ -48,9 +54,9 @@ from dataclasses import dataclass
 from typing import Any
 
 from .models import (
-    PUBLICATION_ACTIONS,
     CompletionOutcome,
     RequestedAction,
+    offers_a_change_for_review,
 )
 
 ESCALATION_RECORD_FILENAME = "coder-escalation.json"
@@ -88,20 +94,29 @@ class CoderCompletionIntent:
         return self.outcome is CompletionOutcome.NEEDS_HUMAN
 
     @property
-    def requests_publication(self) -> bool:
-        """Whether the same turn also asks to reach the remote."""
-        return bool(PUBLICATION_ACTIONS & set(self.requested_actions))
+    def offers_a_change_for_review(self) -> bool:
+        """Whether the same turn also offers its work as a change to review.
+
+        The payload-shaped view of :func:`~.models.offers_a_change_for_review`,
+        so this reader and :attr:`CompletionRecord.offers_a_change_for_review`
+        answer one question in one place.
+        """
+        return offers_a_change_for_review(self.requested_actions)
 
     @property
     def requires_publication_evidence(self) -> bool:
         """Whether this turn must still present current-head validation.
 
-        True for every ordinary turn, and true for an escalation that asks to
-        publish in the same breath. Only the escalation that requests nothing
-        from the remote is exempt, because there is nothing for the evidence
-        to authorize: it asks a question, and a question publishes nothing.
+        True for every ordinary turn, and true for an escalation that offers a
+        change for review in the same breath. The escalation that offers none
+        is exempt, because there is nothing for the evidence to authorize: it
+        asks a question, and a question puts no change up to be judged. The
+        branch-preserving ``push_branch`` a ``needs_human`` completion always
+        carries is not that change — it is the orchestrator preserving work
+        under its own authority, and the exchange publishes nothing either way,
+        because an escalation stops the exchange before any publish path.
         """
-        return not self.escalates_to_human or self.requests_publication
+        return not self.escalates_to_human or self.offers_a_change_for_review
 
 
 @dataclass(frozen=True, slots=True)
@@ -121,7 +136,16 @@ class CoderEscalation:
     raised_at: str
     question: str | None = None
     context: str | None = None
-    requested_publication: bool = False
+    offered_a_change_for_review: bool = False
+    """Whether the escalating turn also asked for a PR.
+
+    Named for what it records rather than for "touched the remote": a
+    ``needs_human`` completion always requests ``push_branch``, so a flag
+    spelled that way would be true on every escalation and would say nothing.
+    True here means the turn asked to publish a change while escalating — the
+    combination that keeps every current-head publication prerequisite — and
+    reaching this record with it set at all is worth a second look.
+    """
 
     def __post_init__(self) -> None:
         if type(self.issue_number) is not int:
@@ -133,8 +157,8 @@ class CoderEscalation:
             raise ValueError("round_index must be >= 1")
         _require_non_empty_str(self.head_sha, "head_sha")
         _require_non_empty_str(self.raised_at, "raised_at")
-        if type(self.requested_publication) is not bool:
-            raise TypeError("requested_publication must be a bool")
+        if type(self.offered_a_change_for_review) is not bool:
+            raise TypeError("offered_a_change_for_review must be a bool")
 
     @property
     def detail(self) -> str:
@@ -152,7 +176,7 @@ class CoderEscalation:
             "round_index": self.round_index,
             "head_sha": self.head_sha,
             "raised_at": self.raised_at,
-            "requested_publication": self.requested_publication,
+            "offered_a_change_for_review": self.offered_a_change_for_review,
         }
         if self.question is not None:
             payload["question"] = self.question
@@ -168,9 +192,11 @@ class CoderEscalation:
             raise ValueError("coder escalation requires int issue_number")
         if not isinstance(round_index, int) or isinstance(round_index, bool):
             raise ValueError("coder escalation requires int round_index")
-        requested_publication = payload.get("requested_publication", False)
-        if not isinstance(requested_publication, bool):
-            raise ValueError("coder escalation requested_publication must be bool")
+        offered = payload.get("offered_a_change_for_review", False)
+        if not isinstance(offered, bool):
+            raise ValueError(
+                "coder escalation offered_a_change_for_review must be bool"
+            )
         return cls(
             issue_number=issue_number,
             session_name=_required_str(payload, "session_name"),
@@ -179,7 +205,7 @@ class CoderEscalation:
             raised_at=_required_str(payload, "raised_at"),
             question=_text(payload.get("question")),
             context=_text(payload.get("context")),
-            requested_publication=requested_publication,
+            offered_a_change_for_review=offered,
         )
 
 
