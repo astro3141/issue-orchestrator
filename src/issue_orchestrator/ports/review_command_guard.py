@@ -68,10 +68,18 @@ class ReviewCommandGuardError(RuntimeError):
 class ReviewCommandGuardOutcome:
     """What the installer did for one reviewer worktree.
 
-    ``guarded`` is the fact callers have to branch on. It exists as a returned
-    value rather than an assumed post-condition because the alternative — a
-    ``Path`` for every provider — is what let a Claude-shaped settings file
-    stand in for enforcement on providers that never read it.
+    ``guarded`` is the fact the caller is *told*. It exists as a returned value
+    rather than an assumed post-condition because the alternative — a ``Path``
+    for every provider — is what let a Claude-shaped settings file stand in for
+    enforcement on providers that never read it. Note that no reviewer caller
+    branches on it today, and none should have to: the unregistered-provider
+    WARNING is emitted by the installer, and a guard that should have been
+    installable and was not raises :class:`ReviewCommandGuardError` instead of
+    returning ``guarded=False``, so ``create_reviewer_worktree`` reports the
+    value rather than deciding on it. This is where the reviewer's outcome
+    differs from ``PlanningCommandGuard.enforced``, which its launch owner
+    genuinely branches on; see :mod:`.command_guard` for why the two predicates
+    are not the same question.
 
     ``probes`` is empty for a mechanism whose enforcement is not established by
     classifying samples (the Claude hook runs the orchestrator's own pinned

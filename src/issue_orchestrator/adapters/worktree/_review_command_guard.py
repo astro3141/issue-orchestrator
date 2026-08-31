@@ -49,9 +49,12 @@ rather than handed over as guarded.
 
 The third thing this module owes its caller is an honest answer:
 :class:`ReviewCommandGuardOutcome` reports what was actually established —
-``guarded`` is a fact the caller must handle, not a value it can assume, and
+``guarded`` is a fact the caller is told, not a value it can assume, and
 ``probes`` carries the classifications a mechanism that can be measured gave
-before the guard was called established.
+before the guard was called established. Being told is the whole contract: the
+unregistered-provider WARNING is emitted here, and a guard that should have
+been installable and was not raises rather than returning ``guarded=False``, so
+the caller has nothing left to branch on.
 
 Both of those types, and the :class:`ReviewCommandGuardInstaller` protocol
 :class:`CodexReviewCommandGuardInstaller` implements, belong to

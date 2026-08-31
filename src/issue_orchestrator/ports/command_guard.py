@@ -15,6 +15,26 @@ in either principal's own module because a guard report is evidence, and
 evidence that came out of two independently-shaped records would let one
 principal's proof drift away from the other's while both still looked like
 proof.
+
+Each principal still carries its own outcome record, and their "is the barrier
+real" predicates are deliberately *not* the same question — do not read them as
+one rule enforced twice:
+
+* :attr:`.planning_command_guard.PlanningCommandGuard.enforced` requires a
+  written policy **and** a probe that came back refused, because the planning
+  principal has exactly one mechanism and it is probe-classified: an exec
+  policy is data, so a file that no checker was asked about is not a barrier.
+* :attr:`.review_command_guard.ReviewCommandGuardOutcome.guarded` requires only
+  a written policy, because the reviewer supports a probe-less mechanism as
+  well. The Claude registration pins the orchestrator's *own* policy module as
+  the hook command, so there is nothing to classify and ``probes`` is
+  legitimately empty; demanding probe evidence there would report a genuinely
+  guarded Claude reviewer as unenforced. Where the reviewer's mechanism *is*
+  probe-classified (Codex), establishment raises unless every pinned sample
+  verified, so ``guarded`` still implies the probes passed.
+
+Merging the two records would not remove that difference — it would only move
+both predicates into one type — so the divergence is stated here instead.
 """
 
 from __future__ import annotations

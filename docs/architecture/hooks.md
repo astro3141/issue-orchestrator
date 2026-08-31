@@ -77,27 +77,38 @@ These are installed and refreshed in the target project by `issue-orchestrator s
 | Execpolicy rules (Codex) | Codex CLI | `.codex/rules/orchestrator.rules` | Blocks dangerous commands outside sandbox | **YES** |
 | AGENTS.md / CLAUDE.md | Policy | `AGENTS.md` (`CLAUDE.md` symlink for compatibility) | Documents prohibited actions | Advisory |
 
-Two more guards are installed per *worktree* rather than per project, and both
-refuse the same thing — the build/test/validation entry points listed once in
-`infra/hooks/gate_commands.py` — through whichever mechanism the provider in
-that worktree actually reads:
+Two more principals are guarded per *worktree* rather than per project, and
+both are refused the same thing — the build/test/validation entry points listed
+once in `infra/hooks/gate_commands.py` — through whichever mechanism the
+provider in that worktree actually reads.
+
+A guard is a *provider's* mechanism, so each guardable worktree carries one
+registration per provider that can actually run there, and a provider with no
+registration is reported unguarded rather than given a file it would never read:
 
 | Worktree | Provider | Registration | Why the gate must not run |
 |----------|----------|--------------|---------------------------|
 | Review-exchange reviewer worktree | `claude-code` | `.claude/settings.local.json` → `infra/hooks/review_command_guard.py` | The worktree is deliberately created without the repository's runtime prerequisites, so a gate command reports on the environment while the record says it reports on the candidate |
+| Review-exchange reviewer worktree | `codex` | `.codex/rules/review-gate.rules` → `adapters/worktree/_review_command_guard.py` | The same reason; the barrier is the provider's own mechanism, so a Codex reviewer needs its own registration to get it (#396) |
 | `planning_investigation` scratch worktree | `codex` | `.codex/rules/planning-gate.rules` → `adapters/worktree/_planning_command_guard.py` | The run prepares a bounded issue; the code-candidate publication gate produces no planning verdict, and R22 Pilot 4 spent a whole round inside one its sandbox could not satisfy (#289) |
 
-Neither is a claim: each installer returns whether a guard was *established*,
-and refuses to write a policy file for a provider that would never read it. The
-planning guard goes further and asks the enforcing mechanism itself — `codex
-execpolicy check` — to classify pinned gate and inspection commands before the
-session is allowed to spawn; a policy that does not verify as refusing fails
-the launch closed rather than launching an apparently-guarded session. Because
-Codex resolves a linked worktree as its own project root, that policy is scoped
-to the one disposable run worktree: the product checkout's `.codex/rules`, the
-repository's shared Codex policy and the operator's `~/.codex` are untouched,
-and it composes with (rather than replaces) `orchestrator.rules`, which the
-installer places beside it.
+None of these is a claim: each installer returns whether a guard was
+*established*, and refuses to write a policy file for a provider that would
+never read it. The **Codex** registrations go further and ask the enforcing
+mechanism itself — `codex execpolicy check` — to classify pinned gate and
+inspection commands before the session is allowed to start; a policy that does
+not verify as refusing fails closed rather than producing an
+apparently-guarded session. Both Codex principals get that property from one
+owner, `adapters/worktree/_codex_gate_policy.py`, which renders the policy,
+composes it with the shipped safety rules, verifies it and hides it from `git
+status`, so the reviewer and planning guards cannot drift apart; each principal
+supplies only where its file goes, the prose the refused principal is shown,
+and the samples whose classification must be measured. Because Codex resolves a
+linked worktree as its own project root, each policy is scoped to the single
+disposable worktree it is written into: the product checkout's `.codex/rules`,
+the repository's shared Codex policy and the operator's `~/.codex` are
+untouched, and it composes with (rather than replaces) `orchestrator.rules`,
+which the installer places beside it.
 
 Both prompts still explain why the refusal happens; per this document, the
 prompt is not what prevents it. See `docs/architecture/validation.md`.
