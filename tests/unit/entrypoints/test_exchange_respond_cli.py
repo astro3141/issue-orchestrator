@@ -60,6 +60,50 @@ class TestBuildVerdict:
             "risk": "medium",
         }
 
+    def test_out_of_contract_marks_the_decision_not_the_response_type(self) -> None:
+        # #399: the reviewer still says what kind of turn this was. The
+        # scope marker rides in the structured decision, because "I want a
+        # change" and "this exchange may make it" are separate answers.
+        verdict = build_verdict(
+            _parse(
+                [
+                    "changes_requested",
+                    "--text",
+                    "Valid, but the fix needs file B.",
+                    "--out-of-contract",
+                ]
+            )
+        )
+
+        assert verdict.response_type == "changes_requested"
+        assert verdict.decision == {"scope": "out_of_contract"}
+
+    def test_out_of_contract_merges_into_an_authored_decision(self) -> None:
+        verdict = build_verdict(
+            _parse(
+                [
+                    "changes_requested",
+                    "--text",
+                    "See F1.",
+                    "--decision-json",
+                    '{"verdict":"changes_requested","risk":"medium"}',
+                    "--out-of-contract",
+                ]
+            )
+        )
+
+        assert verdict.decision == {
+            "verdict": "changes_requested",
+            "risk": "medium",
+            "scope": "out_of_contract",
+        }
+
+    def test_an_unmarked_verdict_says_nothing_about_scope(self) -> None:
+        # F5: a plain disagreement stays a plain disagreement.
+        verdict = build_verdict(_parse(["disagree", "--text", "Wrong approach."]))
+
+        assert verdict.decision is None
+
     def test_full_json_overrides_positional_form(self) -> None:
         assert _wire(["--json", '{"response_type":"ok","response_text":"hi"}']) == {
             "response_type": "ok",

@@ -24,6 +24,17 @@ from .review_exchange_summary import ReviewExchangeSummaryV1
 NitPolicy = Literal["ignore", "surface", "address"]
 ReviewVerdict = Literal["approved", "changes_requested", "disagree"]
 AbstractionReviewStatus = Literal["no_issues", "changes_requested", "deferred"]
+ReviewScope = Literal["in_contract", "out_of_contract"]
+"""Whether closing this review stays inside the admitted leaf contract (#399).
+
+Separate from ``verdict`` because correctness and mutation authority are
+separate questions. ``changes_requested`` says the reviewer wants a
+change; this says whether the exchange is entitled to make it. A
+technically correct finding whose repair the contract does not admit is
+``changes_requested`` + ``out_of_contract``, and it is neither a
+``disagree`` (the reviewer is right) nor ordinary rework (the coder may
+not act on it).
+"""
 
 REVIEW_REPORT_ARTIFACT = "review_report"
 REVIEW_DECISION_ARTIFACT = "review_decision"
@@ -31,6 +42,7 @@ REVIEW_REPORT_FILENAME = "review-report.md"
 REVIEW_DECISION_FILENAME = "review-decision.json"
 _VALID_NIT_POLICIES = {"ignore", "surface", "address"}
 _VALID_ABSTRACTION_REVIEW_STATUSES = {"no_issues", "changes_requested", "deferred"}
+_VALID_REVIEW_SCOPES = {"in_contract", "out_of_contract"}
 
 
 @dataclass(frozen=True)
@@ -160,6 +172,13 @@ class ReviewDecision:
     tests_reviewed: tuple[str, ...] = ()
     abstraction_review: AbstractionReview = field(default_factory=AbstractionReview)
     nit_policy: NitPolicy = "surface"
+    scope: ReviewScope = "in_contract"
+    """Whether closing this review needs a mutation the contract withheld.
+
+    Defaults to ``in_contract`` so every existing reviewer response keeps
+    its exact current meaning: a review says nothing about scope unless
+    the reviewer says something about scope.
+    """
     response_text: str = ""
     report_path: str | None = None
     report_sha256: str | None = None
@@ -214,6 +233,7 @@ class ReviewDecision:
             tests_reviewed=tests,
             abstraction_review=abstraction_review,
             nit_policy=resolved_policy,
+            scope=_coerce_review_scope(data.get("scope")),
             response_text=response_text,
             extra={
                 key: value
@@ -231,6 +251,7 @@ class ReviewDecision:
                     "abstraction_review",
                     "nit_policy",
                     "nit_policy_applied",
+                    "scope",
                     "report_path",
                     "report_sha256",
                 }
@@ -248,6 +269,7 @@ class ReviewDecision:
             tests_reviewed=self.tests_reviewed,
             abstraction_review=self.abstraction_review,
             nit_policy=self.nit_policy,
+            scope=self.scope,
             response_text=self.response_text,
             report_path=str(report_path),
             report_sha256=report_sha256,
@@ -275,6 +297,16 @@ class ReviewDecision:
             and self.abstraction_review.status != "changes_requested"
         )
 
+    def is_scope_conflict(self) -> bool:
+        """Whether closing this review needs mutation the contract withheld.
+
+        Asked by the round-terminal owner instead of read as a raw field,
+        for the same reason :meth:`is_approval` exists: the question
+        "may this exchange act on the review?" has one answer, and it is
+        the decision's to give.
+        """
+        return self.scope == "out_of_contract"
+
     def validate(self) -> None:
         if self.verdict == "approved" and self.blocking_findings:
             raise ValueError(
@@ -289,6 +321,17 @@ class ReviewDecision:
             )
         if self.nit_policy not in _VALID_NIT_POLICIES:
             raise ValueError(f"invalid nit_policy: {self.nit_policy}")
+        if self.scope not in _VALID_REVIEW_SCOPES:
+            raise ValueError(f"invalid scope: {self.scope}")
+        if self.verdict == "approved" and self.scope == "out_of_contract":
+            # An approval says nothing further is required; a scope
+            # conflict says something required cannot be done here. A
+            # decision claiming both leaves no reader able to say whether
+            # the candidate may publish, which is the one thing this
+            # field exists to settle.
+            raise ValueError(
+                "approved review decision must not be marked out_of_contract"
+            )
         self.abstraction_review.validate()
 
     def to_dict(self) -> dict[str, Any]:
@@ -301,6 +344,7 @@ class ReviewDecision:
             "tests_reviewed": list(self.tests_reviewed),
             "abstraction_review": self.abstraction_review.to_dict(),
             "nit_policy": self.nit_policy,
+            "scope": self.scope,
             "response_text": self.response_text,
             "report_path": self.report_path,
             "report_sha256": self.report_sha256,
@@ -506,6 +550,22 @@ def _coerce_nit_policy(value: Any, *, default: NitPolicy) -> NitPolicy:
     if isinstance(value, str) and value in _VALID_NIT_POLICIES:
         return value  # type: ignore[return-value]
     return default
+
+
+def _coerce_review_scope(value: Any) -> ReviewScope:
+    """Read the reviewer's scope marker, refusing anything unrecognised.
+
+    Strict rather than defaulting: an unknown scope spelling is a
+    reviewer trying to say something about mutation authority that the
+    orchestrator cannot read, and silently reading it as ``in_contract``
+    would turn a scope conflict back into ordinary rework — the exact
+    widening this marker exists to stop.
+    """
+    if value is None:
+        return "in_contract"
+    if isinstance(value, str) and value in _VALID_REVIEW_SCOPES:
+        return value  # type: ignore[return-value]
+    raise ValueError(f"invalid scope: {value}")
 
 
 def _coerce_abstraction_review_status(value: Any) -> AbstractionReviewStatus:

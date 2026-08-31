@@ -103,6 +103,10 @@ from ..domain.review_exchange_rework import ReviewExchangeRework
 from ..domain.review_exchange_summary import ReviewExchangeReason, ReviewExchangeStatus
 from ..domain.review_verdict_binding import ReviewVerdictOutcome
 from .candidate_execution_identity import CandidateExecutionIdentityRecorder
+from .review_exchange_leaf_contract import (
+    load_staged_leaf_contract,
+    verify_staged_leaf_contract,
+)
 from .review_exchange_coder_turn import (
     CoderEscalationTerminal,
     CoderTurnRead,
@@ -580,6 +584,14 @@ def run_persistent_session_exchange(  # noqa: PLR0913
     )
 
     run_validation_record_path = exchange_run.assets.validation_record_path
+    # Before either role process opens. An exchange that cannot say which
+    # admitted contract it is reviewing against has nothing to authorize, so
+    # it must not spend a round finding that out (#399 R4). Raising here
+    # precedes the pair spawn, so no agent is ever prompted without one.
+    prompt_files = ReviewExchangePromptFiles(
+        validation_record=run_validation_record_path,
+        leaf_contract=load_staged_leaf_contract(run_assets),
+    )
     pair_validation = PairValidationMirror(
         pair_dir=pair_dir,
         record_path=pair_validation_record,
@@ -835,9 +847,7 @@ def run_persistent_session_exchange(  # noqa: PLR0913
                 reviewer_recording=pair.reviewer_recording_path,
                 coder_completion_path=pair.coder_completion_path,
                 validation_record_path=pair.validation_record_path,
-                prompt_files=ReviewExchangePromptFiles(
-                    validation_record=run_validation_record_path,
-                ),
+                prompt_files=prompt_files,
                 pair_validation=pair_validation,
                 turn_evidence=turn_evidence,
                 coder_timeout_seconds=coder_agent.timeout_minutes * 60,
@@ -1734,6 +1744,17 @@ class _DriveRoundsCommand:
     coder_completion_path: Path
     validation_record_path: Path
     prompt_files: ReviewExchangePromptFiles
+    """Every file dependency the round's prompts name, the admitted leaf
+    contract among them (#399).
+
+    The contract is carried here and nowhere else on this command. A
+    second field holding it would let the round loop verify one contract
+    while the two agents were prompted with another — the exact
+    divergence this exchange exists to close — so the round loop asks
+    ``prompt_files.require_leaf_contract`` for it, the same accessor the
+    prompt builders ask. The field is optional for replay's sake and the
+    accessor is where that optionality ends.
+    """
     pair_validation: PairValidationMirror
     turn_evidence: ExchangeTurnEvidence
     coder_timeout_seconds: float
@@ -1777,6 +1798,14 @@ def _drive_rounds(command: _DriveRoundsCommand) -> ReviewExchangeOutcome:
     coder_completion_path = command.coder_completion_path
     validation_record_path = command.validation_record_path
     prompt_files = command.prompt_files
+    # The one contract this loop and both roles' prompts are bound to,
+    # read from the object the prompts themselves carry (#399). Asking
+    # here rather than per round makes an active round's requirement a
+    # type: everything below holds a ``StagedLeafContract``, not an
+    # optional one.
+    leaf_contract = prompt_files.require_leaf_contract(
+        "the review-exchange round loop"
+    )
     pair_validation = command.pair_validation
     coder_timeout_seconds = command.coder_timeout_seconds
     reviewer_timeout_seconds = command.reviewer_timeout_seconds
@@ -1826,6 +1855,13 @@ def _drive_rounds(command: _DriveRoundsCommand) -> ReviewExchangeOutcome:
         # re-observes it, so neither a commit landing mid-review nor a coder
         # branch advancing mid-checkout can end up inside an approval.
         presented_head_sha = reviewer_presentation.present(round_index)
+        # Re-read the staged contract at the top of every round, not once at
+        # exchange start (#399 R4). Round 3 reviewing a different admitted
+        # scope than round 1 is indistinguishable, from the artifacts, from
+        # round 3 reviewing the same one — unless someone checks. Raising
+        # here fails the exchange closed through the same handler that
+        # catches every other round-loop failure.
+        verify_staged_leaf_contract(leaf_contract)
         reviewer_packet = ReviewExchangeTurnPacket(
             issue_number=issue_number,
             issue_title=issue_title,
@@ -1984,7 +2020,7 @@ def _drive_rounds(command: _DriveRoundsCommand) -> ReviewExchangeOutcome:
         # One question, asked of the owner that knows every way a reviewer
         # round can end the exchange and carries the no-progress budget across
         # rounds. ``None`` is the only answer that continues into a coder turn.
-        terminal = round_terminals.for_round(reviewer)
+        terminal = round_terminals.for_round(reviewer, artifact_pair.decision)
         if terminal is not None:
             return complete_with_reviewer_decision(
                 run_assets=run_assets,
@@ -2013,6 +2049,11 @@ def _drive_rounds(command: _DriveRoundsCommand) -> ReviewExchangeOutcome:
             role=Role.CODER,
             require_validation=require_validation,
             run_dir=run_dir,
+            # The same ``prompt_files`` object the reviewer packet above was
+            # built from, so one exchange's two roles cannot end up naming
+            # two contracts. Both packets are persisted, so a reader can
+            # prove the digests matched rather than take it on trust (#399).
+            prompt_files=prompt_files,
             reviewer_feedback=_coder_reviewer_feedback(decision_result),
             coder_prompt_addendum=command.coder_prompt_addendum,
         )

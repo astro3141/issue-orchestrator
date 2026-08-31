@@ -158,6 +158,74 @@ issue is described in the question, or points at an issue that already exists;
 Control owns creating and admitting follow-up work, and no agent needs that
 authority to make its own verdict representable.
 
+### The admitted leaf contract both roles review against (#399)
+
+The Coder holds the issue's executable leaf contract — the statement of which
+mutation was admitted. The Reviewer used to hold the issue *title* and a diff.
+That asymmetry is not a prompt-quality problem: a Reviewer who cannot see the
+bound can correctly find a defect whose repair lies outside it and ask for that
+repair as ordinary rework, the Coder complies, and the candidate widens past
+what Control admitted. That is what #398 measured, and Operator caught it only
+at the final file boundary.
+
+So the exchange carries the contract as an artifact, not as prose:
+
+| | |
+|---|---|
+| Staged by | `PersistentReviewExchangeRunner`, before either role process spawns |
+| Source | the issue tracker — the same canonical issue the ordinary lane's contract comes from, read **once** by the orchestrator |
+| Artifacts | `issue-contract.md` (exact bytes) and `issue-contract.json` (issue identity + `sha256:` digest), in the exchange run directory |
+| Carried by | `ReviewExchangePromptFiles.leaf_contract` on both roles' `ReviewExchangeTurnPacket`, persisted with the turn |
+
+Neither role refetches the issue, and neither reconstructs scope from PR prose,
+labels, or the title. Because both persisted packets name the same path and the
+same digest, "the two roles reviewed the same admitted scope" is a property a
+reader can *check*, not one it has to assume.
+
+It fails closed at every step. A contract that is missing, unreadable,
+malformed, mismatched against its digest, or edited under a running exchange
+raises `LeafContractUnavailable` — before the pair spawns on the first round,
+and at the top of every round after it. There is no fallback: an exchange that
+cannot say what scope it is reviewing against has nothing it may authorize.
+
+### When the Reviewer is right but the contract says no (#399)
+
+Reviewing the broader codebase does not widen executable scope. The Reviewer
+may read anything and *should* report a material finding it sees outside the
+admitted contract — the correction bounds mutation authority, not attention.
+What it must not do is direct the Coder to perform an out-of-contract mutation
+as ordinary rework.
+
+`ReviewDecision.scope` is how it says which it is. `in_contract` (the default,
+so every existing review keeps its exact meaning) requests ordinary rework;
+`out_of_contract` says the finding is valid and closing it needs a mutation the
+contract withheld. Reviewers set it with `exchange-respond changes_requested
+--out-of-contract`, or as `"scope": "out_of_contract"` in `--decision-json`.
+
+| | |
+|---|---|
+| Terminal | `stopped` / `reviewer_scope_conflict` |
+| Decided by | `ReviewerRoundTerminals.for_round`, ahead of every rework branch |
+| Coder rounds run | none — the mutation never happens |
+| Authority granted | none: no approval, no publication — the verdict it binds is `changes_requested` |
+| Resume decision | `REUSE_HALT` at the same head; `IGNORE_STALE` once the branch moves |
+
+Its reason is its own for the same kind of argument the coder escalation's is:
+`reviewer_requested_changes` would claim a rework round could resolve it, which
+is precisely what the contract forbids; `reviewer_reports_no_progress` would
+claim successive coder turns stopped converging, when none ran; and
+`reviewer_decision_invalid` would claim the Reviewer broke the protocol, when
+it kept it and said so exactly.
+
+On the Coder's side the three cases stay three cases, and the prompt says so:
+an in-contract request is ordinary rework; a Reviewer that is technically
+*wrong* is `exchange-respond disagree`; and a Reviewer that is technically
+right about something the contract does not admit is `coding-done needs_human`
+— the first-class #386 terminal above, which grants no publication. Spelling
+the third as `disagree` is specifically ruled out: correctness and mutation
+authority are separate questions, and answering the second with the first
+destroys the question a human needs to see.
+
 ## Review Artifacts
 
 Before PR creation, each review exchange produces a paired artifact set:

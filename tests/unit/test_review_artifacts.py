@@ -479,3 +479,66 @@ def test_review_artifacts_from_summary_rejects_legacy_dict():
                 ]
             }  # type: ignore[arg-type]
         )
+
+
+class TestTheAdmittedScopeMarker:
+    """#399: correctness and mutation authority are separate fields."""
+
+    def _payload(self, **decision: object) -> dict[str, object]:
+        base: dict[str, object] = {
+            "verdict": "changes_requested",
+            "risk": "medium",
+            "blocking_findings": [{"id": "F1"}],
+            "nits": [],
+            "abstraction_review": {"status": "no_issues", "findings": []},
+        }
+        base.update(decision)
+        return {"decision": base}
+
+    def _decision(self, **overrides: object) -> ReviewDecision:
+        return ReviewDecision.from_agent_payload(
+            self._payload(**overrides),
+            response_type="changes_requested",
+            response_text="See F1.",
+            nit_policy="surface",
+        )
+
+    def test_a_review_that_says_nothing_about_scope_stays_in_contract(self) -> None:
+        decision = self._decision()
+
+        assert decision.scope == "in_contract"
+        assert not decision.is_scope_conflict()
+
+    def test_an_out_of_contract_marker_is_carried_and_persisted(self) -> None:
+        decision = self._decision(scope="out_of_contract")
+
+        assert decision.is_scope_conflict()
+        assert decision.to_dict()["scope"] == "out_of_contract"
+        # It must not leak into ``extra`` as well — one field, one owner.
+        assert "scope" not in decision.extra
+
+    def test_an_unrecognised_scope_is_refused_rather_than_defaulted(self) -> None:
+        # Reading an unknown spelling as ``in_contract`` would turn a scope
+        # conflict back into ordinary rework, which is the widening the
+        # marker exists to stop. The round loop turns this into a
+        # ``reviewer_decision_invalid`` terminal.
+        with pytest.raises(ValueError, match="invalid scope"):
+            self._decision(scope="outside")
+
+    def test_an_approval_may_not_also_claim_a_scope_conflict(self) -> None:
+        with pytest.raises(ValueError, match="out_of_contract"):
+            ReviewDecision(
+                verdict="approved",
+                risk="low",
+                scope="out_of_contract",
+            ).validate()
+
+    def test_the_marker_survives_the_report_binding(self, tmp_path: Path) -> None:
+        decision = self._decision(scope="out_of_contract")
+
+        bound = decision.with_report(
+            report_path=tmp_path / "review-report.md",
+            report_sha256="deadbeef",
+        )
+
+        assert bound.scope == "out_of_contract"

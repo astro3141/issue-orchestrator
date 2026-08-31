@@ -40,6 +40,13 @@ That ends the exchange at its own terminal (`stopped` /
 legitimate outcome, not a failure, and it is never converted into an approval
 or a requested-changes verdict.
 
+It is also not the same answer as `exchange-respond disagree`. Use `disagree`
+when the reviewer is **wrong**. Use `coding-done needs_human` when the reviewer
+is **right** and the repair needs a mutation the admitted contract does not
+allow — whether the finding is correct and whether you may act on it are
+separate questions, and answering the second with the first loses the question
+a human needs to see (#399).
+
 Two limits apply:
 
 - **It grants no publication authority.** `coding-done needs_human` skips the

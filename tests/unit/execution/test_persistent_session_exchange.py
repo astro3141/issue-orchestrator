@@ -27,6 +27,10 @@ from issue_orchestrator.domain.models import AgentConfig
 from issue_orchestrator.domain.review_artifacts import ReviewDecision
 from issue_orchestrator.domain.review_exchange import ReviewExchangeResponse
 from issue_orchestrator.domain.review_exchange_rework import ReviewExchangeRework
+from issue_orchestrator.domain.review_exchange_contract import (
+    AdmittedLeafContract,
+    LeafContractUnavailable,
+)
 from issue_orchestrator.domain.review_exchange_run import ReviewExchangeRun
 from issue_orchestrator.domain.review_exchange_summary import ReviewExchangeSummaryV1
 from issue_orchestrator.domain.review_verdict_binding import (
@@ -63,6 +67,10 @@ from issue_orchestrator.execution.attempt_review_verdict_store import (
 )
 from issue_orchestrator.execution.candidate_execution_identity import (
     CandidateExecutionIdentityRecorder,
+)
+from issue_orchestrator.execution.review_exchange_leaf_contract import (
+    load_staged_leaf_contract,
+    stage_leaf_contract,
 )
 from issue_orchestrator.execution.review_exchange_records import (
     load_coder_escalation,
@@ -116,6 +124,11 @@ from tests.workspace_trust import (
 # ---------------------------------------------------------------------------
 
 
+DEFAULT_LEAF_CONTRACT_BODY = (
+    "## Admitted mutation\n\nChange exactly `src/only_this_file.py`.\n"
+)
+
+
 def _start_exchange_run(
     *,
     session_output: FileSystemSessionOutput,
@@ -124,14 +137,31 @@ def _start_exchange_run(
     coder_label: str,
     parent_session_name: str = "coding-1",
     validation_profile: str = "default",
+    contract_body: str = DEFAULT_LEAF_CONTRACT_BODY,
 ) -> ReviewExchangeRun:
-    return session_output.start_review_exchange_run(
+    """Allocate an exchange run WITH its admitted leaf contract staged.
+
+    Staging belongs to the runner in production (#399). These tests call
+    ``run_persistent_session_exchange`` directly, below that owner, so
+    they stage here — a run without a contract is not a run the exchange
+    will accept, and every positive-path test needs a real one.
+    """
+    run = session_output.start_review_exchange_run(
         coder_worktree_path,
         issue_number=issue_number,
         parent_session_name=parent_session_name,
         agent_label=coder_label,
         validation_profile=validation_profile,
     )
+    stage_leaf_contract(
+        AdmittedLeafContract(
+            issue_number=issue_number,
+            issue_title="Test",
+            body=contract_body,
+        ),
+        assets=run.assets,
+    )
+    return run
 
 
 class _Sink:
@@ -3327,12 +3357,11 @@ class TestCallerHooks:
             },
         )
 
-        exchange_run = session_output.start_review_exchange_run(
-            coder_wt,
+        exchange_run = _start_exchange_run(
+            session_output=session_output,
+            coder_worktree_path=coder_wt,
             issue_number=42,
-            parent_session_name="coding-1",
-            agent_label="agent:backend",
-            validation_profile="default",
+            coder_label="agent:backend",
         )
         outcome = pse.run_persistent_session_exchange(
             exchange_run=exchange_run,
@@ -3389,12 +3418,11 @@ class TestCallerHooks:
             },
         )
 
-        exchange_run = session_output.start_review_exchange_run(
-            coder_wt,
+        exchange_run = _start_exchange_run(
+            session_output=session_output,
+            coder_worktree_path=coder_wt,
             issue_number=42,
-            parent_session_name="coding-1",
-            agent_label="agent:backend",
-            validation_profile="default",
+            coder_label="agent:backend",
         )
         outcome = pse.run_persistent_session_exchange(
             exchange_run=exchange_run,
@@ -3478,12 +3506,11 @@ class TestCallerHooks:
             coder_validation_payload_script=[refreshed_payload],
         )
 
-        exchange_run = session_output.start_review_exchange_run(
-            coder_wt,
+        exchange_run = _start_exchange_run(
+            session_output=session_output,
+            coder_worktree_path=coder_wt,
             issue_number=42,
-            parent_session_name="coding-1",
-            agent_label="agent:backend",
-            validation_profile="default",
+            coder_label="agent:backend",
         )
         outcome = pse.run_persistent_session_exchange(
             exchange_run=exchange_run,
@@ -4842,12 +4869,11 @@ class TestPerSessionRecordingMirror:
             },
         )
 
-        exchange_run = session_output.start_review_exchange_run(
-            coder_wt,
+        exchange_run = _start_exchange_run(
+            session_output=session_output,
+            coder_worktree_path=coder_wt,
             issue_number=42,
-            parent_session_name="coding-1",
-            agent_label="agent:backend",
-            validation_profile="default",
+            coder_label="agent:backend",
         )
         stale_pair_root = tmp_path / "stale-persistent-pairs" / "issue-42"
         stale_pair = pse.PersistentExchangePair(
@@ -9303,3 +9329,391 @@ class TestTheCoderSideLaunchesAsItsPrincipal:
         assert ReviewExchangeCoderPrincipal.declared(declared) is (
             ReviewExchangeCoderPrincipal.ACTOR
         )
+
+
+class TestTheAdmittedLeafContractReachesBothRoles:
+    """#399: one exchange, one admitted scope, proven from the artifacts.
+
+    Driven through ``run_persistent_session_exchange`` rather than the
+    prompt builders directly, because what #398 measured was not a bad
+    prompt — it was a lane in which the two roles could hold different
+    answers to "what may change here" and nothing noticed.
+    """
+
+    CONTRACT = (
+        "## Admitted mutation\n\nChange exactly `src/only_this_file.py`. "
+        "No other tracked path is admitted.\n"
+    )
+
+    def _exchange(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        *,
+        reviewer_script: list[dict[str, Any]],
+        coder_script: list[dict[str, Any]] | None = None,
+        stage_contract: bool = True,
+        before_reviewer_round: Any = None,
+    ) -> tuple[Any, dict[str, Any], FileSystemSessionOutput, ReviewExchangeRun]:
+        prompt_path = tmp_path / "p.md"
+        prompt_path.write_text("Prompt", encoding="utf-8")
+        coder_wt, reviewer_wt = _setup_worktrees(tmp_path)
+        session_output = FileSystemSessionOutput()
+        state = _patch_persistent_runner(
+            monkeypatch,
+            response_script={
+                "reviewer": list(reviewer_script),
+                "coder": list(coder_script or []),
+            },
+        )
+        if stage_contract:
+            exchange_run = _start_exchange_run(
+                session_output=session_output,
+                coder_worktree_path=coder_wt,
+                issue_number=42,
+                coder_label="agent:backend",
+                contract_body=self.CONTRACT,
+            )
+        else:
+            exchange_run = session_output.start_review_exchange_run(
+                coder_wt,
+                issue_number=42,
+                parent_session_name="coding-1",
+                agent_label="agent:backend",
+                validation_profile="default",
+            )
+        outcome = pse.run_persistent_session_exchange(
+            exchange_run=exchange_run,
+            session_output=session_output,
+            pair_registry=state["registry"],
+            persistent_pair_root=tmp_path / "persistent-pairs",
+            coder_worktree_path=coder_wt,
+            reviewer_worktree_factory=lambda: reviewer_wt,
+            issue_number=42,
+            issue_title="Test",
+            coder_label="agent:backend",
+            reviewer_label="agent:reviewer",
+            coder_agent=_make_agent(prompt_path),
+            reviewer_agent=_make_agent(prompt_path),
+            runtime_config=_runtime_config(tmp_path),
+            max_rounds=3,
+            max_no_progress=2,
+            require_validation=False,
+            before_reviewer_round=before_reviewer_round,
+            execution_identities=_identity_recorder(tmp_path),
+        )
+        return outcome, state, session_output, exchange_run
+
+    def test_the_reviewer_prompt_names_the_exact_staged_contract(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # F1: the decisive constraint exists only in the contract, so a
+        # reviewer that cannot see it cannot know the lane is bounded.
+        outcome, state, _output, run = self._exchange(
+            tmp_path,
+            monkeypatch,
+            reviewer_script=[
+                {
+                    "response_type": "ok",
+                    "response_text": "Looks good",
+                    "getting_closer": True,
+                }
+            ],
+        )
+
+        staged = load_staged_leaf_contract(run.assets)
+        reviewer_prompt = next(
+            prompt
+            for role, prompt, _notice in state["prompt_inboxes_seen"]
+            if role == "reviewer"
+        )
+        assert str(run.assets.leaf_contract_path) in reviewer_prompt
+        assert staged.digest in reviewer_prompt
+        assert "does NOT widen the executable scope" in reviewer_prompt
+        assert "--out-of-contract" in reviewer_prompt
+        assert outcome.status == "ok"
+
+    def test_the_reviewer_may_still_inspect_and_report_beyond_the_contract(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # F6: the correction bounds mutation authority, not attention.
+        _outcome, state, _output, _run = self._exchange(
+            tmp_path,
+            monkeypatch,
+            reviewer_script=[
+                {
+                    "response_type": "ok",
+                    "response_text": "Looks good",
+                    "getting_closer": True,
+                }
+            ],
+        )
+
+        reviewer_prompt = next(
+            prompt
+            for role, prompt, _notice in state["prompt_inboxes_seen"]
+            if role == "reviewer"
+        )
+        assert "relevant context in the broader codebase" in reviewer_prompt
+        assert "SHOULD report a material" in reviewer_prompt
+
+    def test_both_roles_record_the_same_contract_digest(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # F2: provable from the persisted artifacts, not from trust.
+        outcome, state, _output, run = self._exchange(
+            tmp_path,
+            monkeypatch,
+            reviewer_script=[
+                {
+                    "response_type": "changes_requested",
+                    "response_text": "See review report.",
+                    "getting_closer": True,
+                },
+                {
+                    "response_type": "ok",
+                    "response_text": "All good",
+                    "getting_closer": True,
+                },
+            ],
+            coder_script=[
+                {
+                    "response_type": "ok",
+                    "response_text": "Fixed",
+                    "getting_closer": None,
+                }
+            ],
+        )
+
+        assert outcome.exchange_dir is not None
+        turns_dir = outcome.exchange_dir / "turns"
+        reviewer_packet = json.loads(
+            (turns_dir / "round-1-reviewer.packet.json").read_text()
+        )
+        coder_packet = json.loads(
+            (turns_dir / "round-1-coder.packet.json").read_text()
+        )
+        staged = load_staged_leaf_contract(run.assets)
+        for packet in (reviewer_packet, coder_packet):
+            contract = packet["prompt_files"]["leaf_contract"]
+            assert contract["digest"] == staged.digest
+            assert contract["path"] == str(run.assets.leaf_contract_path)
+            assert contract["issue_number"] == 42
+        coder_prompt = next(
+            prompt
+            for role, prompt, _notice in state["prompt_inboxes_seen"]
+            if role == "coder"
+        )
+        assert staged.digest in coder_prompt
+        assert "coding-done needs_human" in coder_prompt
+        assert "do not dress it up as `disagree`" in coder_prompt
+
+    def test_an_out_of_contract_finding_stops_before_any_coder_turn(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # F4: file B is never mutated because no coder turn is ever run,
+        # and the exchange publishes nothing.
+        outcome, state, _output, run = self._exchange(
+            tmp_path,
+            monkeypatch,
+            reviewer_script=[
+                {
+                    "response_type": "changes_requested",
+                    "response_text": "src/other_file.py needs the same guard.",
+                    "getting_closer": True,
+                    "decision": {
+                        "verdict": "changes_requested",
+                        "risk": "medium",
+                        "scope": "out_of_contract",
+                        "blocking_findings": [{"id": "F1"}],
+                        "nits": [],
+                        "abstraction_review": {
+                            "status": "no_issues",
+                            "findings": [],
+                        },
+                    },
+                    "_authored_report_text": (
+                        "# Review\n\n## F1\n\n"
+                        "src/other_file.py needs the same guard.\n"
+                    ),
+                }
+            ],
+            coder_script=[],
+        )
+
+        assert outcome.status == "stopped"
+        assert outcome.reason == "reviewer_scope_conflict"
+        assert [role for role, _ in state["rounds_seen"]] == ["reviewer"]
+        # The canonical receipt: the exact contract the exchange consumed,
+        # and the finding, both attributable to this round.
+        assert outcome.exchange_dir is not None
+        decision = json.loads(
+            (
+                outcome.exchange_dir
+                / "turns"
+                / "round-1-reviewer-attempt-1.review-decision.json"
+            ).read_text()
+        )
+        assert decision["scope"] == "out_of_contract"
+        assert [item["id"] for item in decision["blocking_findings"]] == ["F1"]
+        summary = json.loads(run.assets.summary_path.read_text())
+        assert summary["reason"] == "reviewer_scope_conflict"
+
+    def test_an_in_scope_finding_still_reworks_normally(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # F3: nothing about the ordinary lane changes.
+        outcome, state, _output, _run = self._exchange(
+            tmp_path,
+            monkeypatch,
+            reviewer_script=[
+                {
+                    "response_type": "changes_requested",
+                    "response_text": "Fix the guard in the admitted file.",
+                    "getting_closer": True,
+                },
+                {
+                    "response_type": "ok",
+                    "response_text": "All good",
+                    "getting_closer": True,
+                },
+            ],
+            coder_script=[
+                {
+                    "response_type": "ok",
+                    "response_text": "Fixed",
+                    "getting_closer": None,
+                }
+            ],
+        )
+
+        assert outcome.status == "ok"
+        assert [role for role, _ in state["rounds_seen"]] == [
+            "reviewer",
+            "coder",
+            "reviewer",
+        ]
+
+    def test_a_wrong_finding_still_uses_the_disagreement_path(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # F5: an unmarked review is an ordinary one whatever its verdict.
+        outcome, state, _output, _run = self._exchange(
+            tmp_path,
+            monkeypatch,
+            reviewer_script=[
+                {
+                    "response_type": "changes_requested",
+                    "response_text": "Please change the guard.",
+                    "getting_closer": True,
+                },
+                {
+                    "response_type": "ok",
+                    "response_text": "Convinced",
+                    "getting_closer": True,
+                },
+            ],
+            coder_script=[
+                {
+                    "response_type": "disagree",
+                    "response_text": "That guard already exists upstream.",
+                    "getting_closer": None,
+                }
+            ],
+        )
+
+        assert outcome.reason != "reviewer_scope_conflict"
+        assert [role for role, _ in state["rounds_seen"]] == [
+            "reviewer",
+            "coder",
+            "reviewer",
+        ]
+
+    def test_an_unstaged_contract_refuses_the_exchange_before_any_round(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # R4: removing the contract input must fail the proof — and must
+        # do so before an agent is prompted, not after a round is spent.
+        with pytest.raises(LeafContractUnavailable):
+            self._exchange(
+                tmp_path,
+                monkeypatch,
+                reviewer_script=[
+                    {
+                        "response_type": "ok",
+                        "response_text": "Looks good",
+                        "getting_closer": True,
+                    }
+                ],
+                stage_contract=False,
+            )
+
+    def test_a_contract_swapped_mid_exchange_fails_the_round_closed(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        swapped: dict[str, Path] = {}
+
+        def _swap_before_round(round_index: int) -> None:
+            if round_index != 2:
+                return
+            path = swapped["contract"]
+            path.write_text(self.CONTRACT + "Also change file B.\n", encoding="utf-8")
+
+        prompt_path = tmp_path / "p.md"
+        prompt_path.write_text("Prompt", encoding="utf-8")
+        coder_wt, reviewer_wt = _setup_worktrees(tmp_path)
+        session_output = FileSystemSessionOutput()
+        state = _patch_persistent_runner(
+            monkeypatch,
+            response_script={
+                "reviewer": [
+                    {
+                        "response_type": "changes_requested",
+                        "response_text": "Fix the guard.",
+                        "getting_closer": True,
+                    },
+                    {
+                        "response_type": "ok",
+                        "response_text": "All good",
+                        "getting_closer": True,
+                    },
+                ],
+                "coder": [
+                    {
+                        "response_type": "ok",
+                        "response_text": "Fixed",
+                        "getting_closer": None,
+                    }
+                ],
+            },
+        )
+        exchange_run = _start_exchange_run(
+            session_output=session_output,
+            coder_worktree_path=coder_wt,
+            issue_number=42,
+            coder_label="agent:backend",
+            contract_body=self.CONTRACT,
+        )
+        swapped["contract"] = exchange_run.assets.leaf_contract_path
+
+        with pytest.raises(LeafContractUnavailable, match="recorded digest"):
+            pse.run_persistent_session_exchange(
+                exchange_run=exchange_run,
+                session_output=session_output,
+                pair_registry=state["registry"],
+                persistent_pair_root=tmp_path / "persistent-pairs",
+                coder_worktree_path=coder_wt,
+                reviewer_worktree_factory=lambda: reviewer_wt,
+                issue_number=42,
+                issue_title="Test",
+                coder_label="agent:backend",
+                reviewer_label="agent:reviewer",
+                coder_agent=_make_agent(prompt_path),
+                reviewer_agent=_make_agent(prompt_path),
+                runtime_config=_runtime_config(tmp_path),
+                max_rounds=3,
+                max_no_progress=2,
+                require_validation=False,
+                before_reviewer_round=_swap_before_round,
+                execution_identities=_identity_recorder(tmp_path),
+            )

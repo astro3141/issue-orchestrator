@@ -18,6 +18,7 @@ import pytest
 
 from issue_orchestrator.domain.review_exchange_resume import (
     REASON_CODER_ESCALATED_TO_HUMAN,
+    REASON_REVIEWER_SCOPE_CONFLICT,
     REASON_CODER_NO_COMPLETION,
     REASON_CODER_PROTOCOL_ERROR,
     REASON_MAX_ROUNDS_EXCEEDED,
@@ -390,6 +391,7 @@ _MATRIX_AT_CURRENT_HEAD: list[tuple[str, str, ResumeDecision]] = [
     ("stopped", REASON_REVIEWER_REPORTS_NO_PROGRESS, ResumeDecision.REUSE_HALT),
     ("stopped", REASON_MAX_ROUNDS_EXCEEDED, ResumeDecision.REUSE_HALT),
     ("stopped", REASON_CODER_ESCALATED_TO_HUMAN, ResumeDecision.REUSE_HALT),
+    ("stopped", REASON_REVIEWER_SCOPE_CONFLICT, ResumeDecision.REUSE_HALT),
     (
         "error",
         REASON_REVIEWER_NO_COMPLETION,

@@ -6,6 +6,10 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .path_guards import require_absolute_path, require_path_under
+from .review_exchange_contract import (
+    LEAF_CONTRACT_FILENAME,
+    LEAF_CONTRACT_MANIFEST_FILENAME,
+)
 from .review_exchange_turn_artifacts import review_exchange_dir
 
 
@@ -17,12 +21,27 @@ class ReviewExchangeRunAssets:
     exchange_dir: Path
     summary_path: Path
     validation_record_path: Path
+    leaf_contract_path: Path
+    """The exact admitted leaf contract bytes both roles consume (#399).
+
+    One path, owned here rather than derived at each reader, because the
+    whole point of the artifact is that the Coder and the Reviewer of one
+    exchange read the *same* bytes. A second derivation is a second place
+    they could stop being the same file.
+    """
+    leaf_contract_manifest_path: Path
+    """Attribution for the bytes above: issue identity and digest."""
 
     def __post_init__(self) -> None:
         _require_absolute(self.run_dir, "run_dir")
         _require_absolute(self.exchange_dir, "exchange_dir")
         _require_absolute(self.summary_path, "summary_path")
         _require_absolute(self.validation_record_path, "validation_record_path")
+        _require_absolute(self.leaf_contract_path, "leaf_contract_path")
+        _require_absolute(
+            self.leaf_contract_manifest_path,
+            "leaf_contract_manifest_path",
+        )
         expected_exchange_dir = review_exchange_dir(self.run_dir)
         if self.exchange_dir.resolve() != expected_exchange_dir.resolve():
             raise ValueError(
@@ -34,6 +53,16 @@ class ReviewExchangeRunAssets:
             self.run_dir,
             "validation_record_path",
         )
+        _require_under(
+            self.leaf_contract_path,
+            self.exchange_dir,
+            "leaf_contract_path",
+        )
+        _require_under(
+            self.leaf_contract_manifest_path,
+            self.exchange_dir,
+            "leaf_contract_manifest_path",
+        )
 
     @classmethod
     def from_run_dir(cls, run_dir: Path) -> "ReviewExchangeRunAssets":
@@ -43,6 +72,10 @@ class ReviewExchangeRunAssets:
             exchange_dir=exchange_dir,
             summary_path=exchange_dir / "summary.json",
             validation_record_path=run_dir / "validation-record.json",
+            leaf_contract_path=exchange_dir / LEAF_CONTRACT_FILENAME,
+            leaf_contract_manifest_path=(
+                exchange_dir / LEAF_CONTRACT_MANIFEST_FILENAME
+            ),
         )
 
     @classmethod

@@ -45,6 +45,7 @@ from .bootstrap_operator_commands import build_operator_issue_command_factory
 from .bootstrap_completion import (
     _validation_attempt_key_factory,
     build_completion_handler_factory,
+    build_review_exchange_runner,
     build_tech_lead_completion_validator,
     create_completion_components,
 )
@@ -1041,11 +1042,6 @@ def build_orchestrator_for_testing(
     from ..control.completion_processor import CompletionProcessor
     from ..control.pre_publish_gate import PrePublishGate
     from ..control.publication_gate import build_publication_gate
-    from ..execution.attempt_execution_identity_store import AttemptExecutionIdentityStore
-    from ..execution.attempt_review_verdict_store import AttemptReviewVerdictStore
-    from ..execution.persistent_review_exchange_runner import (
-        PersistentReviewExchangeRunner,
-    )
     from ..control.review_exchange_lifecycle import (
         ReviewExchangeCancellation,
         cancel_issue_review_exchange,
@@ -1114,14 +1110,17 @@ def build_orchestrator_for_testing(
         pr_adapter=github,
         git_adapter=working_copy,
         session_output=session_output,
-        review_exchange_runner=PersistentReviewExchangeRunner(
-            session_output,
-            pair_registry_for_testing,
-            AttemptExecutionIdentityStore(attempt_store),
-            AttemptReviewVerdictStore(attempt_store),
+        # Through the same factory the production root uses, so the two
+        # roots cannot hand the runner different collaborators — including
+        # the tracker its admitted leaf contract is read from (#399).
+        review_exchange_runner=build_review_exchange_runner(
+            session_output=session_output,
+            pair_registry=pair_registry_for_testing,
+            attempt_store=attempt_store,
+            tech_lead_completion_validator=tech_lead_validation,
+            repository_host=github,
             turn_mailbox=turn_mailbox,
             coder_prompt_addendum=coder_prompt_addendum,
-            tech_lead_completion_validator=tech_lead_validation,
         ),
         event_bus=None,
         label_config=label_manager.to_label_config_dict(),
