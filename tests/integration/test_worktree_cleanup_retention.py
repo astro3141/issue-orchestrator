@@ -15,6 +15,9 @@ from issue_orchestrator.control.worktree_reconciliation import (
 from issue_orchestrator.domain.artifact_contracts import AgentProvider
 from issue_orchestrator.domain.models import OrchestratorState, PendingCleanup
 from issue_orchestrator.execution.worktree_adapter import GitWorktreeManager
+from issue_orchestrator.adapters.worktree.api import (
+    CodexReviewCommandGuardInstaller,
+)
 from issue_orchestrator.execution.reviewer_worktree import create_reviewer_worktree
 from issue_orchestrator.ports.pull_request_tracker import PRInfo
 
@@ -156,6 +159,7 @@ def test_startup_retains_clean_reviewer_with_detached_commit(tmp_path: Path) -> 
         coder_branch=branch,
         timestamp="20260812T010203123456Z",
         reviewer_provider=CLAUDE_CODE,
+        guard_installer=CodexReviewCommandGuardInstaller(),
     ).path
     (reviewer / "reviewer-only.txt").write_text(
         "must survive startup cleanup\n",
@@ -197,6 +201,7 @@ def test_startup_removes_owned_reviewer_after_coder_advances(tmp_path: Path) -> 
         coder_branch=branch,
         timestamp="20260812T010203123456Z",
         reviewer_provider=CLAUDE_CODE,
+        guard_installer=CodexReviewCommandGuardInstaller(),
     ).path
     reviewer_head = _git(reviewer, "rev-parse", "HEAD").stdout.strip()
 

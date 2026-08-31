@@ -26,7 +26,9 @@ whether one was actually established:
 The policy itself is not declared here. The entry points a planning principal
 is refused come from the one gate-command vocabulary in
 :mod:`issue_orchestrator.infra.hooks.gate_commands`, which the reviewer guard
-reads too.
+reads too, and the evidence shape both principals report — :class:`GuardProbe`,
+re-exported here for the callers that already read it from this module — lives
+in :mod:`.command_guard` for the same reason (#396).
 """
 
 from __future__ import annotations
@@ -36,6 +38,7 @@ from pathlib import Path
 from typing import Protocol
 
 from ..domain.artifact_contracts import AgentProvider
+from .command_guard import GuardProbe
 
 __all__ = [
     "GUARDABLE_PLANNING_PROVIDERS",
@@ -68,23 +71,6 @@ class PlanningCommandGuardError(RuntimeError):
     limitation the caller can log and decide about, while "this provider's
     guard did not take" is a launch that must not happen.
     """
-
-
-@dataclass(frozen=True)
-class GuardProbe:
-    """One command whose classification by the established guard was measured.
-
-    Recorded so the guard's report is evidence rather than assertion: the
-    caller can see *which* commands were put to the enforcing mechanism and
-    what it answered, and a run's manifest keeps that after the fact.
-    """
-
-    command: tuple[str, ...]
-    refused: bool
-
-    @property
-    def label(self) -> str:
-        return " ".join(self.command)
 
 
 @dataclass(frozen=True)

@@ -1302,54 +1302,98 @@ there. What is exempt is the worktree that only reads.
 **A barrier, not an instruction, is what makes the exemption safe.**
 `docs/architecture/hooks.md` is explicit that policy documents and prompts are
 suggestions while hooks are enforcement, so the exemption cannot rest on the
-reviewer choosing to comply. Creating the worktree installs a `PreToolUse`
-Bash guard into it (`adapters/worktree/_review_command_guard.py`), and that
-guard **refuses** build, test and validation commands before they execute
-(`infra/hooks/review_command_guard.py`). Two properties make it trustworthy:
+reviewer choosing to comply. Creating the worktree installs a guard into it
+(`adapters/worktree/_review_command_guard.py`) that **refuses** build, test and
+validation commands before they execute. A guard is a *provider's* mechanism,
+so the installer holds one registration per guardable provider and
+`GUARDABLE_PROVIDERS` is **derived from that table** — a provider cannot be
+named guardable without a registration behind it (#396).
 
-- **Pinned.** The registered command names the running orchestrator's own
-  interpreter and `src` root, so the policy that decides is the orchestrator's,
-  never a copy the guarded worktree contains.
-- **Outside the candidate.** It is written to `.claude/settings.local.json`,
-  the never-tracked local settings layer, and hidden from the worktree's `git
-  status`. Nothing the candidate commit tracks is modified. A guard that
-  should have been installable but could not be written rolls the worktree
-  back, so an I/O failure cannot quietly produce a worktree that was meant to
-  be guarded and is not.
+- **Claude Code — a pinned `PreToolUse` hook.** The registered command names the
+  running orchestrator's own interpreter and `src` root, so the policy that
+  decides is the orchestrator's (`infra/hooks/review_command_guard.py`), never a
+  copy the guarded worktree contains. It is written to
+  `.claude/settings.local.json`, the never-tracked local settings layer, and
+  hidden from the worktree's `git status`; nothing the candidate commit tracks is
+  modified.
+- **Codex — a worktree-local exec policy, verified before it is claimed.** Codex
+  resolves a linked worktree as its own project root, so
+  `.codex/rules/review-gate.rules` inside the reviewer worktree is read by that
+  reviewer and by nothing else; the product checkout's `.codex/rules` and the
+  operator's `~/.codex` are untouched. It loads under the existing #215 grant,
+  which names the **common repository root** — the product checkout this sibling
+  worktree already belongs to — so no new root is trusted and no trust, sandbox
+  or credential state changes. The shipped `orchestrator.rules` is placed beside
+  it (Codex loads every `.rules` file in the directory) so `git push
+  --no-verify`, commit-hook bypass, `gh pr merge` and `gh api` stay denied, and
+  **both** files are put to `codex execpolicy check` before the guard is
+  reported: `make validate-pr-raw` and pytest-shaped commands must come back
+  `forbidden`, `git log`/`rg`/`cat`/`exchange-respond` must not, and the safety
+  file must still refuse its own samples. The last of those is this lane's own
+  exit — the reviewer worktree is created by the review exchange, where a
+  verdict is recorded with `exchange-respond` and `reviewer-done` is forbidden,
+  so refusing it would deadlock the round rather than merely narrow the
+  reviewer's tools. A policy that does not verify, or a checker that cannot
+  answer, is a failure — never a `guarded=False`.
 - **Installed for the provider that will actually run there, or not at all.**
-  The guard is registered through one provider's hook mechanism, and
   `create_reviewer_worktree` is given the provider the exchange launches
   (`launch_config`, the same derivation the execution-identity record reads).
-  For a provider outside `GUARDABLE_PROVIDERS` — today, anything but
-  `claude-code` — **nothing is written**: a `.claude/settings.local.json` in a
-  worktree whose agent never reads it is a claim of enforcement, and this
-  worktree has had enough of those. The installer reports `guarded=False` and
-  logs it at WARNING.
+  For a provider outside `GUARDABLE_PROVIDERS` **nothing is written**: a guard
+  file in a worktree whose agent never reads it is a claim of enforcement, and
+  this worktree has had enough of those. The installer reports `guarded=False`
+  and logs it at WARNING.
+- **A guard that should have been installable and was not rolls the worktree
+  back**, so neither an I/O failure nor an unverifiable policy can quietly
+  produce a worktree that was meant to be guarded and is not.
+- **The exchange asks a port, not this module.**
+  `ports/review_command_guard.py` carries the outcome, the failure and the
+  `ReviewCommandGuardInstaller` protocol; `create_reviewer_worktree` and
+  `PersistentReviewExchangeRunner` take an installer, and the composition
+  default is the CLI-backed `CodexReviewCommandGuardInstaller` — the strict
+  one, so an unwired deployment still gets the barrier. The seam exists
+  because *binding* a guard to the reviewer worktree and *verifying what it
+  refuses* are different facts, and only the second needs `codex` on `PATH`.
+  Without it, every suite that drives a whole exchange with a Codex reviewer
+  would either require the provider CLI or go unguarded; the exchange-level
+  suites substitute a recording installer and assert the guard was requested
+  for the provider the exchange launched, while what the policy actually
+  refuses stays the subject of `tests/unit/adapters/test_review_command_guard.py`
+  and the live `tests/integration/test_codex_reviewer_guard_live.py`. This is
+  the same port-shaped arrangement `PlanningCommandGuardInstaller` already had
+  for the other guarded principal.
 
-**Known gap: a Codex reviewer is unguarded.** `main.yaml`, the default mode,
-configures `agent:reviewer` on `codex`, and no guard mechanism is implemented
-for it, so in that configuration `REVIEWER_WORKTREE_IS_UNPROVISIONED_NOTE` is
-still the only thing between the reviewer and a gate command — the
-prompt-only arrangement `docs/architecture/hooks.md` rules out. It is named
-here rather than papered over. Codex does have project-local exec policies
-(`adapters/hooks/codex.py`, `prefix_rule`/`execpolicy`), but the CLI disables
-project-local config, hooks and exec policies until the project is *trusted*,
-and a reviewer worktree is a directory nothing has trusted — so planting a
-rules file there would produce another decorative guard. The two real closures
-are (a) making the reviewer worktree trusted at creation so a Codex exec policy
-loads, or (b) dropping the exemption for unguardable providers and routing the
-worktree through `WorktreeProvisioner`, which costs `worktrees.setup` per
-exchange. Both are product decisions larger than the installer, and neither is
-made here.
+Both registrations render the same vocabulary: which entry points count as a
+gate is declared once, in `infra/hooks/gate_commands.py`, as command regexes for
+the Claude hook and as Codex `prefix_rule` argv patterns for the exec policy.
+The Codex half of the mechanism — rendering, composing the safety rules,
+verifying, and hiding the files — is
+`adapters/worktree/_codex_gate_policy.py`, shared with the planning guard below
+so the two principals cannot drift apart.
+
+**What a guarded Codex reviewer leaves on your machine.** The policy files go
+away with the reviewer worktree. To keep them out of `git status`, the
+installation adds two lines to the repository's **shared** `.git/info/exclude`
+in the product checkout — `.codex/rules/review-gate.rules` and
+`.codex/rules/orchestrator.rules`. The write is idempotent, so that is two lines
+once, not two per exchange, and both name orchestrator-owned files the
+repository does not track. They are not removed at teardown, for the reason
+given under the planning guard below: the file is shared.
+
+**A provider with no registration is honestly unguarded.** For such a
+configuration `REVIEWER_WORKTREE_IS_UNPROVISIONED_NOTE` is the only thing
+between the reviewer and a gate command — the prompt-only arrangement
+`docs/architecture/hooks.md` rules out — and the WARNING says so. Closing that
+for a new provider means writing its registration and measuring that the
+provider loads it, which is what adding a name to a set would skip.
 
 Every reviewer prompt still carries `REVIEWER_WORKTREE_IS_UNPROVISIONED_NOTE`
 (`domain/review_exchange.py`), unconditionally — `review.exchange.loop.
 require_validation` decides only whether a validation *record* gates approval,
 so with it false the reviewer would meet a refusal with no idea why. Where the
 guard is installed the note is the explanation and the guard is the invariant;
-where it is not (see the gap above) the note is all there is. A change that
-lets the reviewer run gates must remove the guard *and* route this worktree
-through `WorktreeProvisioner`.
+where it is not (see above) the note is all there is. A change that lets the
+reviewer run gates must remove the guard *and* route this worktree through
+`WorktreeProvisioner`.
 
 ### No Tech Lead runs the gate at completion (#370)
 
@@ -1609,9 +1653,16 @@ rather than Claude Code's:
 
 - **One classifier.** Which entry points count as a gate is declared once, in
   `infra/hooks/gate_commands.py`. The reviewer's hook renders it as command
-  regexes; the planning installer renders it as Codex `prefix_rule` argv
-  patterns. Adding a gate entry point teaches both; removing one breaks both,
-  which is how the shared link is testable.
+  regexes; the planning installer and the Codex reviewer registration render it
+  as Codex `prefix_rule` argv patterns. Adding a gate entry point teaches all of
+  them; removing one breaks all of them, which is how the shared link is
+  testable.
+- **One mechanism.** How a Codex worktree policy is rendered, composed with the
+  shipped safety rules, verified through `codex execpolicy check` and hidden
+  from `git status` lives in `adapters/worktree/_codex_gate_policy.py`. Each
+  principal supplies only what differs: where its file goes, the prose the
+  refused principal is shown, and the samples whose classification must be
+  measured before the guard may be called established.
 - **Launch-scoped.** Codex resolves a linked worktree as its own project root,
   so `.codex/rules/planning-gate.rules` inside the run's *disposable* scratch
   worktree is read by that run and by nothing else. The product checkout's

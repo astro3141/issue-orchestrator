@@ -60,9 +60,14 @@ from issue_orchestrator.domain.runtime_config import RuntimeConfigReference
 from issue_orchestrator.domain.repository_launch_selection import (
     RepositoryLaunchSelection,
 )
+from issue_orchestrator.adapters.worktree.api import (
+    CodexReviewCommandGuardInstaller,
+)
 from issue_orchestrator.execution import persistent_review_exchange_runner as prer
 from issue_orchestrator.domain.coder_prompt import PreparedCoderPromptAddendum
 from issue_orchestrator.domain.session_key import TaskKind
+
+from tests.review_command_guard_fakes import RecordingReviewCommandGuard
 
 
 @pytest.fixture
@@ -83,13 +88,16 @@ def stub_lifecycle(monkeypatch, tmp_path):
         calls["resolve_branch"].append(wt)
         return "feature/test"
 
-    def _create(*, coder_worktree, coder_branch, timestamp, reviewer_provider):
+    def _create(
+        *, coder_worktree, coder_branch, timestamp, reviewer_provider, guard_installer
+    ):
         calls["create"].append(
             {
                 "coder_worktree": coder_worktree,
                 "coder_branch": coder_branch,
                 "timestamp": timestamp,
                 "reviewer_provider": reviewer_provider,
+                "guard_installer": guard_installer,
             }
         )
         return SimpleNamespace(
@@ -491,6 +499,72 @@ def test_reviewer_worktree_is_created_for_the_reviewers_launch_provider(
     captured["reviewer_worktree_factory"]()
 
     assert stub_lifecycle["create"][0]["reviewer_provider"] == AgentProvider("codex")
+
+
+def test_reviewer_worktree_creation_gets_the_guard_installer_the_runner_holds(
+    monkeypatch,
+    tmp_path: Path,
+    stub_lifecycle,
+):
+    """The barrier is an injected collaborator, and creation must get *it*.
+
+    A runner that reached for the installer itself would be untestable
+    anywhere the Codex CLI is absent — the verification asks the real one —
+    and would silently ignore whatever the composition root wired.
+    """
+    captured: dict[str, Any] = {}
+
+    def _fake_inner(**kwargs):
+        captured.update(kwargs)
+        return _canned_outcome(kwargs["exchange_run"])
+
+    monkeypatch.setattr(prer, "run_persistent_session_exchange", _fake_inner)
+    guard = RecordingReviewCommandGuard()
+    runner = prer.PersistentReviewExchangeRunner(
+        MagicMock(name="session_output"),
+        MagicMock(name="pair_registry"),
+        _identity_store(tmp_path),
+        _review_verdict_store(tmp_path),
+        review_command_guard=guard,
+    )
+
+    _run(runner, tmp_path, reviewer_agent=_make_agent(tmp_path, ai_system="codex"))
+    captured["reviewer_worktree_factory"]()
+
+    assert stub_lifecycle["create"][0]["guard_installer"] is guard
+
+
+def test_an_unwired_runner_still_reaches_the_real_barrier(
+    monkeypatch,
+    tmp_path: Path,
+    stub_lifecycle,
+):
+    """The default has to be the strict installer, not a permissive stand-in.
+
+    Making the guard injectable is what lets a suite without the provider CLI
+    exercise the exchange. It must not also be what lets a deployment that
+    never named one hand a reviewer an unguarded worktree, so the default is
+    the same CLI-backed installer the composition root would wire.
+    """
+    captured: dict[str, Any] = {}
+
+    def _fake_inner(**kwargs):
+        captured.update(kwargs)
+        return _canned_outcome(kwargs["exchange_run"])
+
+    monkeypatch.setattr(prer, "run_persistent_session_exchange", _fake_inner)
+
+    _run(
+        _make_runner(tmp_path),
+        tmp_path,
+        reviewer_agent=_make_agent(tmp_path, ai_system="codex"),
+    )
+    captured["reviewer_worktree_factory"]()
+
+    assert isinstance(
+        stub_lifecycle["create"][0]["guard_installer"],
+        CodexReviewCommandGuardInstaller,
+    )
 
 
 def test_run_threads_coder_branch_for_inner_fast_forward(

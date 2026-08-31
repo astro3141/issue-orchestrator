@@ -80,39 +80,38 @@ loads it is the provider behaviour measured above and re-measured by
 
 **One classifier.** The refused entry points come from
 :mod:`issue_orchestrator.infra.hooks.gate_commands`, the same vocabulary the
-reviewer worktree's guard reads. This module owns the Codex dialect — how an
-entry point becomes a ``prefix_rule`` — and the planning-specific refusal
-prose. It owns no part of the vocabulary, so a gate command added there is
-refused for both principals and one removed there breaks both.
+reviewer worktree's guard reads. This module owns the planning-specific refusal
+prose and the samples a planning run must keep; how a Codex worktree policy is
+rendered, composed with the shipped safety rules, verified and hidden belongs to
+:mod:`._codex_gate_policy`, which the reviewer's Codex registration (#396) uses
+too. This module owns no part of the vocabulary and no part of the mechanism.
 """
 
 from __future__ import annotations
 
-import json
 import logging
 from pathlib import Path
 
 from ...domain.artifact_contracts import AgentProvider
-from ...infra.hooks.gate_commands import ArgvPattern, codex_argv_patterns
 from ...ports.planning_command_guard import (
     GUARDABLE_PLANNING_PROVIDERS,
-    GuardProbe,
     PlanningCommandGuard,
     PlanningCommandGuardError,
 )
-from ..hooks.codex import CodexAdapter
-from ..hooks.codex_execpolicy import (
-    CodexCliExecPolicy,
-    ExecPolicyChecker,
-    ExecPolicyOutcome,
-    ExecPolicyResultError,
+from ..hooks.codex_execpolicy import CodexCliExecPolicy, ExecPolicyChecker
+from ._codex_gate_policy import (
+    CODEX_SAFETY_RULES,
+    SAFETY_REFUSED_SAMPLES,
+    CodexGatePolicy,
+    CodexGatePolicyError,
 )
-from ._worktree_runtime import _write_worktree_exclude_entries
 
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    "CODEX_SAFETY_RULES",
     "PLANNING_ALLOWED_SAMPLES",
+    "PLANNING_GATE_POLICY",
     "PLANNING_GUARD_RULES",
     "PLANNING_REFUSAL_JUSTIFICATION",
     "PLANNING_REFUSED_SAMPLES",
@@ -123,11 +122,6 @@ __all__ = [
 
 #: Worktree-relative policy file this installer owns outright.
 PLANNING_GUARD_RULES = Path(".codex") / "rules" / "planning-gate.rules"
-
-#: Worktree-relative safety policy the shipped Codex hook template installs.
-#: Named here so this installer can put the planning refusal *beside* it rather
-#: than in place of it.
-CODEX_SAFETY_RULES = Path(".codex") / "rules" / "orchestrator.rules"
 
 #: What the refused principal is told. Deliberately *not* the reviewer's prose:
 #: a planning worktree is a fully provisioned checkout, so "this worktree has
@@ -166,18 +160,6 @@ PLANNING_ALLOWED_SAMPLES: tuple[tuple[str, ...], ...] = (
     ("coding-done", "completed", "--implementation", "prepared the leaf"),
 )
 
-#: What the *composed* safety policy must still refuse once it has been placed
-#: beside the planning one. #289 acceptance 7 says the shipped no-bypass /
-#: no-merge rules compose with the planning refusal rather than being replaced
-#: by it — and this module's own standard is that a written file is not
-#: evidence of a barrier. Copying ``orchestrator.rules`` in and returning would
-#: hold the safety half to exactly the weaker standard the planning half is not
-#: allowed to use, so it is put to the same checker in the same pass.
-SAFETY_REFUSED_SAMPLES: tuple[tuple[str, ...], ...] = (
-    ("git", "push", "--no-verify"),
-    ("gh", "pr", "merge"),
-)
-
 _RULES_HEADER = """\
 # Launch-scoped planning guard for one issue-orchestrator Tech Lead run.
 #
@@ -191,23 +173,15 @@ _RULES_HEADER = """\
 # file by hand has no effect on the next run.
 """
 
-
-def _render_token(token: str | tuple[str, ...]) -> str:
-    if isinstance(token, tuple):
-        inner = ", ".join(json.dumps(value) for value in token)
-        return f"[{inner}]"
-    return json.dumps(token)
-
-
-def _render_rule(pattern: ArgvPattern, justification: str) -> str:
-    tokens = ", ".join(_render_token(token) for token in pattern)
-    return (
-        "prefix_rule(\n"
-        f"    pattern = [{tokens}],\n"
-        '    decision = "forbidden",\n'
-        f"    justification = {json.dumps(justification)},\n"
-        ")\n"
-    )
+#: The planning principal's half of the shared Codex policy mechanism.
+PLANNING_GATE_POLICY = CodexGatePolicy(
+    name="planning command guard",
+    rules_path=PLANNING_GUARD_RULES,
+    header=_RULES_HEADER,
+    justification=PLANNING_REFUSAL_JUSTIFICATION,
+    refused_samples=PLANNING_REFUSED_SAMPLES,
+    allowed_samples=PLANNING_ALLOWED_SAMPLES,
+)
 
 
 def render_planning_rules() -> str:
@@ -217,11 +191,7 @@ def render_planning_rules() -> str:
     compared with what a launch should have written instead of being trusted
     because it exists.
     """
-    body = "\n".join(
-        _render_rule(pattern, PLANNING_REFUSAL_JUSTIFICATION)
-        for pattern in codex_argv_patterns()
-    )
-    return f"{_RULES_HEADER}\n{body}"
+    return PLANNING_GATE_POLICY.render()
 
 
 class CodexPlanningCommandGuardInstaller:
@@ -254,98 +224,14 @@ class CodexPlanningCommandGuardInstaller:
             )
             return PlanningCommandGuard(provider=provider)
 
-        policy_file = Path(worktree_path) / PLANNING_GUARD_RULES
-        safety_file = Path(worktree_path) / CODEX_SAFETY_RULES
-        self._write_policy(policy_file)
-        self._install_safety_rules(worktree_path)
-        probes = self._verify(policy_file, safety_file)
-        _write_worktree_exclude_entries(
-            Path(worktree_path), [PLANNING_GUARD_RULES, CODEX_SAFETY_RULES]
-        )
-        logger.info(
-            "[planning-guard] established: worktree=%s policy=%s refuses=%s "
-            "allows=%s",
-            worktree_path,
-            policy_file,
-            len([probe for probe in probes if probe.refused]),
-            len([probe for probe in probes if not probe.refused]),
-        )
-        return PlanningCommandGuard(
-            provider=provider, policy_file=policy_file, probes=probes
-        )
-
-    def _write_policy(self, policy_file: Path) -> None:
         try:
-            policy_file.parent.mkdir(parents=True, exist_ok=True)
-            policy_file.write_text(render_planning_rules(), encoding="utf-8")
-        except OSError as exc:
-            raise PlanningCommandGuardError(
-                f"Failed to write the planning command guard at {policy_file}: {exc}"
-            ) from exc
-
-    def _install_safety_rules(self, worktree_path: Path) -> None:
-        """Put the shipped Codex safety policy beside the planning one.
-
-        Codex resolves this run's project root to the scratch worktree, so the
-        product checkout's ``orchestrator.rules`` is not in scope for it. #289
-        requires the guarded planning launch to still carry the existing
-        no-bypass / no-merge rules, and Codex loads every ``.rules`` file in
-        the directory — so composition is a matter of both files being here.
-
-        Copying is only half of it. What the copy actually refuses is measured
-        by :meth:`_verify` against :data:`SAFETY_REFUSED_SAMPLES`, so a safety
-        file that arrived empty, truncated or superseded fails the launch
-        instead of riding along unexamined.
-        """
-        try:
-            CodexAdapter(execpolicy=self._execpolicy).install_hooks(worktree_path)
-        except OSError as exc:
-            raise PlanningCommandGuardError(
-                "Failed to install the Codex safety rules alongside the "
-                f"planning command guard in {worktree_path}: {exc}"
-            ) from exc
-
-    def _verify(
-        self, policy_file: Path, safety_file: Path
-    ) -> tuple[GuardProbe, ...]:
-        """Ask the enforcing mechanism how it classifies every pinned sample.
-
-        Both files this launch put in ``.codex/rules/`` are measured, each
-        against the samples it owns: the planning policy must refuse the gate
-        vocabulary and keep the reading and ``coding-done`` samples, and the
-        composed safety policy must still refuse the no-bypass / no-merge
-        entry points it exists for.
-
-        A sample classified the wrong way, or an answer that cannot be
-        classified at all, fails the guard: an unreadable verdict is not
-        evidence of a barrier.
-        """
-        plan: tuple[tuple[Path, tuple[str, ...], bool], ...] = (
-            *((policy_file, s, True) for s in PLANNING_REFUSED_SAMPLES),
-            *((policy_file, s, False) for s in PLANNING_ALLOWED_SAMPLES),
-            *((safety_file, s, True) for s in SAFETY_REFUSED_SAMPLES),
-        )
-        return tuple(
-            self._probe(rules_file, command, expect_refused)
-            for rules_file, command, expect_refused in plan
-        )
-
-    def _probe(
-        self, rules_file: Path, command: tuple[str, ...], expect_refused: bool
-    ) -> GuardProbe:
-        label = " ".join(command)
-        try:
-            outcome = self._execpolicy.check(rules_file, command)
-        except ExecPolicyResultError as exc:
-            raise PlanningCommandGuardError(
-                f"The planning command guard at {rules_file} gave no "
-                f"classifiable answer for {label!r}: {exc}"
-            ) from exc
-        refused = outcome is ExecPolicyOutcome.FORBIDDEN
-        if refused is not expect_refused:
-            wanted = "refuse" if expect_refused else "allow"
-            raise PlanningCommandGuardError(
-                f"The planning command guard at {rules_file} does not "
-                f"{wanted} {label!r} (execpolicy answered {outcome.value})"
+            established = PLANNING_GATE_POLICY.establish(
+                worktree_path, execpolicy=self._execpolicy
             )
-        return GuardProbe(command=tuple(command), refused=refused)
+        except CodexGatePolicyError as exc:
+            raise PlanningCommandGuardError(str(exc)) from exc
+        return PlanningCommandGuard(
+            provider=provider,
+            policy_file=established.policy_file,
+            probes=established.probes,
+        )

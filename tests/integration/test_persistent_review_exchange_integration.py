@@ -39,6 +39,7 @@ from issue_orchestrator.execution.agent_runner_providers.codex_trust import (
 
 from tests.fixtures.live_agent_cli import is_codex_authenticated
 from tests.live_assurance import require_probe_ran
+from tests.review_command_guard_fakes import RecordingReviewCommandGuard
 from tests.workspace_trust import approval_for
 from tests.callback_endpoint_helpers import (
     published_callback_endpoint,
@@ -205,6 +206,7 @@ def _make_review_exchange_runner(
     *,
     identity_root: Path,
     pair_registry: InMemoryPersistentExchangePairRegistry | None = None,
+    review_command_guard: RecordingReviewCommandGuard | None = None,
 ) -> PersistentReviewExchangeRunner:
     """Centralized constructor for the integration tests' review-exchange runner.
 
@@ -219,12 +221,24 @@ def _make_review_exchange_runner(
     pass one in. Pair filesystem state is derived from the coder
     worktree at run time so each test's temporary worktree is the
     isolation boundary.
+
+    ``review_command_guard`` is a recording double by default, and every runner
+    this module builds gets one. The reviewer worktree's real barrier verifies
+    itself by asking ``codex execpolicy check``, which is a provider CLI this
+    suite must not require and CI does not have — but a runner left to reach
+    the real installer would then fail every exchange it launched a Codex
+    reviewer for, which is exactly what happened on #397. The double keeps the
+    guard *bound* and observable here; what the policy actually refuses is the
+    subject of ``tests/unit/adapters/test_review_command_guard`` and the live
+    ``test_codex_reviewer_guard_live`` module. Tests that want to assert on the
+    binding pass their own and read its ``calls``.
     """
     return PersistentReviewExchangeRunner(
         session_output,
         pair_registry or InMemoryPersistentExchangePairRegistry(),
         _identity_store(identity_root),
         _review_verdict_store(identity_root),
+        review_command_guard=review_command_guard or RecordingReviewCommandGuard(),
     )
 
 
@@ -680,6 +694,7 @@ def test_codex_shaped_interactive_agent_receives_argv_bootstrap_then_pty_rounds(
     config.review_exchange_max_rounds = 3
 
     session_output = FileSystemSessionOutput()
+    review_guard = RecordingReviewCommandGuard()
     cre = CompletionReviewExchange(
         agent_callback_endpoint=ready_callback_endpoint(),
         config=config,
@@ -687,7 +702,9 @@ def test_codex_shaped_interactive_agent_receives_argv_bootstrap_then_pty_rounds(
         emit_review_started=lambda **_: None,
         emit_review_outcome=lambda **_: None,
         review_exchange_runner=_make_review_exchange_runner(
-            session_output, identity_root=tmp_path / "identity-root",
+            session_output,
+            identity_root=tmp_path / "identity-root",
+            review_command_guard=review_guard,
         ),
     )
 
@@ -707,6 +724,11 @@ def test_codex_shaped_interactive_agent_receives_argv_bootstrap_then_pty_rounds(
 
     assert outcome.status == "ok", f"unexpected outcome: {outcome}"
     assert outcome.rounds == 2
+    # The reviewer worktree this exchange created was guarded for the provider
+    # it actually launched (#396). A Codex reviewer used to be held by the
+    # prompt's note alone, so "a guard was asked for, and for codex" is the
+    # thing that has to stay measured at this layer.
+    assert review_guard.providers() == ("codex",)
 
     spawn_records = [
         json.loads(line)
@@ -830,6 +852,7 @@ def test_synthetic_raw_tui_review_exchange_suppresses_bootstrap_response(
             captured_events.append(event)
 
     session_output = FileSystemSessionOutput()
+    review_guard = RecordingReviewCommandGuard()
     cre = CompletionReviewExchange(
         agent_callback_endpoint=ready_callback_endpoint(),
         config=config,
@@ -837,7 +860,9 @@ def test_synthetic_raw_tui_review_exchange_suppresses_bootstrap_response(
         emit_review_started=lambda **_: None,
         emit_review_outcome=lambda **_: None,
         review_exchange_runner=_make_review_exchange_runner(
-            session_output, identity_root=tmp_path / "identity-root",
+            session_output,
+            identity_root=tmp_path / "identity-root",
+            review_command_guard=review_guard,
         ),
     )
 
@@ -858,6 +883,7 @@ def test_synthetic_raw_tui_review_exchange_suppresses_bootstrap_response(
     assert outcome.status == "ok", f"unexpected outcome: {outcome}"
     assert outcome.rounds == 2
     assert outcome.reason == "reviewer_ok"
+    assert review_guard.providers() == ("codex",)
     assert outcome.reviewer_response is not None
     assert outcome.reviewer_response.response_text == (
         "Synthetic reviewer approved round 2"
@@ -971,6 +997,7 @@ def test_real_interactive_codex_reviewer_round_trips_through_exchange(
                 _identity_store(tmp_path / "identity-root"),
                 _review_verdict_store(tmp_path / "identity-root"),
                 turn_mailbox=mailbox,
+                review_command_guard=RecordingReviewCommandGuard(),
             ),
         )
 
@@ -1805,6 +1832,7 @@ def test_persistent_review_exchange_end_to_end_through_mailbox(
             _identity_store(tmp_path / "identity-root"),
             _review_verdict_store(tmp_path / "identity-root"),
             turn_mailbox=mailbox,
+            review_command_guard=RecordingReviewCommandGuard(),
         )
         cre = CompletionReviewExchange(
             agent_callback_endpoint=published_callback_endpoint(port),

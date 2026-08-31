@@ -58,6 +58,8 @@ from .persistent_session_exchange import (
     review_exchange_supervisor_timeout_seconds,
     run_persistent_session_exchange,
 )
+from ..adapters.worktree.api import CodexReviewCommandGuardInstaller
+from ..ports.review_command_guard import ReviewCommandGuardInstaller
 from ..ports.turn_mailbox import TurnMailbox
 from .review_exchange_response_channel import (
     ResponseChannel,
@@ -128,6 +130,7 @@ class PersistentReviewExchangeRunner:
         tech_lead_completion_validator: TechLeadCompletionValidator = (
             UNWIRED_TECH_LEAD_COMPLETION_VALIDATOR
         ),
+        review_command_guard: ReviewCommandGuardInstaller | None = None,
     ) -> None:
         self._session_output = session_output
         self._pair_registry = pair_registry
@@ -154,6 +157,18 @@ class PersistentReviewExchangeRunner:
         # that forgot to wire the real one loses a Tech Lead round instead of
         # passing it unvalidated.
         self._tech_lead_completion_validator = tech_lead_completion_validator
+        # The reviewer worktree's barrier (#396). Defaulted to the real,
+        # CLI-backed installer rather than to a permissive stand-in: the
+        # default has to be the strict one, so a deployment that never names it
+        # still gets the guard and still fails an exchange closed when the
+        # guard does not take. It is injectable because verifying what the
+        # policy refuses needs the provider CLI, while binding a guard to the
+        # worktree does not — see ``ports/review_command_guard``.
+        self._review_command_guard: ReviewCommandGuardInstaller = (
+            CodexReviewCommandGuardInstaller()
+            if review_command_guard is None
+            else review_command_guard
+        )
 
     def _execution_identity_recorder(
         self,
@@ -274,6 +289,7 @@ class PersistentReviewExchangeRunner:
                 coder_branch=coder_branch,
                 timestamp=timestamp,
                 reviewer_provider=agent_provider(launch_config(reviewer_agent)),
+                guard_installer=self._review_command_guard,
             )
             return wt.path
 
