@@ -192,6 +192,24 @@ The exemption set is named rather than spelled twice inline because the two
 validation-evidence branches ask one question of one fact and must stay
 answered the same way.
 
+### The reviewer's scope conflict joins that exemption (#399)
+
+`stopped` / `reviewer_scope_conflict` was added the same way — reason constant,
+`decide()` row, state-table row, production-layout row — and it joins
+`_PUBLICATION_EVIDENCE_EXEMPT_REASONS` by the same argument the coder
+escalation does, not by analogy to it.
+
+The terminal fires when the Reviewer reports a valid finding whose repair needs
+a mutation the admitted executable leaf contract does not allow. No coder round
+runs, nothing is offered for review, and no publication is requested — so there
+is no publish evidence for a staleness branch to find, and demanding some would
+send the scope question back through a fresh exchange to be asked and swallowed
+again. That is the same defect shape #386 closed, reached from the Reviewer's
+side rather than the Coder's.
+
+The head comparison still applies in full: a new commit is a new subject, and
+the question about it is asked fresh.
+
 ## Deferred
 
 - **Agent-side packet consumption.** Agents (Codex, Claude Code)

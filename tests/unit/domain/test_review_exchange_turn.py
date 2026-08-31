@@ -16,6 +16,10 @@ from issue_orchestrator.domain.review_exchange import (
     build_coder_prompt,
     build_reviewer_prompt,
 )
+from issue_orchestrator.domain.review_exchange_contract import (
+    AdmittedLeafContract,
+    StagedLeafContract,
+)
 from issue_orchestrator.domain.review_exchange_turn import (
     ReviewExchangePromptFiles,
     ReviewExchangeTurnPacket,
@@ -23,6 +27,22 @@ from issue_orchestrator.domain.review_exchange_turn import (
     Role,
     TurnResultKind,
 )
+
+CONTRACT_PATH = Path(
+    "/wt/.issue-orchestrator/sessions/r1/review-exchange/issue-contract.md",
+)
+
+
+def _staged_contract(
+    *,
+    issue_number: int = 42,
+    body: str = "Change exactly src/only_this_file.py.",
+) -> StagedLeafContract:
+    return AdmittedLeafContract(
+        issue_number=issue_number,
+        issue_title="Make it right",
+        body=body,
+    ).staged_at(CONTRACT_PATH)
 
 
 # ---------------------------------------------------------------------------
@@ -53,6 +73,86 @@ class TestReviewExchangeTurnPacketRoundTrip:
             original.to_manifest_fields(),
         )
         assert recovered == original
+
+    def test_the_leaf_contract_round_trips_with_its_digest(self) -> None:
+        # R2: writer/reader symmetry has to include the contract, or the
+        # persisted proof that both roles consumed the same bytes is not
+        # recoverable from the artifacts.
+        original = ReviewExchangeTurnPacket(
+            issue_number=399,
+            issue_title="Carry the contract",
+            round_index=1,
+            role=Role.REVIEWER,
+            require_validation=False,
+            run_dir=Path("/wt/.issue-orchestrator/sessions/r1"),
+            prompt_files=ReviewExchangePromptFiles(
+                leaf_contract=_staged_contract(issue_number=399),
+            ),
+        )
+
+        recovered = ReviewExchangeTurnPacket.from_manifest(
+            original.to_manifest_fields(),
+        )
+
+        assert recovered == original
+        assert recovered is not None
+        assert recovered.prompt_files.leaf_contract is not None
+        assert (
+            recovered.prompt_files.leaf_contract.digest
+            == _staged_contract(issue_number=399).digest
+        )
+
+    def test_a_malformed_leaf_contract_rejects_the_whole_packet(self) -> None:
+        # Same stance the structured ``prompt_files`` object already takes:
+        # a prompt dependency must never silently degrade to "unset".
+        manifest = ReviewExchangeTurnPacket(
+            issue_number=399,
+            issue_title="Carry the contract",
+            round_index=1,
+            role=Role.REVIEWER,
+            require_validation=False,
+            run_dir=Path("/wt/.issue-orchestrator/sessions/r1"),
+            prompt_files=ReviewExchangePromptFiles(
+                leaf_contract=_staged_contract(issue_number=399),
+            ),
+        ).to_manifest_fields()
+        manifest["prompt_files"]["leaf_contract"]["digest"] = "not-a-digest"
+
+        assert ReviewExchangeTurnPacket.from_manifest(manifest) is None
+
+    def test_a_packet_from_before_the_contract_existed_still_parses(self) -> None:
+        # Session replay reads historical packets; only an ACTIVE round
+        # requires the contract, and the round loop is where that is
+        # enforced.
+        manifest = ReviewExchangeTurnPacket(
+            issue_number=399,
+            issue_title="Carry the contract",
+            round_index=1,
+            role=Role.REVIEWER,
+            require_validation=False,
+            run_dir=Path("/wt/.issue-orchestrator/sessions/r1"),
+        ).to_manifest_fields()
+
+        recovered = ReviewExchangeTurnPacket.from_manifest(manifest)
+
+        assert recovered is not None
+        assert recovered.prompt_files.leaf_contract is None
+
+    def test_a_contract_for_another_issue_refuses_to_build_a_prompt(self) -> None:
+        packet = ReviewExchangeTurnPacket(
+            issue_number=42,
+            issue_title="Make it right",
+            round_index=1,
+            role=Role.REVIEWER,
+            require_validation=False,
+            run_dir=Path("/wt/.issue-orchestrator/sessions/r1"),
+            prompt_files=ReviewExchangePromptFiles(
+                leaf_contract=_staged_contract(issue_number=399),
+            ),
+        )
+
+        with pytest.raises(ValueError, match="leaf contract for issue"):
+            build_reviewer_prompt(packet)
 
     def test_coder_packet_with_reviewer_feedback_round_trip(self) -> None:
         original = ReviewExchangeTurnPacket(
@@ -191,6 +291,9 @@ class TestBuildReviewerPrompt:
             role=Role.REVIEWER,
             require_validation=False,
             run_dir=Path("/wt/.issue-orchestrator/sessions/review-exchange-run"),
+            prompt_files=ReviewExchangePromptFiles(
+                leaf_contract=_staged_contract(),
+            ),
             coder_prompt_addendum="INTERNAL-CODER-ONLY",
         )
 
@@ -210,6 +313,7 @@ class TestBuildReviewerPrompt:
             run_dir=run_dir,
             prompt_files=ReviewExchangePromptFiles(
                 validation_record=validation_record,
+                leaf_contract=_staged_contract(),
             ),
         )
 
@@ -241,6 +345,9 @@ class TestBuildReviewerPrompt:
             role=Role.REVIEWER,
             require_validation=False,
             run_dir=Path("/wt/.issue-orchestrator/sessions/review-exchange-run"),
+            prompt_files=ReviewExchangePromptFiles(
+                leaf_contract=_staged_contract(),
+            ),
         )
 
         prompt = build_reviewer_prompt(packet)
@@ -259,6 +366,9 @@ class TestBuildReviewerPrompt:
             role=Role.REVIEWER,
             require_validation=True,
             run_dir=Path("/wt/.issue-orchestrator/sessions/review-exchange-run"),
+            prompt_files=ReviewExchangePromptFiles(
+                leaf_contract=_staged_contract(),
+            ),
         )
 
         with pytest.raises(ValueError, match="prompt_files.validation_record"):
@@ -274,6 +384,9 @@ class TestBuildCoderPrompt:
             role=Role.CODER,
             require_validation=False,
             run_dir=Path("/wt/.issue-orchestrator/sessions/review-exchange-run"),
+            prompt_files=ReviewExchangePromptFiles(
+                leaf_contract=_staged_contract(),
+            ),
             reviewer_feedback="External reviewer finding.",
             coder_prompt_addendum="MANDATORY-INTERNAL-REVIEW",
         )
@@ -292,6 +405,9 @@ class TestBuildCoderPrompt:
             role=Role.CODER,
             require_validation=True,
             run_dir=Path("/wt/.issue-orchestrator/sessions/review-exchange-run"),
+            prompt_files=ReviewExchangePromptFiles(
+                leaf_contract=_staged_contract(),
+            ),
             reviewer_feedback="Fix the tests and commit the result.",
         )
 

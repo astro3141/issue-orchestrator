@@ -38,6 +38,10 @@ from ..ports.candidate_review_verdicts import CandidateReviewVerdictStore
 from ..ports.execution_identity_store import CandidateExecutionIdentityStore
 from .candidate_execution_identity import CandidateExecutionIdentityRecorder
 from ..ports.review_exchange_approval_gate import ReviewExchangeApprovalGate
+from ..ports.review_exchange_leaf_contract import (
+    AdmittedLeafContractStaging,
+    UNSTAGEABLE_ADMITTED_LEAF_CONTRACT,
+)
 from ..control.tech_lead_completion_validation import (
     UNWIRED_TECH_LEAD_COMPLETION_VALIDATOR,
 )
@@ -131,6 +135,9 @@ class PersistentReviewExchangeRunner:
             UNWIRED_TECH_LEAD_COMPLETION_VALIDATOR
         ),
         review_command_guard: ReviewCommandGuardInstaller | None = None,
+        leaf_contract_staging: AdmittedLeafContractStaging = (
+            UNSTAGEABLE_ADMITTED_LEAF_CONTRACT
+        ),
     ) -> None:
         self._session_output = session_output
         self._pair_registry = pair_registry
@@ -169,6 +176,13 @@ class PersistentReviewExchangeRunner:
             if review_command_guard is None
             else review_command_guard
         )
+        # Who freezes the admitted executable leaf contract this exchange
+        # reviews against (#399). Defaulted to the refusing owner for the
+        # same reason the Tech Lead validator is: a deployment that forgot
+        # to wire the real one must lose the exchange, not run a Reviewer
+        # with no admitted scope and let the widening show up at the file
+        # boundary an Operator happens to check.
+        self._leaf_contract_staging = leaf_contract_staging
 
     def _execution_identity_recorder(
         self,
@@ -292,6 +306,18 @@ class PersistentReviewExchangeRunner:
                 guard_installer=self._review_command_guard,
             )
             return wt.path
+
+        # Before the pair spawns and before a reviewer worktree exists: the
+        # snapshot is orchestrator-owned and produced once per exchange, so
+        # both roles read the same bytes and neither refetches the issue
+        # itself (#399 R1). ``LeafContractUnavailable`` propagates — the
+        # exchange's failure paths already halt the completion without
+        # publishing, which is the required answer to "we cannot prove the
+        # admitted scope".
+        self._leaf_contract_staging.stage(
+            issue_number=issue_number,
+            assets=exchange_run.assets,
+        )
 
         prepared_coder_prompt = self._coder_prompt_addendum.prepare(
             task=TaskKind.REWORK,

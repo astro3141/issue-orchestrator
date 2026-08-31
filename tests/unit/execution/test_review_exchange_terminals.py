@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import pytest
 
+from issue_orchestrator.domain.review_artifacts import ReviewDecision, ReviewScope
 from issue_orchestrator.domain.review_exchange import ReviewExchangeResponse
 from issue_orchestrator.domain.review_exchange_rework import ReviewExchangeRework
 from issue_orchestrator.domain.review_exchange_summary import (
@@ -31,6 +32,22 @@ NO_PROGRESS = (
     ReviewExchangeStatus.STOPPED,
     ReviewExchangeReason.REVIEWER_REPORTS_NO_PROGRESS,
 )
+SCOPE_CONFLICT = (
+    ReviewExchangeStatus.STOPPED,
+    ReviewExchangeReason.REVIEWER_SCOPE_CONFLICT,
+)
+
+
+def _decision(
+    *,
+    verdict: str = "changes_requested",
+    scope: ReviewScope = "in_contract",
+) -> ReviewDecision:
+    return ReviewDecision(
+        verdict=verdict,  # type: ignore[arg-type]
+        risk="low",
+        scope=scope,
+    )
 
 
 def _reviewer(
@@ -56,14 +73,14 @@ class TestApprovalOutranksEverything:
     def test_an_approval_ends_the_exchange_approved(
         self, rework: ReviewExchangeRework
     ) -> None:
-        assert _terminals(rework).for_round(_reviewer("ok")) == APPROVED
+        assert _terminals(rework).for_round(_reviewer("ok"), _decision()) == APPROVED
 
     def test_an_approval_ends_it_even_after_the_budget_is_spent(self) -> None:
         """A spent budget is not a verdict: it only decides non-approvals."""
         terminals = _terminals(ReviewExchangeRework.IN_EXCHANGE, max_no_progress=1)
-        terminals.for_round(_reviewer("changes_requested", getting_closer=False))
+        terminals.for_round(_reviewer("changes_requested", getting_closer=False), _decision())
 
-        assert terminals.for_round(_reviewer("ok")) == APPROVED
+        assert terminals.for_round(_reviewer("ok"), _decision()) == APPROVED
 
 
 class TestTheHandOffPrecedesTheNoProgressBudget:
@@ -73,7 +90,7 @@ class TestTheHandOffPrecedesTheNoProgressBudget:
         terminals = _terminals(ReviewExchangeRework.HAND_OFF, max_no_progress=3)
 
         assert (
-            terminals.for_round(_reviewer("changes_requested", getting_closer=True))
+            terminals.for_round(_reviewer("changes_requested", getting_closer=True), _decision())
             == HANDED_OFF
         )
 
@@ -89,7 +106,7 @@ class TestTheHandOffPrecedesTheNoProgressBudget:
         terminals = _terminals(ReviewExchangeRework.HAND_OFF, max_no_progress=1)
 
         assert (
-            terminals.for_round(_reviewer("changes_requested", getting_closer=False))
+            terminals.for_round(_reviewer("changes_requested", getting_closer=False), _decision())
             == HANDED_OFF
         )
 
@@ -97,7 +114,7 @@ class TestTheHandOffPrecedesTheNoProgressBudget:
         """Any non-approval, not just ``changes_requested``."""
         terminals = _terminals(ReviewExchangeRework.HAND_OFF)
 
-        assert terminals.for_round(_reviewer("disagree")) == HANDED_OFF
+        assert terminals.for_round(_reviewer("disagree"), _decision()) == HANDED_OFF
 
 
 class TestTheNoProgressBudgetInAnExchangeThatOwnsACoder:
@@ -105,16 +122,16 @@ class TestTheNoProgressBudgetInAnExchangeThatOwnsACoder:
         terminals = _terminals(ReviewExchangeRework.IN_EXCHANGE, max_no_progress=2)
 
         assert (
-            terminals.for_round(_reviewer("changes_requested", getting_closer=False))
+            terminals.for_round(_reviewer("changes_requested", getting_closer=False), _decision())
             is None
         )
 
     def test_the_budget_stops_the_exchange_when_it_is_reached(self) -> None:
         terminals = _terminals(ReviewExchangeRework.IN_EXCHANGE, max_no_progress=2)
-        terminals.for_round(_reviewer("changes_requested", getting_closer=False))
+        terminals.for_round(_reviewer("changes_requested", getting_closer=False), _decision())
 
         assert (
-            terminals.for_round(_reviewer("changes_requested", getting_closer=False))
+            terminals.for_round(_reviewer("changes_requested", getting_closer=False), _decision())
             == NO_PROGRESS
         )
 
@@ -125,11 +142,11 @@ class TestTheNoProgressBudgetInAnExchangeThatOwnsACoder:
         by rounds it had already worked past.
         """
         terminals = _terminals(ReviewExchangeRework.IN_EXCHANGE, max_no_progress=2)
-        terminals.for_round(_reviewer("changes_requested", getting_closer=False))
-        terminals.for_round(_reviewer("changes_requested", getting_closer=True))
+        terminals.for_round(_reviewer("changes_requested", getting_closer=False), _decision())
+        terminals.for_round(_reviewer("changes_requested", getting_closer=True), _decision())
 
         assert (
-            terminals.for_round(_reviewer("changes_requested", getting_closer=False))
+            terminals.for_round(_reviewer("changes_requested", getting_closer=False), _decision())
             is None
         )
 
@@ -138,7 +155,7 @@ class TestTheNoProgressBudgetInAnExchangeThatOwnsACoder:
         terminals = _terminals(ReviewExchangeRework.IN_EXCHANGE, max_no_progress=1)
 
         assert (
-            terminals.for_round(_reviewer("changes_requested", getting_closer=None))
+            terminals.for_round(_reviewer("changes_requested", getting_closer=None), _decision())
             is None
         )
 
@@ -148,7 +165,73 @@ class TestTheNoProgressBudgetInAnExchangeThatOwnsACoder:
         for _ in range(5):
             assert (
                 terminals.for_round(
-                    _reviewer("changes_requested", getting_closer=False)
+                    _reviewer("changes_requested", getting_closer=False),
+                    _decision(),
                 )
                 is None
             )
+
+
+class TestAnOutOfContractFindingIsNotOrdinaryRework:
+    """#399 F4/F5/F6: mutation authority is decided before rework is."""
+
+    @pytest.mark.parametrize("rework", list(ReviewExchangeRework))
+    def test_a_scope_conflict_ends_the_exchange_in_either_mode(
+        self, rework: ReviewExchangeRework
+    ) -> None:
+        # Not `reviewer_requested_changes`: that terminal claims a rework
+        # round could resolve it, and the admitted contract says none can.
+        assert (
+            _terminals(rework).for_round(
+                _reviewer("changes_requested", getting_closer=True),
+                _decision(scope="out_of_contract"),
+            )
+            == SCOPE_CONFLICT
+        )
+
+    def test_a_scope_conflict_never_reaches_the_coder(self) -> None:
+        terminals = _terminals(ReviewExchangeRework.IN_EXCHANGE)
+
+        # An in-exchange lane with budget to spare would ordinarily continue
+        # into a coder turn. It must not: the coder turn is where #398's
+        # candidate acquired its second file.
+        assert (
+            terminals.for_round(
+                _reviewer("changes_requested", getting_closer=True),
+                _decision(scope="out_of_contract"),
+            )
+            is not None
+        )
+
+    def test_an_ordinary_finding_still_reworks_normally(self) -> None:
+        terminals = _terminals(ReviewExchangeRework.IN_EXCHANGE)
+
+        assert (
+            terminals.for_round(
+                _reviewer("changes_requested", getting_closer=True),
+                _decision(),
+            )
+            is None
+        )
+
+    def test_a_disagreement_is_not_a_scope_conflict(self) -> None:
+        # F5: the reviewer being WRONG stays the disagreement path. Only an
+        # explicit marker routes to the scope terminal.
+        terminals = _terminals(ReviewExchangeRework.IN_EXCHANGE)
+
+        assert (
+            terminals.for_round(_reviewer("disagree"), _decision(verdict="disagree"))
+            is None
+        )
+
+    def test_an_approval_still_outranks_the_marker(self) -> None:
+        # The decision type refuses approved+out_of_contract outright, but the
+        # transport field and the decision are separate values, so the order
+        # is asserted rather than assumed.
+        assert (
+            _terminals(ReviewExchangeRework.IN_EXCHANGE).for_round(
+                _reviewer("ok"),
+                _decision(scope="out_of_contract"),
+            )
+            == APPROVED
+        )

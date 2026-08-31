@@ -30,6 +30,7 @@ from .review_exchange_summary import (
 )
 
 if TYPE_CHECKING:
+    from .review_exchange_contract import StagedLeafContract
     from .review_exchange_turn import ReviewExchangeTurnPacket
 
 
@@ -130,6 +131,61 @@ class ReviewExchangeOutcome:
 # only whether a validation *record* is required before the reviewer may
 # approve, so with it false the reviewer would otherwise meet the guard with no
 # idea why.
+# What the admitted executable leaf contract is FOR, told to each role in
+# its own terms (#399). The Reviewer's mutation authority and the Coder's
+# are the same authority read from two sides, so both notes are built from
+# one staged artifact and neither may restate the other's rule differently.
+#
+# The Reviewer's note deliberately does NOT narrow what the Reviewer may
+# look at or report. F6: broader inspection stays allowed, and a material
+# adjacent finding stays worth stating. What it bounds is what the
+# Reviewer may direct the Coder to CHANGE — the distinction #398 lacked,
+# where a correct engineering finding arrived as an ordinary "also edit
+# this other file" demand and the candidate widened past what Control
+# admitted.
+def _leaf_contract_note(contract: "StagedLeafContract") -> str:
+    return (
+        f"The admitted executable leaf contract for issue "
+        f"#{contract.issue_number} is staged at {contract.path} "
+        f"(digest {contract.digest}). It is the authority on what this "
+        "exchange may change. Read it before anything else; both roles in "
+        "this exchange were given those exact bytes.\n"
+    )
+
+
+REVIEWER_LEAF_CONTRACT_SCOPE_NOTE = (
+    "Reviewing the broader codebase does NOT widen the executable scope. "
+    "You may read any source you need and you SHOULD report a material "
+    "finding you see outside the admitted contract — noticing it is not "
+    "the problem. But before you ask for a change, decide which of these "
+    "it is:\n"
+    "  (a) required INSIDE the admitted contract — request it normally "
+    "with `exchange-respond changes_requested`; the coder reworks it.\n"
+    "  (b) a valid finding whose repair needs a mutation the admitted "
+    "contract does not allow (another file, another subsystem, work the "
+    "contract excludes) — say so and add `--out-of-contract`. That ends "
+    "the exchange as a scope conflict for a human to settle. Do NOT "
+    "instruct the coder to make that change as ordinary rework.\n"
+    "Being technically right does not grant mutation authority the "
+    "contract withheld.\n"
+)
+
+CODER_LEAF_CONTRACT_SCOPE_NOTE = (
+    "The contract above bounds what you may change. For each thing the "
+    "reviewer asks for:\n"
+    "  - satisfiable inside the admitted contract -> do it, this is "
+    "ordinary rework.\n"
+    "  - the reviewer is technically WRONG -> `exchange-respond disagree` "
+    "and say why.\n"
+    "  - the reviewer is technically RIGHT but the fix needs a mutation "
+    "the contract does not admit -> run `coding-done needs_human "
+    "--question '...'` naming the finding and the contract limit it "
+    "crosses, then `exchange-respond`. Do not make the change, and do not "
+    "dress it up as `disagree`: whether a finding is correct and whether "
+    "you may act on it are separate questions, and answering the second "
+    "with the first loses the question a human needs to see.\n"
+)
+
 REVIEWER_WORKTREE_IS_UNPROVISIONED_NOTE = (
     "This reviewer worktree is not provisioned with the repository's runtime "
     "prerequisites (no virtualenv, no node modules, no browser binaries), so "
@@ -143,6 +199,35 @@ REVIEWER_WORKTREE_IS_UNPROVISIONED_NOTE = (
 )
 
 
+def _require_leaf_contract(
+    packet: "ReviewExchangeTurnPacket",
+    builder: str,
+) -> "StagedLeafContract":
+    """The admitted contract this turn is built against, or refuse to build.
+
+    One check for both roles, because "which admitted scope is this turn
+    bound to" is one question — a lane that could answer it for the coder
+    and not the reviewer is the authority mismatch #399 measured.
+
+    It also pins the identity: a packet whose issue number disagrees with
+    the staged contract's is not a packet with a weak field, it is two
+    different work items in one turn.
+    """
+    contract = packet.prompt_files.leaf_contract
+    if contract is None:
+        raise ValueError(
+            f"{builder} requires packet.prompt_files.leaf_contract — the "
+            "exchange may not review against an unstated admitted scope"
+        )
+    if contract.issue_number != packet.issue_number:
+        raise ValueError(
+            f"{builder} received a leaf contract for issue "
+            f"#{contract.issue_number} on a turn for issue "
+            f"#{packet.issue_number}"
+        )
+    return contract
+
+
 def build_reviewer_prompt(packet: "ReviewExchangeTurnPacket") -> str:
     """Build the reviewer's prompt for one round of the exchange.
 
@@ -150,6 +235,12 @@ def build_reviewer_prompt(packet: "ReviewExchangeTurnPacket") -> str:
     ``role == Role.REVIEWER``); the caller is responsible for
     constructing the packet so all per-turn inputs go through one
     typed seam rather than a free keyword-arg signature.
+
+    The admitted leaf contract is required, not optional prose for model
+    quality (#399): a reviewer prompt built without it is one that cannot
+    tell the coder which demands it is entitled to make, so refusing to
+    build it is how the exchange fails closed rather than reviewing
+    against a title.
     """
     from .review_exchange_turn import Role
 
@@ -157,6 +248,9 @@ def build_reviewer_prompt(packet: "ReviewExchangeTurnPacket") -> str:
         raise ValueError(
             f"build_reviewer_prompt requires Role.REVIEWER packet, got {packet.role!r}"
         )
+    contract_note = _leaf_contract_note(
+        _require_leaf_contract(packet, "build_reviewer_prompt"),
+    )
     validation_note = ""
     if packet.require_validation:
         validation_record = packet.prompt_files.validation_record
@@ -181,10 +275,12 @@ def build_reviewer_prompt(packet: "ReviewExchangeTurnPacket") -> str:
     return (
         f"You are the reviewer in a coder↔reviewer exchange for issue #{packet.issue_number}: {packet.issue_title}.\n"
         f"Round {packet.round_index}.\n"
+        f"{contract_note}"
+        f"{REVIEWER_LEAF_CONTRACT_SCOPE_NOTE}"
         f"{validation_note}\n"
         "Review the current worktree changes.\n"
         "Consider:\n"
-        "A) the changes for this issue\n"
+        "A) the changes for this issue, against the admitted contract above\n"
         "B) relevant context in the broader codebase\n"
         "C) any applicable .claude/skills guidance\n"
         "D) docs/ if needed for intended behavior\n"
@@ -195,6 +291,9 @@ def build_reviewer_prompt(packet: "ReviewExchangeTurnPacket") -> str:
         "(do not write a response file):\n"
         "  exchange-respond ok --getting-closer --text \"Looks good.\"\n"
         "  exchange-respond changes_requested --getting-closer --text \"Fix X.\"\n"
+        "  exchange-respond changes_requested --out-of-contract "
+        "--text \"Valid finding, but the fix needs file B, which this "
+        "contract does not admit.\"\n"
         "  exchange-respond disagree --not-getting-closer --text \"Wrong approach.\"\n"
     )
 
@@ -224,9 +323,14 @@ def build_coder_prompt(packet: "ReviewExchangeTurnPacket") -> str:
         raise ValueError(
             "build_coder_prompt requires packet.reviewer_feedback to be set"
         )
+    contract_note = _leaf_contract_note(
+        _require_leaf_contract(packet, "build_coder_prompt"),
+    )
     prompt = (
         f"You are the coder in a review exchange for issue #{packet.issue_number}: {packet.issue_title}.\n"
         f"Round {packet.round_index}.\n"
+        f"{contract_note}"
+        f"{CODER_LEAF_CONTRACT_SCOPE_NOTE}"
         "Review the full reviewer report below and update the worktree accordingly.\n"
         "\n"
         "Steps:\n"

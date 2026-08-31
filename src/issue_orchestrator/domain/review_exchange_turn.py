@@ -40,6 +40,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .review_exchange_contract import StagedLeafContract
+
 
 class Role(str, enum.Enum):
     """The two roles in the review exchange.
@@ -94,11 +96,26 @@ class ReviewExchangePromptFiles:
     """
 
     validation_record: Path | None = None
+    leaf_contract: "StagedLeafContract | None" = None
+    """The admitted executable leaf contract both roles consume (#399).
+
+    A handle rather than a bare path because the prompt has to be able to
+    *attribute* what it pointed at: the persisted packets of one
+    exchange's Coder and Reviewer carry the same digest, which is what
+    proves the two roles reviewed the same admitted scope. A path alone
+    would prove only that a filename was mentioned.
+
+    Optional on the dataclass, required by both prompt builders — the
+    packet type is also what session replay reconstructs, and a historical
+    packet from before this field existed must still parse.
+    """
 
     def to_manifest_fields(self) -> dict[str, Any]:
         manifest: dict[str, Any] = {}
         if self.validation_record is not None:
             manifest["validation_record"] = str(self.validation_record)
+        if self.leaf_contract is not None:
+            manifest["leaf_contract"] = self.leaf_contract.to_manifest_fields()
         return manifest
 
     @classmethod
@@ -116,7 +133,16 @@ class ReviewExchangePromptFiles:
             if not isinstance(validation_record_raw, str) or not validation_record_raw:
                 return None
             validation_record = Path(validation_record_raw)
-        return cls(validation_record=validation_record)
+        leaf_contract_raw = manifest.get("leaf_contract")
+        leaf_contract = None
+        if leaf_contract_raw is not None:
+            leaf_contract = StagedLeafContract.from_manifest(leaf_contract_raw)
+            if leaf_contract is None:
+                return None
+        return cls(
+            validation_record=validation_record,
+            leaf_contract=leaf_contract,
+        )
 
 
 @dataclass(frozen=True)

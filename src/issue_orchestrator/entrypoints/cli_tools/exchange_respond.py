@@ -12,6 +12,7 @@ Usage::
 
     exchange-respond ok --text "Applied the fixes."
     exchange-respond changes_requested --text "See F1." --decision-json '{...}'
+    exchange-respond changes_requested --out-of-contract --text "Valid, but…"
     exchange-respond disagree --not-getting-closer --text "Wrong approach because…"
     exchange-respond --json '{"response_type":"ok","response_text":"…"}'
 
@@ -83,6 +84,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Reviewer's structured decision object as a JSON string.",
     )
     parser.add_argument(
+        "--out-of-contract",
+        dest="out_of_contract",
+        action="store_true",
+        help=(
+            "Reviewer only: this finding is valid but closing it needs a "
+            "mutation the admitted leaf contract does not allow. Ends the "
+            "exchange as a scope conflict instead of ordinary rework."
+        ),
+    )
+    parser.add_argument(
         "--json",
         dest="full_json",
         help=(
@@ -121,6 +132,14 @@ def build_verdict(args: argparse.Namespace) -> ExchangeVerdict:
             raise ValueError(f"--decision-json is not valid JSON: {exc}") from exc
         if not isinstance(decision, dict):
             raise ValueError("--decision-json must be a JSON object")
+    if getattr(args, "out_of_contract", False):
+        # The flag is shorthand for one field of the structured decision,
+        # not a fifth response type: whether the reviewer wants a change and
+        # whether the exchange may make it are separate questions, and
+        # collapsing them into the transport field is what would make every
+        # scope conflict indistinguishable from a disagreement (#399).
+        decision = dict(decision or {})
+        decision["scope"] = "out_of_contract"
     return ExchangeVerdict(
         response_type=args.response_type,
         response_text=args.text,

@@ -172,6 +172,12 @@ def create_completion_components(
     from ..execution.persistent_review_exchange_runner import (
         PersistentReviewExchangeRunner,
     )
+    from ..execution.review_exchange_leaf_contract import (
+        IssueTrackerLeafContractStaging,
+    )
+    from ..ports.review_exchange_leaf_contract import (
+        UNSTAGEABLE_ADMITTED_LEAF_CONTRACT,
+    )
     from ..control.governed_label_set import GovernedLabelSet
     from ..control.review_exchange_lifecycle import (
         ReviewExchangeCancellation,
@@ -254,6 +260,18 @@ def create_completion_components(
             turn_mailbox=turn_mailbox,
             coder_prompt_addendum=coder_prompt_addendum,
             tech_lead_completion_validator=tech_lead_completion_validator,
+            # The admitted executable leaf contract both exchange roles
+            # consume (#399), read from the issue tracker the ordinary
+            # execution lane already treats as canonical — so this is the
+            # same source of truth moved earlier, not a second one. Without
+            # a repository host there is nothing to read it from, and the
+            # port's default refuses the exchange rather than reviewing
+            # against a title.
+            leaf_contract_staging=(
+                IssueTrackerLeafContractStaging(repository_host)
+                if repository_host is not None
+                else UNSTAGEABLE_ADMITTED_LEAF_CONTRACT
+            ),
         ),
         event_bus=None,
         label_config=label_manager.to_label_config_dict(),

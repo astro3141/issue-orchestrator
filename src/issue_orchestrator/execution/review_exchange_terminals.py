@@ -1,10 +1,11 @@
 """The terminals a reviewer round can reach, and what each one records.
 
-A reviewer round ends the exchange or it does not, and there are exactly three
+A reviewer round ends the exchange or it does not, and there are exactly four
 ways it ends:
 
 =====================================  ======================================
 the reviewer approves                  ``OK`` / ``REVIEWER_OK``
+the finding is out of contract (#399)  ``STOPPED`` / ``REVIEWER_SCOPE_CONFLICT``
 the caller owns no coder (#180)        ``STOPPED`` / ``REVIEWER_REQUESTED_CHANGES``
 the coder stopped getting closer       ``STOPPED`` / ``REVIEWER_REPORTS_NO_PROGRESS``
 =====================================  ======================================
@@ -81,19 +82,38 @@ class ReviewerRoundTerminals:
         self._max_no_progress = max_no_progress
         self._no_progress_count = 0
 
-    def for_round(self, reviewer: ReviewExchangeResponse) -> ReviewerTerminal | None:
+    def for_round(
+        self,
+        reviewer: ReviewExchangeResponse,
+        decision: ReviewDecision,
+    ) -> ReviewerTerminal | None:
         """The terminal ``reviewer`` reached, or ``None`` to run a coder turn.
 
         Order is the policy. The approval is checked first because it is the
-        one answer no other policy may override. #180's handoff comes next and
-        is unconditional: a caller with no coder has nothing to hand the
-        feedback to, so there is no round at which it would be right to
-        continue — and it therefore precedes the no-progress budget, which
+        one answer no other policy may override. #399's scope conflict comes
+        next, ahead of every remaining branch, because those branches all
+        answer "how should this rework proceed?" and a scope conflict says
+        the exchange has no authority to rework at all — running the coder
+        round first is precisely how a valid out-of-contract finding became
+        an ordinary "change these extra files" demand on #398. #180's handoff
+        follows and is unconditional: a caller with no coder has nothing to
+        hand the feedback to, so there is no round at which it would be right
+        to continue — and it therefore precedes the no-progress budget, which
         measures whether successive CODER turns are getting closer and has
         nothing to measure in an exchange that runs none.
+
+        ``decision`` is the reviewer's own structured decision, asked rather
+        than inferred from ``reviewer.response_type``: the transport field
+        says what kind of turn this was, and only the decision says whether
+        closing it is inside the admitted contract.
         """
         if reviewer.response_type == "ok":
             return (ReviewExchangeStatus.OK, ReviewExchangeReason.REVIEWER_OK)
+        if decision.is_scope_conflict():
+            return (
+                ReviewExchangeStatus.STOPPED,
+                ReviewExchangeReason.REVIEWER_SCOPE_CONFLICT,
+            )
         if not self._rework.runs_coder_rounds:
             return (
                 ReviewExchangeStatus.STOPPED,

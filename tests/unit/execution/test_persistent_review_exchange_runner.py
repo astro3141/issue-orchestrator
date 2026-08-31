@@ -38,7 +38,7 @@ import pytest
 from issue_orchestrator.adapters.sidecar_attempt_store import SidecarAttemptStore
 from issue_orchestrator.domain.artifact_contracts import AgentProvider
 from issue_orchestrator.domain.issue_key import GitHubIssueKey
-from issue_orchestrator.domain.models import AgentConfig
+from issue_orchestrator.domain.models import AgentConfig, Issue
 from issue_orchestrator.infra.config import Config
 from issue_orchestrator.execution.attempt_execution_identity_store import (
     AttemptExecutionIdentityStore,
@@ -64,6 +64,9 @@ from issue_orchestrator.adapters.worktree.api import (
     CodexReviewCommandGuardInstaller,
 )
 from issue_orchestrator.execution import persistent_review_exchange_runner as prer
+from issue_orchestrator.execution.review_exchange_leaf_contract import (
+    IssueTrackerLeafContractStaging,
+)
 from issue_orchestrator.domain.coder_prompt import PreparedCoderPromptAddendum
 from issue_orchestrator.domain.session_key import TaskKind
 
@@ -198,6 +201,40 @@ def _run(
         coder_principal=coder_principal,
     )
 
+class _ContractIssues:
+    """The narrow slice of the issue tracker the contract staging asks for."""
+
+    def __init__(self, issue: Issue | None) -> None:
+        self._issue = issue
+
+    def get_issue(self, issue_number: int) -> Issue | None:
+        _ = issue_number
+        return self._issue
+
+
+def _leaf_contract_staging(
+    *,
+    issue: Issue | None = None,
+) -> IssueTrackerLeafContractStaging:
+    """The real staging owner over a fake tracker (#399).
+
+    The real one rather than a stub, so these tests exercise the artifact
+    the exchange will actually load rather than a stand-in that cannot
+    fail the way the production reader can.
+    """
+    return IssueTrackerLeafContractStaging(
+        _ContractIssues(
+            issue
+            if issue is not None
+            else Issue(
+                number=42,
+                title="t",
+                labels=[],
+                body="Change exactly `src/only_this_file.py`.",
+            ),
+        ),  # type: ignore[arg-type]
+    )
+
 
 def _identity_store(tmp_path: Path) -> AttemptExecutionIdentityStore:
     """The real durable store, rooted outside any worktree the test creates."""
@@ -215,6 +252,7 @@ def _make_runner(tmp_path: Path) -> "prer.PersistentReviewExchangeRunner":
         MagicMock(name="pair_registry"),
         _identity_store(tmp_path),
         _review_verdict_store(tmp_path),
+        leaf_contract_staging=_leaf_contract_staging(),
     )
 
 
@@ -293,6 +331,7 @@ def test_run_passes_per_agent_response_channels(
         MagicMock(name="pair_registry"),
         _identity_store(tmp_path),
         _review_verdict_store(tmp_path),
+        leaf_contract_staging=_leaf_contract_staging(),
         turn_mailbox=MagicMock(name="turn_mailbox"),
     )
     reviewer = _make_agent(
@@ -385,6 +424,7 @@ def test_run_resolves_coder_addendum_for_coder_worktree_only(
         MagicMock(name="pair_registry"),
         _identity_store(tmp_path),
         _review_verdict_store(tmp_path),
+        leaf_contract_staging=_leaf_contract_staging(),
         coder_prompt_addendum=provider,
     )
 
@@ -525,6 +565,7 @@ def test_reviewer_worktree_creation_gets_the_guard_installer_the_runner_holds(
         MagicMock(name="pair_registry"),
         _identity_store(tmp_path),
         _review_verdict_store(tmp_path),
+        leaf_contract_staging=_leaf_contract_staging(),
         review_command_guard=guard,
     )
 
@@ -806,6 +847,7 @@ def test_run_forwards_the_coder_principal_and_the_trusted_validator(
         MagicMock(name="pair_registry"),
         _identity_store(tmp_path),
         _review_verdict_store(tmp_path),
+        leaf_contract_staging=_leaf_contract_staging(),
         tech_lead_completion_validator=validator,
     )
 
@@ -837,6 +879,7 @@ def test_an_unwired_deployment_still_hands_the_exchange_a_refusing_owner(
         MagicMock(name="pair_registry"),
         _identity_store(tmp_path),
         _review_verdict_store(tmp_path),
+        leaf_contract_staging=_leaf_contract_staging(),
     )
 
     _run(runner, tmp_path)

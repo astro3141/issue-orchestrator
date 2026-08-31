@@ -232,6 +232,20 @@ D1/D2 pair #386 exists to close. Its head binding still applies in full: a
 new commit means a new subject, and the question is spawned fresh over it."""
 
 
+REASON_REVIEWER_SCOPE_CONFLICT = ReviewExchangeReason.REVIEWER_SCOPE_CONFLICT
+"""Status=stopped terminal: the reviewer's finding cannot be closed inside the
+admitted leaf contract (#399). Deterministic on the same head for the same
+reason the coder escalation is — the conflict is about what this contract
+admits for that exact commit, and respawning cannot admit more — so it halts
+and the caller surfaces the question.
+
+It joins :data:`REASON_CODER_ESCALATED_TO_HUMAN` in
+:data:`_PUBLICATION_EVIDENCE_EXEMPT_REASONS` by the same argument: the
+exchange requested no publication, so it produced no publish evidence, and
+demanding some would send the scope question back through a fresh exchange to
+be asked and swallowed again. Its head binding still applies in full."""
+
+
 _NO_COMPLETION_REASONS: frozenset[ReviewExchangeReason] = frozenset(
     {
         REASON_REVIEWER_NO_COMPLETION,
@@ -247,11 +261,12 @@ _TERMINAL_HALT_REASONS: frozenset[ReviewExchangeReason] = frozenset(
         REASON_CODER_PROTOCOL_ERROR,
         REASON_REVIEWER_DECISION_INVALID,
         REASON_CODER_ESCALATED_TO_HUMAN,
+        REASON_REVIEWER_SCOPE_CONFLICT,
     }
 )
 
 _PUBLICATION_EVIDENCE_EXEMPT_REASONS: frozenset[ReviewExchangeReason] = frozenset(
-    {REASON_CODER_ESCALATED_TO_HUMAN}
+    {REASON_CODER_ESCALATED_TO_HUMAN, REASON_REVIEWER_SCOPE_CONFLICT}
 )
 """Terminals whose cache never claimed publication evidence, so cannot lack it.
 
@@ -349,6 +364,7 @@ _KNOWN_STATUS_REASON_PAIRS: frozenset[
         (STATUS_REVIEWER_STOPPED, REASON_REVIEWER_REPORTS_NO_PROGRESS),
         (STATUS_REVIEWER_STOPPED, REASON_MAX_ROUNDS_EXCEEDED),
         (STATUS_REVIEWER_STOPPED, REASON_CODER_ESCALATED_TO_HUMAN),
+        (STATUS_REVIEWER_STOPPED, REASON_REVIEWER_SCOPE_CONFLICT),
         (STATUS_REVIEWER_ERROR, REASON_REVIEWER_NO_COMPLETION),
         (STATUS_REVIEWER_ERROR, REASON_CODER_NO_COMPLETION),
         (STATUS_REVIEWER_ERROR, REASON_CODER_PROTOCOL_ERROR),

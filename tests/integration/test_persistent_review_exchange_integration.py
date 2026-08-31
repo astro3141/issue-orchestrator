@@ -60,12 +60,15 @@ from issue_orchestrator.execution.manifest_accessor import ManifestAccessor, Run
 from issue_orchestrator.execution.persistent_exchange_pair_registry_inmemory import (
     InMemoryPersistentExchangePairRegistry,
 )
+from issue_orchestrator.execution.review_exchange_leaf_contract import (
+    IssueTrackerLeafContractStaging,
+)
 from issue_orchestrator.execution.persistent_review_exchange_runner import (
     PersistentReviewExchangeRunner,
 )
 from issue_orchestrator.execution.session_output_adapter import FileSystemSessionOutput
 from issue_orchestrator.infra.config import Config
-from issue_orchestrator.domain.models import AgentConfig
+from issue_orchestrator.domain.models import AgentConfig, Issue
 from issue_orchestrator.ports import TraceEvent
 from issue_orchestrator.ports.turn_mailbox import TurnMailbox
 from issue_orchestrator.domain.review_exchange_rework import ReviewExchangeRework
@@ -239,7 +242,25 @@ def _make_review_exchange_runner(
         _identity_store(identity_root),
         _review_verdict_store(identity_root),
         review_command_guard=review_command_guard or RecordingReviewCommandGuard(),
+        # The admitted leaf contract every exchange reviews against (#399),
+        # staged by the real owner over a fake tracker. Without it the
+        # runner refuses the exchange, which is the point of the default.
+        leaf_contract_staging=IssueTrackerLeafContractStaging(
+            _ContractIssues(),  # type: ignore[arg-type]
+        ),
     )
+
+
+class _ContractIssues:
+    """The one tracker method the contract staging asks for."""
+
+    def get_issue(self, issue_number: int) -> Issue:
+        return Issue(
+            number=issue_number,
+            title=f"Issue {issue_number}",
+            labels=[],
+            body="Change exactly `src/only_this_file.py`.",
+        )
 
 
 def _run_review_exchange_for_test(
@@ -998,6 +1019,9 @@ def test_real_interactive_codex_reviewer_round_trips_through_exchange(
                 _review_verdict_store(tmp_path / "identity-root"),
                 turn_mailbox=mailbox,
                 review_command_guard=RecordingReviewCommandGuard(),
+                leaf_contract_staging=IssueTrackerLeafContractStaging(
+                    _ContractIssues(),  # type: ignore[arg-type]
+                ),
             ),
         )
 
@@ -1833,6 +1857,9 @@ def test_persistent_review_exchange_end_to_end_through_mailbox(
             _review_verdict_store(tmp_path / "identity-root"),
             turn_mailbox=mailbox,
             review_command_guard=RecordingReviewCommandGuard(),
+            leaf_contract_staging=IssueTrackerLeafContractStaging(
+                _ContractIssues(),  # type: ignore[arg-type]
+            ),
         )
         cre = CompletionReviewExchange(
             agent_callback_endpoint=published_callback_endpoint(port),

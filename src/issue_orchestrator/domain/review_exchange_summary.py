@@ -37,6 +37,20 @@ class ReviewExchangeReason(StrEnum):
     its to make. A reader that cannot tell the two apart cannot tell a
     question from a failure.
     """
+    REVIEWER_SCOPE_CONFLICT = "reviewer_scope_conflict"
+    """The reviewer's finding cannot be closed inside the admitted contract.
+
+    Its own terminal for the same reason ``coder_escalated_to_human`` is:
+    every neighbour would say something false. ``reviewer_requested_changes``
+    claims a rework round could resolve it, which is exactly what the
+    admitted contract forbids; ``reviewer_reports_no_progress`` claims
+    successive coder turns stopped converging, when no coder turn ran;
+    ``reviewer_decision_invalid`` claims the reviewer broke the contract,
+    when it kept it and said so precisely. A scope conflict is a question
+    for a human about mutation authority, not a verdict on the candidate
+    — and like the coder escalation, it requests nothing from the remote
+    (#399).
+    """
     REVIEWER_DECISION_INVALID = "reviewer_decision_invalid"
 
 
@@ -57,6 +71,10 @@ VALID_REVIEW_EXCHANGE_TERMINALS: frozenset[
         (
             ReviewExchangeStatus.STOPPED,
             ReviewExchangeReason.CODER_ESCALATED_TO_HUMAN,
+        ),
+        (
+            ReviewExchangeStatus.STOPPED,
+            ReviewExchangeReason.REVIEWER_SCOPE_CONFLICT,
         ),
         (ReviewExchangeStatus.ERROR, ReviewExchangeReason.REVIEWER_NO_COMPLETION),
         (ReviewExchangeStatus.ERROR, ReviewExchangeReason.CODER_NO_COMPLETION),
