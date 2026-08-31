@@ -88,10 +88,7 @@ from ..domain.review_exchange_coder_principal import (
     EXCHANGE_CODER_PRINCIPAL_ENV_SUFFIX,
     ReviewExchangeCoderPrincipal,
 )
-from ..domain.review_exchange_contract import (
-    LeafContractUnavailable,
-    StagedLeafContract,
-)
+from ..domain.review_exchange_contract import StagedLeafContract
 from ..domain.review_exchange_escalation import CoderEscalation
 from ..domain.review_exchange_resume import is_no_completion_reason
 from ..domain.review_exchange_turn import (
@@ -592,9 +589,10 @@ def run_persistent_session_exchange(  # noqa: PLR0913
     # admitted contract it is reviewing against has nothing to authorize, so
     # it must not spend a round finding that out (#399 R4). Raising here
     # precedes the pair spawn, so no agent is ever prompted without one.
+    staged_leaf_contract = load_staged_leaf_contract(run_assets)
     prompt_files = ReviewExchangePromptFiles(
         validation_record=run_validation_record_path,
-        leaf_contract=load_staged_leaf_contract(run_assets),
+        leaf_contract=staged_leaf_contract,
     )
     pair_validation = PairValidationMirror(
         pair_dir=pair_dir,
@@ -852,6 +850,7 @@ def run_persistent_session_exchange(  # noqa: PLR0913
                 coder_completion_path=pair.coder_completion_path,
                 validation_record_path=pair.validation_record_path,
                 prompt_files=prompt_files,
+                leaf_contract=staged_leaf_contract,
                 pair_validation=pair_validation,
                 turn_evidence=turn_evidence,
                 coder_timeout_seconds=coder_agent.timeout_minutes * 60,
@@ -1728,23 +1727,6 @@ def _coder_reviewer_feedback(
     )
 
 
-def _require_staged_contract(
-    prompt_files: ReviewExchangePromptFiles,
-) -> StagedLeafContract:
-    """The contract the round loop was handed, or refuse the round.
-
-    ``ReviewExchangePromptFiles`` keeps the field optional so historical
-    packets still parse on replay; an active round is a different matter,
-    and this is where that difference is enforced.
-    """
-    contract = prompt_files.leaf_contract
-    if contract is None:
-        raise LeafContractUnavailable(
-            "review exchange round has no staged admitted leaf contract"
-        )
-    return contract
-
-
 @dataclass(frozen=True)
 class _DriveRoundsCommand:
     session_output: SessionOutput
@@ -1765,6 +1747,16 @@ class _DriveRoundsCommand:
     coder_completion_path: Path
     validation_record_path: Path
     prompt_files: ReviewExchangePromptFiles
+    leaf_contract: StagedLeafContract
+    """The admitted contract this exchange reviews against (#399).
+
+    Required here, and the same object ``prompt_files.leaf_contract``
+    holds. The packet field stays optional so a historical packet still
+    parses on replay; an active round is not a historical one, and this
+    is where that difference is a *type* rather than another runtime
+    check of a rule the exchange already enforced when it loaded the
+    artifact.
+    """
     pair_validation: PairValidationMirror
     turn_evidence: ExchangeTurnEvidence
     coder_timeout_seconds: float
@@ -1863,7 +1855,7 @@ def _drive_rounds(command: _DriveRoundsCommand) -> ReviewExchangeOutcome:
         # round 3 reviewing the same one — unless someone checks. Raising
         # here fails the exchange closed through the same handler that
         # catches every other round-loop failure.
-        verify_staged_leaf_contract(_require_staged_contract(prompt_files))
+        verify_staged_leaf_contract(command.leaf_contract)
         reviewer_packet = ReviewExchangeTurnPacket(
             issue_number=issue_number,
             issue_title=issue_title,
