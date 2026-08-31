@@ -26,6 +26,9 @@ from issue_orchestrator.domain.models import (
     AgentConfig,
 )
 from issue_orchestrator.domain.review_exchange import ReviewExchangeOutcome
+from issue_orchestrator.domain.review_exchange_coder_principal import (
+    ReviewExchangeCoderPrincipal,
+)
 from issue_orchestrator.domain.review_exchange_rework import ReviewExchangeRework
 from issue_orchestrator.domain.review_exchange_run import (
     ReviewExchangeRun,
@@ -1341,32 +1344,24 @@ class TestReviewExchangeModeResolution:
         assert processor._resolve_review_exchange_mode("agent:coder") == "via-local-loop"  # noqa: SLF001
 
     def test_a_tech_lead_agent_is_not_excluded_from_the_exchange(self, tmp_path):
-        """Characterization, and the receipt behind a deferral (#385 round 3 F4).
+        """The inversion of #385's known-gap receipt (#388).
 
-        This pins TODAY'S behaviour, which is a defect and is deliberately not
-        fixed here: nothing on this path asks whether the completing agent is
-        the tech lead. The agent inherits ``code_review_agent`` through
-        ``Config.get_reviewer_for_agent``, so it resolves a reviewer and the
-        mode survives; downstream ``coder_label = agent_label`` makes it the
-        exchange's coder and the lane injects
-        ``resources/review_exchange_coder.md``, whose step 3 mandates
-        ``prepush-check`` — the command a bounded Tech Lead's sandbox refuses.
+        Round 2 of #385 justified leaving the exchange lane alone by claiming
+        it was unreachable for a tech-lead agent. It is not: the agent inherits
+        ``code_review_agent`` through ``Config.get_reviewer_for_agent``, so it
+        resolves a reviewer and the mode survives, and downstream
+        ``coder_label = agent_label`` makes it the exchange's coder.
 
-        Round 2 justified leaving that alone by claiming the lane was
-        unreachable for a tech-lead agent. It is not, and this test is what
-        makes that a measured fact rather than a reading. The real invariant is
-        wider than one role — the exchange coder protocol mandates a
-        shared-git-dir write that NO sandbox-opted-in agent may perform — which
-        is why the repair is a role×lane decision rather than #385's seam, whose
-        STOP conditions exclude generic completion-platform redesign.
+        Exclusion was never the repair — removing internal review from Tech
+        Lead runs is a bigger product change than the seam. What changed in
+        #388 is what the lane HANDS that agent: the side is a position in the
+        protocol, and the principal sitting in it now decides the completion
+        contract. Reachability is still pinned here, because the repair rests
+        on it.
 
-        The exchange mode is NOT a second gate, which round 3 got wrong and
-        round 4 corrected: ``Config.review_exchange_mode`` already defaults to
-        ``via-local-loop``, asserted below so the claim cannot rot. The single
-        real gate is the ``sandbox: true`` opt-in — the configuration R33 turns
-        on — so "latent" describes this repository, not R33's target.
-
-        When the repair lands, this test should be inverted, not deleted.
+        The exchange mode is NOT a second gate:
+        ``Config.review_exchange_mode`` already defaults to ``via-local-loop``,
+        asserted below so the claim cannot rot.
         """
         assert Config().review_exchange_mode == "via-local-loop"
 
@@ -1382,6 +1377,91 @@ class TestReviewExchangeModeResolution:
         assert (
             processor._resolve_review_exchange_mode("agent:tech-lead")  # noqa: SLF001
             == "via-local-loop"
+        )
+
+
+class TestReviewExchangeCoderPrincipalReachesTheRunner:
+    """F1: the lane really tells the runner who is sitting on the coder side.
+
+    The owner's answer only matters if the exchange is launched with it, and
+    ``CompletionReviewExchange`` is the one place ``coder_label = agent_label``
+    is decided — so it is the one place that has to ask.
+    """
+
+    def _config(self, tmp_path: Path) -> Config:
+        config = Config()
+        config.repo = "acme/widgets"
+        config.review_enabled = True
+        config.review_exchange_mode = "via-local-loop"
+        config.code_review_agent = "agent:reviewer"
+        config.tech_lead_review_agent = "agent:tech-lead"
+        config.config_path = _write_test_config(tmp_path)
+        prompt = tmp_path / "prompt.md"
+        prompt.write_text("prompt")
+        config.agents = {
+            "agent:coder": AgentConfig(prompt_path=prompt, ai_system="claude-code"),
+            "agent:reviewer": AgentConfig(prompt_path=prompt, ai_system="codex"),
+            "agent:tech-lead": AgentConfig(prompt_path=prompt, ai_system="claude-code"),
+        }
+        return config
+
+    def _launch_principal(
+        self, tmp_path: Path, agent_label: str
+    ) -> ReviewExchangeCoderPrincipal:
+        from issue_orchestrator.control.completion_review_exchange import (
+            CompletionReviewExchange,
+        )
+
+        captured: dict[str, object] = {}
+
+        class _CapturingRunner:
+            def run(self, **kwargs: object) -> object:
+                captured.update(kwargs)
+                return object()
+
+            def job_timeout_seconds(self, **_: object) -> float | None:
+                return None
+
+        exchange = CompletionReviewExchange(
+            config=self._config(tmp_path),
+            session_output=FileSystemSessionOutput(),
+            emit_review_started=lambda **_: None,
+            emit_review_outcome=lambda **_: None,
+            review_exchange_runner=_CapturingRunner(),
+            agent_callback_endpoint=ready_callback_endpoint(),
+        )
+        run_dir = tmp_path / "sessions" / "20260901-000000Z__review-exchange-388"
+        run_dir.mkdir(parents=True)
+        exchange.run_review_exchange_loop(
+            exchange_run=ReviewExchangeRun(
+                session_name="review-exchange-388",
+                run_id="20260901-000000Z",
+                parent_session_name="coding-1",
+                assets=ReviewExchangeRunAssets.from_run_dir(run_dir),
+                validation_profile="default",
+            ),
+            worktree=tmp_path / "worktree",
+            issue_number=388,
+            issue_title="t",
+            session_name="review-exchange-388",
+            agent_label=agent_label,
+            rework=ReviewExchangeRework.IN_EXCHANGE,
+        )
+        principal = captured["coder_principal"]
+        assert isinstance(principal, ReviewExchangeCoderPrincipal)
+        return principal
+
+    def test_a_tech_lead_coder_is_launched_as_the_tech_lead_principal(
+        self, tmp_path
+    ) -> None:
+        assert self._launch_principal(tmp_path, "agent:tech-lead") is (
+            ReviewExchangeCoderPrincipal.TECH_LEAD
+        )
+
+    def test_an_ordinary_coder_is_launched_as_an_actor(self, tmp_path) -> None:
+        """F5: the ordinary exchange is launched exactly as before."""
+        assert self._launch_principal(tmp_path, "agent:coder") is (
+            ReviewExchangeCoderPrincipal.ACTOR
         )
 
 

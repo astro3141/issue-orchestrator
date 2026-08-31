@@ -28,6 +28,7 @@ from ..domain.execution_identity import (
 from ..domain.issue_key import IssueKey
 from ..domain.models import AgentConfig
 from ..domain.review_exchange import ReviewExchangeOutcome
+from ..domain.review_exchange_coder_principal import ReviewExchangeCoderPrincipal
 from ..domain.review_exchange_rework import ReviewExchangeRework
 from ..domain.review_exchange_run import ReviewExchangeRun
 from ..domain.runtime_config import RuntimeConfigReference
@@ -37,6 +38,10 @@ from ..ports.candidate_review_verdicts import CandidateReviewVerdictStore
 from ..ports.execution_identity_store import CandidateExecutionIdentityStore
 from .candidate_execution_identity import CandidateExecutionIdentityRecorder
 from ..ports.review_exchange_approval_gate import ReviewExchangeApprovalGate
+from ..control.tech_lead_completion_validation import (
+    UNWIRED_TECH_LEAD_COMPLETION_VALIDATOR,
+)
+from ..ports.tech_lead_completion_validation import TechLeadCompletionValidator
 from ..ports.coder_prompt import (
     CoderPromptAddendumProvider,
     NO_CODER_PROMPT_ADDENDUM,
@@ -120,6 +125,9 @@ class PersistentReviewExchangeRunner:
         *,
         turn_mailbox: "TurnMailbox | None" = None,
         coder_prompt_addendum: CoderPromptAddendumProvider = NO_CODER_PROMPT_ADDENDUM,
+        tech_lead_completion_validator: TechLeadCompletionValidator = (
+            UNWIRED_TECH_LEAD_COMPLETION_VALIDATOR
+        ),
     ) -> None:
         self._session_output = session_output
         self._pair_registry = pair_registry
@@ -138,6 +146,14 @@ class PersistentReviewExchangeRunner:
         self._review_verdict_store = review_verdict_store
         self._turn_mailbox = turn_mailbox
         self._coder_prompt_addendum = coder_prompt_addendum
+        # The #385 trusted owner, reused for the exchange's Tech Lead lane
+        # (#388): it executes that lane's mandatory per-round validation
+        # outside the model sandbox and files it against the exact candidate.
+        # Defaulted rather than required because the Actor lane never asks it
+        # anything, and the default refuses every verdict — so a deployment
+        # that forgot to wire the real one loses a Tech Lead round instead of
+        # passing it unvalidated.
+        self._tech_lead_completion_validator = tech_lead_completion_validator
 
     def _execution_identity_recorder(
         self,
@@ -220,6 +236,11 @@ class PersistentReviewExchangeRunner:
         # Required, as the port requires it: this implementation is the last
         # place the caller's answer could be replaced by an inference (#180).
         rework: ReviewExchangeRework,
+        # Required, as the port requires it: the coder SIDE is a position in
+        # the protocol and the principal is the authority sitting in it, and
+        # this implementation is the last place a caller's answer could be
+        # replaced by an inference (#388).
+        coder_principal: ReviewExchangeCoderPrincipal,
         nit_policy: str = "surface",
         initial_validation_record_path: Path | None = None,
         approval_gate: ReviewExchangeApprovalGate | None = None,
@@ -285,6 +306,8 @@ class PersistentReviewExchangeRunner:
             max_no_progress=max_no_progress,
             require_validation=require_validation,
             rework=rework,
+            coder_principal=coder_principal,
+            tech_lead_completion_validator=self._tech_lead_completion_validator,
             nit_policy=nit_policy,
             initial_validation_record_path=initial_validation_record_path,
             approval_gate=approval_gate,

@@ -905,6 +905,9 @@ class TestLaunchPathParity:
         self, tmp_path: Path
     ) -> None:
         from issue_orchestrator.domain.runtime_config import RuntimeConfigReference
+        from issue_orchestrator.domain.review_exchange_coder_principal import (
+            ReviewExchangeCoderPrincipal,
+        )
         from issue_orchestrator.domain.repository_launch_selection import (
             RepositoryLaunchSelection,
         )
@@ -920,6 +923,7 @@ class TestLaunchPathParity:
             role="coder",
             response_file=run_dir / "coder" / "review-response.json",
             review_report_file=None,
+            coder_principal=ReviewExchangeCoderPrincipal.ACTOR,
             completion_path=run_dir / "coder" / "completion-coder.json",
             validation_output_dir=run_dir,
             worktree=worktree,

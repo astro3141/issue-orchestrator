@@ -47,6 +47,9 @@ from issue_orchestrator.execution.attempt_review_verdict_store import (
     AttemptReviewVerdictStore,
 )
 from issue_orchestrator.domain.review_exchange import ReviewExchangeOutcome
+from issue_orchestrator.domain.review_exchange_coder_principal import (
+    ReviewExchangeCoderPrincipal,
+)
 from issue_orchestrator.domain.review_exchange_rework import ReviewExchangeRework
 from issue_orchestrator.domain.review_exchange_run import (
     ReviewExchangeRun,
@@ -166,6 +169,7 @@ def _run(
     coder_agent: AgentConfig | None = None,
     reviewer_agent: AgentConfig | None = None,
     rework: ReviewExchangeRework = ReviewExchangeRework.IN_EXCHANGE,
+    coder_principal: ReviewExchangeCoderPrincipal = ReviewExchangeCoderPrincipal.ACTOR,
 ):
     exchange_run = _make_exchange_run(tmp_path)
     return runner.run(
@@ -183,6 +187,7 @@ def _run(
         max_no_progress=3,
         require_validation=False,
         rework=rework,
+        coder_principal=coder_principal,
     )
 
 
@@ -701,3 +706,72 @@ def test_an_ai_system_only_reviewer_records_the_model_its_launch_resolves_to(
     assert recorder.reviewer.provenance.provider == "codex"
     assert recorder.reviewer.provenance.model is None
     assert recorder.actor.provenance.model == "opus"
+
+
+def test_run_forwards_the_coder_principal_and_the_trusted_validator(
+    monkeypatch,
+    tmp_path: Path,
+    stub_lifecycle,
+) -> None:
+    """The runner is the last place the caller's answer could be replaced (#388).
+
+    Both halves travel together on purpose: the principal decides whether the
+    trusted owner is asked at all, and asking an owner that was never injected
+    is what the fail-closed default exists for.
+    """
+    captured: dict[str, Any] = {}
+
+    def _fake_inner(**kwargs):
+        captured.update(kwargs)
+        return _canned_outcome(kwargs["exchange_run"])
+
+    monkeypatch.setattr(prer, "run_persistent_session_exchange", _fake_inner)
+    validator = MagicMock(name="tech_lead_completion_validator")
+    runner = prer.PersistentReviewExchangeRunner(
+        MagicMock(name="session_output"),
+        MagicMock(name="pair_registry"),
+        _identity_store(tmp_path),
+        _review_verdict_store(tmp_path),
+        tech_lead_completion_validator=validator,
+    )
+
+    _run(
+        runner,
+        tmp_path,
+        coder_principal=ReviewExchangeCoderPrincipal.TECH_LEAD,
+    )
+
+    assert captured["coder_principal"] is ReviewExchangeCoderPrincipal.TECH_LEAD
+    assert captured["tech_lead_completion_validator"] is validator
+
+
+def test_an_unwired_deployment_still_hands_the_exchange_a_refusing_owner(
+    monkeypatch,
+    tmp_path: Path,
+    stub_lifecycle,
+) -> None:
+    """Never ``None``: a missing owner refuses, it does not disable the gate."""
+    captured: dict[str, Any] = {}
+
+    def _fake_inner(**kwargs):
+        captured.update(kwargs)
+        return _canned_outcome(kwargs["exchange_run"])
+
+    monkeypatch.setattr(prer, "run_persistent_session_exchange", _fake_inner)
+    runner = prer.PersistentReviewExchangeRunner(
+        MagicMock(name="session_output"),
+        MagicMock(name="pair_registry"),
+        _identity_store(tmp_path),
+        _review_verdict_store(tmp_path),
+    )
+
+    _run(runner, tmp_path)
+
+    validator = captured["tech_lead_completion_validator"]
+    verdict = validator.validate_completion(
+        run_id="r",
+        session_name="s",
+        worktree=tmp_path,
+        candidate_head_sha="c" * 40,
+    )
+    assert not verdict.permits_completion

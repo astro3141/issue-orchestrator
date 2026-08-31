@@ -658,6 +658,53 @@ Actor and Reviewer completion is untouched: `coding_done.md` still makes the
 step mandatory for them, and the gate lives inside the tech-lead completion
 owner, which no other principal reaches.
 
+#### And so is the review exchange's coder side (#388)
+
+A Tech Lead completion that offers a change for review starts a review exchange,
+and the exchange sets `coder_label = agent_label`. The *coder side* is a
+position in the protocol — the one that reworks — not an authority, but until
+#388 the lane read it as both: it launched with
+`task_kind="review_exchange_coder"` and injected
+`resources/review_exchange_coder.md`, whose step 3 makes `prepush-check
+--dirty-only -v` mandatory again. #385 did not create that wall; it moved the
+road far enough to reach it.
+
+Swapping the document is not enough on its own, because the lane *requires the
+artifact* as well: `read_coder_turn` rejects a turn without a passing
+`validation-record.json` bound to current HEAD, and only the coder's own
+`coding-done completed` used to write one.
+
+One value now carries both halves.
+`domain/review_exchange_coder_principal.ReviewExchangeCoderPrincipal` is
+resolved by `control/tech_lead_session_policy.review_exchange_coder_principal`
+— the same tech-lead identity owner the coding lane asks — and decides:
+
+- **which completion protocol that side is handed** —
+  `resources/review_exchange_tech_lead.md`, the same exchange protocol
+  (`coding-done`, then `exchange-respond`, with #386's `needs_human` terminal
+  intact) minus the pre-push step, plus `SandboxRole.TECH_LEAD`, which widens
+  nothing: an exchange launch carries no evidence read roots, so the computed
+  scope is byte-for-byte the coder's;
+- **whether `coding-done` runs the host-mutating candidate quick gate** — the
+  principal is declared into the session env and read back by
+  `control/completion_gate_routing`, which cannot learn it from the run
+  directory: an exchange coder's run belongs to the *exchange*, not to the
+  tech-lead launch that stages an assignment;
+- **who files the round's validation evidence** —
+  `execution/review_exchange_turn_validation`, which asks the SAME trusted
+  owner #385 gates the primary lane on for a verdict bound to the exchange run,
+  this session and the coder worktree's current commit, and publishes it as the
+  pair's record only when it passed. It files the evidence the exchange *opens*
+  on too, because the reviewer moves first and its approval is gated on that
+  record.
+
+Every other direction refuses and clears the pair's evidence: failed, timed
+out, unavailable, an owner that raised, a verdict naming another
+run/session/commit, an unobservable HEAD, or no trusted owner wired at all.
+Ordinary Actor and Reviewer exchange behaviour is unchanged — an undeclared
+principal is an Actor, and `review_exchange_coder.md` still makes the step
+mandatory for it.
+
 #### Leaving the watch set
 
 The set that trips the batch threshold has to be the set a review settles, or

@@ -36,6 +36,7 @@ __all__ = [
     "DEFAULT_SANDBOX_DENY_READ_FILES",
     "REVIEW_EXCHANGE_CODER_TASK_KIND",
     "REVIEW_EXCHANGE_REVIEWER_TASK_KIND",
+    "REVIEW_EXCHANGE_TECH_LEAD_TASK_KIND",
     "SandboxEgress",
     "SandboxRole",
     "SandboxScope",
@@ -125,14 +126,22 @@ DEFAULT_SANDBOX_DENY_READ_FILES: tuple[str, ...] = (
     "~/.pypirc",
 )
 
-# Review-exchange launches use per-role task kinds (built as
-# ``review_exchange_{role}`` in ``execution.persistent_session_exchange`` and
-# matched in ``resources.get_completion_instructions``). They are not
-# :class:`TaskKind` enum values, but the sandbox role policy recognizes them so
-# an opted-in exchange agent resolves to its true role instead of silently
-# landing on the unknown-task CODER fail-safe below.
+# Review-exchange launches use per-side task kinds, resolved in
+# ``execution.persistent_session_exchange`` and matched in
+# ``resources.get_completion_instructions``. They are not :class:`TaskKind` enum
+# values, but the sandbox role policy recognizes them so an opted-in exchange
+# agent resolves to its true role instead of silently landing on the
+# unknown-task CODER fail-safe below.
 REVIEW_EXCHANGE_CODER_TASK_KIND = "review_exchange_coder"
 REVIEW_EXCHANGE_REVIEWER_TASK_KIND = "review_exchange_reviewer"
+
+#: The coder SIDE of the exchange when a Tech Lead is the one sitting in it
+#: (#388). The lane is the same; the principal is not, and the task kind is
+#: what names the principal — so this resolves to the Tech Lead's completion
+#: protocol document and to :attr:`SandboxRole.TECH_LEAD` below. It grants
+#: nothing extra: an exchange launch carries no ``evidence_read_roots``, so the
+#: computed scope is byte-for-byte the coder's worktree-only scope.
+REVIEW_EXCHANGE_TECH_LEAD_TASK_KIND = "review_exchange_tech_lead"
 
 
 class SandboxRole(Enum):
@@ -236,7 +245,9 @@ _REVIEWER_TASK_KINDS = frozenset(
         REVIEW_EXCHANGE_REVIEWER_TASK_KIND,
     }
 )
-_TECH_LEAD_TASK_KINDS = frozenset({TaskKind.TECH_LEAD.value})
+_TECH_LEAD_TASK_KINDS = frozenset(
+    {TaskKind.TECH_LEAD.value, REVIEW_EXCHANGE_TECH_LEAD_TASK_KIND}
+)
 
 
 def _role_for_task_kind(task_kind: str) -> SandboxRole:

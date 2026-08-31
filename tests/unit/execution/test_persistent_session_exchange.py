@@ -76,6 +76,24 @@ from issue_orchestrator.execution.review_exchange_coder_turn import (
     CoderTurnRead,
     read_coder_turn,
 )
+from issue_orchestrator.domain.review_exchange_coder_principal import (
+    EXCHANGE_CODER_PRINCIPAL_ENV_SUFFIX,
+    ReviewExchangeCoderPrincipal,
+)
+from issue_orchestrator.domain.sandbox_scope import (
+    REVIEW_EXCHANGE_CODER_TASK_KIND,
+    REVIEW_EXCHANGE_REVIEWER_TASK_KIND,
+    REVIEW_EXCHANGE_TECH_LEAD_TASK_KIND,
+)
+from issue_orchestrator.infra.env import ENV_PREFIX
+from issue_orchestrator.resources import (
+    get_completion_instructions,
+    get_review_exchange_tech_lead_instructions,
+)
+from issue_orchestrator.execution.review_exchange_turn_validation import (
+    CoderFiledTurnEvidence,
+    ExchangeTurnEvidence,
+)
 from issue_orchestrator.execution.review_exchange_validation_mirror import (
     PairValidationMirror,
 )
@@ -1348,13 +1366,23 @@ def coder_turn_disposition(
     issue_number: int = 42,
     session_name: str = "issue-42-coder",
     round_index: int = 1,
+    turn_evidence: ExchangeTurnEvidence | None = None,
 ) -> CoderTurnDisposition:
-    """Read one coder turn's disposition through its typed command."""
+    """Read one coder turn's disposition through its typed command.
+
+    ``turn_evidence`` defaults to the Actor lane's owner built from the same
+    paths the caller passes, so every pre-#388 case reads exactly as it did.
+    A Tech Lead case passes its own owner.
+    """
     return read_coder_turn(
         CoderTurnRead(
             completion_path=completion_path,
             pair_validation=pair_validation,
-            run_validation_record_path=run_validation_record_path,
+            turn_evidence=turn_evidence
+            or CoderFiledTurnEvidence(
+                mirror=pair_validation,
+                run_validation_record_path=run_validation_record_path,
+            ),
             require_validation=require_validation,
             issue_number=issue_number,
             session_name=session_name,
@@ -4359,6 +4387,7 @@ class TestRoleEnvironmentScrubbing:
 
         env = pse._build_role_env(  # noqa: SLF001 — testing the env contract
             role="reviewer",
+            coder_principal=ReviewExchangeCoderPrincipal.ACTOR,
             response_file=response_file,
             review_report_file=None,
             completion_path=run_dir / "reviewer" / "completion-reviewer.json",
@@ -4399,6 +4428,7 @@ class TestRoleEnvironmentScrubbing:
 
         env = pse._build_role_env(  # noqa: SLF001 — testing the env contract
             role="coder",
+            coder_principal=ReviewExchangeCoderPrincipal.ACTOR,
             response_file=response_file,
             review_report_file=None,
             completion_path=run_dir / "coder" / "completion-coder.json",
@@ -4445,6 +4475,7 @@ class TestRoleEnvironmentScrubbing:
 
         env = pse._build_role_env(  # noqa: SLF001 — testing the env contract
             role="reviewer",
+            coder_principal=ReviewExchangeCoderPrincipal.ACTOR,
             response_file=run_dir / "reviewer" / "review-response.json",
             review_report_file=worktree / ".issue-orchestrator" / "review-report.md",
             completion_path=run_dir / "reviewer" / "completion-reviewer.json",
@@ -4483,6 +4514,7 @@ class TestRoleEnvironmentScrubbing:
         worktree.mkdir()
         env = pse._build_role_env(  # noqa: SLF001 — testing the env contract
             role="reviewer",
+            coder_principal=ReviewExchangeCoderPrincipal.ACTOR,
             response_file=run_dir / "reviewer" / "review-response.json",
             review_report_file=worktree / ".issue-orchestrator" / "review-report.md",
             completion_path=run_dir / "reviewer" / "completion-reviewer.json",
@@ -9153,4 +9185,121 @@ class TestCoderEscalationRouting:
         assert decision["abstraction_review"]["status"] == "deferred"
         assert decision["abstraction_review"]["follow_up_issue_url"] == (
             "https://github.com/org/repo/issues/388"
+        )
+
+
+class TestTheCoderSideLaunchesAsItsPrincipal:
+    """F1/F2: the lane launches the side under the principal's own contract.
+
+    The side is a position in the protocol; the principal is the authority
+    sitting in it (#388). What that decides at spawn time is the task kind —
+    which selects the completion protocol document and the sandbox role — and
+    the declaration ``coding-done`` reads back to route its own gate.
+    """
+
+    def _spec(
+        self,
+        tmp_path: Path,
+        *,
+        role: pse.Role,
+        principal: ReviewExchangeCoderPrincipal,
+    ) -> "pse._RoleSessionSpec":  # noqa: SLF001 — the launch contract under test
+        run_dir = tmp_path / "run"
+        return pse._RoleSessionSpec(  # noqa: SLF001
+            role=role,
+            agent=AgentConfig(prompt_path=tmp_path / "prompt.md"),
+            worktree=tmp_path / "wt",
+            run_dir=run_dir,
+            recording_path=run_dir / "terminal-recording.jsonl",
+            response_file=run_dir / "review-response.json",
+            completion_path=run_dir / "completion.json",
+            validation_output_dir=run_dir,
+            review_report_file=None,
+            runtime_config=_runtime_config(tmp_path),
+            agent_label="agent:tech-lead",
+            web_port=None,
+            issue_number=388,
+            issue_title="t",
+            session_name="review-exchange-388",
+            response_channel="file",
+            validation_profile="default",
+            coder_principal=principal,
+        )
+
+    def test_a_tech_lead_coder_launches_under_the_tech_lead_task_kind(
+        self, tmp_path: Path
+    ) -> None:
+        spec = self._spec(
+            tmp_path,
+            role=pse.Role.CODER,
+            principal=ReviewExchangeCoderPrincipal.TECH_LEAD,
+        )
+
+        assert spec.task_kind() == REVIEW_EXCHANGE_TECH_LEAD_TASK_KIND
+        assert get_completion_instructions(spec.task_kind()) == (
+            get_review_exchange_tech_lead_instructions()
+        )
+
+    def test_an_actor_coder_still_launches_under_the_coder_task_kind(
+        self, tmp_path: Path
+    ) -> None:
+        spec = self._spec(
+            tmp_path,
+            role=pse.Role.CODER,
+            principal=ReviewExchangeCoderPrincipal.ACTOR,
+        )
+
+        assert spec.task_kind() == REVIEW_EXCHANGE_CODER_TASK_KIND
+
+    def test_the_reviewer_side_is_named_by_its_lane_whoever_the_coder_is(
+        self, tmp_path: Path
+    ) -> None:
+        for principal in ReviewExchangeCoderPrincipal:
+            spec = self._spec(
+                tmp_path, role=pse.Role.REVIEWER, principal=principal
+            )
+
+            assert spec.task_kind() == REVIEW_EXCHANGE_REVIEWER_TASK_KIND
+
+    def _coder_env(
+        self, tmp_path: Path, principal: ReviewExchangeCoderPrincipal
+    ) -> dict[str, str]:
+        run_dir = tmp_path / "run"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        worktree = tmp_path / "wt"
+        worktree.mkdir(exist_ok=True)
+        return pse._build_role_env(  # noqa: SLF001 — testing the env contract
+            role="coder",
+            coder_principal=principal,
+            response_file=run_dir / "review-response.json",
+            review_report_file=None,
+            completion_path=run_dir / "completion-coder.json",
+            validation_output_dir=run_dir,
+            worktree=worktree,
+            runtime_config=_runtime_config(tmp_path),
+            agent_label="agent:tech-lead",
+            web_port=None,
+            issue_number=388,
+            session_name="review-exchange-388",
+            validation_profile="default",
+        )
+
+    def test_the_principal_is_declared_into_the_coder_session(
+        self, tmp_path: Path
+    ) -> None:
+        env = self._coder_env(tmp_path, ReviewExchangeCoderPrincipal.TECH_LEAD)
+
+        declared = env[f"{ENV_PREFIX}{EXCHANGE_CODER_PRINCIPAL_ENV_SUFFIX}"]
+        assert ReviewExchangeCoderPrincipal.declared(declared) is (
+            ReviewExchangeCoderPrincipal.TECH_LEAD
+        )
+
+    def test_the_actor_declaration_reads_back_as_the_ordinary_lane(
+        self, tmp_path: Path
+    ) -> None:
+        env = self._coder_env(tmp_path, ReviewExchangeCoderPrincipal.ACTOR)
+
+        declared = env[f"{ENV_PREFIX}{EXCHANGE_CODER_PRINCIPAL_ENV_SUFFIX}"]
+        assert ReviewExchangeCoderPrincipal.declared(declared) is (
+            ReviewExchangeCoderPrincipal.ACTOR
         )

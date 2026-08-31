@@ -19,6 +19,9 @@ from typing import Any, Protocol, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from ..domain.issue_key import IssueKey
+    from ..domain.review_exchange_coder_principal import (
+        ReviewExchangeCoderPrincipal,
+    )
     from ..domain.review_exchange_rework import ReviewExchangeRework
     from ..domain.models import AgentConfig
     from ..domain.review_exchange import ReviewExchangeOutcome
@@ -41,6 +44,14 @@ class ReviewExchangeRunner(Protocol):
     reconstruct: identity derivation is a control-layer concern, and a runner
     inventing its own spelling of it would file a candidate's admission
     evidence (#34) under a key nothing else uses.
+
+    ``coder_principal`` is the caller's answer to "whose completion contract
+    does the coder SIDE run under" (#388). The side is a position in the
+    protocol; the principal is the authority sitting in it, and only the
+    control layer knows which — the configured tech lead agent reaches this
+    lane like any other. It carries no default for the same reason ``rework``
+    does not: a runner that inferred it would hand a bounded Tech Lead the
+    Actor's protocol, which is the defect this parameter exists to close.
 
     ``rework`` is the caller's answer to "who moves the candidate when this
     review asks for changes" (#180). It is the caller's because only the caller
@@ -68,6 +79,7 @@ class ReviewExchangeRunner(Protocol):
         max_no_progress: int,
         require_validation: bool,
         rework: "ReviewExchangeRework",
+        coder_principal: "ReviewExchangeCoderPrincipal",
         nit_policy: str = "surface",
         initial_validation_record_path: Path | None = None,
         approval_gate: "ReviewExchangeApprovalGate | None" = None,

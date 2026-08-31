@@ -1,9 +1,14 @@
-"""The completion gate routing owner (#293 / #319 / #370).
+"""The completion gate routing owner (#293 / #319 / #370 / #388).
 
-One question, one owner: given the owner-injected managed-run directory, does
+One question, one owner: given the owner-injected managed-run context, does
 ``coding-done completed`` run the code-candidate quick gate? Everything the
 routing owner cannot read as a tech-lead run must come back as the ordinary
 gate — the unsafe direction is skipping a real coder candidate's validation.
+
+Two signals, because the run directory cannot answer for the review exchange's
+coder side: that run belongs to the exchange, not to the tech-lead launch that
+stages an assignment, so the launcher declares the principal instead (#388).
+Both fail safe to the ordinary gate.
 """
 
 import json
@@ -15,6 +20,15 @@ from issue_orchestrator.control.completion_gate_routing import (
     CompletionGateRouting,
     route_completion_gate,
 )
+from issue_orchestrator.domain.review_exchange_coder_principal import (
+    EXCHANGE_CODER_PRINCIPAL_ENV_SUFFIX,
+    ReviewExchangeCoderPrincipal,
+)
+from issue_orchestrator.entrypoints.cli_tools.coding_done import (
+    resolve_completion_gate_routing,
+    resolve_exchange_coder_principal,
+)
+from issue_orchestrator.infra.env import ENV_PREFIX
 from issue_orchestrator.domain.tech_lead_session import (
     TechLeadAssignment,
     TechLeadSessionFlavor,
@@ -208,3 +222,94 @@ class TestRoutingValue:
             CompletionGateRouting(
                 route=CompletionGateRoute.CANDIDATE_QUICK_GATE, reason="  "
             )
+
+
+class TestReviewExchangeCoderPrincipalRouting:
+    """The second owner-injected signal (#388).
+
+    The exchange's coder run directory belongs to the exchange, so no tech-lead
+    assignment is staged there for the first signal to read. The launcher's
+    declaration is what says whose completion contract that side runs under, and
+    it is asked first — before the directory is read at all.
+    """
+
+    def test_a_tech_lead_on_the_exchange_lane_does_not_run_the_candidate_gate(
+        self, tmp_path
+    ):
+        routing = route_completion_gate(
+            tmp_path, exchange_coder=ReviewExchangeCoderPrincipal.TECH_LEAD
+        )
+
+        assert routing.route is (
+            CompletionGateRoute.TECH_LEAD_ORCHESTRATOR_OWNED_VALIDATION
+        )
+        assert "review-exchange coder side" in routing.reason
+
+    def test_it_does_not_need_a_run_directory_to_answer(self):
+        routing = route_completion_gate(
+            None, exchange_coder=ReviewExchangeCoderPrincipal.TECH_LEAD
+        )
+
+        assert not routing.runs_candidate_quick_gate
+
+    def test_a_staged_planning_assignment_does_not_override_the_declaration(
+        self, tmp_path
+    ):
+        """Both signals say "not this session's gate"; neither is bypassed."""
+        run_dir = _stage(
+            tmp_path,
+            TechLeadAssignment(
+                flavor=TechLeadSessionFlavor.PLANNING_INVESTIGATION,
+                focus_issue_number=7,
+                focus_reason="prepare",
+            ),
+        )
+
+        routing = route_completion_gate(
+            run_dir, exchange_coder=ReviewExchangeCoderPrincipal.TECH_LEAD
+        )
+
+        assert not routing.runs_candidate_quick_gate
+
+    def test_an_actor_declaration_leaves_every_prior_answer_alone(self, tmp_path):
+        assert route_completion_gate(
+            tmp_path, exchange_coder=ReviewExchangeCoderPrincipal.ACTOR
+        ).route is CompletionGateRoute.CANDIDATE_QUICK_GATE
+        assert route_completion_gate(tmp_path).route is (
+            CompletionGateRoute.CANDIDATE_QUICK_GATE
+        )
+
+
+class TestTheCompletionCommandReadsTheDeclaration:
+    """``coding-done``'s own resolution of the declared principal."""
+
+    def test_the_exchange_declaration_reaches_the_routing_owner(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv(
+            f"{ENV_PREFIX}{EXCHANGE_CODER_PRINCIPAL_ENV_SUFFIX}", "tech_lead"
+        )
+
+        assert resolve_exchange_coder_principal() is (
+            ReviewExchangeCoderPrincipal.TECH_LEAD
+        )
+        assert not resolve_completion_gate_routing(None).runs_candidate_quick_gate
+
+    def test_an_ordinary_session_declares_nothing_and_routes_ordinarily(
+        self, monkeypatch
+    ):
+        monkeypatch.delenv(
+            f"{ENV_PREFIX}{EXCHANGE_CODER_PRINCIPAL_ENV_SUFFIX}", raising=False
+        )
+
+        assert resolve_exchange_coder_principal() is (
+            ReviewExchangeCoderPrincipal.ACTOR
+        )
+        assert resolve_completion_gate_routing(None).runs_candidate_quick_gate
+
+    def test_unrecognised_text_fails_safe_to_the_ordinary_gate(self, monkeypatch):
+        monkeypatch.setenv(
+            f"{ENV_PREFIX}{EXCHANGE_CODER_PRINCIPAL_ENV_SUFFIX}", "wizard"
+        )
+
+        assert resolve_completion_gate_routing(None).runs_candidate_quick_gate

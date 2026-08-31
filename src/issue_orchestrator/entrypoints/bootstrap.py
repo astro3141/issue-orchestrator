@@ -45,6 +45,7 @@ from .bootstrap_operator_commands import build_operator_issue_command_factory
 from .bootstrap_completion import (
     _validation_attempt_key_factory,
     build_completion_handler_factory,
+    build_tech_lead_completion_validator,
     create_completion_components,
 )
 from .bootstrap_revalidation import build_publication_revalidation
@@ -122,7 +123,6 @@ from .bootstrap_tech_lead import (
     wire_tech_lead_act_executors,
 )
 from ..infra.repo_identity import state_dir
-from ..infra.tech_lead_completion_validation import TrustedTechLeadCompletionValidator
 from ..infra.secret_env import (
     configure_extra_forbidden_env_vars,
 )
@@ -1106,6 +1106,7 @@ def build_orchestrator_for_testing(
         publication_verdict=publication_verdict,
     )
 
+    tech_lead_validation = build_tech_lead_completion_validator(config, working_copy)
     completion_processor = CompletionProcessor(
         label_adapter=GovernedLabelSet(
             labels=github, governed_label=label_manager.needs_human
@@ -1120,6 +1121,7 @@ def build_orchestrator_for_testing(
             AttemptReviewVerdictStore(attempt_store),
             turn_mailbox=turn_mailbox,
             coder_prompt_addendum=coder_prompt_addendum,
+            tech_lead_completion_validator=tech_lead_validation,
         ),
         event_bus=None,
         label_config=label_manager.to_label_config_dict(),
@@ -1140,10 +1142,7 @@ def build_orchestrator_for_testing(
         review_artifact_reader=ManifestReviewArtifactReader(),
         runtime_identity=runtime_identity.resolve_runtime_identity(),
         tech_lead_authority=tech_lead_authority_for_testing,
-        # #385: gated on trusted, orchestrator-executed completion validation.
-        tech_lead_completion_validator=TrustedTechLeadCompletionValidator(
-            working_copy=working_copy, repo_root=config.repo_root
-        ),
+        tech_lead_completion_validator=tech_lead_validation,
         needs_human_block=pending_work.needs_human_block,
         unrecorded_refusals=publication_verdict.unrecorded,
     )
