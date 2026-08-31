@@ -30,7 +30,14 @@ class GuardProbe:
 
     Recorded so the guard's report is evidence rather than assertion: the
     caller can see *which* commands were put to the enforcing mechanism and
-    what it answered, and a run's manifest keeps that after the fact.
+    what it answered.
+
+    What each caller then does with that is its own decision, and they differ
+    today: the planning principal's launch owner writes the classifications
+    into the run manifest, so they survive the launch; the reviewer's installer
+    measures them and returns them, and the review exchange has no manifest
+    seam to keep them in. Read this as "measured", not as "recorded somewhere
+    after the fact", unless the principal you are reading says otherwise.
     """
 
     command: tuple[str, ...]

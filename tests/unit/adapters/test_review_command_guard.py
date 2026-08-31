@@ -44,6 +44,7 @@ from issue_orchestrator.execution.agent_runner_providers.codex_trust import (
     resolve_codex_common_repository_root,
 )
 from issue_orchestrator.infra.hooks.review_command_guard import REFUSAL_REASON
+from issue_orchestrator.resources import get_review_exchange_reviewer_instructions
 
 from tests.codex_execpolicy_fakes import (
     AlwaysAllowingExecPolicy,
@@ -145,12 +146,42 @@ class TestTheCodexGuardIsEstablishedNotClaimed:
     def test_the_rounds_own_way_out_is_verified_still_possible(
         self, reviewer_worktree: Path
     ) -> None:
-        """``reviewer-done`` is how a verdict is recorded at all."""
+        """``exchange-respond`` is how this principal records a verdict at all.
+
+        The worktree this guard is installed in belongs to the review exchange,
+        where ``reviewer-done`` is forbidden and ``exchange-respond`` is the
+        only exit. Refusing it would deadlock the round rather than merely
+        inconvenience the reviewer, so it is the allowance whose classification
+        has to be measured.
+        """
         outcome = _install(reviewer_worktree, CODEX)
 
         assert any(
-            allowance.startswith("reviewer-done approved")
+            allowance.startswith("exchange-respond ok")
             for allowance in outcome.allowances()
+        )
+
+    def test_the_pinned_exit_is_the_one_this_lane_actually_uses(
+        self, reviewer_worktree: Path
+    ) -> None:
+        """The exit is read off the reviewer's instructions, not remembered.
+
+        A sample naming a command this principal must never run would prove
+        nothing about the failure it exists to prevent, and no assertion inside
+        the installer could notice the substitution — the reviewer's own
+        instructions are where this lane's exit is decided, so they are what
+        the pinned sample is held against.
+        """
+        instructions = get_review_exchange_reviewer_instructions()
+        assert "**DO NOT** call `reviewer-done`" in instructions
+
+        allowances = _install(reviewer_worktree, CODEX).allowances()
+
+        assert any(
+            allowance.startswith("exchange-respond ") for allowance in allowances
+        )
+        assert not any(
+            allowance.startswith("reviewer-done ") for allowance in allowances
         )
 
     def test_the_policy_carries_the_shared_gate_vocabulary(
@@ -236,6 +267,34 @@ class TestEstablishmentFailsClosed:
 
         with pytest.raises(WorktreeError, match="Failed to write"):
             _install(blocked, CODEX)
+
+    def test_a_safety_policy_that_cannot_be_installed_does_not_establish(
+        self, reviewer_worktree: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The third F5 direction: composition itself failed.
+
+        A scoped policy can be written perfectly and still leave the worktree
+        half-protected, because the no-bypass / no-merge rules are *copied in*
+        from a shipped template — and a broken install (a moved or missing
+        templates root) makes that copy raise where the scoped write did not.
+        The real ``CodexAdapter`` is left in place and pointed at a templates
+        root that does not exist, so the ``OSError`` this branch translates is
+        raised by the production copy rather than by a double standing in for
+        it.
+
+        The branch lives in the shared :mod:`._codex_gate_policy` owner, so the
+        planning principal is composed the same way and fails closed for the
+        same reason.
+        """
+        monkeypatch.setattr(
+            "issue_orchestrator.adapters.hooks.codex.TEMPLATES_DIR",
+            tmp_path / "templates-that-did-not-ship",
+        )
+
+        with pytest.raises(WorktreeError, match="Failed to install the Codex safety"):
+            _install(reviewer_worktree, CODEX)
+
+        assert not (reviewer_worktree / CODEX_SAFETY_RULES).exists()
 
     def test_a_failure_is_raised_rather_than_reported_as_unguarded(
         self, reviewer_worktree: Path

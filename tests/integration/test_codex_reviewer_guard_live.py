@@ -17,8 +17,9 @@ CLI and measures what #396's acceptance names:
   commands — really are answered ``forbidden``, by decision and by a matched
   rule, not by an absence (F2);
 * reading the candidate — ``git log``, ``rg``, ``cat`` — and recording the
-  verdict through ``reviewer-done`` really are answered with the no-match
-  shape, so the guard does not turn reviewing into a no-tools role (F3);
+  verdict through ``exchange-respond``, this lane's only exit, really are
+  answered with the no-match shape, so the guard does not turn reviewing into a
+  no-tools role (F3);
 * the shipped safety rules the installer places beside it still deny
   ``git push --no-verify`` and still permit ``git push origin main``, and
   neither file shadows the other (F4);
@@ -91,7 +92,10 @@ PINNED_GATE_COMMANDS = (
 )
 
 #: What #396 F3 requires a guarded reviewer to keep: reading the candidate, and
-#: the round's own way out.
+#: this principal's own way out. The reviewer worktree belongs to the review
+#: exchange, where a verdict is recorded with ``exchange-respond`` and
+#: ``reviewer-done`` is forbidden — a refusal of the last entry is the one that
+#: would deadlock the round rather than merely narrow the reviewer's tools.
 PINNED_INSPECTION_COMMANDS = (
     ("git", "log", "--oneline", "-20"),
     ("git", "diff", "main...HEAD"),
@@ -99,7 +103,7 @@ PINNED_INSPECTION_COMMANDS = (
     ("rg", "-n", "install_review_command_guard", "src"),
     ("cat", "AGENTS.md"),
     ("ls", "-la", "src"),
-    ("reviewer-done", "approved", "--summary", "reads clean", "--risk", "low"),
+    ("exchange-respond", "ok", "--getting-closer", "--text", "reads clean"),
 )
 
 SAFETY_DENIED = ("git", "push", "--no-verify")

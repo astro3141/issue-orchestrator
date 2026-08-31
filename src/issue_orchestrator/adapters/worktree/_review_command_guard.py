@@ -126,13 +126,22 @@ REVIEW_GUARD_REFUSED_SAMPLES: tuple[tuple[str, ...], ...] = (
 #: What a reviewer must keep. Verified in the same pass, so a policy that
 #: refuses by refusing everything fails to establish: the reviewer reads the
 #: candidate's code, and a guard that turned reviewing into a no-tools role
-#: would be a worse outcome than the gate it prevents. The last entry is the
-#: round's own way out — ``reviewer-done`` is how a verdict is recorded at all.
+#: would be a worse outcome than the gate it prevents.
+#:
+#: The last entry is *this* principal's way out. The only caller of
+#: ``create_reviewer_worktree`` is the review exchange
+#: (``execution/persistent_review_exchange_runner``), where a verdict is
+#: recorded with ``exchange-respond`` and ``reviewer-done`` is forbidden
+#: outright (``resources/review_exchange_reviewer.md``). A refusal here is the
+#: one that would deadlock the round — the reviewer could not answer, the turn
+#: mailbox would never receive, and the exchange would time out — so it is the
+#: command that has to be put to the checker. Pinning the standalone lane's
+#: exit instead would leave that failure unmeasured.
 REVIEW_GUARD_ALLOWED_SAMPLES: tuple[tuple[str, ...], ...] = (
     ("git", "log", "--oneline", "-20"),
     ("rg", "-n", "install_review_command_guard", "src"),
     ("cat", "AGENTS.md"),
-    ("reviewer-done", "approved", "--summary", "reads clean", "--risk", "low"),
+    ("exchange-respond", "ok", "--getting-closer", "--text", "reads clean"),
 )
 
 _REVIEW_RULES_HEADER = """\

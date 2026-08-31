@@ -1328,9 +1328,13 @@ named guardable without a registration behind it (#396).
   --no-verify`, commit-hook bypass, `gh pr merge` and `gh api` stay denied, and
   **both** files are put to `codex execpolicy check` before the guard is
   reported: `make validate-pr-raw` and pytest-shaped commands must come back
-  `forbidden`, `git log`/`rg`/`cat`/`reviewer-done` must not, and the safety
-  file must still refuse its own samples. A policy that does not verify, or a
-  checker that cannot answer, is a failure — never a `guarded=False`.
+  `forbidden`, `git log`/`rg`/`cat`/`exchange-respond` must not, and the safety
+  file must still refuse its own samples. The last of those is this lane's own
+  exit — the reviewer worktree is created by the review exchange, where a
+  verdict is recorded with `exchange-respond` and `reviewer-done` is forbidden,
+  so refusing it would deadlock the round rather than merely narrow the
+  reviewer's tools. A policy that does not verify, or a checker that cannot
+  answer, is a failure — never a `guarded=False`.
 - **Installed for the provider that will actually run there, or not at all.**
   `create_reviewer_worktree` is given the provider the exchange launches
   (`launch_config`, the same derivation the execution-identity record reads).
