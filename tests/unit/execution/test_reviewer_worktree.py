@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -11,8 +12,11 @@ from pathlib import Path
 import pytest
 
 from issue_orchestrator.adapters.worktree.api import (
+    CODEX_SAFETY_RULES,
     GUARDABLE_PROVIDERS,
+    REVIEW_COMMAND_GUARD_PATHS,
     REVIEW_COMMAND_GUARD_SETTINGS,
+    REVIEW_GUARD_RULES,
     WorktreeError,
     install_review_command_guard,
     read_reviewer_head_ownership,
@@ -33,6 +37,8 @@ from issue_orchestrator.execution.reviewer_worktree import (
     remove_reviewer_worktree,
 )
 from issue_orchestrator.ports.worktree_manager import REVIEWER_OWNED_HEAD_MARKER
+
+from tests.codex_execpolicy_fakes import StarlarkPrefixExecPolicy
 
 
 #: The provider the reviewer runs under in these tests. Required by
@@ -351,18 +357,19 @@ class TestReviewerWorktreeRefusesGateCommands:
         assert not sibling.exists()
         assert str(sibling) not in _git(repo_root, "worktree", "list", "--porcelain")
 
-    @pytest.mark.parametrize("provider", ["codex", "cursor", "gemini", "aider"])
+    @pytest.mark.parametrize("provider", ["cursor", "gemini", "aider"])
     def test_no_guard_file_is_planted_for_a_provider_that_cannot_read_it(
         self, tmp_path: Path, provider: str,
     ) -> None:
-        """A settings file the reviewer never reads is worse than none.
+        """A guard file the reviewer never reads is worse than none.
 
-        The guard is registered in ``.claude/settings.local.json``. A reviewer
-        launched on a provider that reads something else would be handed a
-        worktree that *looks* guarded — settings file present — while nothing
-        refuses anything, which is how a written claim comes to stand in for
-        enforcement (``docs/architecture/hooks.md``). So for such a provider
-        the installer writes nothing at all.
+        Each provider's guard is registered through that provider's own
+        mechanism — Claude Code's ``.claude/settings.local.json``, Codex's
+        ``.codex/rules``. A reviewer launched on a provider that reads neither
+        would be handed a worktree that *looks* guarded — a file is present —
+        while nothing refuses anything, which is how a written claim comes to
+        stand in for enforcement (``docs/architecture/hooks.md``). So for such
+        a provider the installer writes nothing at all.
         """
         _, coder, branch = _bootstrap_repo_with_branch(tmp_path)
         assert provider not in GUARDABLE_PROVIDERS
@@ -374,7 +381,8 @@ class TestReviewerWorktreeRefusesGateCommands:
             reviewer_provider=AgentProvider(provider),
         )
 
-        assert not (reviewer.path / REVIEW_COMMAND_GUARD_SETTINGS).exists()
+        for planted in REVIEW_COMMAND_GUARD_PATHS:
+            assert not (reviewer.path / planted).exists()
 
     def test_an_unguardable_provider_is_reported_as_unguarded_not_installed(
         self, tmp_path: Path,
@@ -383,12 +391,12 @@ class TestReviewerWorktreeRefusesGateCommands:
         _, coder, _branch = _bootstrap_repo_with_branch(tmp_path)
 
         outcome = install_review_command_guard(
-            coder, provider=AgentProvider("codex"),
+            coder, provider=AgentProvider("cursor"),
         )
 
         assert outcome.guarded is False
-        assert outcome.settings_file is None
-        assert outcome.provider == AgentProvider("codex")
+        assert outcome.policy_file is None
+        assert outcome.provider == AgentProvider("cursor")
 
     def test_a_guardable_provider_reports_the_file_it_installed(
         self, tmp_path: Path,
@@ -404,7 +412,7 @@ class TestReviewerWorktreeRefusesGateCommands:
         outcome = install_review_command_guard(reviewer.path, provider=CLAUDE_CODE)
 
         assert outcome.guarded is True
-        assert outcome.settings_file == reviewer.path / REVIEW_COMMAND_GUARD_SETTINGS
+        assert outcome.policy_file == reviewer.path / REVIEW_COMMAND_GUARD_SETTINGS
 
     def test_the_unguarded_case_is_logged_loudly_enough_to_notice(
         self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
@@ -417,12 +425,114 @@ class TestReviewerWorktreeRefusesGateCommands:
                 coder_worktree=coder,
                 coder_branch=branch,
                 timestamp="T",
-                reviewer_provider=AgentProvider("codex"),
+                reviewer_provider=AgentProvider("cursor"),
             )
 
         warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
         assert any("UNGUARDED" in r.getMessage() for r in warnings)
-        assert any("codex" in r.getMessage() for r in warnings)
+        assert any("cursor" in r.getMessage() for r in warnings)
+
+
+class TestTheCodexReviewerWorktreeLifecycle:
+    """A Codex reviewer is guarded too, and its worktree still comes apart.
+
+    #396 gave the Codex reviewer a real worktree-local exec policy instead of
+    the prompt-only arrangement it had. That plants two more untracked files in
+    a worktree whose removal refuses to run while untracked files are present,
+    so the lifecycle owner has to lift exactly what the guard plants — a list
+    it asks the guard for rather than keeping its own copy of.
+    """
+
+    def test_removal_lifts_every_path_a_guard_registration_can_plant(
+        self, tmp_path: Path
+    ) -> None:
+        _, coder, branch = _bootstrap_repo_with_branch(tmp_path)
+        reviewer = create_reviewer_worktree(
+            coder_worktree=coder,
+            coder_branch=branch,
+            timestamp="T",
+            reviewer_provider=CLAUDE_CODE,
+        )
+        # The Codex registration's files, established exactly as a Codex
+        # reviewer's worktree would carry them.
+        outcome = install_review_command_guard(
+            reviewer.path,
+            provider=AgentProvider("codex"),
+            execpolicy=StarlarkPrefixExecPolicy(),
+        )
+        assert outcome.guarded is True
+        assert outcome.policy_file.exists()
+
+        remove_reviewer_worktree(reviewer)
+
+        assert not reviewer.path.exists()
+
+    def test_creation_fails_closed_when_the_codex_guard_cannot_be_verified(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A Codex reviewer worktree that cannot be guarded must not exist.
+
+        The whole production path runs here — creation, the real installer, the
+        real ``codex execpolicy check`` adapter — with the CLI it consults
+        replaced on ``PATH`` by one that cannot answer. That is the direction
+        #396 F5 pins: an unverifiable guard is a failed launch, not a quiet
+        ``guarded=False``, and the worktree it was for is rolled back with no
+        owned orphan left behind.
+        """
+        repo_root, coder, branch = _bootstrap_repo_with_branch(tmp_path)
+        sibling = coder.parent / f"{coder.name}-review-T"
+        fake_bin = tmp_path / "bin"
+        fake_bin.mkdir()
+        unanswerable_codex = fake_bin / "codex"
+        unanswerable_codex.write_text(
+            "#!/bin/sh\necho 'not json' >&2\nexit 1\n", encoding="utf-8"
+        )
+        unanswerable_codex.chmod(0o755)
+        monkeypatch.setenv("PATH", f"{fake_bin}{os.pathsep}{os.environ['PATH']}")
+
+        with pytest.raises(ReviewerWorktreeError, match="command guard"):
+            create_reviewer_worktree(
+                coder_worktree=coder,
+                coder_branch=branch,
+                timestamp="T",
+                reviewer_provider=AgentProvider("codex"),
+            )
+
+        assert not sibling.exists()
+        assert str(sibling) not in _git(repo_root, "worktree", "list", "--porcelain")
+
+    def test_the_lifted_paths_cover_what_the_codex_registration_writes(
+        self, tmp_path: Path
+    ) -> None:
+        """The removal list is the guard's answer, so it cannot fall behind."""
+        _, coder, branch = _bootstrap_repo_with_branch(tmp_path)
+        reviewer = create_reviewer_worktree(
+            coder_worktree=coder,
+            coder_branch=branch,
+            timestamp="T",
+            reviewer_provider=CLAUDE_CODE,
+        )
+        install_review_command_guard(
+            reviewer.path,
+            provider=AgentProvider("codex"),
+            execpolicy=StarlarkPrefixExecPolicy(),
+        )
+
+        written = {
+            path.relative_to(reviewer.path)
+            for path in reviewer.path.rglob("*")
+            if path.is_file() and ".git" not in path.parts and path.name != ".git"
+        }
+        guard_files = {
+            path for path in written if path.parts[0] in {".claude", ".codex"}
+        }
+
+        assert guard_files <= set(REVIEW_COMMAND_GUARD_PATHS)
+        assert guard_files == {
+            REVIEW_COMMAND_GUARD_SETTINGS,
+            REVIEW_GUARD_RULES,
+            CODEX_SAFETY_RULES,
+        }
 
 
 def _guard_command(reviewer_path: Path) -> str:

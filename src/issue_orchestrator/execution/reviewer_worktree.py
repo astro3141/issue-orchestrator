@@ -25,7 +25,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from ..adapters.worktree.api import (
-    REVIEW_COMMAND_GUARD_SETTINGS,
+    REVIEW_COMMAND_GUARD_PATHS,
     WorktreeError,
     install_review_command_guard,
     install_worktree_identity,
@@ -131,9 +131,8 @@ def create_reviewer_worktree(
     cannot run here is not a trade worth making.
 
     What keeps the exemption safe is a barrier, not an instruction:
-    :func:`install_review_command_guard` registers a ``PreToolUse`` policy in
-    this worktree that *refuses* build, test and validation commands before they
-    execute, pinned to the orchestrator's own copy of that policy
+    :func:`install_review_command_guard` registers a policy in this worktree
+    that *refuses* build, test and validation commands before they execute
     (``docs/architecture/hooks.md`` — prompts are suggestions, hooks are
     enforcement). ``REVIEWER_WORKTREE_IS_UNPROVISIONED_NOTE`` stays in every
     reviewer prompt so a refusal is expected rather than surprising, but the
@@ -142,22 +141,20 @@ def create_reviewer_worktree(
     worktree is rolled back and creation fails.
 
     ``reviewer_provider`` is what stops that from being a claim rather than a
-    fact. The guard is registered through one provider's hook mechanism, so a
-    reviewer launched on a provider that mechanism does not reach would get a
+    fact. A guard is one provider's mechanism — Claude Code's pinned
+    ``PreToolUse`` hook, or the worktree-local Codex exec policy #396 added and
+    verifies through ``codex execpolicy check`` before returning — so a reviewer
+    launched on a provider whose mechanism was never registered would get a
     worktree that *looks* guarded and is not. Passing the provider the exchange
     actually launches lets the installer write nothing in that case and say so
     (``ReviewCommandGuardOutcome.guarded``), which is logged here at WARNING.
 
-    **The gap that leaves.** ``claude-code`` is the only guardable provider
-    today, and this repository's default mode configures a Codex reviewer, so
-    for that configuration the note in the reviewer's prompt is still the only
-    thing between the reviewer and a gate command
-    (``docs/architecture/validation.md`` — "the one worktree that is exempt").
-    Closing it needs either a Codex-loadable guard (its project-local exec
-    policies are disabled until the project is trusted, and this worktree is
-    brand new) or provisioning the worktree instead of exempting it. Both are
-    larger than a guard installer, so neither is decided here; what *is*
-    decided here is that no configuration gets a decorative one.
+    Neither registration provisions this worktree, and neither widens trust: the
+    Codex policy loads under the existing #215 grant, which names the *common*
+    repository root this sibling already belongs to. A provider with no
+    registration is still honestly unguarded, protected by the prompt note
+    alone (``docs/architecture/validation.md`` — "the one worktree that is
+    exempt"); what is not on offer is a decorative guard for any of them.
     """
     sibling = coder_worktree.parent / f"{coder_worktree.name}-review-{timestamp}"
     if sibling.exists():
@@ -321,7 +318,7 @@ def remove_reviewer_worktree(
     for relative_marker in (
         WORKTREE_ID_MARKER,
         REVIEWER_OWNED_HEAD_MARKER,
-        REVIEW_COMMAND_GUARD_SETTINGS,
+        *REVIEW_COMMAND_GUARD_PATHS,
     ):
         marker = reviewer.path / relative_marker
         try:
