@@ -45,6 +45,29 @@ def _staged_contract(
     ).staged_at(CONTRACT_PATH)
 
 
+class TestRequireLeafContract:
+    """The one seam that turns replay-optional back into turn-required.
+
+    Both prompt builders and the round loop ask here, so there is a
+    single answer to "which admitted contract is this turn bound to"
+    (#399 A1) — and a single place to delete if someone ever wants to
+    run a round without one.
+    """
+
+    def test_it_returns_the_staged_contract_when_one_was_carried(self) -> None:
+        contract = _staged_contract()
+
+        files = ReviewExchangePromptFiles(leaf_contract=contract)
+
+        assert files.require_leaf_contract("a caller") is contract
+
+    def test_it_refuses_and_names_the_caller_when_none_was_carried(self) -> None:
+        files = ReviewExchangePromptFiles()
+
+        with pytest.raises(ValueError, match="the review-exchange round loop"):
+            files.require_leaf_contract("the review-exchange round loop")
+
+
 # ---------------------------------------------------------------------------
 # ReviewExchangeTurnPacket — round-trip + field validation
 # ---------------------------------------------------------------------------
@@ -153,6 +176,43 @@ class TestReviewExchangeTurnPacketRoundTrip:
 
         with pytest.raises(ValueError, match="leaf contract for issue"):
             build_reviewer_prompt(packet)
+
+    @pytest.mark.parametrize(
+        "role,build",
+        [
+            (Role.REVIEWER, build_reviewer_prompt),
+            (Role.CODER, build_coder_prompt),
+        ],
+    )
+    def test_a_turn_with_no_contract_refuses_to_build_a_prompt(
+        self,
+        role: Role,
+        build,
+    ) -> None:
+        """Removing the contract input must fail the proof (#399 F1).
+
+        The field is optional only so a packet written before it existed
+        still parses on replay. On an active turn its absence is the whole
+        defect this issue closes — a role prompted with no admitted scope
+        — so BOTH builders have to refuse, not just the reviewer's. Delete
+        the ``require_leaf_contract`` guard and this is what fails.
+        """
+        packet = ReviewExchangeTurnPacket(
+            issue_number=399,
+            issue_title="Carry the contract",
+            round_index=1,
+            role=role,
+            require_validation=False,
+            run_dir=Path("/wt/.issue-orchestrator/sessions/r1"),
+            prompt_files=ReviewExchangePromptFiles(),
+            # The coder builder's other requirement, satisfied so this
+            # asserts on the contract and nothing else.
+            reviewer_feedback="Fix the failing case.",
+        )
+
+        assert packet.prompt_files.leaf_contract is None
+        with pytest.raises(ValueError, match="prompt_files.leaf_contract"):
+            build(packet)
 
     def test_coder_packet_with_reviewer_feedback_round_trip(self) -> None:
         original = ReviewExchangeTurnPacket(

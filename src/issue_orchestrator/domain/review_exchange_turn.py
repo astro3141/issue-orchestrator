@@ -105,10 +105,34 @@ class ReviewExchangePromptFiles:
     proves the two roles reviewed the same admitted scope. A path alone
     would prove only that a filename was mentioned.
 
-    Optional on the dataclass, required by both prompt builders — the
-    packet type is also what session replay reconstructs, and a historical
-    packet from before this field existed must still parse.
+    Optional on the dataclass, required on any active turn — the packet
+    type is also what session replay reconstructs, and a historical
+    packet from before this field existed must still parse. Active
+    callers must go through :meth:`require_leaf_contract` rather than
+    reading this field, so the optionality stays a replay concession
+    instead of becoming a way to run a round without an admitted scope.
     """
+
+    def require_leaf_contract(self, requirer: str) -> "StagedLeafContract":
+        """The admitted contract, for a caller that may not proceed without it.
+
+        The one place the field's replay-only optionality is turned back
+        into a requirement. Everything on an active turn — both prompt
+        builders and the round loop that re-verifies the staged bytes —
+        asks here, so there is exactly one answer to "which admitted
+        contract is this turn bound to" and no caller can hold a second
+        one that silently disagrees (#399).
+
+        Raises:
+            ValueError: when no contract was staged onto this turn.
+        """
+        contract = self.leaf_contract
+        if contract is None:
+            raise ValueError(
+                f"{requirer} requires prompt_files.leaf_contract — the "
+                "exchange may not review against an unstated admitted scope"
+            )
+        return contract
 
     def to_manifest_fields(self) -> dict[str, Any]:
         manifest: dict[str, Any] = {}

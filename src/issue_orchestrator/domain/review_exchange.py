@@ -213,12 +213,7 @@ def _require_leaf_contract(
     the staged contract's is not a packet with a weak field, it is two
     different work items in one turn.
     """
-    contract = packet.prompt_files.leaf_contract
-    if contract is None:
-        raise ValueError(
-            f"{builder} requires packet.prompt_files.leaf_contract — the "
-            "exchange may not review against an unstated admitted scope"
-        )
+    contract = packet.prompt_files.require_leaf_contract(builder)
     if contract.issue_number != packet.issue_number:
         raise ValueError(
             f"{builder} received a leaf contract for issue "

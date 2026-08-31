@@ -184,6 +184,19 @@ class PersistentReviewExchangeRunner:
         # boundary an Operator happens to check.
         self._leaf_contract_staging = leaf_contract_staging
 
+    @property
+    def leaf_contract_staging(self) -> AdmittedLeafContractStaging:
+        """Which staging owner this runner was actually handed.
+
+        Read-only, and readable for the same reason
+        ``CompletionProcessor.publication_gate`` is: a collaborator that
+        only a composition root injects and only a live exchange
+        exercises is one whose absence a unit test cannot otherwise see —
+        and "the seam existed but nothing built one" is a defect this
+        repository has already shipped once (#25).
+        """
+        return self._leaf_contract_staging
+
     def _execution_identity_recorder(
         self,
         *,

@@ -27,6 +27,10 @@ from ..ports.coder_prompt import (
 )
 
 if TYPE_CHECKING:
+    from ..execution.persistent_review_exchange_runner import (
+        PersistentReviewExchangeRunner,
+    )
+    from ..ports.issue_tracker import IssueTracker
     from ..control.needs_human_block import SharedNeedsHumanBlock
     from ..control.open_issue_corpus import OpenIssueCorpusManager
     from ..control.publication_authority import UnrecordedRefusals
@@ -107,6 +111,63 @@ def build_tech_lead_completion_validator(
     )
 
 
+def build_review_exchange_runner(
+    *,
+    session_output: "SessionOutput",
+    pair_registry: "InMemoryPersistentExchangePairRegistry",
+    attempt_store: "AttemptStore",
+    tech_lead_completion_validator: TrustedTechLeadCompletionValidator,
+    repository_host: "IssueTracker | None",
+    turn_mailbox: "TurnMailbox | None" = None,
+    coder_prompt_addendum: CoderPromptAddendumProvider = NO_CODER_PROMPT_ADDENDUM,
+) -> "PersistentReviewExchangeRunner":
+    """The one place a review-exchange runner is constructed.
+
+    Same argument as ``build_tech_lead_completion_validator`` above: two
+    composition roots each assembling this runner is two chances to give
+    it a different set of collaborators, and the one that got forgotten
+    is invisible until an exchange runs. Everything the runner needs is
+    required here, so a root that omits one does not typecheck.
+
+    ``repository_host`` is where the admitted executable leaf contract is
+    read from (#399) — the same tracker the ordinary execution lane
+    already treats as canonical, so this is that source of truth moved
+    earlier, not a second one. Without a tracker there is nothing to read
+    it from, and the port's refusing default loses the exchange rather
+    than letting a Reviewer work from a title.
+    """
+    from ..execution.attempt_execution_identity_store import (
+        AttemptExecutionIdentityStore,
+    )
+    from ..execution.attempt_review_verdict_store import AttemptReviewVerdictStore
+    from ..execution.persistent_review_exchange_runner import (
+        PersistentReviewExchangeRunner,
+    )
+    from ..execution.review_exchange_leaf_contract import (
+        IssueTrackerLeafContractStaging,
+    )
+    from ..ports.review_exchange_leaf_contract import (
+        UNSTAGEABLE_ADMITTED_LEAF_CONTRACT,
+    )
+
+    return PersistentReviewExchangeRunner(
+        session_output,
+        pair_registry,
+        # Foundation admission evidence: both roles' execution identities,
+        # bound to the candidate the reviewer was shown (#34).
+        AttemptExecutionIdentityStore(attempt_store),
+        AttemptReviewVerdictStore(attempt_store),
+        turn_mailbox=turn_mailbox,
+        coder_prompt_addendum=coder_prompt_addendum,
+        tech_lead_completion_validator=tech_lead_completion_validator,
+        leaf_contract_staging=(
+            IssueTrackerLeafContractStaging(repository_host)
+            if repository_host is not None
+            else UNSTAGEABLE_ADMITTED_LEAF_CONTRACT
+        ),
+    )
+
+
 def create_completion_components(
     config: Config,
     github: "CompletionRepositoryPorts | None",
@@ -162,21 +223,6 @@ def create_completion_components(
     from ..execution.run_evidence import RunEvidenceRecorder
     from ..execution.persistent_exchange_pair_registry_inmemory import (
         InMemoryPersistentExchangePairRegistry,
-    )
-    from ..execution.attempt_execution_identity_store import (
-        AttemptExecutionIdentityStore,
-    )
-    from ..execution.attempt_review_verdict_store import (
-        AttemptReviewVerdictStore,
-    )
-    from ..execution.persistent_review_exchange_runner import (
-        PersistentReviewExchangeRunner,
-    )
-    from ..execution.review_exchange_leaf_contract import (
-        IssueTrackerLeafContractStaging,
-    )
-    from ..ports.review_exchange_leaf_contract import (
-        UNSTAGEABLE_ADMITTED_LEAF_CONTRACT,
     )
     from ..control.governed_label_set import GovernedLabelSet
     from ..control.review_exchange_lifecycle import (
@@ -250,28 +296,14 @@ def create_completion_components(
         # The review exchange delivers verdicts through the orchestrator-owned
         # mailbox: agents run `exchange-respond`, the Control API delivers into
         # the open turn slot, and send_round polls the mailbox (#6549).
-        review_exchange_runner=PersistentReviewExchangeRunner(
-            session_output,
-            pair_registry,
-            # Foundation admission evidence: both roles' execution
-            # identities, bound to the candidate the reviewer was shown (#34).
-            AttemptExecutionIdentityStore(attempt_store),
-            AttemptReviewVerdictStore(attempt_store),
+        review_exchange_runner=build_review_exchange_runner(
+            session_output=session_output,
+            pair_registry=pair_registry,
+            attempt_store=attempt_store,
+            tech_lead_completion_validator=tech_lead_completion_validator,
+            repository_host=repository_host,
             turn_mailbox=turn_mailbox,
             coder_prompt_addendum=coder_prompt_addendum,
-            tech_lead_completion_validator=tech_lead_completion_validator,
-            # The admitted executable leaf contract both exchange roles
-            # consume (#399), read from the issue tracker the ordinary
-            # execution lane already treats as canonical — so this is the
-            # same source of truth moved earlier, not a second one. Without
-            # a repository host there is nothing to read it from, and the
-            # port's default refuses the exchange rather than reviewing
-            # against a title.
-            leaf_contract_staging=(
-                IssueTrackerLeafContractStaging(repository_host)
-                if repository_host is not None
-                else UNSTAGEABLE_ADMITTED_LEAF_CONTRACT
-            ),
         ),
         event_bus=None,
         label_config=label_manager.to_label_config_dict(),

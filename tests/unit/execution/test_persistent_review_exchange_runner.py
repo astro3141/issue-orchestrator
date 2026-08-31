@@ -47,6 +47,9 @@ from issue_orchestrator.execution.attempt_review_verdict_store import (
     AttemptReviewVerdictStore,
 )
 from issue_orchestrator.domain.review_exchange import ReviewExchangeOutcome
+from issue_orchestrator.domain.review_exchange_contract import (
+    LeafContractUnavailable,
+)
 from issue_orchestrator.domain.review_exchange_coder_principal import (
     ReviewExchangeCoderPrincipal,
 )
@@ -892,3 +895,38 @@ def test_an_unwired_deployment_still_hands_the_exchange_a_refusing_owner(
         candidate_head_sha="c" * 40,
     )
     assert not verdict.permits_completion
+
+
+def test_an_unwired_staging_owner_refuses_the_exchange_before_it_spawns(
+    monkeypatch,
+    tmp_path: Path,
+    stub_lifecycle,
+) -> None:
+    """The staging default is the strict one, and this is what proves it.
+
+    Every other test in this file overrides ``leaf_contract_staging``, so
+    the refusing default the port exports — the one a deployment that
+    forgot to wire the real owner actually gets — is exercised nowhere
+    else. Constructed without it, the runner must lose the exchange
+    rather than open a pair whose Reviewer has no admitted scope (#399).
+    """
+    calls: list[dict[str, Any]] = []
+
+    def _fake_inner(**kwargs):
+        calls.append(kwargs)
+        return _canned_outcome(kwargs["exchange_run"])
+
+    monkeypatch.setattr(prer, "run_persistent_session_exchange", _fake_inner)
+    runner = prer.PersistentReviewExchangeRunner(
+        MagicMock(name="session_output"),
+        MagicMock(name="pair_registry"),
+        _identity_store(tmp_path),
+        _review_verdict_store(tmp_path),
+    )
+
+    with pytest.raises(LeafContractUnavailable, match="no admitted leaf contract"):
+        _run(runner, tmp_path)
+
+    # Refused before the pair opened: no inner exchange ran, so no agent
+    # was ever prompted without a contract.
+    assert calls == []

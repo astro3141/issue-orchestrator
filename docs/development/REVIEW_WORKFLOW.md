@@ -207,7 +207,7 @@ contract withheld. Reviewers set it with `exchange-respond changes_requested
 | Terminal | `stopped` / `reviewer_scope_conflict` |
 | Decided by | `ReviewerRoundTerminals.for_round`, ahead of every rework branch |
 | Coder rounds run | none — the mutation never happens |
-| Authority granted | none: no approval, no verdict binding, no publication |
+| Authority granted | none: no approval, no publication — the verdict it binds is `changes_requested` |
 | Resume decision | `REUSE_HALT` at the same head; `IGNORE_STALE` once the branch moves |
 
 Its reason is its own for the same kind of argument the coder escalation's is:

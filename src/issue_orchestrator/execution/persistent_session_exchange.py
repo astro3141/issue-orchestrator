@@ -88,7 +88,6 @@ from ..domain.review_exchange_coder_principal import (
     EXCHANGE_CODER_PRINCIPAL_ENV_SUFFIX,
     ReviewExchangeCoderPrincipal,
 )
-from ..domain.review_exchange_contract import StagedLeafContract
 from ..domain.review_exchange_escalation import CoderEscalation
 from ..domain.review_exchange_resume import is_no_completion_reason
 from ..domain.review_exchange_turn import (
@@ -589,10 +588,9 @@ def run_persistent_session_exchange(  # noqa: PLR0913
     # admitted contract it is reviewing against has nothing to authorize, so
     # it must not spend a round finding that out (#399 R4). Raising here
     # precedes the pair spawn, so no agent is ever prompted without one.
-    staged_leaf_contract = load_staged_leaf_contract(run_assets)
     prompt_files = ReviewExchangePromptFiles(
         validation_record=run_validation_record_path,
-        leaf_contract=staged_leaf_contract,
+        leaf_contract=load_staged_leaf_contract(run_assets),
     )
     pair_validation = PairValidationMirror(
         pair_dir=pair_dir,
@@ -850,7 +848,6 @@ def run_persistent_session_exchange(  # noqa: PLR0913
                 coder_completion_path=pair.coder_completion_path,
                 validation_record_path=pair.validation_record_path,
                 prompt_files=prompt_files,
-                leaf_contract=staged_leaf_contract,
                 pair_validation=pair_validation,
                 turn_evidence=turn_evidence,
                 coder_timeout_seconds=coder_agent.timeout_minutes * 60,
@@ -1747,15 +1744,16 @@ class _DriveRoundsCommand:
     coder_completion_path: Path
     validation_record_path: Path
     prompt_files: ReviewExchangePromptFiles
-    leaf_contract: StagedLeafContract
-    """The admitted contract this exchange reviews against (#399).
+    """Every file dependency the round's prompts name, the admitted leaf
+    contract among them (#399).
 
-    Required here, and the same object ``prompt_files.leaf_contract``
-    holds. The packet field stays optional so a historical packet still
-    parses on replay; an active round is not a historical one, and this
-    is where that difference is a *type* rather than another runtime
-    check of a rule the exchange already enforced when it loaded the
-    artifact.
+    The contract is carried here and nowhere else on this command. A
+    second field holding it would let the round loop verify one contract
+    while the two agents were prompted with another — the exact
+    divergence this exchange exists to close — so the round loop asks
+    ``prompt_files.require_leaf_contract`` for it, the same accessor the
+    prompt builders ask. The field is optional for replay's sake and the
+    accessor is where that optionality ends.
     """
     pair_validation: PairValidationMirror
     turn_evidence: ExchangeTurnEvidence
@@ -1800,6 +1798,14 @@ def _drive_rounds(command: _DriveRoundsCommand) -> ReviewExchangeOutcome:
     coder_completion_path = command.coder_completion_path
     validation_record_path = command.validation_record_path
     prompt_files = command.prompt_files
+    # The one contract this loop and both roles' prompts are bound to,
+    # read from the object the prompts themselves carry (#399). Asking
+    # here rather than per round makes an active round's requirement a
+    # type: everything below holds a ``StagedLeafContract``, not an
+    # optional one.
+    leaf_contract = prompt_files.require_leaf_contract(
+        "the review-exchange round loop"
+    )
     pair_validation = command.pair_validation
     coder_timeout_seconds = command.coder_timeout_seconds
     reviewer_timeout_seconds = command.reviewer_timeout_seconds
@@ -1855,7 +1861,7 @@ def _drive_rounds(command: _DriveRoundsCommand) -> ReviewExchangeOutcome:
         # round 3 reviewing the same one — unless someone checks. Raising
         # here fails the exchange closed through the same handler that
         # catches every other round-loop failure.
-        verify_staged_leaf_contract(command.leaf_contract)
+        verify_staged_leaf_contract(leaf_contract)
         reviewer_packet = ReviewExchangeTurnPacket(
             issue_number=issue_number,
             issue_title=issue_title,

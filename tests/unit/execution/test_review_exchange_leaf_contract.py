@@ -25,6 +25,10 @@ from issue_orchestrator.execution.review_exchange_leaf_contract import (
     stage_leaf_contract,
     verify_staged_leaf_contract,
 )
+from issue_orchestrator.ports.review_exchange_leaf_contract import (
+    UNSTAGEABLE_ADMITTED_LEAF_CONTRACT,
+    UnstageableAdmittedLeafContract,
+)
 
 BODY = "## Admitted mutation\n\nChange exactly `src/only_this_file.py`.\n"
 
@@ -171,3 +175,38 @@ class TestTheRunAssetsOwnOneStablePath:
         assert assets.leaf_contract_path.parent == assets.exchange_dir
         assert assets.leaf_contract_manifest_path.parent == assets.exchange_dir
         assert assets.leaf_contract_path.name == "issue-contract.md"
+
+
+class TestTheUnwiredDefaultRefuses:
+    """The port's default owner, which every unwired deployment gets.
+
+    ``UNSTAGEABLE_ADMITTED_LEAF_CONTRACT`` is what makes the staging
+    argument safe to default: a root that forgot to wire the real one
+    loses the exchange instead of running a Reviewer with no admitted
+    scope. That is a code path like any other, and an untested
+    fail-closed guarantee is an unproven one.
+    """
+
+    def test_it_stages_nothing_and_names_the_issue_it_could_not_prove(
+        self, tmp_path: Path
+    ) -> None:
+        assets = _assets(tmp_path)
+
+        with pytest.raises(LeafContractUnavailable, match="#399") as excinfo:
+            UNSTAGEABLE_ADMITTED_LEAF_CONTRACT.stage(
+                issue_number=399,
+                assets=assets,
+            )
+
+        assert "no admitted leaf contract staging is wired" in excinfo.value.reason
+        assert not assets.leaf_contract_path.exists()
+        assert not assets.leaf_contract_manifest_path.exists()
+
+    def test_the_module_default_is_the_refusing_owner(self) -> None:
+        # Not merely *a* refusing object: the exported singleton the
+        # runner defaults to has to be this class, or the default the
+        # composition roots rely on is something else.
+        assert isinstance(
+            UNSTAGEABLE_ADMITTED_LEAF_CONTRACT,
+            UnstageableAdmittedLeafContract,
+        )
