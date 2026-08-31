@@ -26,8 +26,17 @@ different facts about different flavors and are both stated below:
 
 This module is the single owner of that discrimination, and it owns exactly
 one question: *given the owner-injected managed-run context, does this
-completion run the code-candidate quick gate?* It answers from the launch-time
-assignment staged in that run's own directory, and from nothing else.
+completion run the code-candidate quick gate?* It answers from two owner-injected
+signals and from nothing else: the launch-time assignment staged in that run's
+own directory, and the principal the launcher declared for a review-exchange
+coder side (#388).
+
+The second exists because the first cannot reach that lane. A review-exchange
+coder run's directory belongs to the *exchange*, not to the tech-lead launch
+that staged an assignment, so a Tech Lead reworking its own candidate inside the
+exchange would read as an ordinary Actor and run the very gate #370 took away
+from it — the sharper form of the same cross-path drift #385 repaired between
+the completion gate and the protocol document.
 
 **Nothing is skipped, only reassigned.** A Tech Lead run that does offer a
 change for review still meets the repository's validation contract — through
@@ -41,8 +50,13 @@ REPOSITORY_VALIDATION`. Neither owner is the model session.
 
 **The answer is a routing hint, and the boundary is deliberate.** The
 assignment copy lives inside the agent-writable worktree, so an agent could
-rewrite it. What it can buy by doing so is bounded to *skipping its own quick
-gate* — a gate whose only product is fast feedback to that same agent. It buys
+rewrite it; the principal declaration is an environment variable the launcher
+exports, so an agent could re-export it to the ``coding-done`` it spawns. What
+either can buy is bounded to *skipping its own quick gate* — a gate whose only
+product is fast feedback to that same agent. On the exchange lane it is worse
+than useless to the forger: skipping the gate writes no
+``validation-record.json``, and the round is then refused for the missing
+evidence the Actor lane still requires. It buys
 no publication, no label, no zero-code settlement and no effect: those keep
 reading the orchestrator-owned :class:`~...domain.tech_lead_session.TechLeadLaunchAuthority`
 record persisted outside the worktree, plus the orchestrator's own observation
@@ -68,6 +82,7 @@ from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 
+from ..domain.review_exchange_coder_principal import ReviewExchangeCoderPrincipal
 from ..domain.tech_lead_session import (
     TechLeadSessionFlavor,
     read_run_assignment,
@@ -119,8 +134,12 @@ def _ordinary(reason: str) -> CompletionGateRouting:
     )
 
 
-def route_completion_gate(run_dir: Path | None) -> CompletionGateRouting:
-    """Route one completion from its owner-injected managed-run directory.
+def route_completion_gate(
+    run_dir: Path | None,
+    *,
+    exchange_coder: ReviewExchangeCoderPrincipal = ReviewExchangeCoderPrincipal.ACTOR,
+) -> CompletionGateRouting:
+    """Route one completion from its owner-injected managed-run context.
 
     Args:
         run_dir: The run directory the session owner injected, already proven
@@ -128,11 +147,28 @@ def route_completion_gate(run_dir: Path | None) -> CompletionGateRouting:
             standalone invocation, and for a managed run whose injected
             context did not prove out — the caller does not get to hand over
             a directory it merely found.
+        exchange_coder: Who the launch owner declared is sitting on the review
+            exchange's coder side (#388). Asked FIRST, and before the run
+            directory is read at all, because a review-exchange coder run
+            stages no tech-lead assignment: its run directory belongs to the
+            exchange, not to the tech-lead launch that staged one. Defaults to
+            ``ACTOR``, the fail-safe direction — an undeclared principal runs
+            the ordinary gate.
 
     Returns:
         The route, never an exception: every unreadable, absent or ambiguous
         signal resolves to the ordinary candidate quick gate.
     """
+    if not exchange_coder.files_its_own_turn_validation:
+        return CompletionGateRouting(
+            route=CompletionGateRoute.TECH_LEAD_ORCHESTRATOR_OWNED_VALIDATION,
+            reason=(
+                "the review-exchange coder side was launched for the"
+                f" {exchange_coder.value} principal, whose mandatory repository"
+                " validation is executed by the orchestrator outside the"
+                " model-provider sandbox, not by this session"
+            ),
+        )
     if run_dir is None:
         return _ordinary("no owner-injected managed-run context")
     try:

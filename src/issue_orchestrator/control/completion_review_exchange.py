@@ -30,6 +30,7 @@ from .review_exchange_cache_resolution import (
 )
 from .review_exchange_contracts import ReviewExchangeCanceller
 from .review_publish_pipeline import resolve_review_publish_pipeline
+from .tech_lead_session_policy import review_exchange_coder_principal
 
 
 if TYPE_CHECKING:
@@ -1360,6 +1361,14 @@ class CompletionReviewExchange:
             # deployment. The completion owner that has no coder to rework with
             # says so per exchange (#180); every other caller reworks in place.
             rework=rework,
+            # Whose completion contract the coder SIDE runs under (#388).
+            # Decided here because this is where ``coder_label = agent_label``
+            # is decided, and answered by the one owner of tech-lead identity —
+            # a launcher-local conditional would be a second place the role is
+            # settled, which is the drift #385 removed from the coding lane.
+            coder_principal=review_exchange_coder_principal(
+                self._config.tech_lead_review_agent, coder_label
+            ),
             nit_policy=nit_policy,
             initial_validation_record_path=initial_validation_record_path,
             approval_gate=approval_gate,

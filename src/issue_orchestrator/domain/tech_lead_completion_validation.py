@@ -21,7 +21,10 @@ instance names the run, the session and the commit it was taken on, and
 :meth:`TechLeadCompletionValidation.binds_to` is the only way to ask whether it
 describes the completion in hand. Evidence for another candidate, another run,
 or a head that has since moved answers ``False`` — it does not answer "close
-enough".
+enough". :meth:`TechLeadCompletionValidation.refusal_against` is that question
+and the status question asked together, as a
+:class:`TrustedVerdictRefusal` naming which one said no, so the two lanes gated
+on a trusted verdict (#385, #388) cannot come to ask them differently.
 
 **Every not-PASSED status is a distinct recorded fact.** A gate that failed, a
 gate that timed out, and a gate whose result could not be produced or read at
@@ -42,6 +45,7 @@ __all__ = [
     "TECH_LEAD_COMPLETION_VALIDATION_SCHEMA",
     "TechLeadCompletionValidation",
     "TechLeadCompletionValidationStatus",
+    "TrustedVerdictRefusal",
 ]
 
 #: Version stamped on the persisted payload. A reader that does not recognise a
@@ -74,6 +78,26 @@ class TechLeadCompletionValidationStatus(Enum):
     def permits_completion(self) -> bool:
         """Whether a Tech Lead completion may settle terminally on this."""
         return self is TechLeadCompletionValidationStatus.PASSED
+
+
+@dataclass(frozen=True, slots=True)
+class TrustedVerdictRefusal:
+    """Why a trusted verdict may not be settled on, in two named parts.
+
+    ``failure`` is the machine-facing cause; ``detail`` is the sentence an
+    operator reads. Kept separate because the callers that ask for a trusted
+    verdict surface them differently — the Tech Lead completion gate tags them
+    into the error string its terminal-effects path parses back (#385), while
+    the review exchange turns them into the round's protocol error (#388) — and
+    neither should have to take the other's shape apart.
+
+    A value object with no I/O, beside the evidence it describes, so "this
+    evidence is not usable for that completion" can be constructed and compared
+    without any layer having to agree on where either lives.
+    """
+
+    failure: str
+    detail: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -127,6 +151,47 @@ class TechLeadCompletionValidation:
             self.run_id == run_id
             and self.session_name == session_name
             and self.candidate_head_sha == candidate_head_sha
+        )
+
+    def refusal_against(
+        self, *, run_id: str, session_name: str, candidate_head_sha: str
+    ) -> "TrustedVerdictRefusal | None":
+        """Why this evidence cannot settle that completion, or ``None``.
+
+        The two questions every caller of a trusted verdict has to ask about
+        one, in the order that keeps them distinguishable: does it describe
+        THIS candidate at all, and does it permit settling. They stay two
+        answers because their remedies differ — a drifted binding means the
+        candidate moved, a non-passing status means the check said no — and an
+        operator who cannot tell them apart cannot tell which to go fix.
+
+        Owned here, beside :meth:`binds_to` and :attr:`permits_completion`,
+        because it is the same rule those two state, asked once instead of
+        re-assembled at each caller.
+        """
+        if not self.binds_to(
+            run_id=run_id,
+            session_name=session_name,
+            candidate_head_sha=candidate_head_sha,
+        ):
+            return TrustedVerdictRefusal(
+                failure="candidate_drift",
+                detail=(
+                    "the trusted completion validation is bound to"
+                    f" {self.run_id}/{self.session_name}@"
+                    f"{self.candidate_head_sha}, not to the"
+                    f" {run_id}/{session_name}@{candidate_head_sha} this"
+                    " completion settles"
+                ),
+            )
+        if self.permits_completion:
+            return None
+        return TrustedVerdictRefusal(
+            failure=f"validation_{self.status.value}",
+            detail=(
+                f"the trusted completion validation for {run_id}/{session_name}@"
+                f"{candidate_head_sha} did not pass: {self.detail}"
+            ),
         )
 
     def to_payload(self) -> dict[str, Any]:

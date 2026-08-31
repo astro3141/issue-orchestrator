@@ -13,6 +13,14 @@ handed — ``control/tech_lead_session_policy.coding_lane_task_kind`` — since 
 three launch sites are only as correct as the answer they ask it for. The
 end-to-end direction, that each launcher actually hands a tech-lead session this
 document, lives in ``tests/unit/test_session_launcher.py``.
+
+#388 closes the one lane #385 left open, on the same shape: the review
+exchange's coder SIDE is a position in the protocol, so
+``review_exchange_coder_principal`` names the authority sitting in it, and that
+one value selects the document, the sandbox role, and whether ``coding-done``
+runs the host-mutating quick gate. Who files the round's validation evidence —
+the other half, which a document swap alone would not have moved — is pinned in
+``tests/unit/execution/test_review_exchange_turn_validation.py``.
 """
 
 from __future__ import annotations
@@ -21,13 +29,31 @@ from pathlib import Path
 
 import pytest
 
+from issue_orchestrator.control.completion_gate_routing import (
+    CompletionGateRoute,
+    route_completion_gate,
+)
 from issue_orchestrator.control.tech_lead_session_policy import (
     coding_lane_task_kind,
+    review_exchange_coder_principal,
 )
+from issue_orchestrator.domain.review_exchange_coder_principal import (
+    ReviewExchangeCoderPrincipal,
+)
+from issue_orchestrator.domain.sandbox_scope import (
+    REVIEW_EXCHANGE_CODER_TASK_KIND,
+    REVIEW_EXCHANGE_TECH_LEAD_TASK_KIND,
+    SandboxRole,
+    SandboxScopeContext,
+    compute_session_scope,
+)
+from issue_orchestrator.domain.models import AgentConfig
 from issue_orchestrator.domain.session_key import TaskKind
 from issue_orchestrator.resources import (
     get_coding_done_instructions,
     get_completion_instructions,
+    get_review_exchange_coder_instructions,
+    get_review_exchange_tech_lead_instructions,
     get_reviewer_done_instructions,
     get_tech_lead_done_instructions,
 )
@@ -238,3 +264,164 @@ class TestNoTechLeadPromptReintroducesTheCommand:
     def test_shipped_tech_lead_prompts_do_not_issue_it(self, variant: str) -> None:
         """A task prompt is the other place the obligation could creep back."""
         assert PREPUSH_IMPERATIVE not in _tech_lead_prompt_variants()[variant]
+
+
+class TestTheReviewExchangeCoderLaneOwner:
+    """The exchange's coder SIDE is a position; the principal is the authority.
+
+    #385 left this lane deliberately unrepaired and wrote the reachability down
+    as a known gap: a completion that offers a change for review starts an
+    exchange with ``coder_label = agent_label``, and a tech-lead agent resolves
+    a reviewer like any other, so a code-bearing Tech Lead really does sit on
+    the coder side. #388 makes the lane ask WHO is sitting there.
+    """
+
+    def test_the_tech_lead_agent_is_the_tech_lead_principal_on_that_side(
+        self,
+    ) -> None:
+        assert review_exchange_coder_principal("agent:tech-lead", "agent:tech-lead") is (
+            ReviewExchangeCoderPrincipal.TECH_LEAD
+        )
+
+    def test_every_other_agent_is_an_actor_there(self) -> None:
+        assert review_exchange_coder_principal("agent:tech-lead", "agent:web") is (
+            ReviewExchangeCoderPrincipal.ACTOR
+        )
+
+    def test_an_unconfigured_tech_lead_agent_never_claims_the_side(self) -> None:
+        assert review_exchange_coder_principal(None, "agent:tech-lead") is (
+            ReviewExchangeCoderPrincipal.ACTOR
+        )
+
+    def test_the_principal_selects_the_document_that_side_is_handed(self) -> None:
+        """One value, both consequences — they cannot be taken separately."""
+        tech_lead = ReviewExchangeCoderPrincipal.TECH_LEAD
+        actor = ReviewExchangeCoderPrincipal.ACTOR
+
+        assert get_completion_instructions(tech_lead.task_kind) == (
+            get_review_exchange_tech_lead_instructions()
+        )
+        assert get_completion_instructions(actor.task_kind) == (
+            get_review_exchange_coder_instructions()
+        )
+
+    def test_the_actor_side_keeps_its_own_task_kind(self) -> None:
+        """F5: nothing about the ordinary exchange coder lane moves."""
+        assert ReviewExchangeCoderPrincipal.ACTOR.task_kind == (
+            REVIEW_EXCHANGE_CODER_TASK_KIND
+        )
+        assert ReviewExchangeCoderPrincipal.TECH_LEAD.task_kind == (
+            REVIEW_EXCHANGE_TECH_LEAD_TASK_KIND
+        )
+
+    def test_only_the_actor_files_its_own_turn_validation(self) -> None:
+        assert ReviewExchangeCoderPrincipal.ACTOR.files_its_own_turn_validation
+        assert not (
+            ReviewExchangeCoderPrincipal.TECH_LEAD.files_its_own_turn_validation
+        )
+
+    def test_an_undeclared_or_unknown_principal_reads_back_as_the_actor(
+        self,
+    ) -> None:
+        """Fail-safe: only the exact recorded value moves a lane's ownership."""
+        for raw in (None, "", "   ", "tech lead", "TECH_LEAD", "nonsense"):
+            assert ReviewExchangeCoderPrincipal.declared(raw) is (
+                ReviewExchangeCoderPrincipal.ACTOR
+            )
+        assert ReviewExchangeCoderPrincipal.declared(" tech_lead ") is (
+            ReviewExchangeCoderPrincipal.TECH_LEAD
+        )
+
+
+class TestTheExchangeTechLeadDocument:
+    def test_it_never_issues_the_host_mutating_command(self) -> None:
+        assert PREPUSH_IMPERATIVE not in get_review_exchange_tech_lead_instructions()
+
+    def test_it_says_who_owns_the_validation_instead(self) -> None:
+        exchange = _flowed(get_review_exchange_tech_lead_instructions())
+
+        assert "Do not run `prepush-check`" in exchange
+        assert "the orchestrator executes the mandatory completion validation" in (
+            exchange
+        )
+
+    def test_it_is_still_the_exchange_protocol(self) -> None:
+        """Same two steps; only the validation owner differs."""
+        exchange = get_review_exchange_tech_lead_instructions()
+
+        assert "coding-done completed" in exchange
+        assert "exchange-respond ok" in exchange
+        assert "coding-done needs_human" in exchange
+        assert "coder_escalated_to_human" in exchange
+
+    def test_it_is_none_of_the_other_completion_documents(self) -> None:
+        exchange = get_review_exchange_tech_lead_instructions()
+
+        assert exchange != get_review_exchange_coder_instructions()
+        assert exchange != get_tech_lead_done_instructions()
+        assert exchange != get_coding_done_instructions()
+        assert exchange != get_reviewer_done_instructions()
+
+    def test_the_actor_exchange_document_still_issues_the_command(self) -> None:
+        """F5: the Actor lane's contract is untouched."""
+        assert PREPUSH_IMPERATIVE in get_review_exchange_coder_instructions()
+
+
+class TestTheExchangeTechLeadSandboxRole:
+    def test_the_side_resolves_to_the_tech_lead_sandbox_role(self) -> None:
+        scope = compute_session_scope(
+            AgentConfig(prompt_path=Path("prompt.md"), sandbox=True),
+            SandboxScopeContext(
+                task_kind=REVIEW_EXCHANGE_TECH_LEAD_TASK_KIND,
+                worktree=Path("/tmp/wt"),
+            ),
+        )
+        actor_scope = compute_session_scope(
+            AgentConfig(prompt_path=Path("prompt.md"), sandbox=True),
+            SandboxScopeContext(
+                task_kind=REVIEW_EXCHANGE_CODER_TASK_KIND,
+                worktree=Path("/tmp/wt"),
+            ),
+        )
+
+        # No authority widening: the computed scope is the coder's, byte for
+        # byte. What the role buys is the completion protocol, not reach.
+        assert scope == actor_scope
+        assert SandboxRole.TECH_LEAD.value == "tech-lead"
+
+
+class TestTheExchangeLaneRoutesItsOwnCompletionGate:
+    """F2: the model runs no host-mutating gate merely by being on this lane."""
+
+    def test_a_declared_tech_lead_principal_routes_validation_to_the_orchestrator(
+        self, tmp_path: Path
+    ) -> None:
+        routing = route_completion_gate(
+            tmp_path,
+            exchange_coder=ReviewExchangeCoderPrincipal.TECH_LEAD,
+        )
+
+        assert routing.route is (
+            CompletionGateRoute.TECH_LEAD_ORCHESTRATOR_OWNED_VALIDATION
+        )
+        assert not routing.runs_candidate_quick_gate
+
+    def test_it_is_answered_before_the_run_directory_is_read(self) -> None:
+        """The exchange run stages no tech-lead assignment to be found."""
+        routing = route_completion_gate(
+            None, exchange_coder=ReviewExchangeCoderPrincipal.TECH_LEAD
+        )
+
+        assert not routing.runs_candidate_quick_gate
+
+    def test_an_actor_on_the_same_lane_still_runs_its_own_gate(
+        self, tmp_path: Path
+    ) -> None:
+        routing = route_completion_gate(
+            tmp_path, exchange_coder=ReviewExchangeCoderPrincipal.ACTOR
+        )
+
+        assert routing.route is CompletionGateRoute.CANDIDATE_QUICK_GATE
+
+    def test_the_undeclared_default_is_the_ordinary_gate(self, tmp_path: Path) -> None:
+        assert route_completion_gate(tmp_path).runs_candidate_quick_gate

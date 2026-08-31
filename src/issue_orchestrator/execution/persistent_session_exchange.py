@@ -84,6 +84,10 @@ from ..domain.review_artifacts import (
     persist_review_artifact_pair,
     review_requires_nit_rework,
 )
+from ..domain.review_exchange_coder_principal import (
+    EXCHANGE_CODER_PRINCIPAL_ENV_SUFFIX,
+    ReviewExchangeCoderPrincipal,
+)
 from ..domain.review_exchange_escalation import CoderEscalation
 from ..domain.review_exchange_resume import is_no_completion_reason
 from ..domain.review_exchange_turn import (
@@ -106,6 +110,7 @@ from .review_exchange_coder_turn import (
     read_coder_turn,
 )
 from .review_exchange_records import write_exchange_summary
+from .review_exchange_turn_validation import ExchangeTurnEvidence, build_turn_evidence
 from .review_exchange_terminals import (
     ReviewerRoundTerminals,
     complete_with_reviewer_decision,
@@ -127,6 +132,10 @@ from ..ports import (
 )
 from ..ports.session_output import SessionOutput
 from ..ports.review_exchange_approval_gate import ReviewExchangeApprovalGate
+from ..control.tech_lead_completion_validation import (
+    UNWIRED_TECH_LEAD_COMPLETION_VALIDATOR,
+)
+from ..ports.tech_lead_completion_validation import TechLeadCompletionValidator
 from .persistent_exchange_pair_registry_inmemory import (
     InMemoryPersistentExchangePairRegistry,
     PersistentExchangePair,
@@ -432,6 +441,19 @@ def run_persistent_session_exchange(  # noqa: PLR0913
     # it serves is the several dozen direct test call sites that never enter
     # the handoff at all.
     rework: ReviewExchangeRework = ReviewExchangeRework.IN_EXCHANGE,
+    # The coder SIDE is a position in the protocol; the principal is the
+    # authority sitting in it (#388). Defaulted for the same reason ``rework``
+    # is — the production caller's port makes it required, and the several
+    # dozen direct test call sites drive the Actor lane this repository's own
+    # configuration runs — and the default is the one that changes nothing.
+    coder_principal: ReviewExchangeCoderPrincipal = ReviewExchangeCoderPrincipal.ACTOR,
+    # Only ever asked when ``coder_principal`` is one that does not file its
+    # own turn validation. Its default refuses every verdict, so a deployment
+    # that forgot to wire the trusted owner loses a Tech Lead lane's round
+    # rather than passing it unvalidated.
+    tech_lead_completion_validator: TechLeadCompletionValidator = (
+        UNWIRED_TECH_LEAD_COMPLETION_VALIDATOR
+    ),
     nit_policy: str = "surface",
     initial_validation_record_path: Path | None = None,
     approval_gate: ReviewExchangeApprovalGate | None = None,
@@ -564,7 +586,23 @@ def run_persistent_session_exchange(  # noqa: PLR0913
         coder_worktree_path=coder_worktree_path,
         run_record_path=run_validation_record_path,
     )
-    pair_validation.replace_from_initial(initial_validation_record_path)
+    # Who files this exchange's validation evidence — settled once, here, from
+    # the same principal that selects the coder side's completion protocol, so
+    # the document the session holds and the artifact the round demands cannot
+    # disagree (#388). It owns the opening evidence too: the reviewer moves
+    # first and its approval is gated on the pair's record, so a lane whose
+    # completing session files none must not open with nothing.
+    turn_evidence = build_turn_evidence(
+        coder_principal,
+        mirror=pair_validation,
+        run_validation_record_path=run_validation_record_path,
+        validator=tech_lead_completion_validator,
+        run_id=run_id,
+        session_name=session_name,
+        coder_worktree=coder_worktree_path,
+        validation_profile=exchange_run.validation_profile,
+    )
+    turn_evidence.seed(initial_validation_record_path)
 
     def _spawn_pair() -> PersistentExchangePair:
         # Cache miss: this is the first exchange for the issue (or the
@@ -598,6 +636,7 @@ def run_persistent_session_exchange(  # noqa: PLR0913
             session_name=session_name,
             response_channel=effective_response_channels.for_role(Role.CODER),
             validation_profile=exchange_run.validation_profile,
+            coder_principal=coder_principal,
         )
         coder = _open_role_session_from_spec(coder_spec)
         # Reviewer-spawn-after-coder-success is the canonical
@@ -630,6 +669,7 @@ def run_persistent_session_exchange(  # noqa: PLR0913
                 session_name=session_name,
                 response_channel=effective_response_channels.for_role(Role.REVIEWER),
                 validation_profile=exchange_run.validation_profile,
+                coder_principal=coder_principal,
             )
             reviewer = _open_role_session_from_spec(reviewer_spec)
         except BaseException:
@@ -721,6 +761,7 @@ def run_persistent_session_exchange(  # noqa: PLR0913
             session_name=session_name,
             response_channel=effective_response_channels.for_role(Role.CODER),
             validation_profile=exchange_run.validation_profile,
+            coder_principal=coder_principal,
         ),
         slice_path=coder_session_slice,
     )
@@ -744,6 +785,7 @@ def run_persistent_session_exchange(  # noqa: PLR0913
             session_name=session_name,
             response_channel=effective_response_channels.for_role(Role.REVIEWER),
             validation_profile=exchange_run.validation_profile,
+            coder_principal=coder_principal,
         ),
         slice_path=reviewer_session_slice,
     )
@@ -797,6 +839,7 @@ def run_persistent_session_exchange(  # noqa: PLR0913
                     validation_record=run_validation_record_path,
                 ),
                 pair_validation=pair_validation,
+                turn_evidence=turn_evidence,
                 coder_timeout_seconds=coder_agent.timeout_minutes * 60,
                 reviewer_timeout_seconds=reviewer_agent.timeout_minutes * 60,
                 max_rounds=max_rounds,
@@ -875,6 +918,27 @@ class _RoleSessionSpec:
     the run manifest already records the choice, and a second resolution at
     spawn time is exactly the cross-path drift #7059 exists to remove.
     """
+    coder_principal: ReviewExchangeCoderPrincipal
+    """Who is sitting on the coder side of this exchange (#388).
+
+    Required on both role specs and consulted on neither but the coder's: the
+    reviewer's authority is not in question, and asking a reviewer spec for it
+    answers nothing. It is a required field rather than a defaulted one because
+    the alternative — a default that silently means ACTOR — is how a spec built
+    for a Tech Lead lane would launch it as a coder.
+    """
+
+    def task_kind(self) -> str:
+        """The task kind this role launches under.
+
+        The coder SIDE asks the principal, because the side is a position in
+        the protocol and the principal is the authority (#388): a Tech Lead
+        occupying it is handed its own completion protocol and resolves to its
+        own sandbox role. Every other role is named by the lane alone.
+        """
+        if self.role is Role.CODER:
+            return self.coder_principal.task_kind
+        return f"review_exchange_{self.role.value}"
 
 
 @dataclass
@@ -1085,7 +1149,7 @@ def _open_role_session(spec: _RoleSessionSpec) -> PersistentSession:
         issue_number=issue_number,
         issue_title=issue_title,
         worktree=worktree,
-        task_kind=f"review_exchange_{role}",
+        task_kind=spec.task_kind(),
     )
     import shlex
 
@@ -1096,6 +1160,7 @@ def _open_role_session(spec: _RoleSessionSpec) -> PersistentSession:
     validation_output_dir.mkdir(parents=True, exist_ok=True)
     env = _build_role_env(
         role=role,
+        coder_principal=spec.coder_principal,
         response_file=response_file,
         review_report_file=review_report_file,
         completion_path=completion_path,
@@ -1132,6 +1197,7 @@ def _open_role_session(spec: _RoleSessionSpec) -> PersistentSession:
 def _build_role_env(
     *,
     role: str,
+    coder_principal: ReviewExchangeCoderPrincipal,
     response_file: Path,
     review_report_file: Path | None,
     completion_path: Path,
@@ -1184,6 +1250,14 @@ def _build_role_env(
     if role == Role.CODER.value:
         overrides[f"{ENV_PREFIX}VALIDATION_OUTPUT_DIR"] = str(validation_output_dir)
         overrides[f"{ENV_PREFIX}RUN_DIR"] = str(validation_output_dir)
+        # The launch owner's statement of whose completion contract this side
+        # runs under (#388). ``coding-done`` reads it back to route its own
+        # gate, because the exchange run directory carries no tech-lead
+        # assignment for the routing owner to read: this run belongs to the
+        # exchange, not to the tech-lead launch that staged one.
+        overrides[f"{ENV_PREFIX}{EXCHANGE_CODER_PRINCIPAL_ENV_SUFFIX}"] = (
+            coder_principal.value
+        )
     if review_report_file is not None:
         review_report_file.parent.mkdir(parents=True, exist_ok=True)
         overrides[f"{ENV_PREFIX}REVIEW_REPORT_FILE"] = str(review_report_file)
@@ -1661,6 +1735,7 @@ class _DriveRoundsCommand:
     validation_record_path: Path
     prompt_files: ReviewExchangePromptFiles
     pair_validation: PairValidationMirror
+    turn_evidence: ExchangeTurnEvidence
     coder_timeout_seconds: float
     reviewer_timeout_seconds: float
     max_rounds: int
@@ -2055,6 +2130,7 @@ def _drive_rounds(command: _DriveRoundsCommand) -> ReviewExchangeOutcome:
                 coder_completion_path=coder_completion_path,
                 validation_record_path=validation_record_path,
                 pair_validation=pair_validation,
+                turn_evidence=command.turn_evidence,
                 run_assets=run_assets,
                 coder_timeout_seconds=coder_timeout_seconds,
                 require_validation=require_validation,
@@ -2130,6 +2206,7 @@ class _CoderProtocolCommand:
     coder_completion_path: Path
     validation_record_path: Path
     pair_validation: PairValidationMirror
+    turn_evidence: ExchangeTurnEvidence
     run_assets: ReviewExchangeRunAssets
     coder_timeout_seconds: float
     require_validation: bool
@@ -2211,7 +2288,7 @@ def _enforce_coder_protocol(
     read_command = CoderTurnRead(
         completion_path=coder_completion_path,
         pair_validation=pair_validation,
-        run_validation_record_path=run_dir / "validation-record.json",
+        turn_evidence=command.turn_evidence,
         require_validation=require_validation,
         issue_number=issue_number,
         session_name=session_name,

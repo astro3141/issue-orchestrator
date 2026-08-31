@@ -6,7 +6,10 @@ session's name distinguishes them. This module is the single owner for:
 
 - **identity**: what makes a session a tech_lead session (the config-declared
   tech lead agent), consolidating the checks previously duplicated in
-  ``SessionLauncher`` and ``CompletionActionPlanner``;
+  ``SessionLauncher`` and ``CompletionActionPlanner`` — and, asked of the two
+  lanes a tech_lead run can be relaunched on, which role that lane runs it in:
+  the coding lane (:func:`coding_lane_task_kind`, #385) and the review
+  exchange's coder side (:func:`review_exchange_coder_principal`, #388);
 - **launch preparation**: per-flavor session inputs (PR manifest download,
   the agent-visible assignment copy) plus the orchestrator-owned
   :class:`TechLeadLaunchAuthority` record that completion later trusts
@@ -25,6 +28,7 @@ from typing import TYPE_CHECKING
 
 from ..domain.artifact_contracts import AgentProvider
 from ..domain.models import RequestedAction
+from ..domain.review_exchange_coder_principal import ReviewExchangeCoderPrincipal
 from ..domain.session_key import TaskKind
 from ..domain.tech_lead_manifest import TechLeadManifest
 from ..domain.board_snapshot import BOARD_SNAPSHOT_FILENAME, BoardSnapshot
@@ -105,6 +109,36 @@ def coding_lane_task_kind(
     if is_tech_lead_session(tech_lead_review_agent, agent_type):
         return TaskKind.TECH_LEAD.value
     return lane_task_kind.value
+
+
+def review_exchange_coder_principal(
+    tech_lead_review_agent: str | None,
+    agent_type: str | None,
+) -> ReviewExchangeCoderPrincipal:
+    """Who occupies the review exchange's CODER side for this agent (#388).
+
+    The third consequence of :func:`is_tech_lead_session`, and it lives here for
+    the same reason the second one does: a launcher-local conditional would be
+    another place the role is decided, and the two answers would drift.
+
+    The exchange sets ``coder_label = agent_label``
+    (:mod:`.completion_review_exchange`) and ``Config.get_reviewer_for_agent``
+    resolves a reviewer for a tech-lead agent like any other, so a code-bearing
+    Tech Lead genuinely reaches that side. What it must not inherit there is the
+    Actor's completion contract: the lane's protocol document made
+    ``prepush-check --dirty-only -v`` mandatory, and the lane's turn gate
+    required the artifact only that command's ``coding-done`` sibling produces —
+    both of them host/shared-repository effects a bounded Tech Lead sandbox
+    refuses, and both of them already reassigned to a trusted owner on the
+    primary lane by #385.
+
+    The returned principal carries both halves of the answer (which protocol
+    document and sandbox role the side launches under, and who files the round's
+    validation evidence), so a caller cannot take one and forget the other.
+    """
+    if is_tech_lead_session(tech_lead_review_agent, agent_type):
+        return ReviewExchangeCoderPrincipal.TECH_LEAD
+    return ReviewExchangeCoderPrincipal.ACTOR
 
 
 def recover_tech_lead_launch_scope(

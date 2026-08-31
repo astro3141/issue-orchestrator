@@ -22,6 +22,7 @@ from typing import Any
 
 from ..infra.atomic_io import atomic_write_bytes
 from ..infra.repo_identity import get_repo_head_sha
+from ..ports.session_output import ValidationRecord
 
 
 def validation_record_error(
@@ -96,10 +97,40 @@ class PairValidationMirror:
             run_validation_record_path=run_validation_record_path,
         )
         if error is not None:
-            self._clear()
+            self.clear()
             return error
         self._replace_from(source)
         return None
+
+    def publish(self, record: ValidationRecord) -> None:
+        """Put evidence a TRUSTED owner produced into pair scope (#388).
+
+        The other writer copies a file the coder's own ``coding-done`` left
+        behind. This one is handed the value directly, because the owner that
+        produced it runs in the orchestrator's process and has no reason to go
+        through the model's filesystem: on the Tech Lead lane the round's
+        mandatory validation is executed outside the session, so there is no
+        agent-written file to mirror.
+
+        Both land in the same two places and are read by the same freshness
+        contract (:func:`validation_record_error`), so there is exactly one
+        answer to "is the pair's evidence current?" regardless of who filed it.
+        The record's ``suite`` is what says which contract ran.
+        """
+        self._write(
+            json.dumps(record.to_dict(), sort_keys=True, indent=2).encode("utf-8")
+        )
+
+    def clear(self) -> None:
+        """Drop the pair's evidence: nothing current stands for this turn.
+
+        Public because the trusted lane's owner needs it for the same reason
+        the mirror does — a refused verdict must not leave the previous round's
+        passing record in place to be mistaken for this round's.
+        """
+        self.record_path.unlink(missing_ok=True)
+        if self.run_record_path is not None:
+            self.run_record_path.unlink(missing_ok=True)
 
     def observe_candidate_head(self) -> str | None:
         """The commit the *coder worktree* currently holds, or None.
@@ -164,18 +195,15 @@ class PairValidationMirror:
 
     def _replace_from(self, source: Path | None) -> None:
         if source is None or not source.exists():
-            self._clear()
+            self.clear()
             return
+        self._write(source.read_bytes())
+
+    def _write(self, payload: bytes) -> None:
         self.pair_dir.mkdir(parents=True, exist_ok=True)
-        payload = source.read_bytes()
         atomic_write_bytes(self.record_path, payload)
         if self.run_record_path is not None:
             atomic_write_bytes(self.run_record_path, payload)
-
-    def _clear(self) -> None:
-        self.record_path.unlink(missing_ok=True)
-        if self.run_record_path is not None:
-            self.run_record_path.unlink(missing_ok=True)
 
 
 __all__ = ["PairValidationMirror", "validation_record_error"]

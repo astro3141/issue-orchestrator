@@ -189,6 +189,7 @@ def _stub_persistent_review_exchange_setup(monkeypatch, request):
         max_no_progress,
         require_validation,
         rework=ReviewExchangeRework.IN_EXCHANGE,
+        coder_principal=None,  # noqa: ARG001 — the lane's principal (#388)
         initial_validation_record_path=None,
         approval_gate=None,
         web_port=None,  # noqa: ARG001

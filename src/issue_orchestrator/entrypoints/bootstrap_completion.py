@@ -87,6 +87,26 @@ def _validation_attempt_key_factory(
     return _IssueKeyValidationAttemptKeyFactory()
 
 
+def build_tech_lead_completion_validator(
+    config: Config, working_copy: GitWorkingCopy
+) -> TrustedTechLeadCompletionValidator:
+    """The one trusted completion-validation owner, for both lanes gated on it.
+
+    The primary Tech Lead completion (#385) and the Tech Lead side of a review
+    exchange (#388) must not be gated on differently-configured owners, and
+    both composition roots must build the same thing — which is what this
+    factory is for.
+
+    The PRIMARY checkout holds the durable verdicts, never the disposable
+    scratch worktree a focused run is reaped from: evidence a session could
+    write is not evidence about that session.
+    """
+    return TrustedTechLeadCompletionValidator(
+        working_copy=working_copy,
+        repo_root=config.repo_root,
+    )
+
+
 def create_completion_components(
     config: Config,
     github: "CompletionRepositoryPorts | None",
@@ -206,6 +226,10 @@ def create_completion_components(
         repo_root=config.repo_root,
     )
 
+    tech_lead_completion_validator = build_tech_lead_completion_validator(
+        config, working_copy
+    )
+
     completion_processor = CompletionProcessor(
         # The governed shared block is refused here BY VALUE, so an
         # agent-supplied ``pr_labels`` entry cannot mint a cause-free block
@@ -229,6 +253,7 @@ def create_completion_components(
             AttemptReviewVerdictStore(attempt_store),
             turn_mailbox=turn_mailbox,
             coder_prompt_addendum=coder_prompt_addendum,
+            tech_lead_completion_validator=tech_lead_completion_validator,
         ),
         event_bus=None,
         label_config=label_manager.to_label_config_dict(),
@@ -241,15 +266,10 @@ def create_completion_components(
         review_artifact_reader=ManifestReviewArtifactReader(),
         runtime_identity=runtime_identity.resolve_runtime_identity(),
         tech_lead_authority=tech_lead_authority,
-        # The completion protocol's mandatory validation, executed here in the
+        # The completion protocol's mandatory validation, executed in the
         # orchestrator's process instead of inside the Tech Lead model session
-        # (#385). The primary checkout — not the disposable scratch worktree —
-        # holds the durable verdicts, so the evidence outlives the run and no
-        # session can write it.
-        tech_lead_completion_validator=TrustedTechLeadCompletionValidator(
-            working_copy=working_copy,
-            repo_root=config.repo_root,
-        ),
+        # (#385) — the same owner the review-exchange runner above holds.
+        tech_lead_completion_validator=tech_lead_completion_validator,
         needs_human_block=needs_human_block,
         unrecorded_refusals=unrecorded_refusals,
         # The gate's verdict is the last moment the agent's completion record

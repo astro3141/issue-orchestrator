@@ -55,6 +55,10 @@ from ...control.completion_gate_routing import (
     CompletionGateRouting,
     route_completion_gate,
 )
+from ...domain.review_exchange_coder_principal import (
+    EXCHANGE_CODER_PRINCIPAL_ENV_SUFFIX,
+    ReviewExchangeCoderPrincipal,
+)
 from ...domain.session_run import SessionRunAssets
 from ...execution.git_planted_paths import local_repo_owns_planted_cli_tools
 from ...infra.env import get_env
@@ -299,6 +303,20 @@ def resolve_managed_run(
     return resolve_orchestrator_run_assets_for_session(worktree_root, session_id)
 
 
+def resolve_exchange_coder_principal() -> ReviewExchangeCoderPrincipal:
+    """Who the launch owner declared is sitting on the exchange's coder side.
+
+    Read from the session environment the exchange spawned this role with
+    (#388), which is the only place that answer exists: a review-exchange coder
+    run's directory belongs to the exchange, so the tech-lead assignment the
+    primary lane stages is not there to be read. Unset — every non-exchange
+    session — reads back as ``ACTOR``, the fail-safe direction.
+    """
+    return ReviewExchangeCoderPrincipal.declared(
+        get_env(EXCHANGE_CODER_PRINCIPAL_ENV_SUFFIX)
+    )
+
+
 def resolve_completion_gate_routing(
     managed_run: ManagedRunAssets | None,
 ) -> CompletionGateRouting:
@@ -306,8 +324,9 @@ def resolve_completion_gate_routing(
 
     Asked BEFORE the candidate quick contract is read, because reading that
     contract is the first half of running it: a run whose validation is not its
-    own to execute — a planning run, or any Tech Lead run whose mandatory
-    repository validation the orchestrator owns (#370) — that got as far as
+    own to execute — a planning run, any Tech Lead run whose mandatory
+    repository validation the orchestrator owns (#370), or a Tech Lead sitting
+    on the review exchange's coder side (#388) — that got as far as
     ``load_validation_cmd`` has already been handed the command it must not
     execute, and a config error in a gate it will never run would fail it.
 
@@ -318,7 +337,8 @@ def resolve_completion_gate_routing(
     directory is not evidence about this run.
     """
     return route_completion_gate(
-        managed_run.run_dir if managed_run is not None else None
+        managed_run.run_dir if managed_run is not None else None,
+        exchange_coder=resolve_exchange_coder_principal(),
     )
 
 

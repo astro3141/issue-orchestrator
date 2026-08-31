@@ -40,6 +40,7 @@ from ..ports import (
 )
 from .review_exchange_records import record_coder_escalation, write_exchange_summary
 from .review_exchange_terminals import emit_built_event
+from .review_exchange_turn_validation import ExchangeTurnEvidence
 from .review_exchange_validation_mirror import PairValidationMirror
 
 EmitEvent = Callable[[EventName, dict[str, Any]], None]
@@ -72,7 +73,7 @@ class CoderTurnRead:
 
     completion_path: Path
     pair_validation: PairValidationMirror
-    run_validation_record_path: Path
+    turn_evidence: ExchangeTurnEvidence
     require_validation: bool
     issue_number: int
     session_name: str
@@ -93,8 +94,10 @@ def read_coder_turn(command: CoderTurnRead) -> CoderTurnDisposition:
 
     * an ordinary turn, and an escalation that offers a change for review in
       the same breath, must present a passing validation record naming current
-      HEAD when ``require_validation`` is on. Escalating grants no publication
-      authority, so asking for both keeps every publication prerequisite;
+      HEAD when ``require_validation`` is on — whoever the lane's principal
+      makes responsible for producing it (#388). Escalating grants no
+      publication authority, so asking for both keeps every publication
+      prerequisite;
     * an escalation that offers no change for review is bound to the coder
       worktree's current HEAD and returned. It is not held to publish
       evidence it never claimed, and a stale record that happens to match
@@ -108,13 +111,13 @@ def read_coder_turn(command: CoderTurnRead) -> CoderTurnDisposition:
     if envelope_error is not None:
         return CoderTurnDisposition(protocol_error=envelope_error)
     intent = CoderCompletionIntent.from_payload(payload)
-    # Mirrored unconditionally, exactly as before: the pair record's freshness
+    # Filed unconditionally, exactly as before: the pair record's freshness
     # contract is about what evidence EXISTS, not about who is going to
     # demand it, so an escalation still invalidates a superseded record.
-    validation_source_error = pair_validation.refresh_from_completion(
-        payload,
-        run_validation_record_path=command.run_validation_record_path,
-    )
+    # WHO files it is the lane's principal to answer (#388) — the coder's own
+    # completion on the Actor lane, a trusted owner outside the sandbox on the
+    # Tech Lead's — and the answer is settled before this reader sees it.
+    validation_source_error = command.turn_evidence.file_for_turn(payload)
     if command.require_validation and intent.requires_publication_evidence:
         error = validation_source_error or pair_validation.current_validation_error()
         if error is not None:

@@ -3,6 +3,11 @@
 from importlib import resources
 from functools import lru_cache
 
+from ..domain.sandbox_scope import (
+    REVIEW_EXCHANGE_CODER_TASK_KIND,
+    REVIEW_EXCHANGE_REVIEWER_TASK_KIND,
+    REVIEW_EXCHANGE_TECH_LEAD_TASK_KIND,
+)
 from ..domain.session_key import TaskKind
 
 
@@ -62,6 +67,32 @@ def get_review_exchange_coder_instructions() -> str:
 
 
 @lru_cache(maxsize=1)
+def get_review_exchange_tech_lead_instructions() -> str:
+    """Load the review-exchange completion protocol for a Tech Lead (#388).
+
+    The exchange's coder SIDE is a position in the protocol, not an authority.
+    A Tech Lead whose completion offers a change for review takes that side and
+    used to be handed the Actor's document with it — whose step 3 makes
+    ``prepush-check --dirty-only -v`` mandatory, the shared-git-dir write a
+    bounded Tech Lead sandbox refuses and that #385 already moved off the
+    primary lane.
+
+    This is the same exchange protocol — ``coding-done`` then
+    ``exchange-respond``, with the #386 ``needs_human`` terminal intact — with
+    that one obligation left where #385 put it: with the trusted owner, which
+    executes the round's mandatory validation outside the session and binds it
+    to the exact commit. Nothing is waived.
+
+    Cached since the content never changes during runtime.
+    """
+    return (
+        resources.files(__package__)
+        .joinpath("review_exchange_tech_lead.md")
+        .read_text()
+    )
+
+
+@lru_cache(maxsize=1)
 def get_review_exchange_reviewer_instructions() -> str:
     """Load review exchange reviewer instructions.
 
@@ -77,12 +108,15 @@ def get_completion_instructions(task_kind: str) -> str:
     The task kind names the ROLE whose completion protocol applies, which is
     why ``tech-lead`` has an entry of its own: a Tech Lead completes with
     ``coding-done`` like a coder, but it may not execute the coder protocol's
-    host/shared-repository pre-push step (#385).
+    host/shared-repository pre-push step (#385). ``review_exchange_tech_lead``
+    is the same statement about the exchange's coder LANE (#388): the lane is a
+    position in the protocol, not an authority, so a Tech Lead sitting in it
+    keeps its own contract rather than inheriting the Actor's.
 
     Args:
         task_kind: The task kind value (e.g., "code", "rework", "review",
                   "tech-lead", "review_exchange_coder",
-                  "review_exchange_reviewer").
+                  "review_exchange_tech_lead", "review_exchange_reviewer").
 
     Returns:
         Markdown instructions for the appropriate completion command.
@@ -91,8 +125,10 @@ def get_completion_instructions(task_kind: str) -> str:
         return get_coding_done_instructions()
     if task_kind == TaskKind.TECH_LEAD.value:
         return get_tech_lead_done_instructions()
-    if task_kind == "review_exchange_coder":
+    if task_kind == REVIEW_EXCHANGE_CODER_TASK_KIND:
         return get_review_exchange_coder_instructions()
-    if task_kind == "review_exchange_reviewer":
+    if task_kind == REVIEW_EXCHANGE_TECH_LEAD_TASK_KIND:
+        return get_review_exchange_tech_lead_instructions()
+    if task_kind == REVIEW_EXCHANGE_REVIEWER_TASK_KIND:
         return get_review_exchange_reviewer_instructions()
     return get_reviewer_done_instructions()

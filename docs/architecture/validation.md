@@ -1493,70 +1493,105 @@ contradiction and resolving it by precedence inside the model is not the
 Agent-Intent/Orchestrator-Authority model; not emitting it is.
 
 `domain/review_exchange.build_coder_prompt` follows the same rule — its step 3
-defers, and `resources/review_exchange_coder.md`, the completion protocol
-document for that lane, is the one place naming the command.
+defers, and the completion protocol document for that lane — which of the two
+depends on who is sitting in it, see below — is the one place naming the
+command.
 
-### Known gap: the review-exchange coder lane and the sandbox boundary
+### Nor on the review-exchange coder lane (#388)
 
 The rule above is about *duplication*. It does not fix the case where the single
-remaining owner names a command the role cannot execute, and there is one open
-instance, deliberately not repaired by #385:
+remaining owner names a command the role cannot execute, and #385 left exactly
+one open instance, which #388 closes.
 
 A completion that requests `create_pr` and resolves a reviewer starts a review
 exchange with `coder_label = agent_label`
-(`control/completion_review_exchange.py`). Nothing on that path asks which role
-the agent is — `Config.get_reviewer_for_agent` falls back to
+(`control/completion_review_exchange.py`). Nothing on that path used to ask
+which role the agent is — `Config.get_reviewer_for_agent` falls back to
 `code_review_agent`, so a tech-lead agent resolves one like any other — and the
-lane launches with `task_kind="review_exchange_coder"`, which injects
+lane launched with `task_kind="review_exchange_coder"`, which injects
 `review_exchange_coder.md` and its mandatory `prepush-check`. A sandboxed Tech
-Lead relaunched as an exchange coder therefore meets the #383 wall again, and
-`tech_lead_done.md`'s override is not present on that lane to counter it.
+Lead relaunched as an exchange coder therefore met the #383 wall again, and
+`tech_lead_done.md`'s override was not present on that lane to counter it. The
+defect was pre-existing rather than introduced by #385: before that change a
+sandboxed Tech Lead could not complete on the primary lane at all, so it never
+reached the exchange. #385 did not create the wall; it moved the road far
+enough to reach it.
 
-The invariant is wider than one role: **the exchange coder protocol mandates a
-shared-git-dir write that no sandbox-opted-in agent may perform**, so a
-sandboxed Actor hits it identically (`AgentConfig.sandbox` defaults `False`, so
-an unsandboxed one is unaffected). It is also **pre-existing rather than
-introduced by #385**: before this change a sandboxed Tech Lead could not
-complete on the primary lane at all, so it never reached the exchange. #385 does
-not create the wall; it moves the road far enough to reach it.
+Swapping the document is not on its own sufficient, and that is what made the
+repair larger than it looked. The lane does not merely *instruct* the coder to
+validate; it *requires the artifact*. `read_coder_turn`
+(`execution/review_exchange_coder_turn.py`) rejects the turn unless a passing
+`validation-record.json` bound to current HEAD is present, and only `coding-done
+completed` used to write one. That requirement is on by default
+(`Config.review_exchange_require_validation` is `True`), as is the lane itself
+(`Config.review_exchange_mode` is `"via-local-loop"`).
 
-What gates it is the `sandbox: true` opt-in **alone**. The other half is on by
-default — `Config.review_exchange_mode` is `"via-local-loop"`
-(`infra/config.py`, `infra/config_sections.py`). This repository's own
-`selfhost.yaml` sets no `sandbox: true`, so the gap is latent *here*; it is not
-latent for the bounded-Codex Tech Lead configuration R33 turns that opt-in on
-for.
+**The lane name is a position in the protocol; the principal is the authority.**
+That is the whole repair, and it is one value:
+`domain/review_exchange_coder_principal.ReviewExchangeCoderPrincipal`, resolved
+by `control/tech_lead_session_policy.review_exchange_coder_principal` — the same
+owner that answers `is_tech_lead_session` for the coding lane, asked for a third
+consequence. It carries both halves of the answer so a caller cannot take one
+and forget the other:
 
-Swapping the document is not on its own sufficient, and that is what makes the
-repair larger than it looks. The lane does not merely *instruct* the coder to
-validate; it *requires the artifact*. `_validate_coder_completion`
-(`execution/persistent_session_exchange.py`) rejects the turn unless a passing
-`validation-record.json` bound to current HEAD is present, and only
-`coding-done completed` writes one (`statuses_requiring_validation`). That
-requirement is on by default — `Config.review_exchange_require_validation` is
-`True` (`infra/config.py`). So a sandboxed coder handed a document that omits
-the command would still fail the turn for the missing record: the in-session
-validation obligation is in the lane's protocol contract, not just in its
-prose.
+| Piece | Where |
+|-------|-------|
+| Which completion protocol document that side is handed | `principal.task_kind` → `resources/review_exchange_tech_lead.md` (no `prepush-check`) |
+| Which sandbox role it resolves to | `REVIEW_EXCHANGE_TECH_LEAD_TASK_KIND` in `domain/sandbox_scope` — `SandboxRole.TECH_LEAD`, and the computed scope is byte-for-byte the coder's, so nothing widens |
+| Whether `coding-done` runs the host-mutating candidate quick gate | `principal.files_its_own_turn_validation`, declared into the session env and read back by `control/completion_gate_routing.route_completion_gate` |
+| Who files the round's validation evidence | `execution/review_exchange_turn_validation` — `CoderFiledTurnEvidence` for an Actor, `TrustedTurnEvidence` for a Tech Lead |
+| The trusted owner it asks | the SAME `ports/tech_lead_completion_validation.TechLeadCompletionValidator` #385 gates the primary lane on, built once at the composition root |
 
-Repairing it therefore means deciding what a sandboxed agent's exchange-coder
-protocol should be *and* who files the record it is judged on — either a
-role-aware document plus a trusted owner filing the turn's validation evidence
-the way #385 files the Tech Lead completion verdict, or excluding
-sandbox-opted-in agents from the exchange lane so their PRs take the ordinary
-review pipeline (smaller, but it removes internal review from those runs). That
-is a role×lane product decision and generic completion-platform redesign, which
-#385's STOP conditions exclude.
+The gate routing needs the env declaration because the run directory cannot
+answer: an exchange coder's `RUN_DIR` is the *exchange* run's, and the tech-lead
+assignment `route_completion_gate` reads is staged by the primary launch into a
+different one. Both signals fail safe to the ordinary gate, and an agent that
+re-exported the declaration to its own `coding-done` would only skip its own
+quick gate — which on this lane means writing no record and failing the round
+for the evidence the Actor lane still requires.
 
-**Status: open, not yet tracked by an issue.** #385 round 4 established that
-`coding-done --follow-up-file` does not file one — the proposal terminates in
-the session-diagnostics dialog (`view_models/dialogs.py`) and no
-`create_issue` producer reads it — and agents hold read-only GitHub access, so
-the follow-up `AGENTS.md`'s deferral rule requires (created, owned, scheduled,
-linked) has to be opened by a human. Until it is, this section is the record.
-`tests/unit/test_completion_processor.py::TestReviewExchangeModeResolution::test_a_tech_lead_agent_is_not_excluded_from_the_exchange`
-pins the reachability, so the gap rests on a measured fact and the repair has an
-anchor to invert.
+`TrustedTurnEvidence` binds exactly: it asks the trusted owner about the
+*exchange* run id, this session and the commit the coder worktree stands at
+right now, checks the returned verdict `binds_to` that same triple, and
+publishes it as the pair's `validation-record.json` only when it passed. Its
+`suite` is `tech_lead_completion_validation`, not `agent_gate`, so a reader can
+see which contract produced it. Every other direction — failed, timed out,
+unavailable, an owner that raised, a verdict naming another candidate, an
+unobservable HEAD, no owner wired at all — clears the pair's evidence and
+returns the refusal as the turn's protocol error. Nothing publishes a pass the
+trusted owner did not file.
+
+It also files the evidence the exchange OPENS on. The reviewer moves first and
+its approval is gated on the pair's record being current
+(`_finalize_reviewer_decision`), so a lane whose completing session files none
+would have met a round-one approval with "validation-record.json missing" and
+handed the Tech Lead a rework request naming an artifact its protocol says is
+not its to write. The trusted owner's verdict is create-once per candidate, so
+the coder's first turn on an unchanged HEAD re-reads exactly that one.
+
+Actor and Reviewer exchange semantics are untouched:
+`review_exchange_coder.md` still makes `prepush-check --dirty-only -v`
+mandatory, `CoderFiledTurnEvidence` mirrors what the coder's own `coding-done`
+left behind exactly as before, and an undeclared principal is an Actor. #386's
+terminal is untouched too: a `needs_human` turn that offers no change for
+review owes no publication evidence, so a trusted refusal does not convert the
+question into a failure — while an escalation that also asks for `create_pr`
+keeps every prerequisite and still fails closed.
+
+**Still open: a sandbox-opted-in ACTOR on the same lane.** #388's boundary is
+role authority, not provider or sandbox posture, so an ordinary coding agent
+configured with `sandbox: true` still meets the wall this section describes: it
+is handed `review_exchange_coder.md`, runs `prepush-check`, and fails on the
+shared-git-dir write. That is deliberate and narrower than it sounds —
+`AgentConfig.sandbox` defaults `False`, and this repository's own
+`selfhost.yaml` sets it nowhere, so nothing here is affected — but it is not
+fixed. Fixing it means deciding what a bounded Actor's exchange-coder protocol
+should be, which is a role×lane product decision rather than the measured Tech
+Lead seam, and is the generic completion-platform redesign #388's STOP
+conditions exclude. It has no issue of its own yet; this paragraph is the
+record, and
+`tests/unit/test_tech_lead_completion_protocol.py::TestTheExchangeTechLeadDocument::test_the_actor_exchange_document_still_issues_the_command`
+pins the behaviour it would have to change.
 
 ### The other principal that must not run the gate
 

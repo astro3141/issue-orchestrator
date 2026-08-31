@@ -26,9 +26,16 @@ answer: refuse. The alternative — admitting a Tech Lead completion whose
 validation is merely unproven — is the exact thing a merge-facing PASS must
 never rest on.
 
-That is not the same as swallowing everything: see :data:`_NO_VERDICT_ERRORS`
+That is not the same as swallowing everything: see :data:`NO_VERDICT_ERRORS`
 for which failures are "no evidence" and which are a composition bug that must
 still crash.
+
+**One reader, two lanes.** :func:`read_trusted_completion_validation` is the
+shared half — did the owner answer at all, and (through the evidence's own
+:meth:`~..domain.tech_lead_completion_validation.TechLeadCompletionValidation.
+refusal_against`) does what it answered settle this candidate — asked by this
+module's completion gate (#385) and by the review exchange's Tech Lead coder
+side (#388). The refusal SURFACE differs by caller and stays with the caller.
 
 **The model cannot manufacture the answer.** The evidence is filed by the
 trusted owner into orchestrator-owned state outside the session's write roots,
@@ -45,6 +52,7 @@ from pathlib import Path
 from ..domain.tech_lead_completion_validation import (
     TechLeadCompletionValidation,
     TechLeadCompletionValidationStatus,
+    TrustedVerdictRefusal,
 )
 from ..ports.tech_lead_completion_validation import TechLeadCompletionValidator
 from .completion_types import ERROR_PREFIX_TECH_LEAD_COMPLETION_VALIDATION
@@ -53,8 +61,10 @@ from .zero_code_reads import ZeroCodeWorktreeReader
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    "NO_VERDICT_ERRORS",
     "UNWIRED_TECH_LEAD_COMPLETION_VALIDATOR",
     "UnwiredTechLeadCompletionValidator",
+    "read_trusted_completion_validation",
     "require_trusted_completion_validation",
 ]
 
@@ -103,7 +113,63 @@ UNWIRED_TECH_LEAD_COMPLETION_VALIDATOR: TechLeadCompletionValidator = (
 #: — a ``TypeError`` from a mis-wired port, say — is a bug in the composition,
 #: and this repo's fail-fast stance says a bug must crash where it is rather
 #: than be laundered into a governed verdict.
-_NO_VERDICT_ERRORS = (OSError, RuntimeError, TimeoutError, ValueError)
+NO_VERDICT_ERRORS = (OSError, RuntimeError, TimeoutError, ValueError)
+
+
+def read_trusted_completion_validation(
+    *,
+    validator: TechLeadCompletionValidator,
+    run_id: str,
+    session_name: str,
+    worktree: Path,
+    candidate_head_sha: str,
+) -> TechLeadCompletionValidation | TrustedVerdictRefusal:
+    """The trusted verdict for this exact candidate, or why there is none.
+
+    The single owner of the three questions every caller of a trusted verdict
+    has to ask in the same order, so no caller can quietly skip one:
+
+    1. did the owner produce a verdict at all (:data:`NO_VERDICT_ERRORS`);
+    2. is it about THIS run, session and commit
+       (:meth:`~...domain.tech_lead_completion_validation.
+       TechLeadCompletionValidation.binds_to`);
+    3. does it permit settling.
+
+    Both lanes gated on a trusted verdict ask it: the primary Tech Lead
+    completion (#385) and the Tech Lead side of a review exchange (#388).
+
+    Returns the verdict itself when all three answer yes — callers that need
+    what it says (the commit it names, when it was taken) read it from there —
+    and a :class:`~..domain.tech_lead_completion_validation.TrustedVerdictRefusal`
+    otherwise.
+    """
+    try:
+        validation = validator.validate_completion(
+            run_id=run_id,
+            session_name=session_name,
+            worktree=worktree,
+            candidate_head_sha=candidate_head_sha,
+        )
+    except NO_VERDICT_ERRORS as exc:
+        logger.warning(
+            "[TECH_LEAD] trusted completion validation raised for run %s/%s: %s",
+            run_id,
+            session_name,
+            exc,
+        )
+        return TrustedVerdictRefusal(
+            failure="validation_unavailable",
+            detail=(
+                "the trusted completion-validation owner failed to produce a"
+                f" verdict for {run_id}/{session_name}: {exc}"
+            ),
+        )
+    refusal = validation.refusal_against(
+        run_id=run_id,
+        session_name=session_name,
+        candidate_head_sha=candidate_head_sha,
+    )
+    return refusal if refusal is not None else validation
 
 
 def _refusal(failure: str, detail: str) -> str:
@@ -142,41 +208,16 @@ def require_trusted_completion_validation(
             f"the commit {worktree} stands at could not be read, so no trusted"
             " completion validation can be bound to a candidate",
         )
-    try:
-        validation = validator.validate_completion(
-            run_id=run_id,
-            session_name=session_name,
-            worktree=worktree,
-            candidate_head_sha=head,
-        )
-    except _NO_VERDICT_ERRORS as exc:
-        logger.warning(
-            "[TECH_LEAD] trusted completion validation raised for run %s/%s: %s",
-            run_id,
-            session_name,
-            exc,
-        )
-        return _refusal(
-            "validation_unavailable",
-            "the trusted completion-validation owner failed to produce a"
-            f" verdict for {run_id}/{session_name}: {exc}",
-        )
-    if not validation.binds_to(
-        run_id=run_id, session_name=session_name, candidate_head_sha=head
-    ):
-        return _refusal(
-            "candidate_drift",
-            "the trusted completion validation is bound to"
-            f" {validation.run_id}/{validation.session_name}@"
-            f"{validation.candidate_head_sha}, not to the"
-            f" {run_id}/{session_name}@{head} this completion settles",
-        )
-    if not validation.permits_completion:
-        return _refusal(
-            f"validation_{validation.status.value}",
-            f"the trusted completion validation for {run_id}/{session_name}@"
-            f"{head} did not pass: {validation.detail}",
-        )
+    outcome = read_trusted_completion_validation(
+        validator=validator,
+        run_id=run_id,
+        session_name=session_name,
+        worktree=worktree,
+        candidate_head_sha=head,
+    )
+    if isinstance(outcome, TrustedVerdictRefusal):
+        return _refusal(outcome.failure, outcome.detail)
+    validation = outcome
     logger.info(
         "[TECH_LEAD] trusted completion validation PASSED for %s/%s@%s: %s",
         run_id,
