@@ -27,12 +27,15 @@ from pathlib import Path
 from ..adapters.worktree.api import (
     REVIEW_COMMAND_GUARD_PATHS,
     WorktreeError,
-    install_review_command_guard,
     install_worktree_identity,
 )
 from ..domain.artifact_contracts import AgentProvider
 from ..domain.review_exchange import REVIEWER_WORKTREE_CHECKOUT_FAILURE_MARKER
 from ..infra.repo_identity import get_repo_head_sha
+from ..ports.review_command_guard import (
+    ReviewCommandGuardError,
+    ReviewCommandGuardInstaller,
+)
 from ..ports.worktree_manager import REVIEWER_OWNED_HEAD_MARKER, WORKTREE_ID_MARKER
 
 logger = logging.getLogger(__name__)
@@ -114,6 +117,7 @@ def create_reviewer_worktree(
     coder_branch: str,
     timestamp: str,
     reviewer_provider: AgentProvider,
+    guard_installer: ReviewCommandGuardInstaller,
 ) -> ReviewerWorktree:
     """Create a sibling reviewer worktree in detached HEAD on the coder's branch tip.
 
@@ -131,14 +135,23 @@ def create_reviewer_worktree(
     cannot run here is not a trade worth making.
 
     What keeps the exemption safe is a barrier, not an instruction:
-    :func:`install_review_command_guard` registers a policy in this worktree
-    that *refuses* build, test and validation commands before they execute
+    ``guard_installer`` registers a policy in this worktree that *refuses*
+    build, test and validation commands before they execute
     (``docs/architecture/hooks.md`` — prompts are suggestions, hooks are
     enforcement). ``REVIEWER_WORKTREE_IS_UNPROVISIONED_NOTE`` stays in every
     reviewer prompt so a refusal is expected rather than surprising, but the
     invariant no longer rests on the reviewer reading it. Installing the guard
     is part of taking ownership of the worktree: if it cannot be installed, the
     worktree is rolled back and creation fails.
+
+    The installer arrives as a
+    :class:`~..ports.review_command_guard.ReviewCommandGuardInstaller` rather
+    than being reached for, because the production one verifies its policy by
+    asking the installed Codex CLI. Binding a guard to this worktree and
+    verifying what that guard refuses are different facts, and only the second
+    needs a provider CLI present; keeping the first askable at this port is what
+    lets an exchange be exercised where no CLI is installed without the
+    worktree quietly going unguarded there instead.
 
     ``reviewer_provider`` is what stops that from being a claim rather than a
     fact. A guard is one provider's mechanism — Claude Code's pinned
@@ -184,9 +197,9 @@ def create_reviewer_worktree(
         ) from exc
     try:
         install_worktree_identity(sibling)
-        guard = install_review_command_guard(sibling, provider=reviewer_provider)
+        guard = guard_installer.establish(sibling, provider=reviewer_provider)
         _persist_owned_head(sibling, tip_sha)
-    except (WorktreeError, ReviewerWorktreeError) as exc:
+    except (WorktreeError, ReviewCommandGuardError, ReviewerWorktreeError) as exc:
         try:
             _git(repo_root, ["worktree", "remove", str(sibling), "--force"])
         except ReviewerWorktreeError:

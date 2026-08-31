@@ -34,8 +34,8 @@ from issue_orchestrator.adapters.worktree.api import (
     GUARDABLE_PROVIDERS,
     REVIEW_COMMAND_GUARD_SETTINGS,
     REVIEW_GUARD_RULES,
+    CodexReviewCommandGuardInstaller,
     ReviewCommandGuardOutcome,
-    WorktreeError,
     install_review_command_guard,
     render_review_rules,
 )
@@ -44,6 +44,7 @@ from issue_orchestrator.execution.agent_runner_providers.codex_trust import (
     resolve_codex_common_repository_root,
 )
 from issue_orchestrator.infra.hooks.review_command_guard import REFUSAL_REASON
+from issue_orchestrator.ports.review_command_guard import ReviewCommandGuardError
 from issue_orchestrator.resources import get_review_exchange_reviewer_instructions
 
 from tests.codex_execpolicy_fakes import (
@@ -242,7 +243,9 @@ class TestTheShippedSafetyPolicyComposes:
         self, reviewer_worktree: Path
     ) -> None:
         """A reviewer worktree must not be handed over half-protected."""
-        with pytest.raises(WorktreeError, match=r"orchestrator\.rules does not refuse"):
+        with pytest.raises(
+            ReviewCommandGuardError, match=r"orchestrator\.rules does not refuse"
+        ):
             _install(reviewer_worktree, CODEX, SafetyBlindExecPolicy())
 
 
@@ -252,20 +255,20 @@ class TestEstablishmentFailsClosed:
     def test_a_policy_that_refuses_nothing_does_not_establish(
         self, reviewer_worktree: Path
     ) -> None:
-        with pytest.raises(WorktreeError, match="does not refuse"):
+        with pytest.raises(ReviewCommandGuardError, match="does not refuse"):
             _install(reviewer_worktree, CODEX, AlwaysAllowingExecPolicy())
 
     def test_an_unclassifiable_answer_does_not_establish(
         self, reviewer_worktree: Path
     ) -> None:
-        with pytest.raises(WorktreeError, match="no classifiable answer"):
+        with pytest.raises(ReviewCommandGuardError, match="no classifiable answer"):
             _install(reviewer_worktree, CODEX, UnanswerableExecPolicy())
 
     def test_an_unwritable_worktree_does_not_establish(self, tmp_path: Path) -> None:
         blocked = tmp_path / "not-a-directory"
         blocked.write_text("", encoding="utf-8")
 
-        with pytest.raises(WorktreeError, match="Failed to write"):
+        with pytest.raises(ReviewCommandGuardError, match="Failed to write"):
             _install(blocked, CODEX)
 
     def test_a_safety_policy_that_cannot_be_installed_does_not_establish(
@@ -291,7 +294,9 @@ class TestEstablishmentFailsClosed:
             tmp_path / "templates-that-did-not-ship",
         )
 
-        with pytest.raises(WorktreeError, match="Failed to install the Codex safety"):
+        with pytest.raises(
+            ReviewCommandGuardError, match="Failed to install the Codex safety"
+        ):
             _install(reviewer_worktree, CODEX)
 
         assert not (reviewer_worktree / CODEX_SAFETY_RULES).exists()
@@ -306,7 +311,7 @@ class TestEstablishmentFailsClosed:
         caller must roll back. Returning the first for the second is how a
         reviewer ends up running in a worktree everyone believes is guarded.
         """
-        with pytest.raises(WorktreeError):
+        with pytest.raises(ReviewCommandGuardError):
             _install(reviewer_worktree, CODEX, AlwaysAllowingExecPolicy())
 
 
@@ -466,3 +471,59 @@ class TestTrustScopeIsUnchanged:
         )
         assert after == before
         assert not (product_checkout / ".git" / "config.toml").exists()
+
+
+class TestTheInstallerTheExchangeHolds:
+    """The port implementation, and the checker it is pinned to.
+
+    ``create_reviewer_worktree`` asks a
+    :class:`~issue_orchestrator.ports.review_command_guard.ReviewCommandGuardInstaller`
+    rather than reaching for this module, so the exchange can be exercised
+    where the Codex CLI is absent without the reviewer worktree quietly going
+    unguarded there. What must not follow from that seam is a checker the
+    caller did not choose: an installer that ignored its own ``execpolicy``
+    would answer every question with the operator's installed CLI while
+    appearing to be under test.
+    """
+
+    def test_the_installer_establishes_the_same_verified_policy(
+        self, reviewer_worktree: Path
+    ) -> None:
+        installer = CodexReviewCommandGuardInstaller(StarlarkPrefixExecPolicy())
+
+        outcome = installer.establish(reviewer_worktree, provider=CODEX)
+
+        assert outcome.guarded is True
+        assert outcome.policy_file == reviewer_worktree / REVIEW_GUARD_RULES
+        assert "make validate-pr-raw" in outcome.refusals()
+        assert "cat AGENTS.md" in outcome.allowances()
+
+    def test_the_injected_checker_is_the_one_asked(
+        self, reviewer_worktree: Path
+    ) -> None:
+        policy = StarlarkPrefixExecPolicy()
+
+        CodexReviewCommandGuardInstaller(policy).establish(
+            reviewer_worktree, provider=CODEX
+        )
+
+        assert reviewer_worktree / REVIEW_GUARD_RULES in policy.asked_files
+        assert reviewer_worktree / CODEX_SAFETY_RULES in policy.asked_files
+
+    def test_the_installer_fails_closed_the_way_the_function_does(
+        self, reviewer_worktree: Path
+    ) -> None:
+        installer = CodexReviewCommandGuardInstaller(AlwaysAllowingExecPolicy())
+
+        with pytest.raises(ReviewCommandGuardError, match="does not refuse"):
+            installer.establish(reviewer_worktree, provider=CODEX)
+
+    def test_an_unregistered_provider_is_still_reported_unguarded(
+        self, reviewer_worktree: Path
+    ) -> None:
+        installer = CodexReviewCommandGuardInstaller(StarlarkPrefixExecPolicy())
+
+        outcome = installer.establish(reviewer_worktree, provider=AgentProvider("gemini"))
+
+        assert outcome.guarded is False
+        assert outcome.policy_file is None

@@ -17,6 +17,7 @@ from issue_orchestrator.adapters.worktree.api import (
     REVIEW_COMMAND_GUARD_PATHS,
     REVIEW_COMMAND_GUARD_SETTINGS,
     REVIEW_GUARD_RULES,
+    CodexReviewCommandGuardInstaller,
     WorktreeError,
     install_review_command_guard,
     read_reviewer_head_ownership,
@@ -39,12 +40,22 @@ from issue_orchestrator.execution.reviewer_worktree import (
 from issue_orchestrator.ports.worktree_manager import REVIEWER_OWNED_HEAD_MARKER
 
 from tests.codex_execpolicy_fakes import StarlarkPrefixExecPolicy
+from tests.review_command_guard_fakes import FailingReviewCommandGuard
 
 
 #: The provider the reviewer runs under in these tests. Required by
 #: ``create_reviewer_worktree``: the command guard is installed through one
 #: provider's hook mechanism, so creation has to know which one will run.
 CLAUDE_CODE = AgentProvider("claude-code")
+
+#: The real installer, because this module's subject *is* what creation
+#: establishes in the worktree. A recording double belongs to the suites whose
+#: subject is upstream of that (``tests/review_command_guard_fakes``); here the
+#: files, the exclude entries and the rollback all have to be the production
+#: ones. The Codex tests below control what its checker answers by pointing
+#: ``PATH`` at a stub or by passing a fake to ``install_review_command_guard``
+#: directly, so nothing here reaches an operator's installed CLI.
+REAL_GUARD_INSTALLER = CodexReviewCommandGuardInstaller()
 
 
 def _git(cwd: Path, *args: str) -> str:
@@ -83,6 +94,7 @@ class TestReviewerWorktreeLifecycle:
             coder_branch=branch,
             timestamp="20260502T000000Z",
             reviewer_provider=CLAUDE_CODE,
+            guard_installer=REAL_GUARD_INSTALLER,
         )
 
         assert reviewer.path == coder.parent / f"{coder.name}-review-20260502T000000Z"
@@ -115,6 +127,7 @@ class TestReviewerWorktreeLifecycle:
                 coder_branch=branch,
                 timestamp="T",
                 reviewer_provider=CLAUDE_CODE,
+                guard_installer=REAL_GUARD_INSTALLER,
             )
 
     def test_create_rolls_back_when_identity_installation_fails(
@@ -139,6 +152,7 @@ class TestReviewerWorktreeLifecycle:
                 coder_branch=branch,
                 timestamp="T",
                 reviewer_provider=CLAUDE_CODE,
+                guard_installer=REAL_GUARD_INSTALLER,
             )
 
         assert not sibling.exists()
@@ -151,6 +165,7 @@ class TestReviewerWorktreeLifecycle:
             coder_branch=branch,
             timestamp="T",
             reviewer_provider=CLAUDE_CODE,
+            guard_installer=REAL_GUARD_INSTALLER,
         )
         original_tip = _git(repo_root, "rev-parse", branch)
 
@@ -178,6 +193,7 @@ class TestReviewerWorktreeLifecycle:
             coder_branch=branch,
             timestamp="T",
             reviewer_provider=CLAUDE_CODE,
+            guard_installer=REAL_GUARD_INSTALLER,
         )
         (reviewer.path / REVIEWER_OWNED_HEAD_MARKER).write_text(
             "partial-write",
@@ -196,6 +212,7 @@ class TestReviewerWorktreeLifecycle:
             coder_branch=branch,
             timestamp="T",
             reviewer_provider=CLAUDE_CODE,
+            guard_installer=REAL_GUARD_INSTALLER,
         )
         assert reviewer.path.exists()
 
@@ -210,6 +227,7 @@ class TestReviewerWorktreeLifecycle:
             coder_branch=branch,
             timestamp="T",
             reviewer_provider=CLAUDE_CODE,
+            guard_installer=REAL_GUARD_INSTALLER,
         )
         # External cleanup beats us to it.
         import shutil
@@ -238,6 +256,7 @@ class TestReviewerWorktreeRefusesGateCommands:
             coder_branch=branch,
             timestamp="T",
             reviewer_provider=CLAUDE_CODE,
+            guard_installer=REAL_GUARD_INSTALLER,
         )
 
         settings = json.loads(
@@ -258,6 +277,7 @@ class TestReviewerWorktreeRefusesGateCommands:
             coder_branch=branch,
             timestamp="T",
             reviewer_provider=CLAUDE_CODE,
+            guard_installer=REAL_GUARD_INSTALLER,
         )
 
         command = _guard_command(reviewer.path)
@@ -274,6 +294,7 @@ class TestReviewerWorktreeRefusesGateCommands:
             coder_branch=branch,
             timestamp="T",
             reviewer_provider=CLAUDE_CODE,
+            guard_installer=REAL_GUARD_INSTALLER,
         )
 
         refused = _run_guard(reviewer.path, "make validate-pr-raw")
@@ -290,6 +311,7 @@ class TestReviewerWorktreeRefusesGateCommands:
             coder_branch=branch,
             timestamp="T",
             reviewer_provider=CLAUDE_CODE,
+            guard_installer=REAL_GUARD_INSTALLER,
         )
 
         assert _run_guard(reviewer.path, "git log --oneline").returncode == 0
@@ -303,6 +325,7 @@ class TestReviewerWorktreeRefusesGateCommands:
             coder_branch=branch,
             timestamp="T",
             reviewer_provider=CLAUDE_CODE,
+            guard_installer=REAL_GUARD_INSTALLER,
         )
 
         tracked = subprocess.run(
@@ -325,6 +348,7 @@ class TestReviewerWorktreeRefusesGateCommands:
             coder_branch=branch,
             timestamp="T",
             reviewer_provider=CLAUDE_CODE,
+            guard_installer=REAL_GUARD_INSTALLER,
         )
 
         remove_reviewer_worktree(reviewer)
@@ -332,19 +356,12 @@ class TestReviewerWorktreeRefusesGateCommands:
         assert not reviewer.path.exists()
 
     def test_create_rolls_back_when_the_guard_cannot_be_installed(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+        self, tmp_path: Path,
     ) -> None:
         """An unguarded reviewer worktree must not exist at all."""
         repo_root, coder, branch = _bootstrap_repo_with_branch(tmp_path)
         sibling = coder.parent / f"{coder.name}-review-T"
-
-        def fail_guard_install(_path: Path, *, provider: AgentProvider) -> None:
-            raise WorktreeError(f"settings unwritable for {provider.value}")
-
-        monkeypatch.setattr(
-            "issue_orchestrator.execution.reviewer_worktree.install_review_command_guard",
-            fail_guard_install,
-        )
+        refusing = FailingReviewCommandGuard(message="settings unwritable")
 
         with pytest.raises(ReviewerWorktreeError, match="command guard"):
             create_reviewer_worktree(
@@ -352,8 +369,10 @@ class TestReviewerWorktreeRefusesGateCommands:
                 coder_branch=branch,
                 timestamp="T",
                 reviewer_provider=CLAUDE_CODE,
+                guard_installer=refusing,
             )
 
+        assert refusing.calls == [(sibling, CLAUDE_CODE.value)]
         assert not sibling.exists()
         assert str(sibling) not in _git(repo_root, "worktree", "list", "--porcelain")
 
@@ -379,6 +398,7 @@ class TestReviewerWorktreeRefusesGateCommands:
             coder_branch=branch,
             timestamp="T",
             reviewer_provider=AgentProvider(provider),
+            guard_installer=REAL_GUARD_INSTALLER,
         )
 
         for planted in REVIEW_COMMAND_GUARD_PATHS:
@@ -408,6 +428,7 @@ class TestReviewerWorktreeRefusesGateCommands:
             coder_branch=branch,
             timestamp="T",
             reviewer_provider=CLAUDE_CODE,
+            guard_installer=REAL_GUARD_INSTALLER,
         )
         outcome = install_review_command_guard(reviewer.path, provider=CLAUDE_CODE)
 
@@ -426,6 +447,7 @@ class TestReviewerWorktreeRefusesGateCommands:
                 coder_branch=branch,
                 timestamp="T",
                 reviewer_provider=AgentProvider("cursor"),
+                guard_installer=REAL_GUARD_INSTALLER,
             )
 
         warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
@@ -452,6 +474,7 @@ class TestTheCodexReviewerWorktreeLifecycle:
             coder_branch=branch,
             timestamp="T",
             reviewer_provider=CLAUDE_CODE,
+            guard_installer=REAL_GUARD_INSTALLER,
         )
         # The Codex registration's files, established exactly as a Codex
         # reviewer's worktree would carry them.
@@ -496,6 +519,7 @@ class TestTheCodexReviewerWorktreeLifecycle:
                 coder_branch=branch,
                 timestamp="T",
                 reviewer_provider=AgentProvider("codex"),
+                guard_installer=REAL_GUARD_INSTALLER,
             )
 
         assert not sibling.exists()
@@ -511,6 +535,7 @@ class TestTheCodexReviewerWorktreeLifecycle:
             coder_branch=branch,
             timestamp="T",
             reviewer_provider=CLAUDE_CODE,
+            guard_installer=REAL_GUARD_INSTALLER,
         )
         install_review_command_guard(
             reviewer.path,
@@ -568,6 +593,7 @@ class TestReviewerCandidatePresentation:
             coder_branch=branch,
             timestamp="T",
             reviewer_provider=CLAUDE_CODE,
+            guard_installer=REAL_GUARD_INSTALLER,
         )
         (coder / "work.py").write_text("print('second')\n")
         _git(coder, "add", "work.py")
@@ -597,6 +623,7 @@ class TestReviewerCandidatePresentation:
             coder_branch=branch,
             timestamp="T",
             reviewer_provider=CLAUDE_CODE,
+            guard_installer=REAL_GUARD_INSTALLER,
         )
         sha_a = _git(reviewer.path, "rev-parse", "HEAD")
 
@@ -625,6 +652,7 @@ class TestReviewerCandidatePresentation:
             coder_branch=branch,
             timestamp="T",
             reviewer_provider=CLAUDE_CODE,
+            guard_installer=REAL_GUARD_INSTALLER,
         )
         created_at = _git(reviewer.path, "rev-parse", "HEAD")
         # The coder moves on; with no branch to track, that must not leak in.
@@ -660,6 +688,7 @@ class TestReviewerCandidatePresentation:
             coder_branch=branch,
             timestamp="T",
             reviewer_provider=CLAUDE_CODE,
+            guard_installer=REAL_GUARD_INSTALLER,
         )
         seen: list[int] = []
 
@@ -691,6 +720,7 @@ class TestReviewerWorktreeDiagnostics:
             coder_branch=branch,
             timestamp="T",
             reviewer_provider=CLAUDE_CODE,
+            guard_installer=REAL_GUARD_INSTALLER,
         )
 
         # Coder advances the branch tip by committing a new tracked file.
@@ -741,6 +771,7 @@ class TestReviewerWorktreeDiagnostics:
                 coder_branch="does/not/exist",
                 timestamp="T",
                 reviewer_provider=CLAUDE_CODE,
+                guard_installer=REAL_GUARD_INSTALLER,
             )
 
         err = excinfo.value

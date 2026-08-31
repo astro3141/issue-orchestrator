@@ -44,14 +44,21 @@ policy, and its verification through ``codex execpolicy check`` belong to
 :mod:`._codex_gate_policy`, which the planning guard (#289) proved and uses
 too; what this module owns is the reviewer's refusal prose and the samples a
 reviewer must keep. Establishment that cannot be verified raises
-:class:`WorktreeError`, and the reviewer worktree is rolled back rather than
-handed over as guarded.
+:class:`ReviewCommandGuardError`, and the reviewer worktree is rolled back
+rather than handed over as guarded.
 
 The third thing this module owes its caller is an honest answer:
 :class:`ReviewCommandGuardOutcome` reports what was actually established —
 ``guarded`` is a fact the caller must handle, not a value it can assume, and
 ``probes`` carries the classifications a mechanism that can be measured gave
 before the guard was called established.
+
+Both of those types, and the :class:`ReviewCommandGuardInstaller` protocol
+:class:`CodexReviewCommandGuardInstaller` implements, belong to
+:mod:`issue_orchestrator.ports.review_command_guard`. The exchange asks that
+port for a guard rather than calling this module, which is what lets "was a
+guard bound to this reviewer worktree, for the provider that will really sit in
+it" be measured without installing a provider CLI.
 """
 
 from __future__ import annotations
@@ -61,7 +68,6 @@ import logging
 import shlex
 import sys
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -72,13 +78,16 @@ from ...infra.hooks.review_command_guard import (
     orchestrator_source_root,
 )
 from ...ports.command_guard import GuardProbe
+from ...ports.review_command_guard import (
+    ReviewCommandGuardError,
+    ReviewCommandGuardOutcome,
+)
 from ..hooks.codex_execpolicy import CodexCliExecPolicy, ExecPolicyChecker
 from ._codex_gate_policy import (
     CODEX_SAFETY_RULES,
     CodexGatePolicy,
     CodexGatePolicyError,
 )
-from ._worktree_errors import WorktreeError
 from ._worktree_runtime import _write_worktree_exclude_entries
 
 logger = logging.getLogger(__name__)
@@ -90,6 +99,7 @@ __all__ = [
     "REVIEW_GUARD_ALLOWED_SAMPLES",
     "REVIEW_GUARD_REFUSED_SAMPLES",
     "REVIEW_GUARD_RULES",
+    "CodexReviewCommandGuardInstaller",
     "ReviewCommandGuardOutcome",
     "install_review_command_guard",
     "render_review_rules",
@@ -170,36 +180,6 @@ REVIEW_GATE_POLICY = CodexGatePolicy(
     refused_samples=REVIEW_GUARD_REFUSED_SAMPLES,
     allowed_samples=REVIEW_GUARD_ALLOWED_SAMPLES,
 )
-
-
-@dataclass(frozen=True)
-class ReviewCommandGuardOutcome:
-    """What the installer did for one reviewer worktree.
-
-    ``guarded`` is the fact callers have to branch on. It exists as a returned
-    value rather than an assumed post-condition because the alternative — a
-    ``Path`` for every provider — is what let a Claude-shaped settings file
-    stand in for enforcement on providers that never read it.
-
-    ``probes`` is empty for a mechanism whose enforcement is not established by
-    classifying samples (the Claude hook runs the orchestrator's own pinned
-    policy module), and carries the measured classifications for one that is
-    (the Codex exec policy, whose file is data a checker must be asked about).
-    """
-
-    provider: AgentProvider
-    policy_file: Path | None
-    probes: tuple[GuardProbe, ...] = ()
-
-    @property
-    def guarded(self) -> bool:
-        return self.policy_file is not None
-
-    def refusals(self) -> tuple[str, ...]:
-        return tuple(probe.label for probe in self.probes if probe.refused)
-
-    def allowances(self) -> tuple[str, ...]:
-        return tuple(probe.label for probe in self.probes if not probe.refused)
 
 
 #: What one provider's registration returns: the file it wrote, and whatever
@@ -293,7 +273,7 @@ def _register_claude_pre_tool_use_hook(
         settings_file.parent.mkdir(parents=True, exist_ok=True)
         settings_file.write_text(json.dumps(settings, indent=2), encoding="utf-8")
     except OSError as exc:
-        raise WorktreeError(
+        raise ReviewCommandGuardError(
             f"Failed to install reviewer command guard at {settings_file}: {exc}"
         ) from exc
     _write_worktree_exclude_entries(worktree_path, [REVIEW_COMMAND_GUARD_SETTINGS])
@@ -314,7 +294,7 @@ def _register_codex_exec_policy(
             worktree_path, execpolicy=execpolicy
         )
     except CodexGatePolicyError as exc:
-        raise WorktreeError(str(exc)) from exc
+        raise ReviewCommandGuardError(str(exc)) from exc
     return established.policy_file, established.probes
 
 
@@ -362,9 +342,10 @@ def install_review_command_guard(
     let the caller mistake that file for a barrier.
 
     Raises:
-        WorktreeError: a guard this installer *can* register could not be
-            written, or could not be verified as refusing. A guardable provider
-            left unguarded is a worktree the caller must not proceed with.
+        ReviewCommandGuardError: a guard this installer *can* register could
+            not be written, or could not be verified as refusing. A guardable
+            provider left unguarded is a worktree the caller must not proceed
+            with.
     """
     register = _REGISTRATIONS.get(provider.value)
     if register is None:
@@ -390,3 +371,36 @@ def install_review_command_guard(
     return ReviewCommandGuardOutcome(
         provider=provider, policy_file=policy_file, probes=probes
     )
+
+
+class CodexReviewCommandGuardInstaller:
+    """The production :class:`ReviewCommandGuardInstaller`, CLI-backed.
+
+    Holds the checker that answers execpolicy questions, exactly as
+    :class:`~.._planning_command_guard.CodexPlanningCommandGuardInstaller`
+    does for the other guarded principal: production passes the installed Codex
+    CLI, the only authority on its own rules, and a test that wants the *real*
+    policy rendered and classified passes a fake checker instead of installing
+    one.
+
+    The class is what the review exchange holds, rather than the module-level
+    function, because an exchange that only ever reaches the real installer
+    cannot be exercised anywhere the provider CLI is absent — which is every
+    hermetic test environment and this repository's own CI. Substituting the
+    installer keeps "the exchange binds a guard to the reviewer worktree, for
+    the provider it launches" a measured fact there, while leaving the question
+    of what the policy actually refuses to the suites that can put it to a
+    checker.
+    """
+
+    def __init__(self, execpolicy: ExecPolicyChecker | None = None) -> None:
+        self._execpolicy: ExecPolicyChecker = (
+            CodexCliExecPolicy() if execpolicy is None else execpolicy
+        )
+
+    def establish(
+        self, worktree_path: Path, *, provider: AgentProvider
+    ) -> ReviewCommandGuardOutcome:
+        return install_review_command_guard(
+            worktree_path, provider=provider, execpolicy=self._execpolicy
+        )

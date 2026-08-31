@@ -1345,6 +1345,22 @@ named guardable without a registration behind it (#396).
 - **A guard that should have been installable and was not rolls the worktree
   back**, so neither an I/O failure nor an unverifiable policy can quietly
   produce a worktree that was meant to be guarded and is not.
+- **The exchange asks a port, not this module.**
+  `ports/review_command_guard.py` carries the outcome, the failure and the
+  `ReviewCommandGuardInstaller` protocol; `create_reviewer_worktree` and
+  `PersistentReviewExchangeRunner` take an installer, and the composition
+  default is the CLI-backed `CodexReviewCommandGuardInstaller` — the strict
+  one, so an unwired deployment still gets the barrier. The seam exists
+  because *binding* a guard to the reviewer worktree and *verifying what it
+  refuses* are different facts, and only the second needs `codex` on `PATH`.
+  Without it, every suite that drives a whole exchange with a Codex reviewer
+  would either require the provider CLI or go unguarded; the exchange-level
+  suites substitute a recording installer and assert the guard was requested
+  for the provider the exchange launched, while what the policy actually
+  refuses stays the subject of `tests/unit/adapters/test_review_command_guard.py`
+  and the live `tests/integration/test_codex_reviewer_guard_live.py`. This is
+  the same port-shaped arrangement `PlanningCommandGuardInstaller` already had
+  for the other guarded principal.
 
 Both registrations render the same vocabulary: which entry points count as a
 gate is declared once, in `infra/hooks/gate_commands.py`, as command regexes for
